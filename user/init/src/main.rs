@@ -11,8 +11,8 @@ compile_error!(
     "init requires --target x86_64-unknown-none; host tools/tests do not enable freestanding"
 );
 
-// Links `kernel::runtime`, the reviewed scalar `memset`/`memcpy` the compiler emits calls to.
-use kernel as _;
+// Links the reviewed scalar `memset`/`memcpy` the compiler emits calls to.
+use linux_rs_runtime as _;
 
 use core::arch::naked_asm;
 use core::fmt::{self, Debug, Display, Write};

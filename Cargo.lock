@@ -9,14 +9,21 @@ version = "0.1.0"
 [[package]]
 name = "kernel"
 version = "0.1.0"
+dependencies = [
+ "linux-rs-runtime",
+]
 
 [[package]]
 name = "linux-rs-init"
 version = "0.1.0"
 dependencies = [
- "kernel",
+ "linux-rs-runtime",
  "syscalls",
 ]
+
+[[package]]
+name = "linux-rs-runtime"
+version = "0.1.0"
 
 [[package]]
 name = "syscalls"

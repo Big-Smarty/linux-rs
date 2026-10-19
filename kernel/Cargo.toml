@@ -15,8 +15,8 @@ required-features = ["freestanding"]
 
 [features]
 default = []
-freestanding = []
-qemu-self-test = ["freestanding"]
+freestanding = ["dep:linux-rs-runtime"]
+qemu-self-test = ["freestanding", "linux-rs-runtime?/self-test"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -24,3 +24,6 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+linux-rs-runtime = { version = "0.1.0", path = "../rt", optional = true }
