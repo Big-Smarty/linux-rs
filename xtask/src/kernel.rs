@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -22,6 +22,8 @@ const REQUIRED_CARGO_COMMIT: &str = "3d7cf6e937d6127d0f49881bf689c560b36d35c4";
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const KILL: &str = "/usr/bin/kill";
+const SETPRIV: &str = "/usr/bin/setpriv";
+pub(crate) const SERIAL_LOG_LIMIT: u64 = 4 * 1024 * 1024;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
 const FAT_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const OVMF_CODE: &str = "/usr/share/edk2/x64/OVMF_CODE.4m.fd";
@@ -235,6 +237,7 @@ struct BootImage {
     disk: PathBuf,
     vars_copy: PathBuf,
     vars_sha256_initial: String,
+    disk_sha256_initial: String,
     kernel_image_sha256: String,
     limine_image_sha256: String,
     module_image_sha256: Vec<String>,
@@ -300,8 +303,8 @@ impl ChildGuard {
 }
 
 fn kill_process_group(group: u32) -> io::Result<()> {
-    // This fixed, non-shell utility is the only signal boundary. The host crate
-    // forbids unsafe code; every ordinary child is placed in its own group.
+    // This fixed, non-shell utility is the only signal boundary; every
+    // ordinary child is placed in its own group.
     let mut signal = Command::new(KILL)
         .args(["--signal", "KILL", "--", &format!("-{group}")])
         .env_clear()
@@ -361,6 +364,42 @@ fn isolate_command(command: &mut Command) {
             command.env_remove(key);
         }
     }
+}
+
+/// Wrap a long-lived child so it gets SIGKILL when xtask's spawning thread dies
+/// (Ctrl-C, SIGTERM, an aborting panic), instead of being orphaned. `setpriv`
+/// sets `PR_SET_PDEATHSIG` and execs in place, keeping pid and process group.
+/// The signal follows the spawning thread: every caller spawns on the thread that
+/// waits for the child. shortcut: no `getppid` recheck, so a parent dying between
+/// fork and the `prctl` still orphans the child; closing that needs `unsafe`/a crate.
+fn supervised(program: &Path) -> Command {
+    let mut command = Command::new(SETPRIV);
+    command.args(["--pdeathsig", "KILL", "--"]).arg(program);
+    command
+}
+
+fn record_setpriv(
+    root: &Path,
+    sha256sum: &Path,
+    values: &mut BTreeMap<String, String>,
+) -> io::Result<()> {
+    // Canonical, like `process_group_kill_path`: package compares it with the hashed runtime input.
+    manifest_value(
+        values,
+        "setpriv_path",
+        display_path(&fs::canonicalize(SETPRIV)?)?,
+    );
+    manifest_value(
+        values,
+        "setpriv_version",
+        single_line(&tool_output(Path::new(SETPRIV), &["--version"], root)?),
+    );
+    manifest_value(
+        values,
+        "sha256_setpriv",
+        file_hash(root, sha256sum, Path::new(SETPRIV))?,
+    );
+    Ok(())
 }
 
 impl Drop for ChildGuard {
@@ -513,21 +552,13 @@ fn create_directory(path: &Path) -> io::Result<()> {
     fs::create_dir(path).map_err(|error| contextual(path, &error))
 }
 
-fn resolve_tool(name: &str, env_name: Option<&str>) -> io::Result<PathBuf> {
-    if let Some(env_name) = env_name
-        && let Some(value) = std::env::var_os(env_name)
-        && !value.is_empty()
-    {
-        return resolve_program(Path::new(&value));
-    }
-    resolve_program(Path::new(name))
-}
-
 pub(crate) fn resolve_program(program: &Path) -> io::Result<PathBuf> {
     let candidates = if program.components().count() > 1 || program.is_absolute() {
         vec![program.to_path_buf()]
     } else {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            // Empty and relative entries mean the current directory, which can hold planted tools.
+            .filter(|directory| directory.is_absolute())
             .map(|directory| directory.join(program))
             .collect()
     };
@@ -628,8 +659,8 @@ pub(crate) fn tool_output(path: &Path, args: &[&str], root: &Path) -> io::Result
     Ok(text.trim().to_owned())
 }
 
-fn tool(root: &Path, name: &str, env_name: Option<&str>, args: &[&str]) -> io::Result<Tool> {
-    let path = resolve_tool(name, env_name)?;
+fn tool(root: &Path, name: &str, args: &[&str]) -> io::Result<Tool> {
+    let path = resolve_program(Path::new(name))?;
     let version = tool_output(&path, args, root)?;
     Ok(Tool { path, version })
 }
@@ -707,10 +738,9 @@ fn capture_tool_version(
     root: &Path,
     output: &Path,
     name: &'static str,
-    env_name: Option<&str>,
     args: &[&str],
 ) -> io::Result<Tool> {
-    let tool = tool(root, name, env_name, args)?;
+    let tool = tool(root, name, args)?;
     let version_dir = create_log_dir(output)?;
     let version_path = version_dir.join(format!("{name}-version.txt"));
     write_new(&version_path, tool.version.as_bytes())?;
@@ -744,17 +774,17 @@ pub(crate) fn file_hash(root: &Path, sha256sum: &Path, path: &Path) -> io::Resul
 }
 
 fn write_manifest(path: &Path, values: BTreeMap<String, String>) -> io::Result<()> {
-    let mut file = create_new(path)?;
-    writeln!(file, "key\tvalue").map_err(|error| contextual(path, &error))?;
+    // Validate every row before creating the file, so a bad value leaves no partial manifest.
+    let mut text = String::from("key\tvalue\n");
     for (key, value) in values {
         if key.contains(['\t', '\n', '\r']) || value.contains(['\t', '\n', '\r']) {
             return Err(invalid(format!(
                 "manifest field contains a tab or newline: {key:?}"
             )));
         }
-        writeln!(file, "{key}\t{value}").map_err(|error| contextual(path, &error))?;
+        writeln!(text, "{key}\t{value}").map_err(|error| invalid(error.to_string()))?;
     }
-    Ok(())
+    write_new(path, text.as_bytes())
 }
 
 fn manifest_value(values: &mut BTreeMap<String, String>, key: &str, value: impl Into<String>) {
@@ -768,10 +798,12 @@ fn single_line(value: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("; ")
+        // Tabs and other controls would make write_manifest/parse_manifest reject the row.
+        .replace(char::is_control, " ")
 }
 
 fn git_value(root: &Path, args: &[&str]) -> String {
-    let Ok(git) = resolve_tool("git", None) else {
+    let Ok(git) = resolve_program(Path::new("git")) else {
         return "unavailable".to_owned();
     };
     let mut command = Command::new(git);
@@ -1598,7 +1630,7 @@ fn build_command(
     lld: &Tool,
     qemu_self_test: bool,
 ) -> io::Result<Command> {
-    let mut command = Command::new(&cargo.path);
+    let mut command = supervised(&cargo.path);
     command
         .args([
             "-Zbuild-std=core,compiler_builtins",
@@ -1828,7 +1860,7 @@ fn record_build_sources(
 
 fn prepare_build(root: &Path, output: &Path, qemu_self_test: bool) -> io::Result<PreparedBuild> {
     create_directory(&output.join("cargo-target"))?;
-    let sha = capture_tool_version(root, output, "sha256sum", None, &["--version"])?;
+    let sha = capture_tool_version(root, output, "sha256sum", &["--version"])?;
     let Toolchain {
         cargo,
         rustc,
@@ -1836,7 +1868,7 @@ fn prepare_build(root: &Path, output: &Path, qemu_self_test: bool) -> io::Result
         lld,
         checked_hashes,
     } = toolchain(root, output, &sha.path)?;
-    let readelf = capture_tool_version(root, output, "readelf", None, &["--version"])?;
+    let readelf = capture_tool_version(root, output, "readelf", &["--version"])?;
     let target_spec = write_target_spec(root, output, &rustc.path)?;
     let cargo_home = output.join("cargo-home");
     create_directory(&cargo_home)?;
@@ -1853,6 +1885,7 @@ fn prepare_build(root: &Path, output: &Path, qemu_self_test: bool) -> io::Result
         fixed_inputs.push(fs::canonicalize(&tool.path)?);
     }
     fixed_inputs.push(fs::canonicalize(KILL)?);
+    fixed_inputs.push(fs::canonicalize(SETPRIV)?);
     let harness = fs::canonicalize(std::env::current_exe()?)?;
     fixed_inputs.push(harness.clone());
     runtime.extend(hash_files(root, &sha.path, &fixed_inputs)?);
@@ -1876,6 +1909,7 @@ fn prepare_build(root: &Path, output: &Path, qemu_self_test: bool) -> io::Result
     ] {
         record_build_tool(root, &sha.path, &mut manifest, name, tool)?;
     }
+    record_setpriv(root, &sha.path, &mut manifest)?;
     record_build_runtime(
         root,
         &sha.path,
@@ -2294,10 +2328,12 @@ fn make_fat_image(
     )?;
     let (kernel_image_sha256, limine_image_sha256, module_image_sha256) =
         verify_image_payloads(root, case_dir, &image_relative, build, tools, with_empty)?;
+    let disk_sha256_initial = file_hash(root, &tools.sha256sum.path, &image)?;
     Ok(BootImage {
         disk: image,
         vars_copy,
         vars_sha256_initial,
+        disk_sha256_initial,
         kernel_image_sha256,
         limine_image_sha256,
         module_image_sha256,
@@ -2469,6 +2505,22 @@ fn require_exit(
     Ok(())
 }
 
+/// Guest-controlled, so bounded; invalid UTF-8 is an error, not an empty log.
+fn read_serial_log(path: &Path) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(|error| contextual(path, &error))?
+        .take(SERIAL_LOG_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > SERIAL_LOG_LIMIT {
+        return Err(invalid(format!(
+            "{} exceeds {SERIAL_LOG_LIMIT} bytes",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|error| invalid(format!("{}: {error}", path.display())))
+}
+
 fn debug_qemu_args(
     root: &Path,
     case_dir: &Path,
@@ -2505,7 +2557,12 @@ fn debug_qemu_args(
             relative(vars_copy)?
         )),
         OsString::from("-drive"),
-        OsString::from(format!("if=ide,format=raw,file={}", relative(image)?)),
+        OsString::from(format!(
+            "if=none,id=boot,format=raw,readonly=on,file={}",
+            relative(image)?
+        )),
+        OsString::from("-device"),
+        OsString::from("virtio-blk-pci,drive=boot"),
         OsString::from("-boot"),
         OsString::from("order=c"),
         OsString::from("-device"),
@@ -2539,17 +2596,24 @@ fn run_debug_case(
     let args_text = command_args(&args)?;
     let stdout = case_dir.join("qemu.stdout.log");
     let stderr = case_dir.join("qemu.stderr.log");
-    let mut command = Command::new(&tools.qemu.path);
+    let mut command = supervised(&tools.qemu.path);
     command.args(&args).current_dir(root).stdin(Stdio::null());
     let process = run_with_logs(&mut command, &stdout, &stderr, timeout)?;
-    let serial = fs::read_to_string(case_dir.join("serial.log")).unwrap_or_default();
-    let (markers_match, mut diagnostic) = validate_debug_case(case, &process, &serial);
+    let (markers_match, mut diagnostic) = match read_serial_log(&case_dir.join("serial.log")) {
+        Ok(serial) => validate_debug_case(case, &process, &serial),
+        Err(error) => (false, format!("unusable serial log: {error}")),
+    };
+    let disk_final = file_hash(root, &tools.sha256sum.path, &boot_image.disk)?;
+    let disk_unchanged = disk_final == boot_image.disk_sha256_initial;
+    if !disk_unchanged {
+        diagnostic.push_str("; boot disk image changed during QEMU run");
+    }
     let elf_after = file_hash(root, &tools.sha256sum.path, &build.elf)?;
     let snapshot_unchanged = elf_after == build.elf_hash;
     if !snapshot_unchanged {
         diagnostic.push_str("; kernel ELF snapshot changed during QEMU run");
     }
-    let passed = markers_match && snapshot_unchanged;
+    let passed = markers_match && snapshot_unchanged && disk_unchanged;
     let vars_final = file_hash(root, &tools.sha256sum.path, &boot_image.vars_copy)?;
     let mut result = BTreeMap::new();
     manifest_value(&mut result, "schema", "1");
@@ -2580,6 +2644,7 @@ fn run_debug_case(
         &mut result,
         boot_image,
         vars_final,
+        disk_final,
     )?;
     write_manifest(&case_dir.join("result.tsv"), result)?;
     Ok(CaseResult {
@@ -2600,6 +2665,7 @@ fn record_debug_tools(
     args: &[String],
     result: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
+    record_setpriv(root, &tools.sha256sum.path, result)?;
     manifest_value(result, "qemu_path", display_path(&tools.qemu.path)?);
     manifest_value(result, "qemu_version", single_line(&tools.qemu.version));
     manifest_value(result, "qemu_arguments", args.join(" | "));
@@ -2652,12 +2718,14 @@ fn record_image_result(
     result: &mut BTreeMap<String, String>,
     image: BootImage,
     vars_final: String,
+    disk_final: String,
 ) -> io::Result<()> {
     manifest_value(
         result,
-        "sha256_disk_image",
-        file_hash(root, sha256sum, &image.disk)?,
+        "sha256_disk_image_initial",
+        image.disk_sha256_initial,
     );
+    manifest_value(result, "sha256_disk_image_after_run", disk_final);
     manifest_value(result, "sha256_image_kernel_elf", image.kernel_image_sha256);
     manifest_value(result, "sha256_image_limine_efi", image.limine_image_sha256);
     for (index, hash) in image.module_image_sha256.into_iter().enumerate() {
@@ -2995,19 +3063,19 @@ fn validate_success_serial(lines: &[&str], with_empty: bool) -> Result<(), Strin
 }
 
 fn capture_qemu_tools(root: &Path, output: &Path) -> io::Result<QemuTools> {
-    let qemu = capture_tool_version(root, output, "qemu-system-x86_64", None, &["--version"])?;
-    let limine = capture_tool_version(root, output, "limine", None, &["--version"])?;
-    if !limine.version.contains("12.9.3") {
+    let qemu = capture_tool_version(root, output, "qemu-system-x86_64", &["--version"])?;
+    let limine = capture_tool_version(root, output, "limine", &["--version"])?;
+    if limine.version.lines().next() != Some("Limine 12.9.3") {
         return Err(invalid(format!(
             "Limine 12.9.3 is required for the pinned base-revision contract; found {}",
             single_line(&limine.version)
         )));
     }
-    let mkfs_fat = resolve_tool("mkfs.fat", None)?;
-    let mdir = capture_tool_version(root, output, "mdir", None, &["--version"])?;
-    let mmd = capture_tool_version(root, output, "mmd", None, &["--version"])?;
-    let mcopy = capture_tool_version(root, output, "mcopy", None, &["--version"])?;
-    let sha256sum = capture_tool_version(root, output, "sha256sum", None, &["--version"])?;
+    let mkfs_fat = resolve_program(Path::new("mkfs.fat"))?;
+    let mdir = capture_tool_version(root, output, "mdir", &["--version"])?;
+    let mmd = capture_tool_version(root, output, "mmd", &["--version"])?;
+    let mcopy = capture_tool_version(root, output, "mcopy", &["--version"])?;
+    let sha256sum = capture_tool_version(root, output, "sha256sum", &["--version"])?;
     Ok(QemuTools {
         qemu,
         limine,
@@ -3230,12 +3298,10 @@ fn create_process(command: &mut Command) -> io::Result<ChildGuard> {
 }
 
 fn wait_qmp_socket(
-    root: &Path,
-    socket: &Path,
+    path: &Path,
     child: &mut ChildGuard,
     timeout: Duration,
 ) -> io::Result<UnixStream> {
-    let path = root.join(socket);
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -3244,12 +3310,12 @@ fn wait_qmp_socket(
                 status.code()
             )));
         }
-        match UnixStream::connect(&path) {
+        match UnixStream::connect(path) {
             Ok(stream) => return Ok(stream),
             Err(error)
                 if error.kind() == io::ErrorKind::ConnectionRefused
                     || error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(contextual(&path, &error)),
+            Err(error) => return Err(contextual(path, &error)),
         }
         if start.elapsed() >= timeout {
             return Err(invalid("QMP socket did not become ready before timeout"));
@@ -3447,18 +3513,51 @@ fn valid_image(path: &Path) -> io::Result<Option<&'static str>> {
     Ok(None)
 }
 
-fn default_qemu_args(
-    root: &Path,
-    case_dir: &Path,
-    image: &BootImage,
-) -> io::Result<(PathBuf, Vec<OsString>)> {
-    let socket = case_dir.join("qmp.sock");
-    if display_path(&root.join(&socket))?.len() >= 100 {
-        return Err(invalid(
-            "QMP Unix socket path is too long; use a shorter project root or output name",
+/// Private directory holding only the QMP socket. `sun_path` is ~108 bytes, so the
+/// socket cannot live in a deep run directory; the path is recorded in the case's
+/// `qemu_arguments`. Removed on drop.
+struct QmpDir(PathBuf);
+
+impl QmpDir {
+    fn create(output: &Path) -> io::Result<Self> {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let name = output
+            .file_name()
+            .ok_or_else(|| invalid("output directory has no name"))?;
+        let path = base.join(format!(
+            "linux-rs-qmp-{}-{}",
+            std::process::id(),
+            name.to_string_lossy()
         ));
+        let socket = display_path(&path.join("qmp.sock"))?;
+        // QEMU option syntax splits on commas; `sun_path` holds 107 bytes plus NUL.
+        if socket.contains(',') || socket.len() >= 100 {
+            return Err(invalid(format!("unusable QMP socket path {socket}")));
+        }
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|error| contextual(&path, &error))?;
+        Ok(Self(path))
     }
-    let socket_relative = display_path(&relative_path(root, &socket)?)?;
+
+    fn socket(&self) -> PathBuf {
+        self.0.join("qmp.sock")
+    }
+}
+
+impl Drop for QmpDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.socket());
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+fn default_qemu_args(root: &Path, socket: &Path, image: &BootImage) -> io::Result<Vec<OsString>> {
+    let socket_text = display_path(socket)?;
     let image_relative = display_path(&relative_path(root, &image.disk)?)?;
     let vars_relative = display_path(&relative_path(root, &image.vars_copy)?)?;
     let args = vec![
@@ -3486,13 +3585,17 @@ fn default_qemu_args(
         OsString::from("-drive"),
         OsString::from(format!("if=pflash,unit=1,format=raw,file={vars_relative}")),
         OsString::from("-drive"),
-        OsString::from(format!("if=ide,format=raw,file={image_relative}")),
+        OsString::from(format!(
+            "if=none,id=boot,format=raw,readonly=on,file={image_relative}"
+        )),
+        OsString::from("-device"),
+        OsString::from("virtio-blk-pci,drive=boot"),
         OsString::from("-boot"),
         OsString::from("order=c"),
         OsString::from("-qmp"),
-        OsString::from(format!("unix:{socket_relative},server=on,wait=off")),
+        OsString::from(format!("unix:{socket_text},server=on,wait=off")),
     ];
-    Ok((socket, args))
+    Ok(args)
 }
 
 fn observe_default_halt(
@@ -3641,6 +3744,7 @@ fn write_default_result(
         "qemu_version",
         single_line(&tools.qemu.version),
     );
+    record_setpriv(root, &tools.sha256sum.path, &mut manifest)?;
     manifest_value(&mut manifest, "qemu_path", display_path(&tools.qemu.path)?);
     manifest_value(&mut manifest, "qemu_arguments", args.join(" | "));
     manifest_value(
@@ -3655,12 +3759,15 @@ fn write_default_result(
         file_hash(root, &tools.sha256sum.path, &build.elf)?,
     );
     let vars_final = file_hash(root, &tools.sha256sum.path, &boot_image.vars_copy)?;
+    let disk_final = file_hash(root, &tools.sha256sum.path, &boot_image.disk)?;
+    let disk_unchanged = disk_final == boot_image.disk_sha256_initial;
     record_image_result(
         root,
         &tools.sha256sum.path,
         &mut manifest,
         boot_image,
         vars_final,
+        disk_final,
     )?;
     manifest_value(
         &mut manifest,
@@ -3668,6 +3775,9 @@ fn write_default_result(
         file_hash(root, &tools.sha256sum.path, Path::new(LIMINE_EFI))?,
     );
     write_manifest(&case_dir.join("result.tsv"), manifest)?;
+    if !disk_unchanged {
+        return Err(invalid("default-boot disk image changed during QEMU run"));
+    }
     Ok((screenshot, screenshot_format.to_owned(), cpu_state))
 }
 
@@ -3700,16 +3810,18 @@ fn capture_default_framebuffer(
             "default kernel ELF snapshot changed before QEMU launch",
         ));
     }
-    let (socket, args) = default_qemu_args(root, &case_dir, &boot_image)?;
+    let qmp_dir = QmpDir::create(output)?;
+    let socket = qmp_dir.socket();
+    let args = default_qemu_args(root, &socket, &boot_image)?;
     let qemu_stdout = case_dir.join("qemu.stdout.log");
     let qemu_stderr = case_dir.join("qemu.stderr.log");
-    let mut command = Command::new(&tools.qemu.path);
+    let mut command = supervised(&tools.qemu.path);
     command.args(&args).current_dir(root).stdin(Stdio::null());
     command.stdout(Stdio::from(create_new(&qemu_stdout)?));
     command.stderr(Stdio::from(create_new(&qemu_stderr)?));
     let start = Instant::now();
     let mut child = create_process(&mut command)?;
-    let stream = wait_qmp_socket(root, &socket, &mut child, timeout)?;
+    let stream = wait_qmp_socket(&socket, &mut child, timeout)?;
     let qmp_log = case_dir.join("qmp.log");
     let mut qmp = Qmp::new(stream, &qmp_log, start + timeout)?;
     let (cpu_state, status_response) =
@@ -3836,6 +3948,82 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn child_dies_when_spawning_thread_exits() -> io::Result<()> {
+        let exe = fs::canonicalize(std::env::current_exe()?)?;
+        let pid = thread::spawn(move || -> io::Result<u32> {
+            let mut command = supervised(&exe);
+            command
+                .args(["--exact", "kernel::tests::process_fixture"])
+                .env("LINUX_RS_PROCESS_FIXTURE", "leaf")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let child = create_process(&mut command)?;
+            let pid = child.child.as_ref().map_or(0, Child::id);
+            // setpriv must have exec'd (and so set the signal) before this thread exits.
+            let start = Instant::now();
+            while fs::read_link(format!("/proc/{pid}/exe"))? != exe {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "setpriv never exec'd"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Skip the guard's cleanup: only the death signal may end the child.
+            std::mem::forget(child);
+            Ok(pid)
+        })
+        .join()
+        .map_err(|_| invalid("spawn thread panicked"))??;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let live = fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|text| {
+                text.rsplit_once(") ")
+                    .is_some_and(|(_, state)| !state.starts_with(['Z', 'X']))
+            });
+            if !live {
+                return Ok(());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child outlived its spawning thread"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn serial_log_is_bounded_and_utf8() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let path = scratch.0.join("serial.log");
+        fs::write(&path, "ok\n")?;
+        assert_eq!(read_serial_log(&path)?, "ok\n");
+        fs::write(&path, [0xff])?;
+        assert!(read_serial_log(&path).is_err());
+        fs::write(
+            &path,
+            vec![b'x'; usize::try_from(SERIAL_LOG_LIMIT).unwrap() + 1],
+        )?;
+        assert!(read_serial_log(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_manifest_leaves_no_partial_file() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let path = scratch.0.join("result.tsv");
+        let mut values = BTreeMap::new();
+        manifest_value(&mut values, "key", "bad\tvalue");
+        assert!(write_manifest(&path, values).is_err());
+        assert!(!path.exists());
+        // Failure manifests build their error text with single_line, so they stay writable.
+        let mut failure = BTreeMap::new();
+        manifest_value(&mut failure, "error", single_line("a\tb\x1b[0m\nc"));
+        write_manifest(&path, failure)?;
+        assert!(fs::read_to_string(&path)?.ends_with("error\ta b [0m; c\n"));
         Ok(())
     }
 
