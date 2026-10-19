@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HELP: &str = "baremetal: bounded, non-destructive Linux functional smoke (NOT qualification)\n\nUsage:\n  baremetal run --output <new-directory> --label <label> --expect-release <exact-osrelease> --environment <reference|qemu|bare-metal>\n  baremetal --help\n  baremetal run --help\n\nAll run options are required once. No positional arguments or implicit environment.\nLabels: 1..80 ASCII letters/digits/dot/underscore/hyphen, starting with a letter/digit.\nThe release must exactly match /proc/sys/kernel/osrelease before output is created.\nEnvironment is the operator's assertion, not automatic physical-machine detection.\nOutput parent must already exist and be trusted; output itself must not exist.\nPreserves reports and a private bounded sandbox; does not clean up arbitrary paths.\nNever use root. No raw devices, mounts, external networking, boot or system changes.\nExit: 0=no failed cases (SKIP is not coverage), 1=failed cases/runtime error, 2=invalid CLI.\n";
 const LIMIT: u16 = 8192;
+// /proc/self/status grows with supplementary groups and CPU lists.
+const READ_LIMIT: u64 = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const CASE_TIMEOUT: Duration = Duration::from_secs(10);
 const CASES: &[&str] = &[
@@ -195,11 +197,11 @@ fn cell(value: &str) -> String {
 fn read_bounded(path: &Path) -> io::Result<String> {
     let mut bytes = Vec::new();
     File::open(path)?
-        .take(u64::from(LIMIT) + 1)
+        .take(READ_LIMIT + 1)
         .read_to_end(&mut bytes)?;
     require(
-        bytes.len() <= usize::from(LIMIT),
-        "input exceeds 8192-byte limit",
+        bytes.len() as u64 <= READ_LIMIT,
+        "input exceeds 1 MiB limit",
     )?;
     String::from_utf8(bytes).map_err(|error| invalid(error.to_string()))
 }
