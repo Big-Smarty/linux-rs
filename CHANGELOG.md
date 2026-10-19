@@ -11,6 +11,10 @@
 
 - Added `user/init`, a static libc-free x86_64 Linux `/init` test program that doubles as a differential oracle (oracle evidence under `target/linux-reference/init-reference-003/`); moved the scalar `memset`/`memcpy` runtime into the shared `linux-rs-runtime` crate (`rt/`) so the kernel and the init link the same providers; admitted `syscalls` 0.8.1 and rejected `origin`/`rustix` for it.
 
+### Registry dependencies and the CPU layer
+
+- First registry dependencies: `x86_64` 0.15.5 and `raw-cpuid` 11.6.0 (seven vendored crates, `vendor/` + checked-in `.cargo/config.toml`, harness merge of rust-src and project vendor for build-std, auditor/packager vendor rules); `cpu.rs` now uses them for descriptor tables, registers, MSRs and CPUID (23 to 11 hand-written `asm!` sites) with Linux 6.18.57's 64-bit GDT selector layout.
+
 ### Kernel audit fixes
 
 - Early framebuffer console before any fallible step, bounded raw command line with `test=` parsing gated on `qemu-self-test`, exposed-provenance pixel stores, CR4.PGE/PCIDE rejection, skip-and-warn for a module that fails inspection, one duplicate buddy validation removed; see [implementation](docs/implementation.md#audit-fixes-2026-10-19).

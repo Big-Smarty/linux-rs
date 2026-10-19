@@ -5,12 +5,31 @@
 // arch/x86/include/asm/irqflags.h and include/linux/spinlock_api_smp.h (GPL-2.0).
 // This implements neither paravirt alternatives nor scheduler/RT lock policy.
 use core::{
-    arch::{asm, naked_asm, x86_64::__cpuid},
+    arch::{asm, naked_asm},
     marker::PhantomData,
     ptr,
     sync::atomic::{AtomicU64, Ordering, compiler_fence},
 };
 use kernel::sync::{RawSpinGuard, RawSpinLock};
+use raw_cpuid::CpuId;
+use x86_64::{
+    PhysAddr, PrivilegeLevel, VirtAddr,
+    instructions::{
+        interrupts,
+        segmentation::{CS, DS, ES, SS, Segment},
+        tables::{DescriptorTablePointer, lidt, load_tss},
+    },
+    registers::{
+        control::{Cr0, Cr0Flags, Cr2, Cr3, Cr4, Cr4Flags},
+        model_specific::{ApicBase, ApicBaseFlags, Efer, EferFlags, Msr},
+    },
+    structures::{
+        gdt::{Descriptor, DescriptorFlags, GlobalDescriptorTable, SegmentSelector},
+        idt::{Entry, HandlerFunc},
+        paging::PhysFrame,
+        tss::TaskStateSegment,
+    },
+};
 
 pub const STACK_BYTES: usize = 64 * 1024;
 #[repr(C, align(4096))]
@@ -76,30 +95,36 @@ pub enum Error {
 }
 
 pub fn validate() -> Result<(), Error> {
-    // x86_64 guarantees CPUID; the supported intrinsic declares scalar clobbers.
-    let extended = __cpuid(0x8000_0000).eax;
-    if extended < 0x8000_0001 || __cpuid(0x8000_0001).edx & (1 << 20) == 0 {
+    // x86_64 guarantees CPUID; raw-cpuid wraps the supported core::arch intrinsic
+    // and reports a leaf above the CPU's maximum as absent.
+    let cpuid = CpuId::new();
+    if !cpuid
+        .get_extended_processor_and_feature_identifiers()
+        .is_some_and(|features| features.has_execute_disable())
+    {
         return Err(Error::Nx);
     }
-    if __cpuid(1).edx & (1 << 16) == 0 {
+    if !cpuid
+        .get_feature_info()
+        .is_some_and(|features| features.has_pat())
+    {
         return Err(Error::Pat);
     }
-    let pat = read_msr(0x277);
+    // SAFETY: CPL0; IA32_PAT (0x277) exists because CPUID.1:EDX.PAT was checked.
+    let pat = unsafe { Msr::new(0x277).read() };
     if pat & 0xff != 6 || (pat >> 40) & 0xff != 1 {
         return Err(Error::Pat);
     }
-    let cr0: u64;
-    let cr4: u64;
-    let rsp: u64;
-    // SAFETY: CPL0, no memory changes or stack accesses; integer outputs only.
-    // MOV CR instructions have no Rust intrinsic. Read flags/stack unchanged.
-    unsafe {
-        asm!("mov {}, cr0", "mov {}, cr4", "mov {}, rsp", out(reg) cr0, out(reg) cr4, out(reg) rsp, options(nomem, nostack, preserves_flags));
-    }
+    let cr0 = Cr0::read();
+    let cr4 = Cr4::read();
+    // The address of a live local lies in the current stack frame; this replaces
+    // an `mov rsp` asm site with the same containment check below.
+    let marker = 0u8;
+    let rsp = ptr::addr_of!(marker) as u64;
     // CR4.LA57, PGE and PCIDE: MOV to CR3 would leave global or other-PCID
     // loader translations alive (SDM Vol.3 4.10.4.1), defeating the new tree.
-    if cr0 & ((1 << 31) | (1 << 16) | 1) != ((1 << 31) | (1 << 16) | 1)
-        || cr4 & ((1 << 12) | (1 << 7) | (1 << 17)) != 0
+    if !cr0.contains(Cr0Flags::PAGING | Cr0Flags::WRITE_PROTECT | Cr0Flags::PROTECTED_MODE_ENABLE)
+        || cr4.intersects(Cr4Flags::L5_PAGING | Cr4Flags::PAGE_GLOBAL | Cr4Flags::PCID)
     {
         return Err(Error::Paging);
     }
@@ -107,28 +132,26 @@ pub fn validate() -> Result<(), Error> {
     if rsp < base + 4096 || rsp >= base + core::mem::size_of::<Stack>() as u64 {
         return Err(Error::Stack);
     }
-    let efer = read_msr(0xc000_0080);
-    if efer & (1 << 11) == 0 {
+    if !Efer::read().contains(EferFlags::NO_EXECUTE_ENABLE) {
         return Err(Error::Nx);
     }
     // Keep x87/SIMD inaccessible until real per-task xstate ownership exists.
     // CR0.EM/TS force #NM; OSFXSR/OSXSAVE remain clear from base5. Thus this
     // scalar-only cell neither depends on nor exposes unspecified firmware FP
-    // state. No Rust intrinsic can establish these privileged execution bits.
-    // SAFETY: CPL0 IF=0, preserves paging/WP/PE and all reserved bits; the target
-    // and linked code exclude FP/SIMD, no stack/flags changes or unwind.
+    // state.
+    // SAFETY: CPL0 IF=0; Cr0::write keeps every unlisted (reserved) bit and the
+    // paging/WP/PE bits are read back unchanged; the target and linked code
+    // exclude FP/SIMD. The crate's `mov cr0` asm has no `nomem`, preserves flags.
     unsafe {
-        asm!("mov cr0, {}", in(reg) cr0 | (1 << 2) | (1 << 3), options(nostack, preserves_flags));
+        Cr0::write(cr0 | Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED);
     }
     Ok(())
 }
 
 pub fn interrupts_off() {
-    // SAFETY: CPL0 BSP only; CLI changes IF, not memory or stack. Deliberately
-    // omit nomem so ordinary operations cannot cross the exclusion boundary.
-    unsafe {
-        asm!("cli", options(nostack));
-    }
+    // x86_64's CLI has no `nomem`, so ordinary operations cannot cross the
+    // exclusion boundary (docs/implementation.md asm register).
+    interrupts::disable();
 }
 
 const INTERRUPT_FLAG: u64 = 1 << 9;
@@ -254,11 +277,9 @@ const IRQ_LOCK_PASSED: u64 = 3;
 pub fn halt() -> ! {
     interrupts_off();
     loop {
-        // SAFETY: CPL0 stop policy, no stack/memory/flags changes. NMI can still
-        // arrive and uses its own IST; no implicit reboot or firmware call.
-        unsafe {
-            asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
+        // CPL0 stop policy; NMI can still arrive and uses its own IST; no
+        // implicit reboot or firmware call.
+        x86_64::instructions::hlt();
     }
 }
 
@@ -275,51 +296,27 @@ pub fn exit(success: bool) -> ! {
     halt()
 }
 
-fn read_msr(index: u32) -> u64 {
-    let low: u32;
-    let high: u32;
-    // SAFETY: only architecturally defined EFER/APIC_BASE/PAT are passed after
-    // CPU checks; CPL0, ECX input EAX/EDX outputs, no memory/stack/flags effects.
-    unsafe {
-        asm!("rdmsr", in("ecx") index, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
-    }
-    u64::from(low) | (u64::from(high) << 32)
-}
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "WRMSR's architectural ABI splits all 64 value bits into EDX:EAX; the low cast intentionally discards bits already supplied in EDX."
-)]
-fn write_msr(index: u32, value: u64) {
-    // SAFETY: private callers constrain architectural bits to documented states;
-    // CPL0 IRQ-disabled; EAX/EDX/ECX inputs only, flags/stack preserved. Omit nomem
-    // so compiler memory operations do not cross a CPU-state transition.
-    unsafe {
-        asm!("wrmsr", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nostack, preserves_flags));
-    }
-}
-
 /// # Safety
 /// Root is a live aligned owned four-level tree mapping every current
 /// instruction/stack/descriptor/resource address with valid permissions. BSP
 /// alone executes, IF clear, PCID/global mappings disabled; keep root alive.
 pub unsafe fn activate_tables(root: u64) {
+    let frame = PhysAddr::try_new(root)
+        .ok()
+        .and_then(|address| PhysFrame::from_start_address(address).ok())
+        .expect("CR3 root must be a 4 KiB-aligned physical frame");
     // SAFETY: private caller has built a 4KiB-aligned owned four-level root,
     // maps current RIP/RSP/GDT/TSS/IDT and diagnostic/allocator resources with
     // same addresses, no PCID/global translations, only BSP executes. CR3 load
-    // retires old non-global translations before continued accesses. Memory
-    // operand ordering is intentional; flags/stack unchanged, no Rust intrinsic.
+    // retires old non-global translations before continued accesses. The crate's
+    // `mov cr3` omits nomem and preserves flags; PCD/PWT flags are zero as before.
     unsafe {
-        asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+        Cr3::write_raw(frame, 0);
     }
 }
 
 pub fn active_tables() -> u64 {
-    let value: u64;
-    // SAFETY: CPL0 read, no memory/stack/flags effects; scalar output.
-    unsafe {
-        asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
-    }
-    value & 0x000f_ffff_ffff_f000
+    Cr3::read_raw().0.start_address().as_u64()
 }
 
 fn out_byte(port: u16, value: u8) {
@@ -365,113 +362,124 @@ pub fn serial_byte(byte: u8) {
     }
 }
 
-#[repr(C, packed)]
-struct TablePointer {
-    limit: u16,
-    base: u64,
-}
-#[repr(C, packed)]
-struct TaskState {
-    reserved0: u32,
-    rsp: [u64; 3],
-    reserved1: u64,
-    ist: [u64; 7],
-    reserved2: u64,
-    reserved3: u16,
-    iomap: u16,
-}
-static mut TSS: TaskState = TaskState {
-    reserved0: 0,
-    rsp: [0; 3],
-    reserved1: 0,
-    ist: [0; 7],
-    reserved2: 0,
-    reserved3: 0,
-    iomap: 104,
+// 64-bit GDT layout of Linux 6.18.57 arch/x86/include/asm/segment.h: 1 KERNEL32_CS,
+// 2 KERNEL_CS, 3 KERNEL_DS, 4 USER32_CS, 5 USER_DS, 6 USER_CS (SYSRET order),
+// 8-9 TSS. Flags are desc_defs.h DESC_CODE64/DESC_DATA64/DESC_CODE32 (+DESC_USER).
+const KERNEL32_CS: SegmentSelector = SegmentSelector::new(1, PrivilegeLevel::Ring0);
+pub const KERNEL_CS: SegmentSelector = SegmentSelector::new(2, PrivilegeLevel::Ring0);
+const KERNEL_DS: SegmentSelector = SegmentSelector::new(3, PrivilegeLevel::Ring0);
+const USER32_CS: SegmentSelector = SegmentSelector::new(4, PrivilegeLevel::Ring3);
+const USER_DS: SegmentSelector = SegmentSelector::new(5, PrivilegeLevel::Ring3);
+const USER_CS: SegmentSelector = SegmentSelector::new(6, PrivilegeLevel::Ring3);
+const TSS_SELECTOR: SegmentSelector = SegmentSelector::new(8, PrivilegeLevel::Ring0);
+// The crate documents Linux-equal descriptors; pin them to the Linux values here.
+const _: () = {
+    assert!(DescriptorFlags::KERNEL_CODE32.bits() == 0x00cf_9b00_0000_ffff);
+    assert!(DescriptorFlags::KERNEL_CODE64.bits() == 0x00af_9b00_0000_ffff);
+    assert!(DescriptorFlags::KERNEL_DATA.bits() == 0x00cf_9300_0000_ffff);
+    assert!(DescriptorFlags::USER_CODE32.bits() == 0x00cf_fb00_0000_ffff);
+    assert!(DescriptorFlags::USER_DATA.bits() == 0x00cf_f300_0000_ffff);
+    assert!(DescriptorFlags::USER_CODE64.bits() == 0x00af_fb00_0000_ffff);
+    assert!(KERNEL32_CS.0 == 0x08 && KERNEL_CS.0 == 0x10 && KERNEL_DS.0 == 0x18);
+    assert!(USER32_CS.0 == 0x23 && USER_DS.0 == 0x2b && USER_CS.0 == 0x33);
+    assert!(TSS_SELECTOR.0 == 0x40);
 };
-static mut GDT: [u64; 5] = [0, 0x00af_9a00_0000_ffff, 0x00cf_9200_0000_ffff, 0, 0];
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Gate {
-    low: u16,
-    selector: u16,
-    ist: u8,
-    flags: u8,
-    middle: u16,
-    high: u32,
-    zero: u32,
-}
-impl Gate {
-    const fn empty() -> Self {
-        Self {
-            low: 0,
-            selector: 0,
-            ist: 0,
-            flags: 0,
-            middle: 0,
-            high: 0,
-            zero: 0,
-        }
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "The IDT ABI splits the complete 64-bit handler address into low16, middle16, and high32 fields; every discarded bit is retained in a higher field."
-    )]
-    fn new(handler: u64, ist: u8) -> Self {
-        Self {
-            low: handler as u16,
-            selector: 8,
-            ist,
-            flags: 0x8e,
-            middle: (handler >> 16) as u16,
-            high: (handler >> 32) as u32,
-            zero: 0,
-        }
-    }
-}
-static mut IDT: [Gate; 256] = [Gate::empty(); 256];
+// The CPU writes the TSS busy bit and descriptor accessed bits; the crate's GDT
+// entries are atomics, so those writes are not a data race with Rust accesses.
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
+static mut GDT: GlobalDescriptorTable<10> = GlobalDescriptorTable::empty();
+static mut IDT: [Entry<HandlerFunc>; 256] = [Entry::missing(); 256];
 
 /// # Safety
 /// Called once on BSP with IF clear, no AP execution and no live Rust references
 /// to descriptor memory. All static image/stacks remain permanently reserved.
 pub unsafe fn install_descriptors() {
-    let top = |pointer: *const Stack| pointer as u64 + core::mem::size_of::<Stack>() as u64;
-    // SAFETY: unique initialization before publication; packed fields written
-    // unaligned through raw pointers, no references to descriptor RAM survive.
+    // SAFETY: forwarded caller contract; the GDT/CS must be live before the IDT
+    // gates copy CS.
     unsafe {
-        ptr::addr_of_mut!(TSS.rsp).write_unaligned([top(ptr::addr_of!(BOOT_STACK)), 0, 0]);
-        ptr::addr_of_mut!(TSS.ist).write_unaligned([
+        install_gdt();
+        install_idt();
+    }
+}
+
+/// # Safety
+/// Same contract as [`install_descriptors`].
+unsafe fn install_gdt() {
+    // VirtAddr::new panics on a non-canonical address; these are our own
+    // higher-half image statics, so that is a link-time invariant, not input.
+    let top = |pointer: *const Stack| {
+        VirtAddr::new(pointer as u64 + core::mem::size_of::<Stack>() as u64)
+    };
+    let tss = ptr::addr_of_mut!(TSS);
+    // SAFETY: unique initialization before publication; the packed TSS fields are
+    // assigned as whole places through a raw pointer, never by reference.
+    unsafe {
+        (*tss).privilege_stack_table = [
+            top(ptr::addr_of!(BOOT_STACK)),
+            VirtAddr::zero(),
+            VirtAddr::zero(),
+        ];
+        (*tss).interrupt_stack_table = [
             top(ptr::addr_of!(DOUBLE_STACK)),
             top(ptr::addr_of!(NMI_STACK)),
             top(ptr::addr_of!(MACHINE_STACK)),
-            0,
-            0,
-            0,
-            0,
-        ]);
-        let base = ptr::addr_of!(TSS) as u64;
-        let limit = (core::mem::size_of::<TaskState>() - 1) as u64;
-        let low =
-            limit | ((base & 0x00ff_ffff) << 16) | (0x89u64 << 40) | ((base & 0xff00_0000) << 32);
-        ptr::addr_of_mut!(GDT[3]).write(low);
-        ptr::addr_of_mut!(GDT[4]).write(base >> 32);
+            VirtAddr::zero(),
+            VirtAddr::zero(),
+            VirtAddr::zero(),
+            VirtAddr::zero(),
+        ];
     }
-    let gdtr = TablePointer {
-        limit: 39,
-        base: ptr::addr_of!(GDT) as u64,
-    };
-    // SAFETY: GDTR points to initialized permanent GDT; stack valid/aligned; far
-    // return pops exactly the 16 bytes pushed and reloads CS=8, data=16. RAX is
-    // declared clobbered. LTR marks the owned TSS descriptor busy. No unwind,
-    // only CPL0, IRQ-disabled BSP, no memory references alias these writes.
-    unsafe {
-        asm!(
-            "lgdt [{}]", "push 8", "lea rax, [rip + 2f]", "push rax", "retfq", "2:",
-            "mov ax, 16", "mov ds, ax", "mov es, ax", "mov ss, ax",
-            "mov ax, 24", "ltr ax",
-            in(reg) &raw const gdtr, out("rax") _,
+    // SAFETY: the caller guarantees exclusive access to descriptor memory.
+    let gdt = unsafe { &mut *ptr::addr_of_mut!(GDT) };
+    for (descriptor, selector) in [
+        (
+            Descriptor::UserSegment(DescriptorFlags::KERNEL_CODE32.bits()),
+            KERNEL32_CS,
+        ),
+        (Descriptor::kernel_code_segment(), KERNEL_CS),
+        (Descriptor::kernel_data_segment(), KERNEL_DS),
+        (
+            Descriptor::UserSegment(DescriptorFlags::USER_CODE32.bits()),
+            USER32_CS,
+        ),
+        (Descriptor::user_data_segment(), USER_DS),
+        (Descriptor::user_code_segment(), USER_CS),
+        // Linux leaves entry 7 null; append returns the layout index checked here.
+        (
+            Descriptor::UserSegment(0),
+            SegmentSelector::new(7, PrivilegeLevel::Ring0),
+        ),
+        // SAFETY: TSS is a permanent static that outlives every use of the GDT.
+        (
+            unsafe { Descriptor::tss_segment_unchecked(tss) },
+            TSS_SELECTOR,
+        ),
+    ] {
+        assert_eq!(
+            gdt.append(descriptor),
+            selector,
+            "GDT layout drifted from Linux"
         );
     }
+    // SAFETY: the permanent GDT is complete and never modified after this point
+    // except by the CPU's atomic-entry accessed/busy writes; CS reload far-returns
+    // to the next instruction with the new kernel code selector (the crate's asm
+    // pushes/pops exactly that frame), SS/DS/ES then load the flat data selector,
+    // and LTR marks the owned, not-yet-busy TSS descriptor busy. Only CPL0,
+    // IRQ-disabled BSP; none of the crate asm blocks unwind, they preserve flags.
+    unsafe {
+        gdt.load_unsafe();
+        CS::set_reg(KERNEL_CS);
+        SS::set_reg(KERNEL_DS);
+        DS::set_reg(KERNEL_DS);
+        ES::set_reg(KERNEL_DS);
+        load_tss(TSS_SELECTOR);
+    }
+}
+
+/// # Safety
+/// Same contract as [`install_descriptors`]; the new GDT and CS are loaded.
+unsafe fn install_idt() {
     let handlers = [
         v0 as *const (),
         v1 as *const (),
@@ -506,35 +514,39 @@ pub unsafe fn install_descriptors() {
         v30 as *const (),
         v31 as *const (),
     ];
-    for index in 0..256 {
+    // SAFETY: the caller guarantees exclusive access to descriptor memory.
+    let idt = unsafe { &mut *ptr::addr_of_mut!(IDT) };
+    for (index, gate) in idt.iter_mut().enumerate() {
         let handler = match handlers.get(index) {
             Some(&handler) => handler,
             None if index == 32 => timer_entry as *const (),
             None => unexpected_entry as *const (),
         };
+        // Zero-based IST slots (the crate adds the hardware +1): #DF 1, NMI 2, #MC 3.
         let ist = match index {
-            8 => 1,
-            2 => 2,
-            18 => 3,
-            _ => 0,
+            8 => Some(0),
+            2 => Some(1),
+            18 => Some(2),
+            _ => None,
         };
-        // SAFETY: unique initialization of this exact in-bounds IDT element.
+        // SAFETY: every handler is one of our entry stubs, which obey the CPU
+        // interrupt-gate contract (documented at the entry macro); set_handler_addr
+        // copies the CS loaded above, a valid 64-bit kernel code selector. IST slots
+        // 0..=2 name the TSS stacks initialized above.
         unsafe {
-            ptr::addr_of_mut!(IDT)
-                .cast::<Gate>()
-                .add(index)
-                .write(Gate::new(handler as u64, ist));
+            let options = gate.set_handler_addr(VirtAddr::new(handler as u64));
+            if let Some(slot) = ist {
+                options.set_stack_index(slot);
+            }
         }
     }
-    let idtr = TablePointer {
-        limit: 4095,
-        base: ptr::addr_of!(IDT) as u64,
-    };
-    // SAFETY: initialized permanent IDT, CPU copies 10-byte packed descriptor;
-    // only CPL0, no memory mutation/stack effect, flags unchanged. LIDT has no
-    // supported intrinsic. Do not assert nomem: the descriptor is read.
+    // SAFETY: the permanent initialized IDT is read by the CPU; lidt copies the
+    // 10-byte pointer (readonly, no stack effect, flags unchanged).
     unsafe {
-        asm!("lidt [{}]", in(reg) &raw const idtr, options(readonly, nostack, preserves_flags));
+        lidt(&DescriptorTablePointer {
+            limit: 4095,
+            base: VirtAddr::from_ptr(idt.as_ptr()),
+        });
     }
 }
 
@@ -628,7 +640,7 @@ static FAULT_ERROR: AtomicU64 = AtomicU64::new(0);
 static FAULT_ARMED: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: u64) {
-    if frame.cs != 8 {
+    if frame.cs != u64::from(KERNEL_CS.0) {
         unexpected(frame, vector, error, 0);
     }
     match vector {
@@ -636,12 +648,8 @@ extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: 
             BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
         }
         14 => {
-            let address: u64;
-            // SAFETY: page-fault CPL0 handler reads CR2 before any fallible work;
-            // output only, no memory/stack/flag changes, architecture-only read.
-            unsafe {
-                asm!("mov {}, cr2", out(reg) address, options(nomem, nostack, preserves_flags));
-            }
+            // Read CR2 before any fallible work (CPL0; nomem asm, scalar output).
+            let address = Cr2::read_raw();
             if FAULT_ARMED.swap(0, Ordering::Acquire) == 1
                 && address == FAULT_ADDRESS.load(Ordering::Relaxed)
                 && frame.rip == FAULT_RIP.load(Ordering::Relaxed)
@@ -823,10 +831,10 @@ pub fn irq_register_test() -> bool {
 }
 
 pub fn unexpected_breakpoint() -> ! {
-    // SAFETY: deliberate terminal negative case; no armed breakpoint permit.
-    unsafe {
-        asm!("int3", options(noreturn));
-    }
+    // Deliberate terminal negative case; no armed breakpoint permit, so the
+    // handler is fatal. halt() is the defence if it ever returned.
+    interrupts::int3();
+    halt()
 }
 
 #[unsafe(naked)]
@@ -907,15 +915,22 @@ pub fn start_timer(legacy_pic: bool) -> Result<(), Error> {
     if !legacy_pic {
         return Err(Error::Cpu);
     }
-    // SAFETY: x86_64 CPUID available. APIC_BASE only exists when feature set.
-    if __cpuid(1).edx & (1 << 9) != 0 {
-        let apic = read_msr(0x1b);
-        if apic & (1 << 10) != 0 {
+    // IA32_APIC_BASE only exists when CPUID reports a local APIC.
+    if CpuId::new()
+        .get_feature_info()
+        .is_some_and(|features| features.has_apic())
+    {
+        let mut msr = ApicBase::MSR;
+        // SAFETY: CPL0 BSP; the MSR exists per the CPUID check above.
+        let apic = unsafe { msr.read() };
+        if apic & ApicBaseFlags::X2APIC_ENABLE.bits() != 0 {
             return Err(Error::Apic);
         }
         // Disable the local APIC for this explicit legacy-PIC UP test cell.
         // This is not APIC initialization or a permanent Linux policy choice.
-        write_msr(0x1b, apic & !(1 << 11));
+        // SAFETY: only the enable bit changes; every other bit (including the
+        // base address and reserved bits) is written back as read.
+        unsafe { msr.write(apic & !ApicBaseFlags::LAPIC_ENABLE.bits()) };
     }
     out_byte(0x20, 0x11);
     io_wait();
