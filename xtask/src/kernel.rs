@@ -1549,6 +1549,34 @@ fn check_rust_src_vendor(vendor_dir: &Path, source_config: &Path) -> io::Result<
     Ok(())
 }
 
+fn link_project_packages(
+    inputs: &mut BTreeMap<String, String>,
+    merged: &Path,
+    project: &[(LockedRegistryPackage, PathBuf)],
+    packages: &[LockedRegistryPackage],
+) -> io::Result<()> {
+    manifest_value(inputs, "project_package_count", project.len().to_string());
+    for (index, (package, directory)) in project.iter().enumerate() {
+        // The same name-version in both sets (e.g. memchr, used by std and serde_json) must be
+        // the same .crate by checksum; the already-linked rust-src copy then serves both.
+        match packages
+            .iter()
+            .find(|std| std.name == package.name && std.version == package.version)
+        {
+            Some(std) if std.checksum == package.checksum => {}
+            Some(_) => {
+                return Err(invalid(format!(
+                    "{}-{} is locked with different checksums by rust-src and the project",
+                    package.name, package.version
+                )));
+            }
+            None => link_vendored(merged, directory)?,
+        }
+        record_locked(inputs, &format!("project_package_{index:04}"), package);
+    }
+    Ok(())
+}
+
 fn prepare_vendored_std(
     root: &Path,
     cargo_home: &Path,
@@ -1622,15 +1650,7 @@ fn prepare_vendored_std(
             file_hash(root, sha256sum, &checksum_manifest)?,
         );
     }
-    manifest_value(
-        &mut inputs,
-        "project_package_count",
-        project.len().to_string(),
-    );
-    for (index, (package, directory)) in project.iter().enumerate() {
-        link_vendored(&merged, directory)?;
-        record_locked(&mut inputs, &format!("project_package_{index:04}"), package);
-    }
+    link_project_packages(&mut inputs, &merged, &project, &packages)?;
     let manifest = cargo_home.join("vendored-std-inputs.tsv");
     write_manifest(&manifest, inputs)?;
     let local_config = cargo_home.join("config.toml");
@@ -4445,13 +4465,17 @@ mod tests {
                 package.join(".cargo-checksum.json"),
                 format!("{{\"files\":{{{listed}}},\"package\":\"{checksum}\"}}"),
             )?;
-            dependencies.push_str(&format!(
-                "{name} = {{ version = \"={version}\", optional = true }}\n"
-            ));
+            writeln!(
+                dependencies,
+                "{name} = {{ version = \"={version}\", optional = true }}"
+            )
+            .unwrap();
             names.push(format!("\"dep:{name}\""));
-            lock.push_str(&format!(
-                "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"
-            ));
+            writeln!(
+                lock,
+                "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\""
+            )
+            .unwrap();
         }
         fs::write(
             root.join("Cargo.toml"),
