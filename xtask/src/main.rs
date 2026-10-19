@@ -270,7 +270,11 @@ fn project_files(root: &Path) -> Result<BTreeSet<String>> {
                 )));
             }
             if metadata.is_dir() {
-                if path == root.join(".git") || path == root.join("target") {
+                // vendor/ is third-party source checked by `verify_project_vendor`, not Rust-only project code.
+                if [".git", "target", "vendor"]
+                    .iter()
+                    .any(|skipped| path == root.join(skipped))
+                {
                     continue;
                 }
                 if directory.strip_prefix(root).ok() == Some(Path::new(".agents/skills"))
@@ -956,9 +960,15 @@ fn audit(options: &Options) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(invalid("--root must name a real directory, not a symlink"));
     }
+    let mut vendored = 0;
     let root =
         fs::canonicalize(&options.root).map_err(|error| contextual(&options.root, &error))?;
     let files = project_files(&root)?;
+    if files.contains("Cargo.lock") || root.join("vendor").exists() {
+        let sha256sum = kernel::resolve_program(Path::new("sha256sum"))?;
+        let packages = kernel::verify_project_vendor(&root, &sha256sum)?;
+        vendored = packages.len();
+    }
     let reference_text = read_file(&root, &files, REFERENCE)?;
     let reference = reference(&reference_text)?;
     let workstream_text = read_file(&root, &files, WORKSTREAMS)?;
@@ -1008,7 +1018,7 @@ fn audit(options: &Options) -> Result<()> {
     match options.command {
         Command::Check => writeln!(
             output,
-            "check: structural audit passed; {} pinned upstream entries, {} planned workstreams, {} skills, {markdown_count} Markdown files, {} local file links checked",
+            "check: structural audit passed; {} pinned upstream entries, {} planned workstreams, {} skills, {markdown_count} Markdown files, {} local file links checked, {vendored} vendored packages verified",
             inventory.kinds.len(),
             streams.len(),
             SKILLS.len(),
@@ -1081,9 +1091,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_root_target_and_git_are_skipped() -> Result<()> {
+    fn only_root_target_git_and_vendor_are_skipped() -> Result<()> {
         let root = std::env::temp_dir().join(format!("linux-rs-audit-{}", std::process::id()));
-        for directory in [".git", "target", "src/target"] {
+        for directory in [".git", "target", "vendor", "src/target"] {
             fs::create_dir_all(root.join(directory))?;
             fs::write(root.join(directory).join("evil.txt"), "")?;
         }
