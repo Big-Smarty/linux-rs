@@ -9,7 +9,8 @@ use cpio::{NewcBuilder, write_cpio};
 use elf::{ElfBytes, abi, endian::LittleEndian, file::Class};
 
 /// Everything that is only valid when the kernel rejects it: not a cpio, starts with the gzip magic.
-pub(crate) const CORRUPT_MODULE: &[u8] = b"\x1f\x8b\x08\x00bad-module: deterministic garbage, not a gzip stream\n";
+pub(crate) const CORRUPT_MODULE: &[u8] =
+    b"\x1f\x8b\x08\x00bad-module: deterministic garbage, not a gzip stream\n";
 
 /// Linux `PAGE_SIZE`: Limine reserves each module in whole pages (a zero-byte module keeps one).
 const PAGE: usize = 4096;
@@ -18,7 +19,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn parse_error(error: elf::ParseError) -> io::Error {
+fn parse_error(error: &elf::ParseError) -> io::Error {
     invalid(format!("ELF parse error: {error}"))
 }
 
@@ -35,7 +36,8 @@ pub(crate) struct ElfFacts {
 }
 
 pub(crate) fn elf_facts(bytes: &[u8]) -> io::Result<ElfFacts> {
-    let file = ElfBytes::<LittleEndian>::minimal_parse(bytes).map_err(parse_error)?;
+    let file =
+        ElfBytes::<LittleEndian>::minimal_parse(bytes).map_err(|error| parse_error(&error))?;
     let header = file.ehdr;
     if header.class != Class::ELF64
         || header.e_type != abi::ET_EXEC
@@ -70,8 +72,12 @@ pub(crate) fn elf_facts(bytes: &[u8]) -> io::Result<ElfFacts> {
             _ => {}
         }
     }
-    if let Some((symbols, _)) = file.symbol_table().map_err(parse_error)? {
-        facts.undefined_symbols = symbols.iter().skip(1).filter(|s| s.is_undefined()).count() as u64;
+    if let Some((symbols, _)) = file.symbol_table().map_err(|error| parse_error(&error))? {
+        facts.undefined_symbols = symbols
+            .iter()
+            .skip(1)
+            .filter(elf::symbol::Symbol::is_undefined)
+            .count() as u64;
     }
     Ok(facts)
 }
@@ -122,18 +128,35 @@ mod tests {
             assert_eq!(at % 4, 0, "entry starts 4-byte aligned");
             assert_eq!(&archive[at..at + 6], b"070701");
             let field = |n: usize| &archive[at + 6 + 8 * n..at + 14 + 8 * n];
-            let (mode, nlink, size, name_size) = (hex(field(1)), hex(field(4)), hex(field(6)), hex(field(11)));
-            assert_eq!((hex(field(2)), hex(field(3)), hex(field(5))), (0, 0, 0), "uid, gid, mtime");
+            let (mode, nlink, size, name_size) =
+                (hex(field(1)), hex(field(4)), hex(field(6)), hex(field(11)));
+            assert_eq!(
+                (hex(field(2)), hex(field(3)), hex(field(5))),
+                (0, 0, 0),
+                "uid, gid, mtime"
+            );
             assert_eq!(hex(field(12)), 0, "newc checksum field");
             let name_at = at + 110;
             let name = &archive[name_at..name_at + name_size as usize - 1];
             assert_eq!(archive[name_at + name_size as usize - 1], 0);
             let data_at = (name_at + name_size as usize).next_multiple_of(4);
-            assert!(archive[name_at + name_size as usize..data_at].iter().all(|&b| b == 0));
+            assert!(
+                archive[name_at + name_size as usize..data_at]
+                    .iter()
+                    .all(|&b| b == 0)
+            );
             let end = data_at + size as usize;
             let next = end.next_multiple_of(4);
-            assert!(archive[end..next].iter().all(|&b| b == 0), "zero data padding");
-            found.push((String::from_utf8(name.to_vec()).unwrap(), mode, nlink, archive[data_at..end].to_vec()));
+            assert!(
+                archive[end..next].iter().all(|&b| b == 0),
+                "zero data padding"
+            );
+            found.push((
+                String::from_utf8(name.to_vec()).unwrap(),
+                mode,
+                nlink,
+                archive[data_at..end].to_vec(),
+            ));
             at = next;
         }
         found
@@ -146,10 +169,18 @@ mod tests {
         assert_eq!(archive.len() % 4, 0);
         assert_eq!(archive, initramfs(&init).unwrap(), "deterministic");
         let found = entries(&archive);
-        let summary = found.iter().map(|(n, m, l, d)| (n.as_str(), *m, *l, d.len())).collect::<Vec<_>>();
+        let summary = found
+            .iter()
+            .map(|(n, m, l, d)| (n.as_str(), *m, *l, d.len()))
+            .collect::<Vec<_>>();
         assert_eq!(
             summary,
-            [("dev", 0o040_755, 2, 0), ("init", 0o100_755, 1, 251), ("linuxrc", 0o120_777, 1, 5), ("TRAILER!!!", 0, 1, 0)]
+            [
+                ("dev", 0o040_755, 2, 0),
+                ("init", 0o100_755, 1, 251),
+                ("linuxrc", 0o120_777, 1, 5),
+                ("TRAILER!!!", 0, 1, 0)
+            ]
         );
         assert_eq!(found[1].3, init);
         assert_eq!(found[2].3, b"/init");
@@ -178,7 +209,7 @@ mod tests {
         bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
         bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
         bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
-        bytes[56..58].copy_from_slice(&(programs.len() as u16).to_le_bytes());
+        bytes[56..58].copy_from_slice(&u16::try_from(programs.len()).unwrap().to_le_bytes());
         for (i, (kind, flags, vaddr, filesz, memsz)) in programs.iter().enumerate() {
             let p = 64 + 56 * i;
             bytes[p..p + 4].copy_from_slice(&kind.to_le_bytes());
@@ -193,22 +224,44 @@ mod tests {
     #[test]
     fn elf_facts_count_loads_interpreters_and_executable_ranges() {
         let bytes = synthetic_elf(
-            &[(3, 4, 0, 0, 0), (1, 5, 0x20_0000, 16, 32), (1, 6, 0x30_0000, 8, 8), (1, 5, 0x40_0000, 0, 0), (2, 6, 0, 0, 0)],
+            &[
+                (3, 4, 0, 0, 0),
+                (1, 5, 0x20_0000, 16, 32),
+                (1, 6, 0x30_0000, 8, 8),
+                (1, 5, 0x40_0000, 0, 0),
+                (2, 6, 0, 0, 0),
+            ],
             62,
         );
         let facts = elf_facts(&bytes).unwrap();
         assert_eq!(facts.loads, 3);
-        assert_eq!((facts.interpreters, facts.dynamics, facts.undefined_symbols), (1, 1, 0));
+        assert_eq!(
+            (facts.interpreters, facts.dynamics, facts.undefined_symbols),
+            (1, 1, 0)
+        );
         assert_eq!(facts.executable_segments, [(0x20_0000, 0x20_0020)]);
-        assert!(elf_facts(&synthetic_elf(&[(1, 5, 0, 0, 0)], 3)).is_err(), "not x86-64");
-        assert!(elf_facts(&synthetic_elf(&[(1, 5, 0, 9, 8)], 62)).is_err(), "filesz > memsz");
-        assert!(elf_facts(&synthetic_elf(&[(1, 5, u64::MAX, 0, 2)], 62)).is_err(), "overflow");
+        assert!(
+            elf_facts(&synthetic_elf(&[(1, 5, 0, 0, 0)], 3)).is_err(),
+            "not x86-64"
+        );
+        assert!(
+            elf_facts(&synthetic_elf(&[(1, 5, 0, 9, 8)], 62)).is_err(),
+            "filesz > memsz"
+        );
+        assert!(
+            elf_facts(&synthetic_elf(&[(1, 5, u64::MAX, 0, 2)], 62)).is_err(),
+            "overflow"
+        );
         assert!(elf_facts(&bytes[..100]).is_err(), "truncated program table");
     }
 
     #[test]
     fn expected_counts_follow_the_archive_and_the_elf() {
-        let facts = elf_facts(&synthetic_elf(&[(1, 5, 0x20_0000, 16, 16), (1, 6, 0x30_0000, 8, 8)], 62)).unwrap();
+        let facts = elf_facts(&synthetic_elf(
+            &[(1, 5, 0x20_0000, 16, 16), (1, 6, 0x30_0000, 8, 8)],
+            62,
+        ))
+        .unwrap();
         let counts = archive_counts(4096, &facts);
         assert!(counts.starts_with("reserved=4096 bytes=4096 records=4 files=3 regular=1 symlinks=1 trailers=1 skipped=0 elf=1 loads=2 interpreters=0 "));
         assert!(archive_counts(4097, &facts).starts_with("reserved=8192 bytes=4097 "));
