@@ -13,7 +13,7 @@
 
 ### Registry dependencies and the CPU layer
 
-- First registry dependencies: `x86_64` 0.15.5 and `raw-cpuid` 11.6.0 (seven vendored crates, `vendor/` + checked-in `.cargo/config.toml`, harness merge of rust-src and project vendor for build-std, auditor/packager vendor rules); `cpu.rs` now uses them for descriptor tables, registers, MSRs and CPUID (23 to 11 hand-written `asm!` sites) with Linux 6.18.57's 64-bit GDT selector layout.
+- First registry dependencies: `x86_64` 0.15.5 and `raw-cpuid` 11.6.0 (seven kernel crates plus `serde_json` and its graph for the host vendor gate, 18 vendored packages, `vendor/` + checked-in `.cargo/config.toml`, harness merge of rust-src and project vendor for build-std, auditor/packager vendor rules); `cpu.rs` now uses them for descriptor tables, registers, MSRs and CPUID (23 to 11 hand-written `asm!` sites) with Linux 6.18.57's 64-bit GDT selector layout.
 
 ### Kernel audit fixes
 
