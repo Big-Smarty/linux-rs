@@ -136,6 +136,11 @@ mod tests {
                 "uid, gid, mtime"
             );
             assert_eq!(hex(field(12)), 0, "newc checksum field");
+            assert_eq!(
+                (7..=10).map(|n| hex(field(n))).collect::<Vec<_>>(),
+                [0; 4],
+                "dev and rdev numbers"
+            );
             let name_at = at + 110;
             let name = &archive[name_at..name_at + name_size as usize - 1];
             assert_eq!(archive[name_at + name_size as usize - 1], 0);
@@ -184,9 +189,9 @@ mod tests {
         );
         assert_eq!(found[1].3, init);
         assert_eq!(found[2].3, b"/init");
-        // Sequential inode numbers 0, 1, 2 (write_cpio) and the trailer.
-        let inodes = [0, 1, 2].map(|i| hex(&archive[entry_offset(&archive, i) + 6..][..8]));
-        assert_eq!(inodes, [0, 1, 2]);
+        // Sequential inode numbers 0, 1, 2 (write_cpio); the trailer has ino 0, mode 0, nlink 1.
+        let inodes = [0, 1, 2, 3].map(|i| hex(&archive[entry_offset(&archive, i) + 6..][..8]));
+        assert_eq!(inodes, [0, 1, 2, 0]);
     }
 
     fn entry_offset(archive: &[u8], index: usize) -> usize {
@@ -266,6 +271,36 @@ mod tests {
         assert!(counts.starts_with("reserved=4096 bytes=4096 records=4 files=3 regular=1 symlinks=1 trailers=1 skipped=0 elf=1 loads=2 interpreters=0 "));
         assert!(archive_counts(4097, &facts).starts_with("reserved=8192 bytes=4097 "));
         assert!(archive_counts(0, &facts).starts_with("reserved=4096 bytes=0 "));
+    }
+
+    #[test]
+    fn expected_counts_describe_the_generated_archive() {
+        let program = synthetic_elf(&[(1, 5, 0x20_0000, 16, 16), (1, 6, 0x30_0000, 8, 8)], 62);
+        let facts = elf_facts(&program).unwrap();
+        let archive = initramfs(&program).unwrap();
+        let found = entries(&archive);
+        let of_type = |kind: u32| {
+            found
+                .iter()
+                .filter(|e| e.0 != "TRAILER!!!" && e.1 & 0o170_000 == kind)
+                .count()
+        };
+        let trailers = found.iter().filter(|e| e.0 == "TRAILER!!!").count();
+        let elfs = found
+            .iter()
+            .filter(|e| e.1 & 0o170_000 == 0o100_000 && e.3.starts_with(b"\x7fELF"))
+            .count();
+        let expected = format!(
+            "records={} files={} regular={} symlinks={} trailers={trailers} skipped=0 elf={elfs} loads={} interpreters={} ",
+            found.len(),
+            found.len() - trailers,
+            of_type(0o100_000),
+            of_type(0o120_000),
+            facts.loads,
+            facts.interpreters,
+        );
+        let counts = archive_counts(archive.len(), &facts);
+        assert!(counts.contains(&expected), "{counts} vs {expected}");
     }
 
     #[test]

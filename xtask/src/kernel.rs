@@ -2127,7 +2127,15 @@ fn remap_flags(root: &Path, output: &Path, rustc: &Tool) -> io::Result<String> {
         .ok_or_else(|| invalid("rustc has no sysroot"))?;
     Ok([(root, "/src"), (output, "/out"), (sysroot, "/toolchain")]
         .into_iter()
-        .map(|(path, to)| Ok(format!("--remap-path-prefix={}={to}", display_path(path)?)))
+        .map(|(path, to)| {
+            let text = display_path(path)?;
+            // `\x1f` separates the encoded flags (a path containing it would inject a flag);
+            // other control bytes have no place in a recorded build path either.
+            if text.chars().any(char::is_control) {
+                return Err(invalid(format!("path has a control character: {text:?}")));
+            }
+            Ok(format!("--remap-path-prefix={text}={to}"))
+        })
         .collect::<io::Result<Vec<_>>>()?
         .join("\x1f"))
 }
@@ -3567,7 +3575,9 @@ fn validate_success_serial(
     Ok(())
 }
 
-fn capture_qemu_tools(root: &Path, output: &Path, init_elf: &Path) -> io::Result<QemuTools> {
+/// Captures the QEMU/image tool identities and generates the run's boot-module fixtures
+/// (they need the recorded `sha256sum`), so everything a case stages exists after this call.
+fn prepare_qemu_inputs(root: &Path, output: &Path, init_elf: &Path) -> io::Result<QemuTools> {
     let qemu = capture_tool_version(root, output, "qemu-system-x86_64", &["--version"])?;
     let limine = capture_tool_version(root, output, "limine", &["--version"])?;
     if limine.version.lines().next() != Some("Limine 12.9.3") {
@@ -3822,7 +3832,7 @@ fn run_kernel_test(output: &Output, timeout: Duration) -> io::Result<TestRun> {
             ));
         }
     }
-    let tools = capture_qemu_tools(&output.root, &output.path, &init_build.elf)?;
+    let tools = prepare_qemu_inputs(&output.root, &output.path, &init_build.elf)?;
     copy_notices(&output.root, &output.path, &tools.sha256sum.path)?;
     let mut cases = Vec::with_capacity(DEBUG_CASES.len());
     for case in DEBUG_CASES {
@@ -4577,6 +4587,29 @@ mod tests {
                 "child outlived its spawning thread"
             );
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn remap_flags_reject_separator_and_control_bytes_in_paths() {
+        let rustc = |path: &str| Tool {
+            path: PathBuf::from(path),
+            version: String::new(),
+        };
+        let flags = remap_flags(
+            Path::new("/work/root"),
+            Path::new("/work/root/out"),
+            &rustc("/tc/bin/rustc"),
+        )
+        .unwrap();
+        assert_eq!(flags.split('\x1f').count(), 3);
+        assert!(flags.starts_with("--remap-path-prefix=/work/root=/src\x1f"));
+        for bad in ["/w/a\x1fb", "/w/a\nb", "/w/a\x7fb"] {
+            let (root, output) = (Path::new(bad), Path::new("/w/out"));
+            assert!(remap_flags(root, output, &rustc("/tc/bin/rustc")).is_err());
+            assert!(
+                remap_flags(Path::new("/w"), output, &rustc(&format!("{bad}/bin/rustc"))).is_err()
+            );
         }
     }
 
