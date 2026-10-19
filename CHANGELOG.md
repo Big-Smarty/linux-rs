@@ -6,6 +6,10 @@
 
 - Recorded user decisions A18–A20 (checkpoint close-out plus first-userspace slice, full roadmap, branch-and-PR flow preferring audited crates) and updated the authority paragraphs; the structural auditor now accepts Symposium-synced skill copies.
 
+### First userspace program
+
+- Added `user/init`, a static libc-free x86_64 Linux `/init` test program that doubles as a differential oracle (oracle evidence under `target/linux-reference/init-reference-001/`); moved the scalar `memset`/`memcpy` runtime into the kernel library so it can link them; admitted `syscalls` 0.8.1 and rejected `origin`/`rustix` for it.
+
 ### Kernel audit fixes
 
 - Early framebuffer console before any fallible step, bounded raw command line with `test=` parsing gated on `qemu-self-test`, exposed-provenance pixel stores, CR4.PGE/PCIDE rejection, skip-and-warn for a module that fails inspection, one duplicate buddy validation removed; see [implementation](docs/implementation.md#audit-fixes-2026-10-19).
