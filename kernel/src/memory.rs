@@ -270,7 +270,6 @@ impl<'a> Allocator<'a> {
         if alignment < PAGE || !alignment.is_power_of_two() {
             return Err(Error::Alignment);
         }
-        Buddy::validate_request(order, alignment / PAGE)?;
         #[cfg(feature = "qemu-self-test")]
         if self.allocation_budget == Some(0) {
             return Err(Error::NoMemory);

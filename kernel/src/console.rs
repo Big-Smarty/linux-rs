@@ -129,12 +129,14 @@ fn pixel_byte(byte: u8) {
                 && glyph[(row - 1) / 2] & (1 << (5 - column)) != 0;
             let address = base + (y + row) * pitch + (x + column) * 4;
             // SAFETY: init validated 32bpp layout, dimensions and whole resource
-            // extent through BootInfo. Coordinates remain within that extent.
+            // extent through BootInfo. Coordinates remain within that extent. The
+            // address is a loader-published integer for foreign MMIO, so the
+            // pointer takes exposed provenance, not none.
             // MMIO is outside Rust allocations, aligned, writable and nontrapping
             // under the loader resource contract; u32 accepts all bit patterns.
             unsafe {
                 ptr::write_volatile(
-                    ptr::without_provenance_mut(address),
+                    ptr::with_exposed_provenance_mut::<u32>(address),
                     if white { foreground } else { 0 },
                 );
             };
