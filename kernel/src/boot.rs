@@ -115,6 +115,7 @@ pub enum BootError {
     Alignment,
     Address,
     Firmware,
+    CommandLine,
 }
 
 pub struct BootInfo {
@@ -124,9 +125,15 @@ pub struct BootInfo {
     pub image_physical: u64,
     pub image_virtual: u64,
     pub rsdp: u64,
-    pub framebuffer: Option<Framebuffer>,
     pub test: TestMode,
+    command_line: [u8; COMMAND_LINE_SIZE],
+    command_line_length: usize,
 }
+
+/// Linux x86 `COMMAND_LINE_SIZE` (arch/x86/include/asm/setup.h), NUL included.
+/// Linux silently truncates a longer line; a cut word or a cut `--` separator
+/// would change its meaning, so this loader boundary rejects it instead.
+const COMMAND_LINE_SIZE: usize = 2048;
 
 // Limine File Structure's consumed prefix, under the protocol/0BSD notice
 // above. Remaining file/path/UUID fields are not dereferenced.
@@ -247,6 +254,20 @@ fn aligned(address: u64, alignment: usize) -> bool {
     address != 0 && address & (alignment as u64 - 1) == 0 && address >= 0xffff_8000_0000_0000
 }
 
+/// Copy a NUL-terminated line of at most `COMMAND_LINE_SIZE - 1` bytes.
+fn bounded_command_line(
+    mut byte: impl FnMut(usize) -> Result<u8, BootError>,
+) -> Result<([u8; COMMAND_LINE_SIZE], usize), BootError> {
+    let mut line = [0; COMMAND_LINE_SIZE];
+    for length in 0..COMMAND_LINE_SIZE {
+        match byte(length)? {
+            0 => return Ok((line, length)),
+            value => line[length] = value,
+        }
+    }
+    Err(BootError::CommandLine)
+}
+
 /// Read a response scalar without forming a reference to mutable request memory.
 /// # Safety
 /// The trusted loader must have completed its writes and supplied a mapped,
@@ -264,16 +285,11 @@ unsafe fn response(request: *const Request, words: usize) -> Result<&'static [u6
 }
 
 impl BootInfo {
-    /// Consume the one bootstrap handoff. No other constructor exists.
-    ///
-    /// # Errors
-    /// Rejects unsupported protocol/firmware, invalid response pointers/counts,
-    /// malformed memory ranges, or overflowing/unmapped addresses.
+    /// Protocol revision plus the memory-map view; entries are NOT yet validated.
     ///
     /// # Safety
-    /// Called once at CPL0 from a conforming, trusted Limine base-5+ loader;
-    /// response allocations/mappings remain reserved and immutable indefinitely.
-    pub unsafe fn take() -> Result<Self, BootError> {
+    /// Same contract as `take`.
+    unsafe fn mapped() -> Result<Self, BootError> {
         // SAFETY: caller establishes completed loader writes to this image.
         if unsafe { ptr::read_volatile(ptr::addr_of!(BASE[2])) } != 0
             || unsafe { ptr::read_volatile(ptr::addr_of!(BASE[1])) } != 5
@@ -283,15 +299,7 @@ impl BootInfo {
         // SAFETY: same handoff contract, each layout is defined by its request ID.
         let memory = unsafe { response(ptr::addr_of!(MEMORY), 3)? };
         let direct_map = unsafe { response(ptr::addr_of!(HHDM), 2)? }[1];
-        let address = unsafe { response(ptr::addr_of!(ADDRESS), 3)? };
-        let rsdp = unsafe { response(ptr::addr_of!(RSDP), 2)? }[1];
-        let firmware = unsafe { response(ptr::addr_of!(FIRMWARE), 2)? }[1];
-        if firmware != 2 {
-            return Err(BootError::Firmware);
-        }
-        // UEFI RSDP storage need not be naturally aligned: all ACPI fields are
-        // decoded from bytes. Only its mapped canonical address is required.
-        if !aligned(direct_map, 4096) || rsdp < direct_map {
+        if !aligned(direct_map, 4096) {
             return Err(BootError::Address);
         }
         let count = usize::try_from(memory[1]).map_err(|_| BootError::Count)?;
@@ -304,18 +312,88 @@ impl BootInfo {
         // SAFETY: the protocol supplies exactly count pointer entries in its live
         // immutable response allocation; no capacity guess or merged allocation.
         let regions = unsafe { slice::from_raw_parts(memory[2] as *const *const Region, count) };
-        let mut info = Self {
+        Ok(Self {
             regions,
             modules: &[],
             direct_map,
-            image_physical: address[1],
-            image_virtual: address[2],
-            rsdp,
-            framebuffer: None,
+            image_physical: 0,
+            image_virtual: 0,
+            rsdp: 0,
             test: TestMode::Normal,
-        };
+            command_line: [0; COMMAND_LINE_SIZE],
+            command_line_length: 0,
+        })
+    }
+
+    /// The loader framebuffer, found before any other fallible step so that every
+    /// later failure can reach the screen. A missing or invalid display is
+    /// explicit (`None`), never fabricated.
+    ///
+    /// The extent is checked against the still-unvalidated memory map: a union
+    /// of loader-declared kind7 entries is sound for that question whatever the
+    /// order, and a malformed map only fails the later `take`.
+    ///
+    /// # Safety
+    /// CPL0 on a conforming, trusted Limine base-5+ loader; response allocations
+    /// and mappings stay reserved and immutable. May run before `take`, which
+    /// remains the single consuming handoff.
+    #[must_use]
+    pub unsafe fn take_framebuffer() -> Option<Framebuffer> {
+        // SAFETY: same contract as this function.
+        let info = unsafe { Self::mapped() }.ok()?;
+        // SAFETY: same response lifetime, optional response is handled as failure.
+        let fb = unsafe { response(ptr::addr_of!(FRAMEBUFFER), 3) }.ok()?;
+        if fb[1] == 0 || !info.contains_virtual(fb[2], 8, 5) {
+            return None;
+        }
+        // SAFETY: the first array slot lies inside reserved loader memory; the
+        // protocol does not promise its alignment, so read it unaligned.
+        let pointer = unsafe { ptr::read_unaligned(fb[2] as *const *const Framebuffer) };
+        if !info.contains_virtual(pointer as u64, mem::size_of::<Framebuffer>() as u64, 5) {
+            return None;
+        }
+        // SAFETY: validated mapped loader storage; all fields integers.
+        let display = unsafe { ptr::read_unaligned(pointer) };
+        let length = display.pitch.checked_mul(display.height)?;
+        info.contains_virtual(display.address, length, 7)
+            .then_some(display)
+    }
+
+    /// The loader command line without its NUL, at most 2047 bytes.
+    #[must_use]
+    pub fn command_line(&self) -> &[u8] {
+        &self.command_line[..self.command_line_length]
+    }
+
+    /// Consume the one bootstrap handoff. No other constructor exists.
+    ///
+    /// # Errors
+    /// Rejects unsupported protocol/firmware, invalid response pointers/counts,
+    /// malformed memory ranges, or overflowing/unmapped addresses.
+    ///
+    /// # Safety
+    /// Called once at CPL0 from a conforming, trusted Limine base-5+ loader;
+    /// response allocations/mappings remain reserved and immutable indefinitely.
+    pub unsafe fn take() -> Result<Self, BootError> {
+        // SAFETY: same contract as this function.
+        let mut info = unsafe { Self::mapped()? };
+        // SAFETY: same handoff contract, each layout is defined by its request ID.
+        let address = unsafe { response(ptr::addr_of!(ADDRESS), 3)? };
+        let rsdp = unsafe { response(ptr::addr_of!(RSDP), 2)? }[1];
+        let firmware = unsafe { response(ptr::addr_of!(FIRMWARE), 2)? }[1];
+        if firmware != 2 {
+            return Err(BootError::Firmware);
+        }
+        // UEFI RSDP storage need not be naturally aligned: all ACPI fields are
+        // decoded from bytes. Only its mapped canonical address is required.
+        if rsdp < info.direct_map {
+            return Err(BootError::Address);
+        }
+        info.image_physical = address[1];
+        info.image_virtual = address[2];
+        info.rsdp = rsdp;
         let mut previous_end = 0;
-        for index in 0..count {
+        for index in 0..info.regions.len() {
             let region = info.region(index)?;
             previous_end = checked_region(region, previous_end)?;
         }
@@ -327,58 +405,36 @@ impl BootInfo {
         unsafe {
             info.take_modules()?;
         }
-        // Optional framebuffer: a missing display is explicit, never fabricated.
-        // SAFETY: same response lifetime, optional response is handled as failure.
-        if let Ok(fb) = unsafe { response(ptr::addr_of!(FRAMEBUFFER), 3) }
-            && fb[1] != 0
-            && info.contains_virtual(fb[2], 8, 5)
-        {
-            // SAFETY: array first pointer lies inside reserved loader memory.
-            let pointer = unsafe { ptr::read(fb[2] as *const *const Framebuffer) };
-            if info.contains_virtual(pointer as u64, mem::size_of::<Framebuffer>() as u64, 5) {
-                // SAFETY: validated mapped loader storage; all fields integers.
-                let display = unsafe { ptr::read_unaligned(pointer) };
-                let length = display
-                    .pitch
-                    .checked_mul(display.height)
-                    .ok_or(BootError::Overflow)?;
-                if info.contains_virtual(display.address, length, 7) {
-                    info.framebuffer = Some(display);
-                }
-            }
-        }
-        // SAFETY: optional command response, with bounded reserved-byte traversal.
+        // SAFETY: optional command response; every byte is checked against kind5.
         if let Ok(command) = unsafe { response(ptr::addr_of!(COMMAND), 2) } {
-            let mut bytes = [0u8; 64];
-            let mut length = 0;
-            while length < bytes.len()
-                && info.contains_virtual(
-                    command[1]
-                        .checked_add(length as u64)
-                        .ok_or(BootError::Overflow)?,
-                    1,
-                    5,
-                )
-            {
-                // SAFETY: individual byte validated inside immutable loader RAM.
-                let byte = unsafe { ptr::read((command[1] as *const u8).add(length)) };
-                if byte == 0 {
-                    break;
+            let (line, length) = bounded_command_line(|offset| {
+                let address = command[1]
+                    .checked_add(offset as u64)
+                    .ok_or(BootError::Overflow)?;
+                if !info.contains_virtual(address, 1, 5) {
+                    return Err(BootError::CommandLine);
                 }
-                bytes[length] = byte;
-                length += 1;
+                // SAFETY: this byte lies inside immutable loader RAM (kind5).
+                Ok(unsafe { ptr::read(address as *const u8) })
+            })?;
+            info.command_line = line;
+            info.command_line_length = length;
+            // The mutation selectors exist only in the QEMU self-test build: a
+            // physical entry's editable command line must not choose them.
+            #[cfg(feature = "qemu-self-test")]
+            {
+                info.test = match info.command_line() {
+                    b"test=panic" => TestMode::Panic,
+                    b"test=unexpected-fault" => TestMode::UnexpectedFault,
+                    b"test=unexpected-page-fault" => TestMode::UnexpectedPageFault,
+                    b"test=unexpected-breakpoint" => TestMode::UnexpectedBreakpoint,
+                    b"test=unexpected-interrupt" => TestMode::UnexpectedInterrupt,
+                    b"test=unmasked-timer" => TestMode::UnmaskedTimer,
+                    b"test=irq-restore-early" => TestMode::IrqRestoreEarly,
+                    b"test=bad-map" => TestMode::BadMap,
+                    _ => TestMode::Normal,
+                };
             }
-            info.test = match &bytes[..length] {
-                b"test=panic" => TestMode::Panic,
-                b"test=unexpected-fault" => TestMode::UnexpectedFault,
-                b"test=unexpected-page-fault" => TestMode::UnexpectedPageFault,
-                b"test=unexpected-breakpoint" => TestMode::UnexpectedBreakpoint,
-                b"test=unexpected-interrupt" => TestMode::UnexpectedInterrupt,
-                b"test=unmasked-timer" => TestMode::UnmaskedTimer,
-                b"test=irq-restore-early" => TestMode::IrqRestoreEarly,
-                b"test=bad-map" => TestMode::BadMap,
-                _ => TestMode::Normal,
-            };
         }
         Ok(info)
     }
@@ -679,6 +735,21 @@ mod tests {
     }
 
     #[test]
+    fn command_line_is_copied_exactly_or_rejected() {
+        let copy = |text: &[u8]| {
+            bounded_command_line(|i| text.get(i).copied().ok_or(BootError::CommandLine))
+        };
+        let (line, length) = copy(b"a b -- c\0junk").unwrap();
+        assert_eq!(&line[..length], b"a b -- c");
+        let mut longest = [b'x'; COMMAND_LINE_SIZE];
+        longest[COMMAND_LINE_SIZE - 1] = 0;
+        assert_eq!(copy(&longest).unwrap().1, COMMAND_LINE_SIZE - 1);
+        longest[COMMAND_LINE_SIZE - 1] = b'x';
+        assert_eq!(copy(&longest), Err(BootError::CommandLine));
+        assert_eq!(copy(b"unterminated"), Err(BootError::CommandLine));
+    }
+
+    #[test]
     fn zero_byte_module_retains_its_page_without_borrowing_padding() {
         let direct_map = 0xffff_8000_0000_0000;
         let span = ModuleSpan::from_file(direct_map + 0x3000, 0, direct_map).unwrap();
@@ -692,8 +763,9 @@ mod tests {
             image_physical: 0,
             image_virtual: 0,
             rsdp: 0,
-            framebuffer: None,
             test: TestMode::Normal,
+            command_line: [0; COMMAND_LINE_SIZE],
+            command_line_length: 0,
         };
         // SAFETY: the explicit empty-file path forms no storage reference and
         // needs no live host mapping. This is not a simulated loader allocation.

@@ -96,7 +96,11 @@ pub fn validate() -> Result<(), Error> {
     unsafe {
         asm!("mov {}, cr0", "mov {}, cr4", "mov {}, rsp", out(reg) cr0, out(reg) cr4, out(reg) rsp, options(nomem, nostack, preserves_flags));
     }
-    if cr0 & ((1 << 31) | (1 << 16) | 1) != ((1 << 31) | (1 << 16) | 1) || cr4 & (1 << 12) != 0 {
+    // CR4.LA57, PGE and PCIDE: MOV to CR3 would leave global or other-PCID
+    // loader translations alive (SDM Vol.3 4.10.4.1), defeating the new tree.
+    if cr0 & ((1 << 31) | (1 << 16) | 1) != ((1 << 31) | (1 << 16) | 1)
+        || cr4 & ((1 << 12) | (1 << 7) | (1 << 17)) != 0
+    {
         return Err(Error::Paging);
     }
     let base = ptr::addr_of!(BOOT_STACK) as u64;
