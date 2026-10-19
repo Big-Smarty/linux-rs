@@ -282,11 +282,17 @@ impl Debug for Stack {
         }
         write!(
             f,
-            " execfn={:?} platform={:?} envp={:?}",
+            " execfn={:?} platform={:?} envp=",
             self.aux_string(AT_EXECFN),
-            self.aux_string(AT_PLATFORM),
-            self.envp
-        )
+            self.aux_string(AT_PLATFORM)
+        )?;
+        // Only the kernel-built init environment is printed: a host run's
+        // environment may hold secrets.
+        if pid() == 1 {
+            write!(f, "{:?}", self.envp)
+        } else {
+            write!(f, "{}", self.envp.0.len())
+        }
     }
 }
 
