@@ -54,7 +54,7 @@ A Linux syscall-number table alone is not compatibility. Signals, cancellation/r
 - Detailed [subsystem implementation plans](docs/README.md), including dependencies, compatibility traps, security invariants, candidate dependencies, safe simplifications, and observable gates.
 - A pinned upstream tree assignment in [reference metadata](planning/reference.tsv), [workstreams](planning/workstreams.tsv), and [upstream paths](planning/upstream-paths.tsv). This maps structural scope, not implemented behavior.
 - Sixteen original project-local skills, indexed through the [skills guide](docs/skills.md).
-- A dependency-free Rust host audit described in [project audit](docs/project-audit.md). Its `check`/`status` commands check structural consistency, not kernel execution. The Rust-owned `kernel-build`/`kernel-test`/`kernel-package` interfaces are documented separately in [kernel tooling](docs/kernel-tooling.md), with their actual maintained-run and package evidence distinguished above.
+- A Rust host audit (one vendored dependency, `serde_json`, for the vendor gate) described in [project audit](docs/project-audit.md). Its `check`/`status` commands check structural consistency, not kernel execution. The Rust-owned `kernel-build`/`kernel-test`/`kernel-package` interfaces are documented separately in [kernel tooling](docs/kernel-tooling.md), with their actual maintained-run and package evidence distinguished above.
 - A dependency-free Rust [bare-metal smoke runner](docs/bare-metal-suite.md), usable on reference Linux now and on future candidate kernels. It is bounded and nondestructive; it does not certify full compatibility, physical provenance, or performance.
 
 From the repository root, after the host toolchain prerequisites are satisfied:
