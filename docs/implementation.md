@@ -14,7 +14,7 @@ The first implementation cell is x86_64, little endian, 4 KiB pages, four-level 
 
 ### Merged pull requests
 
-Each was merged only after an independent subagent review posted to GitHub as a `COMMENT` review. Those are agent reviews, not independent human review.
+Each received at least one independent subagent review on GitHub (a `COMMENT` review) before it was merged; #6's last commit was a merge from `main`, and #7 and #10 each gained a docs-only commit answering their reviewer's notes after the last review. Those are agent reviews, not independent human review. The `v0.1.0` tag marks the merge of this record; its executable sources are identical to 6aaeb93, where the evidence below ran.
 
 | PR | Merge commit | Change |
 | --- | --- | --- |
@@ -40,8 +40,8 @@ cargo +1.88.0 test -p xtask -p baremetal --locked --offline        # baremetal 1
 cargo +nightly clippy --workspace --all-targets --locked --offline -- -D warnings
 cargo +nightly test --workspace --locked --offline                  # kernel 121, xtask 70, baremetal 10, 2 doc tests
 env PATH="/bin:$PATH" cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/final-001 --timeout-seconds 60
-cargo run -p xtask -- check                                         # 22 vendored packages verified
-cargo run -p xtask -- status                                        # 14 in_progress, 2609 not_started of 2623
+cargo +1.88.0 run -p xtask --locked --offline -- check            # 22 vendored packages verified
+cargo +1.88.0 run -p xtask --locked --offline -- status           # 14 in_progress, 2609 not_started of 2623
 ```
 
 Both target strict Clippy profiles (`qemu-self-test`, `freestanding`) also passed, run with `--config target/kernel-tooling/final-001/freestanding-build/cargo-home/config.toml` (the per-run merged vendor source; see [kernel tooling](kernel-tooling.md#vendored-dependencies-and-the-fresh-clone-build)). `final-001` matched **18/18** cases: bad-map, bad-module, cpu-max, cpu-without-pat, empty-module, init-segfault, irq-restore-early, no-init, panic, rseq, sse, success, unexpected-breakpoint, unexpected-fault, unexpected-interrupt, unexpected-page-fault, unimplemented-syscall, unmasked-timer.
@@ -53,9 +53,9 @@ Both target strict Clippy profiles (`qemu-self-test`, `freestanding`) also passe
 | `/init` | `0daf382f152b522484710260d0b1549b4656cc913b7dfbdac8416b1cb3fcd8fb` |
 | initramfs | `1d463e2c8c81ebe8f00f6c4eca0d07dd72c50806259f55db3d0159e8f5d513bc` |
 
-The `/init` is the exact binary the pinned Linux 6.18.57 oracle ran in `target/linux-reference/init-reference-004`.
+The `/init` is the exact binary the pinned Linux 6.18.57 oracle ran in `target/linux-reference/init-reference-004`. That oracle kernel was built with `CONFIG_RSEQ=y` and `CONFIG_IA32_EMULATION=y` and booted with `vdso=0`; the candidate's summary line equals the oracle's after removing the two `AT_RSEQ_*` entries, which the declared configuration omits. The default `qemu64` cases report `smep=false smap=false`; only `cpu-max` reports `smep=true smap=true`. UMIP enablement has no dedicated harness assertion.
 
-**Fresh clone.** An https clone of commit 6aaeb93 with no `target/`, an empty `CARGO_HOME` and `CARGO_NET_OFFLINE=true` (same workstation, user and toolchain installation) ran `kernel-test --output target/kernel-tooling/fresh-001` -> 18/18 and `xtask check` -> exit 0. All four artifact hashes above were byte-identical to the canonical run, and `CARGO_HOME` gained only Cargo's cache files. This is not a different machine or toolchain location and is not independently attested.
+**Fresh clone.** An https clone of commit 6aaeb93 with no `target/`, an empty `CARGO_HOME` and `CARGO_NET_OFFLINE=true` (same workstation, user and toolchain installation; command record `target/final-fresh-command.txt`, written after the run from the session transcript, with output `target/final-fresh-output.log`) ran `kernel-test --output target/kernel-tooling/fresh-001` -> 18/18 and `xtask check` -> exit 0. All four artifact hashes above were byte-identical to the canonical run, and `CARGO_HOME` gained only Cargo's cache files. This is not a different machine or toolchain location and is not independently attested.
 
 **Package.** `kernel-package --build-output target/kernel-tooling/final-001/freestanding-build --output target/kernel-tooling/final-pkg-001` produced an unsigned diagnostic archive, sha256 `fba257d798ecef9289a4289ab472508117145354cedd79d58d8c13581d78add8`. It is a new lineage and is **not physically cleared**; diagnostic-003 remains the only conditionally cleared lineage ([handoff](diagnostic-handoff.md)).
 
@@ -68,7 +68,7 @@ Fourteen routed rows are `in_progress` and 2,609 are `not_started` of 2,623 (see
 ### Not done / blockers
 
 - Physical execution and recovery of any candidate; no physical evidence exists and no lineage but diagnostic-003 is cleared.
-- CPU-vulnerability mitigations and the broader platform closure (APIC/x2APIC, IOAPIC, TSS/IST, xstate beyond FXSR, timekeeping).
+- CPU-vulnerability mitigations and the broader platform closure (APIC/x2APIC, IOAPIC, per-CPU TSS/IST for SMP, xstate beyond FXSR, timekeeping).
 - SMP, scheduler, VFS, storage, networking and the rest of M2-M8; the slice is single-task, BSP-only and storage-free.
 - Compat (32-bit) syscalls (`ia32_emulation=0`) and the vDSO (`vdso=0`); `CONFIG_RSEQ=n`, `noxsave` and `norandmaps` are declared-configuration limits, not Linux defaults.
 - Performance qualification against pinned Linux; no measurement was taken.
@@ -290,7 +290,7 @@ The five-column [ledger](../planning/workstreams.tsv) still accepts only `not_st
 | `ws-mm-mmap-c` / `mm/mmap.c` | [mmap/brk argument checks inside the ELF plan](../kernel/src/exec/plan.rs), [access_ok and copies](../kernel/src/usercopy.rs) | `vm_mmap`/`do_mmap`/`__get_unmapped_area` errors for `PT_LOAD` mappings against a fixed stack; no VMA tree, `mmap`/`munmap`/`brk` syscalls or demand paging. |
 | `ws-mm-page-alloc-c` / `mm/page_alloc.c` | [Selected indexed buddy splitting/coalescing](../kernel/src/buddy.rs) | Orders0–10, natural/caller byte alignment, fragmentation/conservation and real RAM consumers. Not full Linux page allocator/GFP/watermarks/migration/per-CPU cache policy. |
 
-The [current publication checkpoint](#publication-checkpoint) binds the combined source and evidence. Historical cell9 and004–010 records remain immutable and scoped to their own inputs; ignored local evidence is **not** a checked-in distribution. No `done` state or whole-prefix completion is introduced.
+The [publication checkpoint](#publication-checkpoint) bound the combined source and evidence of that round; the [v0.1.0 checkpoint](#v010-continuation-checkpoint) is now current. Historical cell9 and004–010 records remain immutable and scoped to their own inputs; ignored local evidence is **not** a checked-in distribution. No `done` state or whole-prefix completion is introduced.
 
 ## First-userspace slice (kernel side)
 
