@@ -24,14 +24,14 @@ const PROJECT_CARGO_CONFIG: &str = "[source.crates-io]\nreplace-with = \"vendore
 const VENDOR_BUILD_SCRIPTS: [(&str, &str); 9] = [
     ("const_fn-0.4.12", "build.rs"),
     ("rustversion-1.0.23", "build/build.rs"),
-    // Only prints rerun-if-changed and a thumb-mode cfg for ARM targets (read in full); no process, network or file access.
-    ("syscalls-0.8.1", "build.rs"),
     ("proc-macro2-1.0.107", "build.rs"),
     ("quote-1.0.47", "build.rs"),
     ("serde-1.0.229", "build.rs"),
     ("serde_core-1.0.229", "build.rs"),
     ("serde_json-1.0.154", "build.rs"),
     ("zmij-1.0.23", "build.rs"),
+    // user/init only: prints rerun-if-changed and a thumb-mode cfg for ARM targets (read in full); no process, network or file access.
+    ("syscalls-0.8.1", "build.rs"),
 ];
 // The only proc-macro packages (host-executed at build time, or locked but unbuilt).
 const VENDOR_PROC_MACROS: [&str; 3] = [
