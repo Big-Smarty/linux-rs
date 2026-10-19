@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Isolated freestanding kernel builds and bounded QEMU evidence capture.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -16,6 +16,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TARGET: &str = "x86_64-unknown-none";
+// Reviewed host-build source replacement; kernel builds accept the checked-in file only if identical.
+const PROJECT_CARGO_CONFIG: &str = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"\n";
+// The only vendored build scripts: (package directory, script path). Review them again on any bump.
+const VENDOR_BUILD_SCRIPTS: [(&str, &str); 2] = [
+    ("const_fn-0.4.12", "build.rs"),
+    ("rustversion-1.0.23", "build/build.rs"),
+];
 const BINARY: &str = "linux-rs-kernel";
 const REQUIRED_RUSTC_COMMIT: &str = "5c543b0b8c73c7b72bc8284ced4fb22ead15734d";
 const REQUIRED_CARGO_COMMIT: &str = "3d7cf6e937d6127d0f49881bf689c560b36d35c4";
@@ -847,6 +854,16 @@ fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     for directory in ["kernel", "xtask", "baremetal"] {
         collect_source_tree(&root.join(directory), &mut files)?;
     }
+    // Optional: absent in a tree with no registry dependencies.
+    for optional in [".cargo/config.toml", "vendor"] {
+        let path = root.join(optional);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => collect_source_tree(&path, &mut files)?,
+            Ok(_) => files.push(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(contextual(&path, &error)),
+        }
+    }
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
         let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
@@ -967,6 +984,17 @@ fn reject_build_overrides(root: &Path) -> io::Result<()> {
         for name in [".cargo/config", ".cargo/config.toml"] {
             let config = directory.join(name);
             match fs::symlink_metadata(&config) {
+                Ok(metadata)
+                    if metadata.is_file() && directory == root && name == ".cargo/config.toml" =>
+                {
+                    let text = fs::read(&config).map_err(|error| contextual(&config, &error))?;
+                    if text != PROJECT_CARGO_CONFIG.as_bytes() {
+                        return Err(invalid(format!(
+                            "{} differs from the reviewed source replacement",
+                            config.display()
+                        )));
+                    }
+                }
                 Ok(_) => {
                     return Err(invalid(format!(
                         "kernel builds reject inherited Cargo configuration: {}",
@@ -1005,7 +1033,7 @@ fn runtime_source_files(sysroot: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-struct LockedRegistryPackage {
+pub(crate) struct LockedRegistryPackage {
     name: String,
     version: String,
     checksum: String,
@@ -1231,12 +1259,24 @@ fn verify_vendor_checksums(
     package: &LockedRegistryPackage,
     hashes: &BTreeMap<PathBuf, String>,
 ) -> io::Result<()> {
-    let path = directory.join(".cargo-checksum.json");
-    let (checksum, files) = vendor_checksums(&fs::read_to_string(&path)?)?;
+    let checksum_path = directory.join(".cargo-checksum.json");
+    let (checksum, files) = vendor_checksums(&fs::read_to_string(&checksum_path)?)?;
     if checksum != package.checksum || files.is_empty() {
         return Err(invalid(format!(
             "vendor integrity metadata does not match locked {}",
             package.name
+        )));
+    }
+    // Cargo itself only checks the listed files; an unlisted extra file would be unhashed source.
+    let actual = hashes
+        .keys()
+        .filter(|path| path.starts_with(directory) && *path != &checksum_path)
+        .count();
+    if actual != files.len() {
+        return Err(invalid(format!(
+            "vendor package {} has {actual} files but its checksum manifest lists {}",
+            package.name,
+            files.len()
         )));
     }
     for (relative, expected) in files {
@@ -1273,6 +1313,95 @@ fn toml_string(value: &str) -> String {
     quoted
 }
 
+/// Verifies the root `vendor/` directory against the root `Cargo.lock`: the exact locked
+/// registry package set, checksum manifests, no unlisted file and only reviewed build scripts.
+/// Returns `(package, directory)` pairs. A lock with no registry packages needs no `vendor/`.
+pub(crate) fn verify_project_vendor(
+    root: &Path,
+    sha256sum: &Path,
+) -> io::Result<Vec<(LockedRegistryPackage, PathBuf)>> {
+    let packages = parse_std_registry_packages(&root.join("Cargo.lock"))?;
+    let vendor = root.join("vendor");
+    let mut files = Vec::new();
+    match fs::symlink_metadata(&vendor) {
+        Ok(_) => collect_source_tree(&vendor, &mut files)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && packages.is_empty() => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(contextual(&vendor, &error)),
+    }
+    let hashes = hash_files(root, sha256sum, &files)?;
+    let expected = packages
+        .iter()
+        .map(|package| format!("{}-{}", package.name, package.version))
+        .collect::<BTreeSet<_>>();
+    let mut found = BTreeSet::new();
+    for entry in fs::read_dir(&vendor)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            return Err(invalid(format!(
+                "vendor/ may contain only package directories: {}",
+                entry.path().display()
+            )));
+        }
+        found.insert(entry.file_name().to_string_lossy().into_owned());
+    }
+    if found != expected {
+        return Err(invalid(format!(
+            "vendor/ does not match Cargo.lock; unexpected {:?}, missing {:?}",
+            found.difference(&expected).collect::<Vec<_>>(),
+            expected.difference(&found).collect::<Vec<_>>()
+        )));
+    }
+    for file in &files {
+        let relative = file
+            .strip_prefix(&vendor)
+            .map_err(|error| invalid(error.to_string()))?;
+        let is_script = relative.file_name().is_some_and(|name| name == "build.rs");
+        let allowed = VENDOR_BUILD_SCRIPTS
+            .iter()
+            .any(|(package, script)| relative == Path::new(package).join(script));
+        if is_script && !allowed {
+            return Err(invalid(format!(
+                "unreviewed vendored build script: vendor/{}",
+                relative.display()
+            )));
+        }
+    }
+    packages
+        .into_iter()
+        .map(|package| {
+            let directory = vendor.join(format!("{}-{}", package.name, package.version));
+            verify_vendor_checksums(&directory, &package, &hashes)?;
+            // A manifest may name any script (`build = "x.rs"`); only reviewed ones may exist.
+            let manifest = fs::read_to_string(directory.join("Cargo.toml"))
+                .map_err(|error| contextual(&directory, &error))?;
+            let reviewed = VENDOR_BUILD_SCRIPTS
+                .iter()
+                .find(|(name, _)| directory.ends_with(name))
+                .map(|(_, script)| format!("build = \"{script}\""));
+            for line in manifest.lines().filter(|line| line.starts_with("build = ")) {
+                if line != "build = false" && Some(line) != reviewed.as_deref() {
+                    return Err(invalid(format!(
+                        "unreviewed build key in {}/Cargo.toml: {line}",
+                        directory.display()
+                    )));
+                }
+            }
+            Ok((package, directory))
+        })
+        .collect()
+}
+
+fn link_vendored(merged: &Path, package: &Path) -> io::Result<()> {
+    let name = package
+        .file_name()
+        .ok_or_else(|| invalid("vendored package has no directory name"))?;
+    // create_new semantics: a std/project name-version collision fails instead of shadowing.
+    std::os::unix::fs::symlink(package, merged.join(name))
+        .map_err(|error| contextual(&merged.join(name), &error))
+}
+
 fn prepare_vendored_std(
     root: &Path,
     cargo_home: &Path,
@@ -1302,17 +1431,18 @@ fn prepare_vendored_std(
         ));
     }
     let packages = parse_std_registry_packages(&lock_file)?;
+    let project = verify_project_vendor(root, sha256sum)?;
     let mut inputs = BTreeMap::new();
-    manifest_value(&mut inputs, "schema", "1");
+    manifest_value(&mut inputs, "schema", "2");
     manifest_value(
         &mut inputs,
         "source",
-        "installed rust-src library/vendor; no global Cargo cache or config copied",
+        "installed rust-src library/vendor plus project vendor/, merged by symlink; no global Cargo cache or config copied",
     );
     manifest_value(
         &mut inputs,
         "trust",
-        "installed qualified toolchain; checksum consistency is not independent cryptographic authentication",
+        "installed qualified toolchain and committed vendor/; checksum consistency is not independent cryptographic authentication",
     );
     manifest_value(
         &mut inputs,
@@ -1329,6 +1459,12 @@ fn prepare_vendored_std(
         "registry_package_count",
         packages.len().to_string(),
     );
+    // Cargo allows one directory behind a replaced source and build-std needs both sets.
+    let merged = cargo_home.join("vendor");
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&merged)
+        .map_err(|error| contextual(&merged, &error))?;
     for (index, package) in packages.iter().enumerate() {
         let directory = vendor_dir.join(format!("{}-{}", package.name, package.version));
         let metadata =
@@ -1344,6 +1480,7 @@ fn prepare_vendored_std(
         let checksum_manifest = directory.join(".cargo-checksum.json");
         validate_input(&checksum_manifest)?;
         verify_vendor_checksums(&directory, package, hashes)?;
+        link_vendored(&merged, &directory)?;
         let prefix = format!("package_{index:04}");
         manifest_value(&mut inputs, &format!("{prefix}_name"), &package.name);
         manifest_value(&mut inputs, &format!("{prefix}_version"), &package.version);
@@ -1358,12 +1495,28 @@ fn prepare_vendored_std(
             file_hash(root, sha256sum, &checksum_manifest)?,
         );
     }
+    manifest_value(
+        &mut inputs,
+        "project_package_count",
+        project.len().to_string(),
+    );
+    for (index, (package, directory)) in project.iter().enumerate() {
+        link_vendored(&merged, directory)?;
+        let prefix = format!("project_package_{index:04}");
+        manifest_value(&mut inputs, &format!("{prefix}_name"), &package.name);
+        manifest_value(&mut inputs, &format!("{prefix}_version"), &package.version);
+        manifest_value(
+            &mut inputs,
+            &format!("{prefix}_lock_checksum"),
+            &package.checksum,
+        );
+    }
     let manifest = cargo_home.join("vendored-std-inputs.tsv");
     write_manifest(&manifest, inputs)?;
     let local_config = cargo_home.join("config.toml");
     let config_text = format!(
-        "[source.crates-io]\nreplace-with = \"rust-src-vendored\"\n\n[source.rust-src-vendored]\ndirectory = {}\n",
-        toml_string(&display_path(&vendor_dir)?)
+        "[source.crates-io]\nreplace-with = \"kernel-vendored\"\n\n[source.kernel-vendored]\ndirectory = {}\n",
+        toml_string(&display_path(&merged)?)
     );
     write_new(&local_config, config_text.as_bytes())?;
     Ok(VendoredStdInputs {
@@ -1631,8 +1784,11 @@ fn build_command(
             "rustc",
             "--offline",
             "--locked",
-            "--target-dir",
+            "--config",
         ])
+        // Highest precedence: the checked-in host source replacement must not shadow the merged one.
+        .arg(output.join("cargo-home/config.toml"))
+        .arg("--target-dir")
         .arg(output.join("cargo-target"))
         .args([
             "-p",
@@ -4092,6 +4248,74 @@ mod tests {
         fs::remove_file(scratch.0.join("xtask/new-module.rs"))?;
         fs::remove_file(scratch.0.join("kernel/main.rs"))?;
         assert!(require_unchanged(&before, &snapshot()?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn checked_in_cargo_config_is_the_reviewed_constant() -> io::Result<()> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.cargo/config.toml");
+        assert_eq!(fs::read_to_string(path)?, PROJECT_CARGO_CONFIG);
+        Ok(())
+    }
+
+    #[test]
+    fn project_vendor_must_match_the_lock_exactly() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let root = &scratch.0;
+        let sha = resolve_program(Path::new("sha256sum"))?;
+        let package = root.join("vendor/demo-1.0.0");
+        fs::create_dir_all(package.join("src"))?;
+        fs::write(package.join("src/lib.rs"), b"pub fn f() {}\n")?;
+        fs::write(package.join("Cargo.toml"), b"build = false\n")?;
+        let hashes = hash_files(
+            root,
+            &sha,
+            &[package.join("src/lib.rs"), package.join("Cargo.toml")],
+        )?;
+        let checksums = format!(
+            "{{\"files\":{{\"Cargo.toml\":\"{}\",\"src/lib.rs\":\"{}\"}},\"package\":\"{}\"}}",
+            hashes[&package.join("Cargo.toml")],
+            hashes[&package.join("src/lib.rs")],
+            "ab".repeat(32)
+        );
+        fs::write(package.join(".cargo-checksum.json"), checksums)?;
+        fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n",
+                "ab".repeat(32)
+            ),
+        )?;
+        assert_eq!(verify_project_vendor(root, &sha)?.len(), 1);
+
+        let broken =
+            |name: &str, change: &dyn Fn() -> io::Result<()>, undo: &dyn Fn() -> io::Result<()>| {
+                change()?;
+                let failed = verify_project_vendor(root, &sha).is_err();
+                undo()?;
+                assert!(failed, "{name} must be rejected");
+                io::Result::Ok(())
+            };
+        let lib = package.join("src/lib.rs");
+        broken(
+            "modified byte",
+            &|| fs::write(&lib, b"pub fn g() {}\n"),
+            &|| fs::write(&lib, b"pub fn f() {}\n"),
+        )?;
+        let extra = package.join("src/extra.rs");
+        broken("unlisted file", &|| fs::write(&extra, b""), &|| {
+            fs::remove_file(&extra)
+        })?;
+        let script = package.join("build.rs");
+        broken(
+            "unreviewed build script",
+            &|| fs::write(&script, b""),
+            &|| fs::remove_file(&script),
+        )?;
+        let stray = root.join("vendor/other-2.0.0");
+        broken("unlocked package", &|| fs::create_dir(&stray), &|| {
+            fs::remove_dir(&stray)
+        })?;
         Ok(())
     }
 
