@@ -2,11 +2,77 @@
 
 ## Authority, boundary and current claims
 
-The checkpoint below was published on 2026-10-19; the user then asked to continue with a first-userspace slice ([A18](decisions.md)). This is a bounded task checkpoint, not a reduced definition of the whole port: Linux6.18.57 commit `2ff600d29ee478d0a8d46ef8a58afb5e038fe692`, every architecture/driver/protocol/filesystem/facility and all qualification obligations remain mandatory and unfinished. Existing planning inventories retain their structural meaning.
+The [publication checkpoint](#publication-checkpoint) was published on 2026-10-19; the user then asked to continue, and that round is recorded in the [v0.1.0 checkpoint](#v010-continuation-checkpoint) (first-userspace slice [A18](decisions.md), roadmap A19, branch-and-PR flow A20). Both are bounded task checkpoints, not a reduced definition of the whole port: Linux6.18.57 commit `2ff600d29ee478d0a8d46ef8a58afb5e038fe692`, every architecture/driver/protocol/filesystem/facility and all qualification obligations remain mandatory and unfinished. Existing planning inventories retain their structural meaning.
 
-The first implementation cell is x86_64, little endian, 4 KiB pages, four-level paging, one executing bootstrap CPU, QEMU q35/TCG, UEFI OVMF and external Limine 12.9.3. No Linux userspace, syscall, scheduler, durable filesystem, networking or other-architecture claim follows. Physical execution, independent architecture/unsafe/security review and all reference performance gates remain mandatory and open. No host installation, boot-entry change, reboot, firmware change or raw-device operation is authorized.
+The first implementation cell is x86_64, little endian, 4 KiB pages, four-level paging, one executing bootstrap CPU, QEMU q35/TCG, UEFI OVMF and external Limine 12.9.3. Since v0.1.0 one static `/init` also runs in ring 3 with a minimal exact-ABI syscall slice under a declared configuration; no scheduler, durable filesystem, networking, SMP or other-architecture claim follows. Physical execution, independent architecture/unsafe/security review and all reference performance gates remain mandatory and open. No host installation, boot-entry change, reboot, firmware change or raw-device operation is authorized.
 
 **Current physical authority:** diagnostic-001/002 remain permanently withdrawn after the confirmed emitted error-code ABI defect. Actual007 supplies its missing-path failing-before witness; corrected008 and the independently reviewed minimal repair underpin new diagnostic-003. Director accepted the actual archive/metadata and software-consumer records and conditionally cleared **only its exact original lineage** under [unchanged separate-media/recovery requirements](diagnostic-handoff.md). Old artifacts/HOLD records are untouched; no physical evidence, later-source clearance or full Linux qualification is claimed.
+
+## v0.1.0 continuation checkpoint
+
+**2026-10-19, `main` 6aaeb93 (v0.1.0).** Observed by the integrator on the canonical checkout `/home/bigsmarty/Projects/linux-rs`; all `target/` paths are retained local ignored evidence, not Git content. This closes the user's continuation round ([A18–A20](decisions.md)) and supersedes the publication checkpoint's *current* counts, fixtures and `kernel-test` prerequisites; that section stays below as history. It is a bounded software checkpoint, **not** M1 exit, Linux compatibility, physical qualification or performance evidence.
+
+### Merged pull requests
+
+Each received at least one independent subagent review on GitHub (a `COMMENT` review) before it was merged; #6's last commit was a merge from `main`, and #7 and #10 each gained a docs-only commit answering their reviewer's notes after the last review. Those are agent reviews, not independent human review. The `v0.1.0` tag marks the merge of this record; its executable sources are identical to 6aaeb93, where the evidence below ran.
+
+| PR | Merge commit | Change |
+| --- | --- | --- |
+| #1 | `3f64e0c` | Auditor accepts Symposium-synced skill copies |
+| #2 | `640573c` | Authority decisions A18–A20 recorded |
+| #3 | `91a1faf` | Kernel audit fixes: early console, bounded command line, CR4.PGE/PCIDE rejection, module skip |
+| #4 | `375d50e` | Host-tool audit fixes: `setpriv --pdeathsig`, bounded serial log, read-only virtio boot disk, root-only skip, QMP socket directory |
+| #5 | `a5528da` | Complete idiomatic-Rust roadmap (119 WPs) |
+| #6 | `cefc4d1` | Linux-ABI `/init` test program, shared `linux-rs-runtime` crate, `syscalls` crate |
+| #7 | `3d1c89b` | Vendored audited crates (`x86_64`, `raw-cpuid`; `serde_json` in `xtask`), checksum/`cargo metadata` vendor verification, CPU layer on crates with Linux GDT selectors |
+| #9 | `448407a` | Rust-generated initramfs fixtures, harness-built `/init`, bad-module case, path-remapped reproducible builds |
+| #10 | `0d59628` | Exact ASCII framebuffer font via `font8x8` |
+| #8 | `6aaeb93` | [First-userspace slice](#first-userspace-slice-kernel-side): static `/init` in ring 3, Linux `pt_regs` `SYSCALL` entry, exact `create_elf_tables` stack/auxv under a declared configuration (`vdso=0`, `CONFIG_RSEQ=n`, `noxsave`/FXSR, `ia32_emulation=0`, `norandmaps`, ...), `write`/`getpid`/`exit`/`exit_group` and configuration-equivalent `-ENOSYS`, Linux-exact init-death/segfault/no-root texts, user FPU via FXSR, SMEP/SMAP/UMIP, executed user/kernel isolation audit |
+
+### Final evidence (main 6aaeb93)
+
+Gate chain, every command exit 0:
+
+```text
+cargo fmt --all --check
+cargo +1.88.0 clippy -p xtask -p baremetal --all-targets --locked --offline -- -D warnings
+cargo +1.88.0 test -p xtask -p baremetal --locked --offline        # baremetal 10, xtask 70
+cargo +nightly clippy --workspace --all-targets --locked --offline -- -D warnings
+cargo +nightly test --workspace --locked --offline                  # kernel 121, xtask 70, baremetal 10, 2 doc tests
+env PATH="/bin:$PATH" cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/final-001 --timeout-seconds 60
+cargo +1.88.0 run -p xtask --locked --offline -- check            # 22 vendored packages verified
+cargo +1.88.0 run -p xtask --locked --offline -- status           # 14 in_progress, 2609 not_started of 2623
+```
+
+Both target strict Clippy profiles (`qemu-self-test`, `freestanding`) also passed, run with `--config target/kernel-tooling/final-001/freestanding-build/cargo-home/config.toml` (the per-run merged vendor source; see [kernel tooling](kernel-tooling.md#vendored-dependencies-and-the-fresh-clone-build)). `final-001` matched **18/18** cases: bad-map, bad-module, cpu-max, cpu-without-pat, empty-module, init-segfault, irq-restore-early, no-init, panic, rseq, sse, success, unexpected-breakpoint, unexpected-fault, unexpected-interrupt, unexpected-page-fault, unimplemented-syscall, unmasked-timer.
+
+| Artifact (`final-001`) | SHA-256 |
+| --- | --- |
+| `qemu-self-test` kernel ELF | `1db79daa76a6016de30625dc94ac334a215d5015bda87641476d3668ecf81803` |
+| `freestanding` kernel ELF | `890e603804f5df56ea355be809e89cf433b1b671afebcc5ddd615377555f078b` |
+| `/init` | `0daf382f152b522484710260d0b1549b4656cc913b7dfbdac8416b1cb3fcd8fb` |
+| initramfs | `1d463e2c8c81ebe8f00f6c4eca0d07dd72c50806259f55db3d0159e8f5d513bc` |
+
+The `/init` is the exact binary the pinned Linux 6.18.57 oracle ran in `target/linux-reference/init-reference-004`. That oracle kernel was built with `CONFIG_RSEQ=y` and `CONFIG_IA32_EMULATION=y` and booted with `vdso=0`; the candidate's summary line equals the oracle's after removing the two `AT_RSEQ_*` entries, which the declared configuration omits. The default `qemu64` cases report `smep=false smap=false`; only `cpu-max` reports `smep=true smap=true`. UMIP enablement has no dedicated harness assertion.
+
+**Fresh clone.** An https clone of commit 6aaeb93 with no `target/`, an empty `CARGO_HOME` and `CARGO_NET_OFFLINE=true` (same workstation, user and toolchain installation; command record `target/final-fresh-command.txt`, written after the run from the session transcript, with output `target/final-fresh-output.log`) ran `kernel-test --output target/kernel-tooling/fresh-001` -> 18/18 and `xtask check` -> exit 0. All four artifact hashes above were byte-identical to the canonical run, and `CARGO_HOME` gained only Cargo's cache files. This is not a different machine or toolchain location and is not independently attested.
+
+**Package.** `kernel-package --build-output target/kernel-tooling/final-001/freestanding-build --output target/kernel-tooling/final-pkg-001` produced an unsigned diagnostic archive, sha256 `fba257d798ecef9289a4289ab472508117145354cedd79d58d8c13581d78add8`. It is a new lineage and is **not physically cleared**; diagnostic-003 remains the only conditionally cleared lineage ([handoff](diagnostic-handoff.md)).
+
+**Visual.** The integrator viewed the default-boot framebuffer PNG: the exact-text bootstrap checkpoint, the userspace audit, `Run /init as init process`, the `/init` output and `Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000`.
+
+### Routing
+
+Fourteen routed rows are `in_progress` and 2,609 are `not_started` of 2,623 (see [routed status](#routed-implementation-status)); the five-column schema and the two status values are unchanged. Rows route actual slices, not complete upstream prefixes.
+
+### Not done / blockers
+
+- Physical execution and recovery of any candidate; no physical evidence exists and no lineage but diagnostic-003 is cleared.
+- CPU-vulnerability mitigations and the broader platform closure (APIC/x2APIC, IOAPIC, per-CPU TSS/IST for SMP, xstate beyond FXSR, timekeeping).
+- SMP, scheduler, VFS, storage, networking and the rest of M2-M8; the slice is single-task, BSP-only and storage-free.
+- Compat (32-bit) syscalls (`ia32_emulation=0`) and the vDSO (`vdso=0`); `CONFIG_RSEQ=n`, `noxsave` and `norandmaps` are declared-configuration limits, not Linux defaults.
+- Performance qualification against pinned Linux; no measurement was taken.
+- Independent human review of unsafe, architecture and security boundaries; only agent reviews exist.
 
 ## Publication checkpoint
 
@@ -224,7 +290,7 @@ The five-column [ledger](../planning/workstreams.tsv) still accepts only `not_st
 | `ws-mm-mmap-c` / `mm/mmap.c` | [mmap/brk argument checks inside the ELF plan](../kernel/src/exec/plan.rs), [access_ok and copies](../kernel/src/usercopy.rs) | `vm_mmap`/`do_mmap`/`__get_unmapped_area` errors for `PT_LOAD` mappings against a fixed stack; no VMA tree, `mmap`/`munmap`/`brk` syscalls or demand paging. |
 | `ws-mm-page-alloc-c` / `mm/page_alloc.c` | [Selected indexed buddy splitting/coalescing](../kernel/src/buddy.rs) | Orders0–10, natural/caller byte alignment, fragmentation/conservation and real RAM consumers. Not full Linux page allocator/GFP/watermarks/migration/per-CPU cache policy. |
 
-The [current publication checkpoint](#publication-checkpoint) binds the combined source and evidence. Historical cell9 and004–010 records remain immutable and scoped to their own inputs; ignored local evidence is **not** a checked-in distribution. No `done` state or whole-prefix completion is introduced.
+The [publication checkpoint](#publication-checkpoint) bound the combined source and evidence of that round; the [v0.1.0 checkpoint](#v010-continuation-checkpoint) is now current. Historical cell9 and004–010 records remain immutable and scoped to their own inputs; ignored local evidence is **not** a checked-in distribution. No `done` state or whole-prefix completion is introduced.
 
 ## First-userspace slice (kernel side)
 

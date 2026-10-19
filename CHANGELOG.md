@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.1.0 — 2026-10-19
+
+Bounded continuation checkpoint on `main` 6aaeb93 (PRs #1–#10, each merged after an independent agent `COMMENT` review); gate results, artifact hashes, fresh-clone comparison and the not-done list are in the [implementation record](docs/implementation.md#v010-continuation-checkpoint). Not whole-kernel completion, physical or performance qualification.
+
 ### Post-publication continuation
 
 - First-userspace slice, last review notes: the init-segfault validator binds `init[off,start+len]` to the executable `PT_LOAD`'s file-backed extent (`p_filesz`, as `print_vma_addr`), and `validate()` clears rather than rejects CR4.OSXSAVE.
