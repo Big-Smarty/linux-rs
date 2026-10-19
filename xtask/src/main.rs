@@ -287,6 +287,9 @@ fn project_files(root: &Path) -> Result<BTreeSet<String>> {
                         .file_name()
                         .to_str()
                         .is_some_and(|name| SKILLS.contains(&name))
+                    // Symposium (`cargo agents sync`) marks its self-gitignored skill copies;
+                    // they are still walked and audited, just not counted as project skills.
+                    && !path.join(".symposium").is_file()
                 {
                     return Err(invalid(format!(
                         "{}: unexpected skill directory",
@@ -914,6 +917,9 @@ fn validate_skills(root: &Path, files: &BTreeSet<String>) -> Result<()> {
                 .next()
                 .ok_or_else(|| invalid("invalid skill path"))?;
             if !SKILLS.contains(&name) {
+                if files.contains(&format!(".agents/skills/{name}/.symposium")) {
+                    continue;
+                }
                 return Err(invalid(format!(
                     "{path}: unexpected skill (expected the approved 16-skill set)"
                 )));
