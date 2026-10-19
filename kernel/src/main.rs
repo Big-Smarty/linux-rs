@@ -27,7 +27,19 @@ fn inspect_boot_images(boot: &boot::BootInfo) {
             // no DMA/AP/firmware writer or reclaim, loader CR3 still active.
             // All bytes/Record/Elf borrows end here before Tables::activate.
             let bytes = unwrap(unsafe { boot.module_bytes(span) }, "boot-module-bytes");
-            unwrap(image::inspect_archive(bytes), "boot-image-inspection")
+            image::inspect_archive(bytes)
+        };
+        // Linux (init/initramfs.c) reports a bad initramfs and still boots.
+        let summary = match summary {
+            Ok(summary) => summary,
+            Err(error) => {
+                log!(
+                    "WARN Initramfs unpacking failed: module={} error={:?} skipped=true\n",
+                    index,
+                    error
+                );
+                continue;
+            }
         };
         log!(
             "CHECK image inspected module={} physical={:#x} reserved={} bytes={} records={} files={} regular={} symlinks={} trailers={} skipped={} elf={} loads={} interpreters={} execution=false rootfs=false\n",
