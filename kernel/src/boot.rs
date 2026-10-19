@@ -334,7 +334,9 @@ impl BootInfo {
     /// order, and a malformed map only fails the later `take`.
     ///
     /// # Safety
-    /// Same contract as `take`.
+    /// CPL0 on a conforming, trusted Limine base-5+ loader; response allocations
+    /// and mappings stay reserved and immutable. May run before `take`, which
+    /// remains the single consuming handoff.
     #[must_use]
     pub unsafe fn take_framebuffer() -> Option<Framebuffer> {
         // SAFETY: same contract as this function.
@@ -344,8 +346,9 @@ impl BootInfo {
         if fb[1] == 0 || !info.contains_virtual(fb[2], 8, 5) {
             return None;
         }
-        // SAFETY: array first pointer lies inside reserved loader memory.
-        let pointer = unsafe { ptr::read(fb[2] as *const *const Framebuffer) };
+        // SAFETY: the first array slot lies inside reserved loader memory; the
+        // protocol does not promise its alignment, so read it unaligned.
+        let pointer = unsafe { ptr::read_unaligned(fb[2] as *const *const Framebuffer) };
         if !info.contains_virtual(pointer as u64, mem::size_of::<Framebuffer>() as u64, 5) {
             return None;
         }
