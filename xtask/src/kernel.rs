@@ -992,13 +992,22 @@ fn reject_build_overrides(root: &Path) -> io::Result<()> {
             )));
         }
     }
+    reject_inherited_cargo_config(root)
+}
+
+// Cargo merges every `.cargo/config*` from the working directory upwards. The only
+// one accepted is the reviewed host source replacement, byte-identical, at the
+// root or in an enclosing checkout (e.g. a worktree nested under the main checkout's
+// `target/`). That is safe: its relative `directory = "vendor"` resolves against
+// the file's own directory, the deeper (root) config takes precedence for the same
+// keys, and build-std builds override `crates-io` with the per-run `--config`
+// file anyway. Anything else, including a legacy `.cargo/config`, is rejected.
+fn reject_inherited_cargo_config(root: &Path) -> io::Result<()> {
     for directory in root.ancestors() {
         for name in [".cargo/config", ".cargo/config.toml"] {
             let config = directory.join(name);
             match fs::symlink_metadata(&config) {
-                Ok(metadata)
-                    if metadata.is_file() && directory == root && name == ".cargo/config.toml" =>
-                {
+                Ok(metadata) if metadata.is_file() && name == ".cargo/config.toml" => {
                     let text = fs::read(&config).map_err(|error| contextual(&config, &error))?;
                     if text != PROJECT_CARGO_CONFIG.as_bytes() {
                         return Err(invalid(format!(
@@ -1045,6 +1054,7 @@ fn runtime_source_files(sysroot: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+#[derive(Debug)]
 pub(crate) struct LockedRegistryPackage {
     name: String,
     version: String,
@@ -1380,29 +1390,175 @@ pub(crate) fn verify_project_vendor(
             )));
         }
     }
-    packages
+    let verified = packages
         .into_iter()
         .map(|package| {
             let directory = vendor.join(format!("{}-{}", package.name, package.version));
             verify_vendor_checksums(&directory, &package, &hashes)?;
-            // A manifest may name any script (`build = "x.rs"`); only reviewed ones may exist.
-            let manifest = fs::read_to_string(directory.join("Cargo.toml"))
-                .map_err(|error| contextual(&directory, &error))?;
-            let reviewed = VENDOR_BUILD_SCRIPTS
-                .iter()
-                .find(|(name, _)| directory.ends_with(name))
-                .map(|(_, script)| format!("build = \"{script}\""));
-            for line in manifest.lines().filter(|line| line.starts_with("build = ")) {
-                if line != "build = false" && Some(line) != reviewed.as_deref() {
-                    return Err(invalid(format!(
-                        "unreviewed build key in {}/Cargo.toml: {line}",
-                        directory.display()
-                    )));
-                }
-            }
             Ok((package, directory))
         })
-        .collect()
+        .collect::<io::Result<Vec<_>>>()?;
+    verify_build_scripts(root)?;
+    Ok(verified)
+}
+
+fn cargo_program() -> io::Result<PathBuf> {
+    match std::env::var_os("CARGO").map(PathBuf::from) {
+        Some(path) if path.is_absolute() => Ok(path),
+        _ => resolve_program(Path::new("cargo")),
+    }
+}
+
+/// Asks Cargo itself which targets are build scripts (`custom-build`), whatever spelling the
+/// manifests use, and requires each to be a reviewed (name, version, path) entry. The reviewed
+/// source replacement is forced with `--config` so no user-level config can change resolution.
+fn verify_build_scripts(root: &Path) -> io::Result<()> {
+    let mut command = Command::new(cargo_program()?);
+    command
+        .args([
+            "metadata",
+            "--offline",
+            "--locked",
+            "--format-version",
+            "1",
+            "--config",
+            ".cargo/config.toml",
+        ])
+        .current_dir(root)
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "");
+    let output = capture_command(&mut command, METADATA_TIMEOUT)?;
+    let text = String::from_utf8(output)
+        .map_err(|error| invalid(format!("cargo metadata output was not UTF-8: {error}")))?;
+    for (name, version, source) in custom_build_targets(&text)? {
+        let package = format!("{name}-{version}");
+        let reviewed = VENDOR_BUILD_SCRIPTS.iter().any(|(reviewed, script)| {
+            *reviewed == package
+                && source.ends_with(Path::new("vendor").join(&package).join(script))
+        });
+        if !reviewed {
+            return Err(invalid(format!(
+                "unreviewed build script: {package} {}",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+enum Json {
+    String(String),
+    Array(Vec<Json>),
+    Object(BTreeMap<String, Json>),
+    Scalar,
+}
+
+impl Json {
+    fn field(&self, key: &str) -> io::Result<&Json> {
+        match self {
+            Self::Object(fields) => fields
+                .get(key)
+                .ok_or_else(|| invalid(format!("cargo metadata lacks {key:?}"))),
+            _ => Err(invalid("cargo metadata value is not an object")),
+        }
+    }
+
+    fn array(&self) -> io::Result<&[Json]> {
+        match self {
+            Self::Array(items) => Ok(items),
+            _ => Err(invalid("cargo metadata value is not an array")),
+        }
+    }
+
+    fn string(&self) -> io::Result<&str> {
+        match self {
+            Self::String(text) => Ok(text),
+            _ => Err(invalid("cargo metadata value is not a string")),
+        }
+    }
+}
+
+impl ChecksumJson<'_> {
+    fn value(&mut self, depth: u8) -> io::Result<Json> {
+        if depth == 0 {
+            return Err(invalid("cargo metadata JSON is nested too deeply"));
+        }
+        self.rest = self.rest.trim_start();
+        match self.rest.chars().next() {
+            Some('"') => Ok(Json::String(self.string()?)),
+            Some('[') => {
+                self.consume('[')?;
+                let mut items = Vec::new();
+                if self.rest.trim_start().starts_with(']') {
+                    self.consume(']')?;
+                    return Ok(Json::Array(items));
+                }
+                loop {
+                    items.push(self.value(depth - 1)?);
+                    if self.rest.trim_start().starts_with(']') {
+                        self.consume(']')?;
+                        return Ok(Json::Array(items));
+                    }
+                    self.consume(',')?;
+                }
+            }
+            Some('{') => {
+                self.consume('{')?;
+                let mut fields = BTreeMap::new();
+                if self.rest.trim_start().starts_with('}') {
+                    self.consume('}')?;
+                    return Ok(Json::Object(fields));
+                }
+                loop {
+                    let key = self.string()?;
+                    self.consume(':')?;
+                    if fields.insert(key, self.value(depth - 1)?).is_some() {
+                        return Err(invalid("duplicate cargo metadata key"));
+                    }
+                    if self.rest.trim_start().starts_with('}') {
+                        self.consume('}')?;
+                        return Ok(Json::Object(fields));
+                    }
+                    self.consume(',')?;
+                }
+            }
+            Some(_) => {
+                let end = self
+                    .rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+                    .unwrap_or(self.rest.len());
+                if end == 0 {
+                    return Err(invalid("unexpected character in cargo metadata JSON"));
+                }
+                self.rest = &self.rest[end..];
+                Ok(Json::Scalar)
+            }
+            None => Err(invalid("truncated cargo metadata JSON")),
+        }
+    }
+}
+
+/// `(name, version, src_path)` of every `custom-build` target in `cargo metadata` output.
+fn custom_build_targets(metadata: &str) -> io::Result<Vec<(String, String, PathBuf)>> {
+    let mut json = ChecksumJson { rest: metadata };
+    let document = json.value(32)?;
+    if !json.rest.trim().is_empty() {
+        return Err(invalid("trailing cargo metadata JSON"));
+    }
+    let mut found = Vec::new();
+    for package in document.field("packages")?.array()? {
+        for target in package.field("targets")?.array()? {
+            let mut kinds = target.field("kind")?.array()?.iter();
+            if kinds.any(|kind| kind.string().is_ok_and(|kind| kind == "custom-build")) {
+                found.push((
+                    package.field("name")?.string()?.to_owned(),
+                    package.field("version")?.string()?.to_owned(),
+                    PathBuf::from(target.field("src_path")?.string()?),
+                ));
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn record_locked(
@@ -4305,46 +4461,85 @@ mod tests {
     }
 
     #[test]
+    fn enclosing_checkout_config_is_accepted_only_when_identical() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let outer = &scratch.0;
+        let root = outer.join("target/worktrees/inner");
+        fs::create_dir_all(root.join(".cargo"))?;
+        fs::create_dir_all(outer.join(".cargo"))?;
+        fs::write(root.join(".cargo/config.toml"), PROJECT_CARGO_CONFIG)?;
+        fs::write(outer.join(".cargo/config.toml"), PROJECT_CARGO_CONFIG)?;
+        reject_inherited_cargo_config(&root)?;
+        fs::write(
+            outer.join(".cargo/config.toml"),
+            "[build]\nrustflags = []\n",
+        )?;
+        assert!(reject_inherited_cargo_config(&root).is_err());
+        fs::remove_file(outer.join(".cargo/config.toml"))?;
+        fs::write(outer.join(".cargo/config"), PROJECT_CARGO_CONFIG)?;
+        assert!(reject_inherited_cargo_config(&root).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn checked_in_cargo_config_is_the_reviewed_constant() -> io::Result<()> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.cargo/config.toml");
         assert_eq!(fs::read_to_string(path)?, PROJECT_CARGO_CONFIG);
         Ok(())
     }
 
-    #[test]
-    fn project_vendor_must_match_the_lock_exactly() -> io::Result<()> {
-        let scratch = Scratch::new()?;
-        let root = &scratch.0;
+    // A one-dependency project whose vendored `demo` manifest is `manifest`.
+    fn vendor_fixture(scratch: &Scratch, manifest: &str) -> io::Result<PathBuf> {
+        let root = scratch.0.clone();
         let sha = resolve_program(Path::new("sha256sum"))?;
         let package = root.join("vendor/demo-1.0.0");
         fs::create_dir_all(package.join("src"))?;
+        fs::create_dir_all(root.join(".cargo"))?;
+        fs::write(root.join(".cargo/config.toml"), PROJECT_CARGO_CONFIG)?;
         fs::write(package.join("src/lib.rs"), b"pub fn f() {}\n")?;
-        fs::write(package.join("Cargo.toml"), b"build = false\n")?;
-        let hashes = hash_files(
-            root,
-            &sha,
-            &[package.join("src/lib.rs"), package.join("Cargo.toml")],
+        fs::write(package.join("evil.rs"), b"fn main() {}\n")?;
+        fs::write(package.join("Cargo.toml"), manifest)?;
+        let files = ["Cargo.toml", "evil.rs", "src/lib.rs"].map(|name| package.join(name));
+        let hashes = hash_files(&root, &sha, &files)?;
+        let listed = files
+            .iter()
+            .zip(["Cargo.toml", "evil.rs", "src/lib.rs"])
+            .map(|(path, name)| format!("\"{name}\":\"{}\"", hashes[path]))
+            .collect::<Vec<_>>()
+            .join(",");
+        let checksum = "ab".repeat(32);
+        fs::write(
+            package.join(".cargo-checksum.json"),
+            format!("{{\"files\":{{{listed}}},\"package\":\"{checksum}\"}}"),
         )?;
-        let checksums = format!(
-            "{{\"files\":{{\"Cargo.toml\":\"{}\",\"src/lib.rs\":\"{}\"}},\"package\":\"{}\"}}",
-            hashes[&package.join("Cargo.toml")],
-            hashes[&package.join("src/lib.rs")],
-            "ab".repeat(32)
-        );
-        fs::write(package.join(".cargo-checksum.json"), checksums)?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndemo = \"=1.0.0\"\n\n[lib]\npath = \"lib.rs\"\n",
+        )?;
+        fs::write(root.join("lib.rs"), b"")?;
         fs::write(
             root.join("Cargo.lock"),
             format!(
-                "[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n",
-                "ab".repeat(32)
+                "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"demo\"]\n\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"
             ),
         )?;
-        assert_eq!(verify_project_vendor(root, &sha)?.len(), 1);
+        Ok(root)
+    }
 
+    const DEMO: &str = "[package]\nname = \"demo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
+
+    #[test]
+    fn project_vendor_must_match_the_lock_exactly() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let root = vendor_fixture(&scratch, &format!("{DEMO}build = false\n"))?;
+        let sha = resolve_program(Path::new("sha256sum"))?;
+        assert_eq!(verify_project_vendor(&root, &sha)?.len(), 1);
+
+        let package = root.join("vendor/demo-1.0.0");
         let broken =
             |name: &str, change: &dyn Fn() -> io::Result<()>, undo: &dyn Fn() -> io::Result<()>| {
                 change()?;
-                let failed = verify_project_vendor(root, &sha).is_err();
+                let failed = verify_project_vendor(&root, &sha).is_err();
                 undo()?;
                 assert!(failed, "{name} must be rejected");
                 io::Result::Ok(())
@@ -4360,16 +4555,51 @@ mod tests {
             fs::remove_file(&extra)
         })?;
         let script = package.join("build.rs");
-        broken(
-            "unreviewed build script",
-            &|| fs::write(&script, b""),
-            &|| fs::remove_file(&script),
-        )?;
+        broken("build.rs file", &|| fs::write(&script, b""), &|| {
+            fs::remove_file(&script)
+        })?;
         let stray = root.join("vendor/other-2.0.0");
         broken("unlocked package", &|| fs::create_dir(&stray), &|| {
             fs::remove_dir(&stray)
         })?;
         Ok(())
+    }
+
+    #[test]
+    fn cargo_decides_which_manifest_spellings_are_build_scripts() -> io::Result<()> {
+        let sha = resolve_program(Path::new("sha256sum"))?;
+        // Each manifest is valid TOML that Cargo treats as naming an unreviewed script
+        // (the vendored checksum JSON is consistent: a coordinated edit).
+        for (name, manifest) in [
+            ("no spaces", format!("{DEMO}build=\"evil.rs\"\n")),
+            ("single quoted", format!("{DEMO}build = 'evil.rs'\n")),
+            (
+                "dotted key",
+                "package.name = \"demo\"\npackage.version = \"1.0.0\"\npackage.edition = \"2021\"\npackage.build = \"evil.rs\"\n".to_owned(),
+            ),
+        ] {
+            let scratch = Scratch::new()?;
+            let root = vendor_fixture(&scratch, &manifest)?;
+            let error = verify_project_vendor(&root, &sha).expect_err(name);
+            assert!(error.to_string().contains("unreviewed build script"), "{name}: {error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_custom_builds_are_extracted() {
+        let metadata = r#"{"packages":[{"name":"a","version":"1.0.0","dependencies":[],"targets":[{"kind":["lib"],"src_path":"/x/lib.rs","edition":"2021","doc":true},{"kind":["custom-build"],"src_path":"/x/build.rs","n":-1.5e3,"f":false,"z":null}]}],"workspace_members":[]}"#;
+        let found = custom_build_targets(metadata).unwrap();
+        assert_eq!(
+            found,
+            [(
+                "a".to_owned(),
+                "1.0.0".to_owned(),
+                PathBuf::from("/x/build.rs")
+            )]
+        );
+        assert!(custom_build_targets("{} x").is_err());
+        assert!(custom_build_targets(r#"{"packages":[{"name":"a"}]}"#).is_err());
     }
 
     #[test]
