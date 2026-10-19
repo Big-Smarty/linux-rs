@@ -12,7 +12,7 @@
 
 ### Generated QEMU fixtures and a built init
 
-- `kernel-test` builds `user/init` itself (exact toolchain, merged vendor, `-Cstrip=debuginfo`, snapshot and SHA-256, ET_EXEC/no-PT_INTERP/no-undefined verified with the `elf` crate against readelf) and generates its boot modules in Rust with `cpio` (`write_cpio`): the two ignored external CPIO fixtures and their constants are gone, a fresh clone reproduces the suite (12/12, recorded in `docs/implementation.md`), and the expected `CHECK image inspected` record is computed by construction. New case `bad-module` exercises the kernel's gzip-skip warning path.
+- `kernel-test` builds `user/init` itself (exact toolchain, merged vendor, `-Cstrip=debuginfo`, snapshot and SHA-256, ET_EXEC/no-PT_INTERP/no-undefined verified with the `elf` crate against readelf) and generates its boot modules in Rust with `cpio` (`write_cpio`): the two ignored external CPIO fixtures and their constants are gone, a fresh clone ran the suite 12/12 on the maintainer workstation (recorded in `docs/implementation.md`; not yet reproduced on another machine or toolchain location), and the expected `CHECK image inspected` record is computed by construction. New case `bad-module` exercises the kernel's gzip-skip warning path.
 - All build profiles remap checkout/run/toolchain paths; worktree and fresh-clone builds gave byte-identical init and kernel ELFs. `package.rs::check_elf` uses `elf`; the QMP client uses `serde_json::Value`. Vendored `cpio` 0.4.1 and `elf` 0.8.0 with admission records.
 
 ### First userspace program

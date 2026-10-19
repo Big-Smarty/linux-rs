@@ -669,6 +669,7 @@ fn check_elf(path: &Path) -> io::Result<()> {
     if header.class != Class::ELF64
         || header.e_type != abi::ET_EXEC
         || header.e_machine != abi::EM_X86_64
+        || header.e_ehsize != 64
     {
         return Err(invalid(
             "payload is not a little-endian ELF64 x86_64 ET_EXEC kernel",
@@ -1733,6 +1734,10 @@ mod tests {
         bytes[104..112].copy_from_slice(&1_u64.to_le_bytes());
         fs::write(&input, bytes).unwrap();
         assert!(check_elf(&input).is_ok());
+        bytes[52..54].copy_from_slice(&63_u16.to_le_bytes());
+        fs::write(&input, bytes).unwrap();
+        assert!(check_elf(&input).is_err(), "e_ehsize must be 64");
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
         bytes[68..72].copy_from_slice(&7_u32.to_le_bytes());
         fs::write(&input, bytes).unwrap();
         assert!(check_elf(&input).is_err());
