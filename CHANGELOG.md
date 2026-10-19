@@ -7,6 +7,11 @@
 - Host-tool audit fixes: `xtask` children die with xtask (`setpriv --pdeathsig KILL`), the QMP socket lives in a short private `$XDG_RUNTIME_DIR`/`/tmp` directory, the guest serial log is bounded, the boot disk is read-only with before/after hashes, `check` skips only root `.git`/`target`, plus manifest/PATH/Limine-version/`/proc` read-cap hardening and dead-code removal.
 - Recorded user decisions A18–A20 (checkpoint close-out plus first-userspace slice, full roadmap, branch-and-PR flow preferring audited crates) and updated the authority paragraphs; the structural auditor now accepts Symposium-synced skill copies.
 
+### Generated QEMU fixtures and a built init
+
+- `kernel-test` builds `user/init` itself (exact toolchain, merged vendor, `-Cstrip=debuginfo`, snapshot and SHA-256, ET_EXEC/no-PT_INTERP/no-undefined verified with the `elf` crate against readelf) and generates its boot modules in Rust with `cpio` (`write_cpio`): the two ignored external CPIO fixtures and their constants are gone, a fresh clone ran the suite 12/12 on the maintainer workstation (recorded in `docs/implementation.md`; not yet reproduced on another machine or toolchain location), and the expected `CHECK image inspected` record is computed by construction. New case `bad-module` exercises the kernel's gzip-skip warning path.
+- All build profiles remap checkout/run/toolchain paths; worktree and fresh-clone builds gave byte-identical init and kernel ELFs. `package.rs::check_elf` uses `elf`; the QMP client uses `serde_json::Value`. Vendored `cpio` 0.4.1 and `elf` 0.8.0 with admission records.
+
 ### First userspace program
 
 - Added `user/init`, a static libc-free x86_64 Linux `/init` test program that doubles as a differential oracle (oracle evidence under `target/linux-reference/init-reference-003/`); moved the scalar `memset`/`memcpy` runtime into the shared `linux-rs-runtime` crate (`rt/`) so the kernel and the init link the same providers; admitted `syscalls` 0.8.1 and rejected `origin`/`rustix` for it.
