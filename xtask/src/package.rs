@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! A separate, unsigned ALPM diagnostic payload. This module never installs it.
 
+use elf::{ElfBytes, abi, endian::LittleEndian, file::Class};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File, FileTimes, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -650,63 +651,55 @@ fn verify_external_input(
     Ok(())
 }
 
+const ELF_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Program-header policy for the payload kernel, decoded by the `elf` crate: little-endian ELF64
+/// x86-64 `ET_EXEC`, no interpreter, bounded non-W+X loads, entry inside an executable segment.
 fn check_elf(path: &Path) -> io::Result<()> {
-    let mut file = open_regular(path)?;
-    let mut header = [0_u8; 64];
-    file.read_exact(&mut header)?;
-    if header[..7] != [0x7f, b'E', b'L', b'F', 2, 1, 1]
-        || u16::from_le_bytes([header[16], header[17]]) != 2
-        || u16::from_le_bytes([header[18], header[19]]) != 62
-        || u16::from_le_bytes([header[52], header[53]]) != 64
-        || u16::from_le_bytes([header[54], header[55]]) != 56
-        || u16::from_le_bytes([header[56], header[57]]) == 0
+    let mut bytes = Vec::new();
+    open_regular(path)?
+        .take(ELF_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > ELF_LIMIT {
+        return Err(invalid("kernel ELF exceeds the package inspection limit"));
+    }
+    let file = ElfBytes::<LittleEndian>::minimal_parse(&bytes)
+        .map_err(|error| invalid(format!("ELF parse error: {error}")))?;
+    let header = file.ehdr;
+    if header.class != Class::ELF64
+        || header.e_type != abi::ET_EXEC
+        || header.e_machine != abi::EM_X86_64
     {
         return Err(invalid(
             "payload is not a little-endian ELF64 x86_64 ET_EXEC kernel",
         ));
     }
-    let size = file.metadata()?.len();
-    let word = |bytes: &[u8]| {
-        <[u8; 8]>::try_from(bytes)
-            .map(u64::from_le_bytes)
-            .map_err(|error| invalid(error.to_string()))
-    };
-    let entry = word(&header[24..32])?;
-    let offset = word(&header[32..40])?;
-    let count = u64::from(u16::from_le_bytes([header[56], header[57]]));
-    if offset.checked_add(count * 56).is_none_or(|end| end > size) {
-        return Err(invalid("ELF program header table escapes the regular file"));
-    }
-    file.seek(SeekFrom::Start(offset))?;
+    let size = bytes.len() as u64;
     let mut executable_entry = false;
-    for _ in 0..count {
-        let mut program = [0_u8; 56];
-        file.read_exact(&mut program)?;
-        let kind = u32::from_le_bytes([program[0], program[1], program[2], program[3]]);
-        if kind == 3 {
-            return Err(invalid(
-                "diagnostic ELF must not require a userspace interpreter",
-            ));
+    for program in file.segments().into_iter().flatten() {
+        match program.p_type {
+            abi::PT_INTERP => {
+                return Err(invalid(
+                    "diagnostic ELF must not require a userspace interpreter",
+                ));
+            }
+            abi::PT_LOAD => {
+                let in_file = program.p_offset.checked_add(program.p_filesz);
+                if program.p_filesz > program.p_memsz
+                    || in_file.is_none_or(|end| end > size)
+                    || program.p_vaddr.checked_add(program.p_memsz).is_none()
+                    || program.p_flags & (abi::PF_W | abi::PF_X) == abi::PF_W | abi::PF_X
+                {
+                    return Err(invalid(
+                        "ELF contains an invalid or writable-executable load segment",
+                    ));
+                }
+                executable_entry |= program.p_flags & abi::PF_X != 0
+                    && program.p_vaddr <= header.e_entry
+                    && header.e_entry < program.p_vaddr + program.p_filesz;
+            }
+            _ => {}
         }
-        if kind != 1 {
-            continue;
-        }
-        let flags = u32::from_le_bytes([program[4], program[5], program[6], program[7]]);
-        let start = word(&program[16..24])?;
-        let filesz = word(&program[32..40])?;
-        let memsz = word(&program[40..48])?;
-        if filesz > memsz
-            || word(&program[8..16])?
-                .checked_add(filesz)
-                .is_none_or(|end| end > size)
-            || start.checked_add(memsz).is_none()
-            || flags & 3 == 3
-        {
-            return Err(invalid(
-                "ELF contains an invalid or writable-executable load segment",
-            ));
-        }
-        executable_entry |= flags & 1 != 0 && start <= entry && entry < start + filesz;
     }
     if !executable_entry {
         return Err(invalid(
@@ -972,7 +965,7 @@ fn stage_documentation(staging: &mut Staging<'_>) -> io::Result<()> {
 
 const NOTICE: &str = "Experimental storage-free bootstrap diagnostic; NOT a Linux-replacement kernel.\n\nProject kernel and host sources: GPL-2.0-only, complete LICENSE and original\nsource comments retained. Selected Limine protocol definitions retain 0BSD\ncopyright/permission/warranty notices in kernel/src/boot.rs and notices/.\nNo Limine executable, OVMF, machine firmware, microcode, initramfs or Linux\nroot filesystem is redistributed. Existing external Limine must load the ELF.\n\nThe matching Rust core is MIT OR Apache-2.0; MIT is elected for its selected\ncode. COPYRIGHT-library.html preserves actual authorship and per-file terms;\nthe generic MIT.txt template is not an invented project copyright holder.\nUnicode and other per-file exceptions remain in the original source/notices.\nCompiler-builtins 0.1.160 retains MIT AND Apache-2.0 WITH LLVM-exception AND\n(MIT OR Apache-2.0); the optional MIT branch is elected, not a removal of the\nconjunctive LLVM-exception terms. Its complete LICENSE.txt and libm/LICENSE.txt\nremain in corresponding-source/rust-library/compiler-builtins/. The kernel\nsupplies the required scalar Rust memset; see its link map and actual runtime\naudit, not an assumption that every builtins archive member is linked.\n\nThird-party crates in corresponding-source/project/vendor keep their own MIT,\nApache-2.0 or (syscalls, user/init only) BSD-2-Clause terms and notices; MIT is\nelected where dual. The whole installed rust-src library workspace and vendor source are retained\nto reproduce Cargo's locked build-std resolution. Inactive targets, build-only\ndependencies, external upstream scripts and C/assembly test/reference sources\ninside that separate compiler-source bundle are NOT project-owned packaging\nlogic or claims of linked kernel implementation. Original copyright, NOTICE,\nlicense and checksum files are preserved without relabeling them GPL. Review\nthose file-specific terms for further distribution or changed build features.\n\nThis package is unsigned. No signing approval, approved SPDX/CycloneDX SBOM,\nindependent reproducibility result, legal release clearance, physical pass,\nsecurity certification, full M1 or Linux 6.18.57 compatibility is asserted.\nChecksums are local integrity/lineage evidence, not source authentication.\n";
 
-const REPRODUCING: &str = "Corresponding source and reproduction boundary\n\ncorresponding-source/project contains the exact build-bound root Cargo.toml,\nCargo.lock, LICENSE, .cargo/config.toml and complete kernel, rt, user/init, xtask,\nbaremetal and vendor trees. vendor/ is the checksum-verified third-party Rust source of\nevery locked registry crate linked into or used to build the kernel, with its\nlicense files; it is corresponding source, not project-owned code. It is not a root workspace pointing at omitted members. Build arguments,\nsource hashes, exact compiler/linker identities, target specification and map\nare under provenance/build. Source changes after build are refused, not\nsilently repackaged under an older ELF hash.\n\ncorresponding-source/rust-library is the complete build-bound installed\nrust-src library workspace, including vendor, Cargo.lock, .cargo configuration,\ncore, compiler-builtins and their workspace members. It is external compiler\nsource, not an admission of every archived provider for target linkage.\nUse the exact compiler commit in build-manifest.tsv and matching installed\nrust-src from this source set in a separate disposable development workspace.\nDo not overwrite a global toolchain or install a target as a packaging step.\nCompiler/tool executables are identified and checked, not included.\n\nFrom a writable copy of corresponding-source/project, with that exact already\navailable nightly toolchain and its matching rust-src library/vendor, run:\n\ncargo +1.88.0 run -p xtask --locked --offline -- kernel-build --output target/kernel-tooling/reproduce\n\nThe maintained build command creates a private Cargo home and target directory,\nuses locked offline build-std for core/compiler_builtins, and refuses compiler\ndrift. Compare the rebuilt ELF, map, target specification and source/runtime\ninput manifests to this package. Original build paths and debug information\nare recorded; changing absolute paths or toolchain layout can change bytes.\nNo independently reproduced or bit-identical result is claimed. The package\narchive additionally records its actual creation time; rebuilding the same\nELF does not promise a byte-identical package archive.\n\ncorresponding-source/PKGBUILD is the actual constant assignment-only recipe\nparsed and consumed by the Rust producer; BUILDINFO hashes those exact bytes.\nIt is not an executable makepkg/AUR recipe and is never sourced as shell.\nBUILDINFO describes package assembly: actual xtask version, directories, time\nand queried installed packages. Original kernel compilation has its separate\nbuild-bound compiler/runtime manifest; no past host inventory is fabricated.\nThe package has no shell installer, hooks or automatic boot selection. The kernel\nbuild itself runs two reviewed third-party host build scripts (vendor/const_fn-0.4.12/build.rs and\nvendor/rustversion-1.0.23/build/build.rs; each only queries rustc), and building the host xtask runs\nfour more (serde, serde_core, serde_json, zmij), all unsandboxed as the build user.\nSee diagnostic-handoff.md for inspection and user-only trial/recovery.\n";
+const REPRODUCING: &str = "Corresponding source and reproduction boundary\n\ncorresponding-source/project contains the exact build-bound root Cargo.toml,\nCargo.lock, LICENSE, .cargo/config.toml and complete kernel, rt, user/init, xtask,\nbaremetal and vendor trees. vendor/ is the checksum-verified third-party Rust source of\nevery locked registry crate linked into or used to build the kernel, with its\nlicense files; it is corresponding source, not project-owned code. It is not a root workspace pointing at omitted members. Build arguments,\nsource hashes, exact compiler/linker identities, target specification and map\nare under provenance/build. Source changes after build are refused, not\nsilently repackaged under an older ELF hash.\n\ncorresponding-source/rust-library is the complete build-bound installed\nrust-src library workspace, including vendor, Cargo.lock, .cargo configuration,\ncore, compiler-builtins and their workspace members. It is external compiler\nsource, not an admission of every archived provider for target linkage.\nUse the exact compiler commit in build-manifest.tsv and matching installed\nrust-src from this source set in a separate disposable development workspace.\nDo not overwrite a global toolchain or install a target as a packaging step.\nCompiler/tool executables are identified and checked, not included.\n\nFrom a writable copy of corresponding-source/project, with that exact already\navailable nightly toolchain and its matching rust-src library/vendor, run:\n\ncargo +1.88.0 run -p xtask --locked --offline -- kernel-build --output target/kernel-tooling/reproduce\n\nThe maintained build command creates a private Cargo home and target directory,\nuses locked offline build-std for core/compiler_builtins, and refuses compiler\ndrift. Compare the rebuilt ELF, map, target specification and source/runtime\ninput manifests to this package. Build paths are remapped (checkout to /src, run\ndirectory to /out, toolchain to /toolchain; see cargo_encoded_rustflags), so a\ncheckout at another path is expected to give the same ELF bytes (one such\ncomparison is recorded in implementation.md); a different toolchain layout or\nsource byte can still change them.\nNo independently reproduced or bit-identical result is claimed. The package\narchive additionally records its actual creation time; rebuilding the same\nELF does not promise a byte-identical package archive.\n\ncorresponding-source/PKGBUILD is the actual constant assignment-only recipe\nparsed and consumed by the Rust producer; BUILDINFO hashes those exact bytes.\nIt is not an executable makepkg/AUR recipe and is never sourced as shell.\nBUILDINFO describes package assembly: actual xtask version, directories, time\nand queried installed packages. Original kernel compilation has its separate\nbuild-bound compiler/runtime manifest; no past host inventory is fabricated.\nThe package has no shell installer, hooks or automatic boot selection. The kernel\nbuild itself runs two reviewed third-party host build scripts (vendor/const_fn-0.4.12/build.rs and\nvendor/rustversion-1.0.23/build/build.rs; each only queries rustc), and building the host xtask runs\nfour more (serde, serde_core, serde_json, zmij), all unsandboxed as the build user. The QEMU test harness's init build additionally\nruns syscalls-0.8.1/build.rs (not part of the kernel ELF).\nSee diagnostic-handoff.md for inspection and user-only trial/recovery.\n";
 
 fn manifest_text(values: &Manifest) -> io::Result<String> {
     let mut text = String::from("key\tvalue\n");

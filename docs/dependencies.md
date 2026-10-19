@@ -64,7 +64,7 @@ Build-script and proc-macro review (read in full for both scripts; proc-macro so
 
 ### Host-tool dependency: `serde_json` for the vendor gate
 
-`xtask` (host only, never linked into the kernel) depends on `serde_json = { version = "1.0.154", default-features = false, features = ["std"] }` to parse `cargo metadata` output in the vendor build-script gate, replacing a hand-written JSON parser (use the vetted crate). It is used only through `serde_json::Value` (no derive). Host MSRV 1.88 is verified (`cargo +1.88.0 build/test/clippy` pass; the crates declare 1.56-1.71). The QMP client's own JSON handling is unchanged and is converted in a later harness PR. The same source-reading limits as above apply: archive-to-tag diff and `cargo audit` were not run; advisory status is not checked beyond the research-time listing.
+`xtask` (host only, never linked into the kernel) depends on `serde_json = { version = "1.0.154", default-features = false, features = ["std"] }` to parse `cargo metadata` output in the vendor build-script gate, replacing a hand-written JSON parser (use the vetted crate). It is used only through `serde_json::Value` (no derive). Host MSRV 1.88 is verified (`cargo +1.88.0 build/test/clippy` pass; the crates declare 1.56-1.71). The QMP client (`xtask/src/kernel.rs`) now also builds requests with `json!` and classifies replies by structure (`return`/`error` members, events skipped) instead of string interpolation and substring matching; a socketpair unit test covers an event whose text mentions "return"/"error", malformed JSON and request escaping. Raw reply lines stay the retained evidence. The same source-reading limits as above apply: archive-to-tag diff and `cargo audit` were not run; advisory status is not checked beyond the research-time listing.
 
 | Crate / version | License; election | Role | Build script / proc-macro | `unsafe` / `asm!` (lines in `src/`) |
 | --- | --- | --- | --- | --- |
@@ -80,6 +80,18 @@ Locked and vendored but **not built**: `serde_derive` 1.0.229 (proc-macro), `syn
 Present but unreachable: `cargo vendor` keeps every file of each crate, including non-Rust and non-build material such as `x86_64`'s `scripts/ci-release.py`, CI workflow files (`.github`/`.travis.yml`), `typos.toml`, a nested `rust-toolchain.toml`, `benches/`, tests and READMEs. None is a Cargo target of the selected configuration or referenced by a build script, so none is compiled, executed or linked; they are checksum-covered source and are why the auditor exempts `vendor/` from the Rust-only extension walk. Only the two reviewed build scripts above run.
 
 Rejected or deferred in the same research (not admitted): `x86` 0.52 (unmaintained, duplicate `bitflags` 1.x/`raw-cpuid` 10.x), `trapframe` (assembly files), `spin`/`critical-section` (second locking model), `x2apic` 0.5.1 (unmaintained `paste`, duplicate majors), `uart_16550` and `pic8259` (kept in-house for the bounded-wait and lock-free EOI requirements), `lock_api`, `volatile` 0.6 and `acpi` (deferred to their slices). Port I/O stays in-house because the crate's `Port<T>` uses `options(nomem)` while this kernel deliberately does not.
+
+### Host-tool dependencies: `cpio` and `elf` for the generated test fixtures
+
+`xtask` (host only, never linked into the kernel) depends on `cpio = "=0.4.1"` and `elf = { version = "=0.8.0", default-features = false }`. `cpio` writes the deterministic newc initramfs that replaces the two external fixtures ([kernel tooling](kernel-tooling.md#generated-initramfs-fixtures)); `elf` replaces the hand-written ELF header decoding in `package.rs::check_elf` and counts the init's `PT_LOAD`/`PT_INTERP` headers and undefined symbols. Both were read in full from the vendored source (`cpio` 865 lines, `elf` with `default-features = false` is zero-allocation `ElfBytes`). Host MSRV 1.88 is exercised (`cargo +1.88.0 build/test/clippy`; the crates declare no MSRV and 1.81). No `cargo audit`/archive-to-tag diff was run.
+
+| Crate / version | License; election | Role | Build script / proc-macro / dependencies | `unsafe` / `asm!` (lines in `src/`) |
+| --- | --- | --- | --- | --- |
+| `cpio` 0.4.1 | `MIT` (`LICENSE.md`) | newc archive writer, used only through `write_cpio` | `build = false`; no dependencies | 0 / 0 |
+| `elf` 0.8.0 | `MIT/Apache-2.0`; MIT elected | `ElfBytes` header, segment and symbol-table parsing from a byte slice | `build = false`; no dependencies; `std`/`alloc`/`to_str` features off; `#![forbid(unsafe_code)]` | 0 / 0 |
+
+Known `cpio` limits, handled by the caller: sizes are cast to `u32` without a check (the generator rejects an input over `u32::MAX`), inode numbers are the entry index, and `Writer::finish()` after a short write emits a header-only entry with no padding, so only `write_cpio` (which copies exactly the seeked length) is used. The archive bytes are unit-tested (headers, padding, `TRAILER!!!`), not trusted from the crate. Rejected for this role: `cpio-archive` 0.10.0 (`chrono`, `is_executable`, `simple-file-manifest`, `thiserror` graph) and `cpio_reader` 0.1.2 (read-only). `object`/`goblin` were not selected for ELF: neither was source-reviewed; `elf` alone covers the three header tables needed.
+
 
 ## Core representation, allocation and concurrency
 
