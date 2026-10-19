@@ -109,6 +109,14 @@ fn unwrap<T, E: core::fmt::Debug>(result: Result<T, E>, label: &str) -> T {
 extern "C" fn kernel_main() -> ! {
     #[cfg(feature = "qemu-self-test")]
     cpu::serial_init();
+    // SAFETY: _start has established our BSS stack, long mode and IF/DF=0; the
+    // loader mappings are active. Nothing fallible precedes this, so every later
+    // failure reaches the screen. The framebuffer extent is a kind7 loader
+    // reservation (checked against the not-yet-validated map, see
+    // take_framebuffer), mapped by the loader, never republished, and no Rust
+    // references to it are created.
+    let framebuffer = unsafe { console::init(boot::BootInfo::take_framebuffer()) };
+    log!("linux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
     #[cfg(feature = "qemu-self-test")]
     require(runtime::self_test(), "scalar-rust-memory-boundaries");
     #[cfg(feature = "qemu-self-test")]
@@ -123,7 +131,7 @@ extern "C" fn kernel_main() -> ! {
     }
     // SAFETY: _start has established our BSS stack, long mode and IF/DF=0. This
     // is the one BSP handoff; loader memory is never reclaimed in this cell.
-    let (boot, acpi) = loader_handoff();
+    let (boot, acpi) = loader_handoff(framebuffer);
     inspect_boot_images(&boot);
     // SAFETY: one constructor call consumes usable RAM ownership from the
     // trusted handoff, no DMA/AP/firmware mutation or competing allocator.
@@ -213,7 +221,7 @@ extern "C" fn kernel_main() -> ! {
     cpu::halt()
 }
 
-fn loader_handoff() -> (boot::BootInfo, firmware::Acpi) {
+fn loader_handoff(framebuffer: bool) -> (boot::BootInfo, firmware::Acpi) {
     // SAFETY: kernel_main reaches this exactly once from the CPL0 bootstrap
     // entry with our owned stack and IF/DF clear; the trusted loader's response
     // allocations remain live, reserved, and immutable for this execution.
@@ -224,11 +232,6 @@ fn loader_handoff() -> (boot::BootInfo, firmware::Acpi) {
             fail();
         }
     };
-    // SAFETY: this is the sole BSP initialization before AP execution. BootInfo
-    // validated the entire framebuffer MMIO extent; its reservation/mapping stay
-    // live, no Rust references are created and the layout is never republished.
-    let framebuffer = unsafe { console::init(boot.framebuffer) };
-    log!("linux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
     log!(
         "CHECK entry ok framebuffer={} map_entries={}\n",
         framebuffer,
