@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask", "baremetal", "kernel"]
+members = ["xtask", "baremetal", "kernel", "user/init"]
 default-members = ["xtask", "baremetal"]
 resolver = "3"
 
