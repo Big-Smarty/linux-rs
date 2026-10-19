@@ -13,7 +13,6 @@ use kernel::{boot, firmware, image, memory};
 mod console;
 mod cpu;
 mod paging;
-mod runtime;
 
 use boot::TestMode;
 use core::{panic::PanicInfo, ptr};
@@ -118,7 +117,10 @@ extern "C" fn kernel_main() -> ! {
     let framebuffer = unsafe { console::init(boot::BootInfo::take_framebuffer()) };
     log!("linux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
     #[cfg(feature = "qemu-self-test")]
-    require(runtime::self_test(), "scalar-rust-memory-boundaries");
+    require(
+        kernel::runtime::self_test(),
+        "scalar-rust-memory-boundaries",
+    );
     #[cfg(feature = "qemu-self-test")]
     log!(
         "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true\n"

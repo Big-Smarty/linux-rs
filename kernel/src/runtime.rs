@@ -93,6 +93,7 @@ unsafe extern "C" fn memcpy(
 }
 
 #[cfg(feature = "qemu-self-test")]
+#[must_use]
 pub fn self_test() -> bool {
     for offset in 0..8 {
         for count in 0..=33 {

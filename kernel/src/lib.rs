@@ -7,4 +7,6 @@ pub mod boot;
 pub mod firmware;
 pub mod image;
 pub mod memory;
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub mod runtime;
 pub mod sync;
