@@ -1,0 +1,12 @@
+# Cargo-generated build outputs and retained local execution evidence.
+/target/
+/kernel/target/
+/xtask/target/
+/baremetal/target/
+
+# External lab inputs and bulky generated evidence; never implementation source.
+/lab/external/
+/lab/artifacts/
+
+# Private agent/session context is never publication source.
+/.omp/

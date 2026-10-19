@@ -1,0 +1,12 @@
+[package]
+name = "baremetal"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded non-destructive Linux host and guest functional smoke suite"
+publish = false
+build = false
+
+[lints]
+workspace = true

@@ -1,0 +1,132 @@
+# Offline project audit
+
+This document describes the **host structural audit**, not kernel qualification. The Cargo workspace now also contains the real Rust bootstrap documented in [implementation](implementation.md), alongside dependency-free `xtask` and the [bounded smoke runner](bare-metal-suite.md). Audit `check`/`status` produces no emulator, physical or performance evidence. The maintained [kernel harness](kernel-tooling.md) has actual source-bound QEMU runs and a separately inspected [diagnostic archive](diagnostic-handoff.md); those are not executions of the structural audit. Current integrated `check`/`status`, strict nightly workspace Clippy, 51 workspace tests and formatting passed as recorded below, separately from historical host runs. [Verification](verification.md), [coverage](coverage.md), [performance](performance.md), [bare metal](bare-metal.md), [definition of done](definition-of-done.md) and [packaging](packaging.md) preserve the complete baseline obligations. Arch/CachyOS userspace and balanced server ordering do not include downstream CachyOS kernel patches.
+
+## Invocation and exit contract
+
+From the repository root:
+
+```console
+cargo run --offline -p xtask -- check
+cargo run --offline -p xtask -- status
+cargo run --offline -p xtask -- check --root /absolute/path/to/disposable-fixture
+cargo run --offline -p xtask -- --root /absolute/path/to/disposable-fixture status
+cargo run --offline -p xtask -- --help
+```
+
+`--root PATH` changes the audited data tree, not Cargo's build workspace. It is accepted before or after the single command. Without it the current directory is used; the tool does not search ancestors. Both `check` and `status` perform the same complete structural audit before printing success. Exit 0 means those checks succeeded, exit 1 means invalid project data or an I/O/output error, and exit 2 means incorrect CLI usage. Diagnostics go to stderr; reports go to stdout. The first encountered problem stops the audit. A supplied root must be an existing directory, not a symlink. Missing paths, unreadable or non-UTF-8 inputs, duplicate options, extra commands, and unknown arguments are errors, not panics.
+
+`status` reports the baseline, inventory, P0–P3 totals and actual status/assigned-entry counts. The current ledger has **ten `in_progress` and2,613 `not_started`** rows; [routing](implementation.md#routed-implementation-status) binds them to source and bounded evidence. These are not completion percentages. The [publication checkpoint](implementation.md#publication-checkpoint) supersedes historical integration counts below.
+
+The Rust 2024 **host** workspace declares MSRV **1.88**, an engineering baseline alignment rather than a user-specified Rust version or a result of the nightly kernel tests. Host minimum-version gates must select `xtask` and `baremetal` only (or exclude `kernel`); an all-workspace 1.88 gate includes the kernel's separate 1.101 manifest requirement and is not a valid host-only check. The audit code needs no nightly language feature, external crate, build script, network call, package installation or kernel target. Host lints forbid unsafe code and enable Clippy `all` and `pedantic`. The kernel instead uses its exact ABI-qualified 1.101 nightly plus matching `rust-src`, documented in [toolchain](toolchain.md); neither declaration alone proves qualification.
+
+## TSV format and validation
+
+All three files are UTF-8, LF-only, have a final newline and exactly the headers below, with no blank rows, empty fields, or control characters in fields. Rows are strictly lexically sorted by their first field; duplicates and out-of-order rows are errors. Tabs delimit fields and cannot be escaped into a field.
+
+| File | Exact header (tabs shown as `\t`) |
+| --- | --- |
+| [Reference](../planning/reference.tsv) | `key\tvalue` |
+| [Workstreams](../planning/workstreams.tsv) | `id\tupstream_prefix\tplan\tpriority\tstatus` |
+| [Upstream paths](../planning/upstream-paths.tsv) | `path\tkind\tobject\tworkstream` |
+
+The migrated reference contract retains `version=6.18.57`, `tag=v6.18.57`, `repository=https://github.com/gregkh/linux`, `retrieved=2026-10-19`, `inventory_complete=true`, and unsigned decimal `entry_count`. Current `signature_status` is `locally_verified_kernel_org_wkd_fingerprint_pinned_trust_undefined`; separate historical `github_signature_status=github_verified_not_locally_verified` preserves the original retrieval result. The exact tag object, commit and root tree remain:
+
+- tag object: `c05de972ca192e22ce318dd70ce8e990b9466f6d`;
+- commit: `2ff600d29ee478d0a8d46ef8a58afb5e038fe692`;
+- tree: `911d5155c230d7d778ac38585e01e8ab46d75a90`.
+
+Additional single-line provenance keys are permitted. If `tree_count`, `blob_count`, or `commit_count` is present, it must equal the corresponding inventory count. `entry_count` must equal the nonzero number of path records. Decimal overflow is an error. Replacing the approved baseline requires an explicit coordinated change to provenance, inventory and auditor, not merely editing the metadata string.
+
+Each workstream has a unique nonempty lowercase ASCII letter/digit/hyphen ID, unique prefix, existing regular plan path under `docs/` with a case-insensitively recognized Markdown extension (`.md` or `.MD`, including mixed case), without a fragment or query, priority P0/P1/P2/P3, and status exactly `not_started` or `in_progress`. The header remains exactly five columns; no result/evidence column or `done` status is added. `.` is required as root fallback. Every other prefix must name an actual pinned inventory entry. Every top-level directory and immediate directory child of `arch`, `drivers`, `fs` and `net` needs an explicit prefix. Top-level metadata files may use fallback; meaningful deeper mechanisms remain a human review obligation.
+
+Inventory paths are unique, normalized relative paths; empty components, absolute paths, `.`/`..`, backslashes, colons and control characters are rejected. These same safety restrictions apply to project paths and non-root prefixes. No root inventory entry is accepted. Kinds are exactly `tree`, `blob`, or `commit`; every object ID is SHA40-shaped. Every nested entry must have a previously inventoried `tree` parent. Each assignment must name a known workstream and equal the **longest path-component-aware prefix**: `net/ipv4` beats `net`, while `net` never matches `network`. Unknown IDs, duplicate prefixes, missing owners, non-tree parents and wrong shorter-prefix assignments fail.
+
+The audit does not fetch Git trees, rehash Git objects, independently reconstruct the upstream tree, or prove that a locally self-consistent inventory contains every upstream path. `inventory_complete=true` and counts are checked for consistency, not accepted as cryptographic completeness evidence. Acquisition and truncation handling are explained in the [coverage evidence](coverage.md). The exact upstream tag/commit/tree API references are in the sources below.
+
+## Local Markdown file links
+
+All regular files with a case-insensitively recognized Markdown extension (`.md` or `.MD`, including mixed case) under the root are scanned, including hidden project-local skill documents. The same extension rule applies to workstream plan paths. The supported authoring subset is ordinary same-line inline links and images with a plain relative file destination: a label in square brackets immediately followed by a parenthesized path. A fragment may follow the path; the **file** is checked, the anchor is not. File links may use `../` or `./` provided normalization stays inside the root. Destinations must resolve to regular audited files, not directories. Thus a skill at `.agents/skills/<name>/SKILL.md` reaches a repository document through `../../../docs/...`.
+
+The scanner skips fenced backtick/tilde blocks, lines indented with four spaces or a tab, and same-line backtick code spans. It is deliberately **not a full CommonMark parser**. Avoid multiline links, escaped/nested labels or destinations, optional link titles, angle-bracket destinations, reference-style links, HTML links, autolinks, percent-encoded paths, query strings, escaped punctuation, and complex block/inline-code nesting for local navigation. Recognized inline local links using whitespace, percent escapes, queries, angle wrappers, backslashes or nested destination parentheses fail rather than being reported as checked. Other unsupported CommonMark constructs may not be detected at all; no claim of exhaustive rendered-document link validation is made. Bracket-like text outside code should not imitate unsupported links. General HTML/entity/YAML parsing is out of scope.
+
+Fence opening and closing markers may have at most three leading ASCII spaces; four-space/tab-indented code cannot open or close a fence. A same-line code span closes only on a backtick run of exactly the opening run's length. Unmatched backtick runs are literal text and do not suppress validation of following links.
+
+Anchor-only links and URI-scheme/protocol-relative links, including HTTP/HTTPS/mailto links, are counted as **unvalidated**, not fetched. Neither remote availability/content nor any fragment anchor is checked. There is no network path inside either command. Human review must validate citations and anchors; an external network failure cannot silently become a local audit pass claim.
+
+## Skills and Rust-only source policy
+
+The expected local set consists of exactly these 16 skill names: `kernel-abi`, `kernel-architecture`, `kernel-concurrency`, `kernel-dependencies`, `kernel-documentation`, `kernel-drivers`, `kernel-firmware`, `kernel-memory`, `kernel-networking`, `kernel-performance`, `kernel-porting`, `kernel-release`, `kernel-security`, `kernel-storage`, `kernel-unsafe`, and `kernel-verification`. Each must have `.agents/skills/<name>/SKILL.md`; files under unexpected skill names fail. See the [skill catalog](skills.md).
+
+Each skill requires opening and closing `---` frontmatter lines, unique top-level keys, a one-line `name` scalar matching its directory, and a nonempty one-line `description` scalar of at most 1024 Unicode characters. Names are 1–64 ASCII lowercase letters/digits/hyphens, with no leading/trailing or doubled hyphen. Plain and simply single-/double-quoted scalars are accepted. Required fields using YAML block scalars, aliases, tags, collections, nulls, or inline comments are not supported; nested optional YAML metadata is also outside this intentionally small frontmatter subset. This is not a complete YAML or Agent Skills specification validator.
+
+The file walk ignores only directories named `.git` and `target` (at any depth), not general hidden directories or ignore-file patterns. It rejects every encountered symlink, including internal/broken symlinks and links bearing an ignored directory's name; no symlink is followed deliberately. Special files and non-UTF-8 filenames fail. The explicit `--root` path is canonicalized only after its own symlink check. The audit assumes a quiescent, trusted local checkout: it is **not a race-proof sandbox** against concurrent replacement of directories or files, nor a check of symlinks in the caller-selected root's ancestors.
+
+`build.rs` is rejected anywhere in the audited tree. A case-insensitive prohibited-extension list rejects C/C++/Objective-C headers and sources, standalone assembly, Zig, common scripting and other compiled-language sources, LLVM IR, and common compiled object/library/executable extensions. The authoritative explicit list is `PROHIBITED_EXTENSIONS` in the [audit implementation](../xtask/src/main.rs). No source bytes are imported merely by mentioning such filenames inside the upstream TSV. Rust inline assembly remains subject to the separate [architecture](architecture.md) and [unsafe-review](../.agents/skills/kernel-unsafe/SKILL.md) policies.
+
+**An extension scan is not proof of binary purity.** Renamed/extensionless code, interpreted data, uncommon extensions, native compiler/linker behavior, manifest changes, generated code, supply-chain compromises and unsafe bugs are not ruled out. The audit does not parse arbitrary Cargo graphs or perform binary provenance/disassembly proof. The current project packages have no third-party Cargo dependencies and no project `build.rs`; target compiler inputs remain separately auditable. Nor does this offline audit verify a downloaded signature. Actual independent kernel.org/GitHub object matching and GPG Good signature with fingerprint-pinned HTTPS/WKD and `TRUST_UNDEFINED` are recorded in [coverage](coverage.md), not produced by `check`. Historical cell9 and separate final004 artifact/provider findings are recorded in [implementation](implementation.md); neither comes from this extension scan. See [licensing](licensing.md) and [dependencies](dependencies.md).
+
+## Definition of done for this host audit
+
+This tool's acceptance gate is separate from M1–M8 kernel work. It is satisfied only when the project owner actually executes and records all applicable cases below against the final integrated tree; implementation of the checks alone is not test evidence.
+
+1. Build with the available compiler without downloads, then execute both `check` and `status` against the final root. Both must exit 0, identify the exact inventory/workstream totals, and state that planning counts are not compatibility coverage.
+2. Exercise `--root` before and after the command on a disposable positive fixture. Check `--help` and usage errors: missing command/path, duplicate root, extra command and unknown option. Usage failures must exit 2.
+3. On isolated copied fixtures, mutate one invariant at a time. Require exit 1 and a diagnostic that identifies the violated data or file. Never mutate the actual project's pinned inventory just to test failure paths.
+4. Exercise synthetic parser/assignment behavior tests using `cargo test --offline -p xtask`. These test code behavior, not repository-document wording, source-text snapshots, or a fake kernel. Run Clippy and formatting checks if those are part of the owner's requested handoff gates.
+5. Remove disposable fixtures and keep no generated foreign-language test runner in the project. Record observed outcomes, compiler version and unresolved issues; do not substitute this audit for upstream/kernel testing.
+
+Negative fixture matrix (each row is an independent case, not a permanent documentation-content test):
+
+| Area | Mutations that must fail |
+| --- | --- |
+| TSV framing | Wrong/missing header, extra/missing column, blank row, CRLF, missing final LF, duplicate/out-of-order first field, empty field |
+| Provenance | Missing required key, wrong baseline object, nonhex/short SHA, `inventory_complete=false`, invalid/overflow/mismatching count |
+| Workstreams | Duplicate ID/prefix, missing root fallback, unsafe/nonexistent prefix, missing/escaping/fragment-bearing plan, bad priority/status |
+| Inventory | Duplicate/unsafe path, bad kind/SHA, missing or blob parent, unknown owner, wrong shorter-prefix owner, omitted explicit top-level/first-level directory prefix |
+| Markdown | Missing linked file, link escaping root, directory rather than file destination, malformed recognized local destination |
+| Skills | Missing expected skill, unexpected skill directory containing files, missing/unclosed delimiters, duplicate field, empty description, name-directory mismatch |
+| Source tree | C/C++/assembly/Zig/script source extension including uppercase, `build.rs`, external/internal/broken symlink, special file |
+
+Positive boundary cases also matter: `net` must not own `network`; the longest nested prefix must win; valid same-line local links with `../` and fragments must work; unavailable HTTP links and anchor-only links must be reported unvalidated rather than fetched; fenced/inline code examples should not create fake links; `target`/`.git` directory contents must not be scanned. The observed initial host acceptance run is recorded below; these criteria must still be applied to subsequent integrated changes.
+
+## Observed initial host integration evidence
+
+The project owner executed the following on the setup host with `rustc 1.101.0-nightly (5c543b0b8 2026-09-29)`. This is a record of those executions, not a claim that later edits have already passed final integration gates.
+
+- Offline Clippy with warnings denied (`-D warnings`) passed. The workspace test execution at that point reported **17 passed**; this is a historical run count, not the final workspace test total.
+- Actual offline `cargo run -p xtask -- check` and `cargo run -p xtask -- status` executions both exited 0. They reported **97,294 inventory entries, 2,623 workstreams, 16 skills, and 53 Markdown files**. The status output reported all 2,623 workstreams `not_started`, assigned-entry sum 97,294, and priority totals **P0=620, P1=544, P2=1,419, P3=40**. These are structural planning counts, not implemented kernel coverage. Local-link counts are deliberately not frozen here because documentation edits change them.
+- A temporary end-to-end acceptance harness exercised **83 independent audit scenarios**: **6 successes**, **72 invalid-project cases exiting 1**, and **5 invalid-CLI cases exiting 2**. Coverage included the entire negative fixture matrix above; bounded-parser fence, unmatched-code-span and comment-only-frontmatter regressions; uppercase Markdown broken-link detection; internal, external and broken symlinks, symlink roots and symlinks bearing ignored directory names; FIFO and non-UTF-8 filenames; prohibited source extensions; coherent inventories omitting required explicit `net` or `net/ipv4` prefixes; and metadata/routing failures. Default-root `check` and `status`, `--root` in both argument orders, and help were exercised. All temporary fixtures were removed; the actual pinned inventory was unchanged.
+- Both attempted language-server diagnostic requests reported that no language server was available. They provide no language-server validation evidence. Rust 1.85 MSRV execution was not performed.
+- Separate normal-path and non-UTF-8-path full smoke-runner executions each observed **14 cases, 0 failed, 0 skipped, `qualified=false`**, on the **7.2.10-1-cachyos reference environment**. They were not executions on the pinned 6.18.57 oracle or a new kernel. They do not prove absence of runner bugs; subsequent runner fixes require their own final integration gates.
+
+These observations establish bounded host-tool evidence only. They do not validate external networking or citations, signatures, fragment anchors, Linux semantic compatibility, kernel safety, QEMU or physical candidate boots, or performance. No M1–M8 kernel work or remaining M0 provenance/security gate is completed merely by these host results.
+
+### Historical setup integration after corrections
+
+At the end of the original setup delivery, after the maps-observation corrections, `cargo fmt --all -- --check`, `cargo clippy --offline --workspace --all-targets -- -D warnings`, and `cargo test --offline --workspace` passed; that workspace contained **20 passing tests**. The actual `xtask check` and ordinary-path reference smoke were rerun successfully. The auditor implementation exercised by the 83-case acceptance harness was unchanged by those runner corrections. The [suite evidence](bare-metal-suite.md#observed-host-runner-verification) distinguishes successful observations from an intentionally unqualified bounded-prefix skip. These are historical results, not a final gate for the subsequent kernel/status/harness migration; neither test execution nor a structural audit closes kernel qualification.
+
+## Subsequent bootstrap evidence is separate
+
+The historical all-`not_started`, Rust 1.85 declaration and host test counts above describe the original setup revision, not current kernel status or the final integrated workspace. [Implementation evidence](implementation.md) preserves the manual cell9 eight-case QEMU runs, five kernel production-parser host tests, strict owned host/freestanding Clippy and both-profile runtime inspection. Those historical executions were not tests of the migrated audit, maintained harness or host MSRV 1.88; the distinct later observations follow.
+
+### Current integrated evidence and final gates
+
+The004 checkpoint results below remain historical source-bound facts. The subsequent [consumed bitmap revision](implementation.md#consumed-native-word-bitmap-revision) actually passed host1.88 strict Clippy/46tests and, after retaining/fixing a kernel-only `manual_bits` lint failure, nightly strict-Clippy/55tests/format/check/status plus both freestanding strict-Clippy profiles. Its structural audit observed97,294entries/2,623workstreams/16skills/56Markdown/1,493localfilelinks and6`in_progress`/2,617`not_started`;683external destinations and all fragment anchors remain unvalidated. `integrated-005/artifact-review/gates.json` retains exact commands/failure/passed output. These pre-result-summary structural counts are separate from that revision's actual8/8QEMU/default visual/provider evidence.
+
+- **Observed host baseline:** host Rust 1.88 strict Clippy and 46 tests in two suites passed after the package metadata repair, as recorded in [maintained integration evidence](implementation.md#maintained-integration-and-retained-harness-failure). These are not the historical 17/20-test setup runs or the five kernel parser tests.
+- **Observed maintained bootstrap:** `integrated-002`, `integrated-003` and final source-bound `integrated-004` each returned 0 with eight matched cases. `integrated-001` remains an actual retained failure with seven matches because the old validator rejected leading OVMF CSI framing. Under `target/kernel-tooling/integrated-004/`, `default-boot/director-visual-review.json` records independent director inspection of the exact default PNG/ELF, while `artifact-review/review.json` records the separate integration-owner runtime/provider inspection. Their hashes and bounded findings are not an automated visual pass or whole-kernel approval.
+- **Observed diagnostic archive:** the actual unsigned `diagnostic-001` package has retained `inspection/review.json`, `commands.json` and `extraction-commands.json` under `target/kernel-tooling/diagnostic-001/`; [diagnostic handoff](diagnostic-handoff.md#evidence-status-do-not-substitute-old-results-for-this-package) owns the archive identity and findings. Read-only `bsdtar`/`pacman` inspection and fresh project-owned extraction checked the actual metadata, members, inner checksums and source binding. No installation occurred. The director independently opened the actual archive and accepted the required metadata/recipe/source boundary in `inspection/director-review.json`, closing the missing-BUILDINFO finding without granting release/legal/reproducibility approval.
+- **Observed delivered-source consumer:** the documented `kernel-build` ran successfully from a new writable copy of the packaged project, using the existing exact toolchain/rust-src. `target/kernel-tooling/source-build-001/review.json` records all21 matching project source files, matching target specification/runtime libraries, different whole ELF/map bytes and identical loaded segment bytes/metadata. Only nonloaded `.debug_info`/`.debug_str` section payloads differ; source-root strings and map paths differ. This same-host smoke is not independent or bit-for-bit reproducibility.
+- **Observed final integrated gates:** after both global documentation changes landed, `cargo +nightly clippy --workspace --all-targets --locked --offline -- -D warnings`, `cargo +nightly test --workspace --all-targets --locked --offline`, `cargo fmt --all --check`, and actual `cargo +1.88.0 run -p xtask --locked --offline -- check` / `status` all returned0. Tests: **51 passed in three suites**. The structural audit observed **97,294 entries, 2,623 workstreams, 16 skills, 56 Markdown files and 1,473 local file links**; status observed **five `in_progress`, 2,618 `not_started`**. It did not validate680 external destinations, fragment anchors, semantic completeness, signatures, execution or performance. `target/kernel-tooling/integrated-004/final-gates.json` and `final-gates-output.txt` preserve the exact command chain and raw output; these are observed pre-result-write counts, not a compatibility percentage.
+
+The integrated-004 inputs and diagnostic-001 archive remain frozen in their retained evidence; the working source may advance only with new source-bound checks, never by relabelling those historical results. Append later review records without altering hashed creation-time manifests. None of these bounded observations completes M0/M1, independent release/SBOM/reproducibility review, user-operated physical boot/recovery, Linux replacement, or performance qualification.
+
+## Primary references
+
+- [Cargo workspaces, shared package settings and lint inheritance](https://doc.rust-lang.org/cargo/reference/workspaces.html).
+- [Cargo manifest format and lint configuration](https://doc.rust-lang.org/cargo/reference/manifest.html).
+- [Rust `symlink_metadata` semantics and errors](https://doc.rust-lang.org/std/fs/fn.symlink_metadata.html).
+- [Agent Skills format specification](https://agentskills.io/specification); this project intentionally validates only its documented local subset.
+- [CommonMark 0.31.2 links specification](https://spec.commonmark.org/0.31.2/#links); this scanner is not a CommonMark implementation.
+- [Pinned Linux tag reference](https://api.github.com/repos/gregkh/linux/git/ref/tags/v6.18.57), [annotated tag object](https://api.github.com/repos/gregkh/linux/git/tags/c05de972ca192e22ce318dd70ce8e990b9466f6d), and [pinned commit metadata](https://api.github.com/repos/gregkh/linux/git/commits/2ff600d29ee478d0a8d46ef8a58afb5e038fe692).
