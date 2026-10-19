@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! A separate, unsigned ALPM diagnostic payload. This module never installs it.
 
+use elf::{ElfBytes, abi, endian::LittleEndian, file::Class};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File, FileTimes, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -650,63 +651,55 @@ fn verify_external_input(
     Ok(())
 }
 
+const ELF_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Program-header policy for the payload kernel, decoded by the `elf` crate: little-endian ELF64
+/// x86-64 `ET_EXEC`, no interpreter, bounded non-W+X loads, entry inside an executable segment.
 fn check_elf(path: &Path) -> io::Result<()> {
-    let mut file = open_regular(path)?;
-    let mut header = [0_u8; 64];
-    file.read_exact(&mut header)?;
-    if header[..7] != [0x7f, b'E', b'L', b'F', 2, 1, 1]
-        || u16::from_le_bytes([header[16], header[17]]) != 2
-        || u16::from_le_bytes([header[18], header[19]]) != 62
-        || u16::from_le_bytes([header[52], header[53]]) != 64
-        || u16::from_le_bytes([header[54], header[55]]) != 56
-        || u16::from_le_bytes([header[56], header[57]]) == 0
+    let mut bytes = Vec::new();
+    open_regular(path)?
+        .take(ELF_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > ELF_LIMIT {
+        return Err(invalid("kernel ELF exceeds the package inspection limit"));
+    }
+    let file = ElfBytes::<LittleEndian>::minimal_parse(&bytes)
+        .map_err(|error| invalid(format!("ELF parse error: {error}")))?;
+    let header = file.ehdr;
+    if header.class != Class::ELF64
+        || header.e_type != abi::ET_EXEC
+        || header.e_machine != abi::EM_X86_64
     {
         return Err(invalid(
             "payload is not a little-endian ELF64 x86_64 ET_EXEC kernel",
         ));
     }
-    let size = file.metadata()?.len();
-    let word = |bytes: &[u8]| {
-        <[u8; 8]>::try_from(bytes)
-            .map(u64::from_le_bytes)
-            .map_err(|error| invalid(error.to_string()))
-    };
-    let entry = word(&header[24..32])?;
-    let offset = word(&header[32..40])?;
-    let count = u64::from(u16::from_le_bytes([header[56], header[57]]));
-    if offset.checked_add(count * 56).is_none_or(|end| end > size) {
-        return Err(invalid("ELF program header table escapes the regular file"));
-    }
-    file.seek(SeekFrom::Start(offset))?;
+    let size = bytes.len() as u64;
     let mut executable_entry = false;
-    for _ in 0..count {
-        let mut program = [0_u8; 56];
-        file.read_exact(&mut program)?;
-        let kind = u32::from_le_bytes([program[0], program[1], program[2], program[3]]);
-        if kind == 3 {
-            return Err(invalid(
-                "diagnostic ELF must not require a userspace interpreter",
-            ));
+    for program in file.segments().into_iter().flatten() {
+        match program.p_type {
+            abi::PT_INTERP => {
+                return Err(invalid(
+                    "diagnostic ELF must not require a userspace interpreter",
+                ));
+            }
+            abi::PT_LOAD => {
+                let in_file = program.p_offset.checked_add(program.p_filesz);
+                if program.p_filesz > program.p_memsz
+                    || in_file.is_none_or(|end| end > size)
+                    || program.p_vaddr.checked_add(program.p_memsz).is_none()
+                    || program.p_flags & (abi::PF_W | abi::PF_X) == abi::PF_W | abi::PF_X
+                {
+                    return Err(invalid(
+                        "ELF contains an invalid or writable-executable load segment",
+                    ));
+                }
+                executable_entry |= program.p_flags & abi::PF_X != 0
+                    && program.p_vaddr <= header.e_entry
+                    && header.e_entry < program.p_vaddr + program.p_filesz;
+            }
+            _ => {}
         }
-        if kind != 1 {
-            continue;
-        }
-        let flags = u32::from_le_bytes([program[4], program[5], program[6], program[7]]);
-        let start = word(&program[16..24])?;
-        let filesz = word(&program[32..40])?;
-        let memsz = word(&program[40..48])?;
-        if filesz > memsz
-            || word(&program[8..16])?
-                .checked_add(filesz)
-                .is_none_or(|end| end > size)
-            || start.checked_add(memsz).is_none()
-            || flags & 3 == 3
-        {
-            return Err(invalid(
-                "ELF contains an invalid or writable-executable load segment",
-            ));
-        }
-        executable_entry |= flags & 1 != 0 && start <= entry && entry < start + filesz;
     }
     if !executable_entry {
         return Err(invalid(
