@@ -221,7 +221,7 @@ The user manually selects the separate medium through the established one-time b
 
 ## Expected framebuffer, failure and recovery protocol
 
-The default profile does **not** use QEMU COM1 or port `0xf4`; it writes only through the accepted 32bpp RGB framebuffer and ultimately masks interrupts and halts. The console validates the handoff's address/range, geometry, pitch and channel layout. Requesting 1024×768×32 does not prove that firmware supplied an acceptable display. The renderer uses uppercase glyphs, so source log names below appear uppercase on screen.
+The default profile does **not** use QEMU COM1 or port `0xf4`; it writes only through the accepted 32bpp RGB framebuffer and ultimately masks interrupts and halts. The console validates the handoff's address/range, geometry, pitch and channel layout. Requesting 1024×768×32 does not prove that firmware supplied an acceptable display. The diagnostic-003 lineage's renderer used uppercase glyphs, so source log names below appear uppercase on its screen (later lineages render exact ASCII via `font8x8`; they are not diagnostic-003 and carry no physical clearance).
 
 Within **30 seconds after manually selecting the diagnostic**, expect all of these in order, with real machine-dependent counts:
 
