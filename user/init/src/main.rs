@@ -84,7 +84,7 @@ impl Write for Out {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let mut rest = s.as_bytes();
         while !rest.is_empty() {
-            match write(1, rest.as_ptr().addr(), rest.len()) {
+            match write(1, rest.as_ptr().expose_provenance(), rest.len()) {
                 Ok(0) => return Err(fmt::Error),
                 Ok(n) => rest = rest.get(n..).ok_or(fmt::Error)?,
                 Err(Errno::EINTR) => {}
@@ -172,6 +172,14 @@ impl Strings {
         self.0
             .iter()
             .map(|&p| unsafe { cstr(p) }.unwrap_or_default())
+    }
+}
+
+impl Strings {
+    /// The environment Linux gives init when the command line adds none
+    /// (`envp_init` in `init/main.c`).
+    fn is_kernel_default(self) -> bool {
+        self.iter().eq([b"HOME=/".as_slice(), b"TERM=linux"])
     }
 }
 
@@ -286,9 +294,11 @@ impl Debug for Stack {
             self.aux_string(AT_EXECFN),
             self.aux_string(AT_PLATFORM)
         )?;
-        // Only the kernel-built init environment is printed: a host run's
-        // environment may hold secrets.
-        if pid() == 1 {
+        // Print entries only when they are exactly the kernel's default init
+        // environment (see `Strings::is_kernel_default`). Any other environment,
+        // including a pid-1 one in a container's PID namespace, may hold secrets
+        // and is reduced to its entry count.
+        if pid() == 1 && self.envp.is_kernel_default() {
             write!(f, "{:?}", self.envp)
         } else {
             write!(f, "{}", self.envp.0.len())
@@ -346,11 +356,16 @@ fn run(stack: &Stack) {
         }
     }
 
-    let buf = b"x".as_ptr().addr();
+    let buf = b"x".as_ptr().expose_provenance();
     expect("write_zero_length", write(1, buf, 0), Ok(0));
     expect("write_null", write(1, 0, 1), Err(Errno::EFAULT));
     expect("write_low_address", write(1, 8, 5), Err(Errno::EFAULT));
-    expect("write_closed_fd", write(5, buf, 1), Err(Errno::EBADF));
+    // Above any RLIMIT_NOFILE, so it is never open and nothing can be written.
+    expect(
+        "write_bad_fd",
+        write(0x7fff_ffff, buf, 1),
+        Err(Errno::EBADF),
+    );
     expect(
         "write_fd_minus_one",
         write(usize::MAX, buf, 1),
@@ -367,8 +382,9 @@ fn run(stack: &Stack) {
         if argv0 != b"/init" {
             fail("pid1_argv0", Lossy(argv0));
         }
-        if !stack.envp.iter().eq([b"HOME=/".as_slice(), b"TERM=linux"]) {
-            fail("pid1_envp", stack.envp);
+        if !stack.envp.is_kernel_default() {
+            // Count only: this pid 1 may be a PID-namespace one with a real environment.
+            fail("pid1_envp", stack.envp.0.len());
         }
     }
 
@@ -386,7 +402,7 @@ extern "C" fn start_rust(sp: *const usize) -> ! {
     const HELLO: &str = "init: hello from userspace\n";
     expect(
         "write",
-        write(1, HELLO.as_ptr().addr(), HELLO.len()),
+        write(1, HELLO.as_ptr().expose_provenance(), HELLO.len()),
         Ok(HELLO.len()),
     );
     // SAFETY: `entry` passes the stack pointer at process entry.

@@ -9,7 +9,7 @@
 
 ### First userspace program
 
-- Added `user/init`, a static libc-free x86_64 Linux `/init` test program that doubles as a differential oracle (oracle evidence under `target/linux-reference/init-reference-001/`); moved the scalar `memset`/`memcpy` runtime into the shared `linux-rs-runtime` crate (`rt/`) so the kernel and the init link the same providers; admitted `syscalls` 0.8.1 and rejected `origin`/`rustix` for it.
+- Added `user/init`, a static libc-free x86_64 Linux `/init` test program that doubles as a differential oracle (oracle evidence under `target/linux-reference/init-reference-003/`); moved the scalar `memset`/`memcpy` runtime into the shared `linux-rs-runtime` crate (`rt/`) so the kernel and the init link the same providers; admitted `syscalls` 0.8.1 and rejected `origin`/`rustix` for it.
 
 ### Kernel audit fixes
 
