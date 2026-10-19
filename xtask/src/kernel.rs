@@ -30,7 +30,7 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const KILL: &str = "/usr/bin/kill";
 const SETPRIV: &str = "/usr/bin/setpriv";
-const SERIAL_LOG_LIMIT: u64 = 4 * 1024 * 1024;
+pub(crate) const SERIAL_LOG_LIMIT: u64 = 4 * 1024 * 1024;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
 const FAT_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const OVMF_CODE: &str = "/usr/share/edk2/x64/OVMF_CODE.4m.fd";
@@ -390,7 +390,12 @@ fn record_setpriv(
     sha256sum: &Path,
     values: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
-    manifest_value(values, "setpriv_path", SETPRIV);
+    // Canonical, like `process_group_kill_path`: package compares it with the hashed runtime input.
+    manifest_value(
+        values,
+        "setpriv_path",
+        display_path(&fs::canonicalize(SETPRIV)?)?,
+    );
     manifest_value(
         values,
         "setpriv_version",
@@ -559,8 +564,8 @@ pub(crate) fn resolve_program(program: &Path) -> io::Result<PathBuf> {
         vec![program.to_path_buf()]
     } else {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            // An empty entry means the current directory, which can hold planted tools.
-            .filter(|directory| !directory.as_os_str().is_empty())
+            // Empty and relative entries mean the current directory, which can hold planted tools.
+            .filter(|directory| directory.is_absolute())
             .map(|directory| directory.join(program))
             .collect()
     };
@@ -800,6 +805,8 @@ fn single_line(value: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("; ")
+        // Tabs and other controls would make write_manifest/parse_manifest reject the row.
+        .replace(char::is_control, " ")
 }
 
 fn git_value(root: &Path, args: &[&str]) -> String {
@@ -4168,6 +4175,11 @@ mod tests {
         manifest_value(&mut values, "key", "bad\tvalue");
         assert!(write_manifest(&path, values).is_err());
         assert!(!path.exists());
+        // Failure manifests build their error text with single_line, so they stay writable.
+        let mut failure = BTreeMap::new();
+        manifest_value(&mut failure, "error", single_line("a\tb\x1b[0m\nc"));
+        write_manifest(&path, failure)?;
+        assert!(fs::read_to_string(&path)?.ends_with("error\ta b [0m; c\n"));
         Ok(())
     }
 
