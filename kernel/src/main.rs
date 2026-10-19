@@ -175,7 +175,7 @@ extern "C" fn kernel_main() -> ! {
         "stack-guard-unmapped",
     );
     log!(
-        "CHECK paging ok tables={} wx=separated guards=4 image_alias=absent\n",
+        "CHECK paging ok tables={} wx=separated guards=5 image_alias=absent\n",
         table_pages
     );
     check_exceptions(&boot, &mut allocator);
@@ -221,21 +221,8 @@ extern "C" fn kernel_main() -> ! {
         allocator.available(),
         tables.pages
     );
-    finish(user)
-}
-
-/// Diverges (init runs, then its death ends the boot) except for a
-/// qemu-self-test build whose fixtures have no /init, which keeps the old
-/// bootstrap result.
-fn finish(user: Result<userspace::Loaded, userspace::Error>) -> ! {
-    userspace::run(user);
-    #[cfg(feature = "qemu-self-test")]
-    {
-        log!("RESULT success\n");
-        cpu::exit(true);
-    }
-    #[cfg(not(feature = "qemu-self-test"))]
-    cpu::halt()
+    // Diverges: init runs and its death ends the boot, or Linux's failure text.
+    userspace::run(user)
 }
 
 fn loader_handoff(framebuffer: bool) -> (boot::BootInfo, firmware::Acpi) {

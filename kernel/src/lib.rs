@@ -4,6 +4,7 @@
 //! primitives as the freestanding entry; privileged code is in the gated binary.
 pub mod bitmap;
 pub mod boot;
+pub mod config;
 pub mod exec;
 pub mod firmware;
 pub mod image;

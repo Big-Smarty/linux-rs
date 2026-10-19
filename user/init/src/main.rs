@@ -14,7 +14,7 @@ compile_error!(
 // Links the reviewed scalar `memset`/`memcpy` the compiler emits calls to.
 use linux_rs_runtime as _;
 
-use core::arch::naked_asm;
+use core::arch::{asm, naked_asm};
 use core::fmt::{self, Debug, Display, Write};
 use core::{panic::PanicInfo, ptr, slice};
 use syscalls::{Errno, Sysno, raw};
@@ -388,13 +388,89 @@ fn run(stack: &Stack) {
         }
     }
 
-    if stack.argv.iter().nth(1) == Some(b"fault") {
-        out!("init: faulting on purpose");
-        // SAFETY: not sound, deliberately: the read of address 0 must raise SIGSEGV.
-        let _ = unsafe { ptr::null::<u8>().read_volatile() };
-        fail("fault", "returned");
+    match stack.argv.iter().nth(1) {
+        Some(b"fault") => {
+            out!("init: faulting on purpose");
+            // SAFETY: not sound, deliberately: the read of address 0 must raise SIGSEGV.
+            let _ = unsafe { ptr::null::<u8>().read_volatile() };
+            fail("fault", "returned");
+        }
+        // A syscall inside Linux's table that the first kernel slice does not
+        // implement: the candidate kernel stops with `FAIL syscall unimplemented
+        // nr=9`. Real Linux returns EINVAL for this zero-length mmap.
+        Some(b"mmap") => {
+            out!("init: calling mmap");
+            // SAFETY: length 0 maps nothing; the call takes no pointers.
+            let result = Errno::from_ret(unsafe {
+                raw::syscall6(Sysno::mmap as usize, 0, 0, 3, 0x22, usize::MAX, 0)
+            });
+            fail("mmap", result);
+        }
+        // rseq(2) is -ENOSYS in the candidate's declared configuration
+        // (CONFIG_RSEQ=n); a Linux with RSEQ=y answers EINVAL for these arguments.
+        Some(b"rseq") => {
+            // SAFETY: a null rseq area with flags 0 and length 0 is rejected by the kernel.
+            let result =
+                Errno::from_ret(unsafe { raw::syscall4(Sysno::rseq as usize, 0, 0, 0, 0) });
+            expect("rseq", result, Err(Errno::ENOSYS));
+            out!("init: rseq enosys");
+        }
+        Some(b"sse") => fpu_checks(),
+        _ => {}
     }
     out!("init: ok");
+}
+
+/// Initial x87/SSE state and arithmetic: Linux gives a new task FCW 0x37f,
+/// MXCSR 0x1f80 and zero registers (`fpstate_init_fxstate`), and even with
+/// `noxsave` x87/SSE keep working through FXSR. The target is soft-float, so
+/// the instructions are written explicitly; no register operand is named (the
+/// compiler never allocates XMM/x87 here, so nothing live is clobbered).
+fn fpu_checks() {
+    let mut fcw = 0u16;
+    let mut mxcsr = 0u32;
+    let (mut xmm5, mut xmm15) = (u64::MAX, u64::MAX);
+    // SAFETY: stores through two valid local pointers and reads XMM registers
+    // into general registers; user mode, no other side effects.
+    unsafe {
+        asm!(
+            "fnstcw word ptr [{fcw}]",
+            "stmxcsr dword ptr [{mxcsr}]",
+            "movq {a}, xmm5",
+            "movq {b}, xmm15",
+            fcw = in(reg) ptr::addr_of_mut!(fcw),
+            mxcsr = in(reg) ptr::addr_of_mut!(mxcsr),
+            a = out(reg) xmm5,
+            b = out(reg) xmm15,
+            options(nostack, preserves_flags),
+        );
+    }
+    expect("fpu_fcw", fcw, 0x37f);
+    expect("fpu_mxcsr", mxcsr, 0x1f80);
+    expect("xmm5", xmm5, 0);
+    expect("xmm15", xmm15, 0);
+    let mut two = 0i32;
+    let nine: i64;
+    // SAFETY: x87: 1 + 1 stored as an integer through a valid local pointer;
+    // SSE2: (double)3 squared, truncated. No memory besides `two`.
+    unsafe {
+        asm!(
+            "fld1",
+            "fld1",
+            "faddp st(1), st",
+            "fistp dword ptr [{two}]",
+            "cvtsi2sd xmm0, {three}",
+            "mulsd xmm0, xmm0",
+            "cvttsd2si {nine}, xmm0",
+            two = in(reg) ptr::addr_of_mut!(two),
+            three = in(reg) 3i64,
+            nine = out(reg) nine,
+            options(nostack, preserves_flags),
+        );
+    }
+    expect("x87_add", two, 2);
+    expect("sse2_mul", nine, 9);
+    out!("init: sse ok");
 }
 
 extern "C" fn start_rust(sp: *const usize) -> ! {

@@ -19,7 +19,10 @@
 //! [`Outcome::Unimplemented`] so the caller stops loudly instead of faking
 //! success or a broad `ENOSYS`.
 
-use crate::usercopy::{UserPages, access_ok, copy_from_user};
+use crate::{
+    config,
+    usercopy::{UserPages, access_ok, copy_from_user},
+};
 use syscalls::{Errno, Sysno};
 
 /// `MAX_RW_COUNT = INT_MAX & PAGE_MASK`.
@@ -69,13 +72,21 @@ pub fn dispatch<P: UserPages, C: Console>(
     let Some(sysno) = Sysno::new(number as usize) else {
         return Outcome::Return(error(Errno::ENOSYS));
     };
-    if NOT_IMPLEMENTED_BY_LINUX.binary_search(&number).is_ok() {
+    // Table holes and `sys_ni_syscall`, then the declared configuration's
+    // COND_SYSCALLs (`config::DECLARED`): all `-ENOSYS` in Linux too.
+    if NOT_IMPLEMENTED_BY_LINUX.binary_search(&number).is_ok()
+        || config::is_disabled_syscall(number)
+    {
         return Outcome::Return(error(Errno::ENOSYS));
     }
     match sysno {
         Sysno::write => Outcome::Return(write(pages, console, args[0], args[1], args[2])),
         Sysno::getpid => Outcome::Return(1),
         Sysno::exit | Sysno::exit_group => Outcome::Exit(exit_code(args[0])),
+        // shortcut: single-init only. A syscall Linux implements but this slice
+        // does not ends the kernel (explicitly, never as success or ENOSYS);
+        // with a second task this must become the real syscall or an error
+        // returned to that task, since a user must never be able to stop the kernel.
         _ => Outcome::Unimplemented(number),
     }
 }
@@ -208,6 +219,24 @@ mod tests {
         );
         assert_eq!(call(u64::MAX, &mut space, &mut sink), neg(Errno::ENOSYS));
         assert_eq!(sink.0, b"");
+    }
+
+    #[test]
+    fn declared_config_syscalls_are_enosys_not_unimplemented() {
+        let mut space = Space::default();
+        let mut sink = Sink::default();
+        for number in [
+            Sysno::rseq,
+            Sysno::map_shadow_stack,
+            Sysno::uretprobe,
+            Sysno::uprobe,
+        ] {
+            let outcome = dispatch(&mut space, &mut sink, number as u64, [0; 6]);
+            assert_eq!(outcome, neg(Errno::ENOSYS), "{number:?}");
+        }
+        // Everything else Linux implements still stops loudly.
+        let outcome = dispatch(&mut space, &mut sink, Sysno::mmap as u64, [0; 6]);
+        assert_eq!(outcome, Outcome::Unimplemented(9));
     }
 
     #[test]

@@ -9,4 +9,5 @@ pub mod args;
 pub mod find;
 pub mod plan;
 pub mod report;
+pub mod script;
 pub mod stack;

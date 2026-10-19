@@ -28,6 +28,20 @@ pub const SIGSEGV: u8 = 11;
 /// `panic("No working init found. ...")` after every candidate failed.
 pub const NO_INIT: &str = "Kernel panic - not syncing: No working init found.  Try passing init= option to kernel. See Linux Documentation/admin-guide/init.rst for guidance.";
 
+/// What Linux 6.18.57 prints, in order, when `init_eaccess("/init")` fails and
+/// `prepare_namespace` finds no root device (no `root=`): observed with the
+/// pinned reference kernel in QEMU, then `NO_ROOT_PANIC`. The reference kernel
+/// also lists its block filesystems after the last line; that list depends on
+/// the kernel configuration and this kernel has none, so it is omitted.
+pub const NO_ROOT: [&str; 4] = [
+    "check access for rdinit=/init failed: -2, ignoring",
+    "/dev/root: Can't open blockdev",
+    "VFS: Cannot open root device \"\" or unknown-block(0,0): error -6",
+    "Please append a correct \"root=\" boot option; here are the available partitions:",
+];
+pub const NO_ROOT_PANIC: &str =
+    "Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)";
+
 /// `pr_err("Failed to execute %s (error %d)\n")` for `/init`.
 pub struct ExecFailed(pub i32);
 impl fmt::Display for ExecFailed {

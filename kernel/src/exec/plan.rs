@@ -55,6 +55,8 @@ pub enum Unsupported {
     Overlap,
     BeyondEof,
     TooManyLoads,
+    /// A `#!` script whose interpreter exists in the rootfs.
+    Script,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
