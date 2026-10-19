@@ -1,0 +1,29 @@
+[package]
+name = "linux-rs-init"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version = "1.101"
+publish = false
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["freestanding"]
+
+[features]
+default = []
+freestanding = []
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+linux-rs-runtime = { version = "0.1.0", path = "../../rt" }
+syscalls = { version = "=0.8.1", default-features = false, features = ["x86_64"] }

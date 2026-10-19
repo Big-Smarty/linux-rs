@@ -21,7 +21,7 @@ const PROJECT_CARGO_CONFIG: &str = "[source.crates-io]\nreplace-with = \"vendore
 // The only vendored build scripts: (package directory, script path). Review them again on any bump.
 // proc-macro2/quote/serde_derive/syn come only through serde_core's never-active `cfg(any())`
 // edge, so they are locked and vendored but not built; their scripts are listed conservatively.
-const VENDOR_BUILD_SCRIPTS: [(&str, &str); 8] = [
+const VENDOR_BUILD_SCRIPTS: [(&str, &str); 9] = [
     ("const_fn-0.4.12", "build.rs"),
     ("rustversion-1.0.23", "build/build.rs"),
     ("proc-macro2-1.0.107", "build.rs"),
@@ -30,6 +30,8 @@ const VENDOR_BUILD_SCRIPTS: [(&str, &str); 8] = [
     ("serde_core-1.0.229", "build.rs"),
     ("serde_json-1.0.154", "build.rs"),
     ("zmij-1.0.23", "build.rs"),
+    // user/init only: prints rerun-if-changed and a thumb-mode cfg for ARM targets (read in full); no process, network or file access.
+    ("syscalls-0.8.1", "build.rs"),
 ];
 // The only proc-macro packages (host-executed at build time, or locked but unbuilt).
 const VENDOR_PROC_MACROS: [&str; 3] = [
@@ -866,13 +868,16 @@ fn collect_source_tree(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result
     Ok(())
 }
 
+/// Every workspace member whose source is bound to a build and shipped as corresponding source.
+pub(crate) const SOURCE_MEMBERS: [&str; 5] = ["kernel", "rt", "user/init", "xtask", "baremetal"];
+
 fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = vec![
         root.join("Cargo.toml"),
         root.join("Cargo.lock"),
         root.join("LICENSE"),
     ];
-    for directory in ["kernel", "xtask", "baremetal"] {
+    for directory in SOURCE_MEMBERS {
         collect_source_tree(&root.join(directory), &mut files)?;
     }
     // Optional: absent in a tree with no registry dependencies.
@@ -4369,8 +4374,8 @@ mod tests {
     #[test]
     fn source_binding_detects_bytes_additions_and_removals() -> io::Result<()> {
         let scratch = Scratch::new()?;
-        for directory in ["kernel", "xtask", "baremetal"] {
-            fs::create_dir(scratch.0.join(directory))?;
+        for directory in SOURCE_MEMBERS {
+            fs::create_dir_all(scratch.0.join(directory))?;
         }
         for file in [
             "Cargo.toml",
@@ -4378,6 +4383,8 @@ mod tests {
             "LICENSE",
             "kernel/main.rs",
             "xtask/package.rs",
+            "rt/lib.rs",
+            "user/init/main.rs",
         ] {
             fs::write(scratch.0.join(file), b"initial\n")?;
         }
@@ -4393,6 +4400,34 @@ mod tests {
         fs::remove_file(scratch.0.join("xtask/new-module.rs"))?;
         fs::remove_file(scratch.0.join("kernel/main.rs"))?;
         assert!(require_unchanged(&before, &snapshot()?).is_err());
+        fs::write(scratch.0.join("kernel/main.rs"), b"initial\n")?;
+        require_unchanged(&before, &snapshot()?)?;
+        // The kernel links rt, and user/init is a workspace member: edits must be seen.
+        for file in ["rt/lib.rs", "user/init/main.rs"] {
+            fs::write(scratch.0.join(file), b"modified\n")?;
+            assert!(require_unchanged(&before, &snapshot()?).is_err(), "{file}");
+            fs::write(scratch.0.join(file), b"initial\n")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_members_cover_every_workspace_member() -> io::Result<()> {
+        let manifest =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml"))?;
+        let members = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("members = ["))
+            .and_then(|rest| rest.strip_suffix(']'))
+            .ok_or_else(|| invalid("workspace members line not found"))?;
+        let mut declared = members
+            .split(',')
+            .map(|member| member.trim().trim_matches('"'))
+            .collect::<Vec<_>>();
+        declared.sort_unstable();
+        let mut bound = SOURCE_MEMBERS.to_vec();
+        bound.sort_unstable();
+        assert_eq!(declared, bound);
         Ok(())
     }
 

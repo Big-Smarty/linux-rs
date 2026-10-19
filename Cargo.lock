@@ -34,9 +34,22 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "linux-rs-runtime",
  "raw-cpuid",
  "x86_64",
 ]
+
+[[package]]
+name = "linux-rs-init"
+version = "0.1.0"
+dependencies = [
+ "linux-rs-runtime",
+ "syscalls",
+]
+
+[[package]]
+name = "linux-rs-runtime"
+version = "0.1.0"
 
 [[package]]
 name = "memchr"
@@ -129,6 +142,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "syscalls"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81c645a4de0d803ced6ef0388a2646aa1ef8467173b5d59a2c33c88de4ab76e7"
 
 [[package]]
 name = "unicode-ident"

@@ -15,8 +15,8 @@ required-features = ["freestanding"]
 
 [features]
 default = []
-freestanding = ["dep:x86_64", "dep:raw-cpuid"]
-qemu-self-test = ["freestanding"]
+freestanding = ["dep:x86_64", "dep:raw-cpuid", "dep:linux-rs-runtime"]
+qemu-self-test = ["freestanding", "linux-rs-runtime?/self-test"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -28,3 +28,4 @@ pedantic = { level = "warn", priority = -1 }
 [dependencies]
 raw-cpuid = { version = "=11.6.0", optional = true }
 x86_64 = { version = "=0.15.5", default-features = false, features = ["instructions"], optional = true }
+linux-rs-runtime = { version = "0.1.0", path = "../rt", optional = true }
