@@ -74,9 +74,9 @@ pub const DECLARED: [Declared; 9] = [
         enosys: &[],
     },
     Declared {
-        symbol: "CONFIG_IA32_EMULATION",
-        value: "y for AT_MINSIGSTKSZ (sigframe_ia32 sizing, needed to equal the oracle), but the compat entry points are NOT implemented: int $0x80 is #GP, SYSENTER and compat SYSCALL fail as with IA32_EMULATION=n",
-        source: "arch/x86/kernel/signal.c:181-185, arch/x86/kernel/idt.c:124-126, arch/x86/kernel/cpu/common.c:2230-2252",
+        symbol: "CONFIG_IA32_EMULATION=y with boot ia32_emulation=0",
+        value: "y (sigframe_ia32 sizing: AT_MINSIGSTKSZ 0x5a0 equals the oracle) but ia32_enabled() is false: no int $0x80 gate (#GP), no SYSENTER/compat SYSCALL entry (CSTAR -> -ENOSYS stub, SYSENTER MSRs zero)",
+        source: "arch/x86/kernel/signal.c:181-185, arch/x86/kernel/idt.c:124-126 and 233-239, arch/x86/kernel/cpu/common.c:2230-2252, arch/x86/include/asm/ia32.h:84",
         enosys: &[],
     },
 ];

@@ -96,6 +96,9 @@ pub enum Error {
     Pat,
     Paging,
     Stack,
+    /// CR4.OSXSAVE is set: XSAVE state (YMM upper halves) is not managed here
+    /// and would reach ring 3 uncleared.
+    Xsave,
     Cpu,
     Apic,
     TimerCounter,
@@ -136,6 +139,11 @@ pub fn validate() -> Result<(), Error> {
         || cr4.intersects(Cr4Flags::L5_PAGING | Cr4Flags::PAGE_GLOBAL | Cr4Flags::PCID)
     {
         return Err(Error::Paging);
+    }
+    // No XSAVE state management exists (`noxsave`): a loader that enabled it
+    // would leave YMM/ZMM upper state that ring 3 could read.
+    if cr4.contains(Cr4Flags::OSXSAVE) {
+        return Err(Error::Xsave);
     }
     let base = ptr::addr_of!(BOOT_STACK) as u64;
     if rsp < base + 4096 || rsp >= base + core::mem::size_of::<Stack>() as u64 {
@@ -1345,7 +1353,7 @@ pub unsafe fn enable_syscalls() -> Result<(), Error> {
             Msr::new(MSR_CSTAR).write(syscall32_ignore as *const () as u64);
         }
     }
-    // Linux `idt_syscall_init` (IA32_EMULATION=n branch): SYSENTER_CS/ESP/EIP
+    // Linux `idt_syscall_init` (`ia32_enabled()` false branch): SYSENTER_CS/ESP/EIP
     // are zeroed, so SYSENTER from ring 3 raises #GP and never enters ring 0
     // at a stale target left by firmware or the loader.
     if cpuid
@@ -1531,6 +1539,13 @@ pub unsafe fn init_user_fpu() -> Result<(), Error> {
     if !supported {
         return Err(Error::Cpu);
     }
+    // On AMD, EFER.FFXSR makes FXRSTOR at CPL0 skip the XMM registers, so
+    // firmware XMM values would survive into ring 3: clear it first.
+    // SAFETY: CPL0; `update` preserves every other EFER bit and FFXSR is
+    // only an optimisation of FXSAVE/FXRSTOR.
+    unsafe {
+        Efer::update(|flags| flags.remove(EferFlags::FAST_FXSAVE_FXRSTOR));
+    }
     // SAFETY: the CPUID bits above were checked; OSFXSR/OSXMMEXCPT are
     // reserved-free CR4 bits when FXSR/SSE exist; other bits are preserved.
     unsafe {
@@ -1560,4 +1575,15 @@ pub unsafe fn scrub_debug_registers() {
     Dr1::write(0);
     Dr2::write(0);
     Dr3::write(0);
+    // Linux `DR6_RESERVED`: the architectural reset value, with no stale
+    // status bits (BS, B0-B3...) left by firmware or the loader. The crate has
+    // no DR6 writer, and there is no intrinsic for `mov dr6`: one `asm!` site,
+    // CPL0 only, a single register input, no memory, stack or flags effect.
+    // SAFETY: CPL0; writing DR6 changes no execution state and no breakpoint
+    // is armed (DR7 was cleared above).
+    unsafe {
+        asm!("mov dr6, {}", in(reg) DR6_RESET, options(nomem, nostack, preserves_flags));
+    }
 }
+
+const DR6_RESET: u64 = 0xffff_0ff0;

@@ -42,7 +42,7 @@ use kernel::{
         script,
         stack::{self, ARG_PAGES, Aux, ENVP, EXPAND_PAGES, STACK_START, STACK_TOP, StackError},
     },
-    image::cpio::FileType,
+    image::{cpio::FileType, elf::Elf},
     sync::RawSpinLock,
     syscall::{self, Console, Outcome},
     usercopy,
@@ -232,6 +232,13 @@ fn check_executable(entry: &InitEntry) -> Result<(), Error> {
 /// `load_script`: `-ENOENT` when the interpreter is not in the rootfs (what
 /// `open_exec` returns), otherwise an explicit unsupported failure.
 fn script_failure(boot: &BootInfo, interpreter: &[u8]) -> Error {
+    interpreter_failure(boot, interpreter, Unsupported::Script)
+}
+
+/// The shared tail of `load_script` and `load_elf_binary`'s `PT_INTERP` scan:
+/// `open_exec(interpreter)` fails `-ENOENT` (or the access error) exactly as
+/// Linux does; an interpreter that exists is `unsupported`.
+fn interpreter_failure(boot: &BootInfo, interpreter: &[u8], unsupported: Unsupported) -> Error {
     if interpreter.is_empty() {
         return Error::Exec(Errno::ENOENT);
     }
@@ -239,7 +246,7 @@ fn script_failure(boot: &BootInfo, interpreter: &[u8]) -> Error {
         Ok(None) => Error::Exec(Errno::ENOENT),
         Ok(Some(entry)) => match check_executable(&entry) {
             Err(error) => error,
-            Ok(()) => Error::Load(LoadError::Unsupported(Unsupported::Script)),
+            Ok(()) => Error::Load(LoadError::Unsupported(unsupported)),
         },
         Err(error) => error,
     }
@@ -265,7 +272,18 @@ fn load_init(
         Ok(Some(interpreter)) => return Err(script_failure(boot, interpreter)),
         Ok(None) => {}
     }
-    let plan = LoadPlan::new(file)?;
+    let plan = match LoadPlan::new(file) {
+        Err(LoadError::Unsupported(Unsupported::Interpreter)) => {
+            // The plan checked the header and the `PT_INTERP` bytes (Linux
+            // order); the interpreter is now looked up in the archives.
+            let path = Elf::linux_x86_64(file)
+                .ok()
+                .and_then(|elf| elf.interpreter().ok().flatten())
+                .unwrap_or_default();
+            return Err(interpreter_failure(boot, path, Unsupported::Interpreter));
+        }
+        other => other?,
+    };
 
     for segment in plan.segments() {
         for page in 0..segment.pages() {

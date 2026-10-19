@@ -3623,7 +3623,7 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     if let Some(mode_line) = mode_line {
         positions.push(find.exact(mode_line, "init mode line")?);
     }
-    positions.extend(user_tail(&find, user)?);
+    positions.extend(user_tail(&find, user, init)?);
     if positions.windows(2).all(|pair| pair[0] < pair[1]) {
         Ok(())
     } else {
@@ -3631,8 +3631,47 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     }
 }
 
+/// `init[1]: segfault at 0 ip <ip> sp <sp> error 4 in init[<off>,<start>+<len>] likely on CPU 0
+/// (core 0, socket 0)` with the bracket bound to the ELF: `ip` lies in the page-rounded extent of
+/// an executable `PT_LOAD` (`print_vma_addr`), and `start`/`len` are exactly that extent.
+fn segfault_line_matches(line: &str, init: &fixture::ElfFacts) -> bool {
+    let Some(rest) = line.strip_prefix("init[1]: segfault at 0 ip ") else {
+        return false;
+    };
+    let Some((ip, rest)) = rest.split_once(" sp ") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once(" error 4 in init[") else {
+        return false;
+    };
+    let Some((bracket, tail)) = rest.split_once(']') else {
+        return false;
+    };
+    let parse = |text: &str| u64::from_str_radix(text, 16).ok();
+    let (Some(ip), Some((_, extent))) = (parse(ip), bracket.split_once(',')) else {
+        return false;
+    };
+    let Some((start, length)) = extent
+        .split_once('+')
+        .and_then(|(start, length)| Some((parse(start)?, parse(length)?)))
+    else {
+        return false;
+    };
+    tail == " likely on CPU 0 (core 0, socket 0)"
+        && init.executable_segments.iter().any(|&(vaddr, end)| {
+            let first = vaddr & !4095;
+            start == first
+                && length == end.next_multiple_of(4096) - first
+                && (start..start + length).contains(&ip)
+        })
+}
+
 /// The records after the summary line, by what init did.
-fn user_tail(find: &Finder<'_>, user: User) -> Result<Vec<usize>, String> {
+fn user_tail(
+    find: &Finder<'_>,
+    user: User,
+    init: &fixture::ElfFacts,
+) -> Result<Vec<usize>, String> {
     const DEATH: &str = "Kernel panic - not syncing: Attempted to kill init! exitcode=";
     Ok(match user {
         User::Ok { .. } => vec![
@@ -3643,11 +3682,7 @@ fn user_tail(find: &Finder<'_>, user: User) -> Result<Vec<usize>, String> {
         User::Segfault => vec![
             find.exact("init: faulting on purpose", "fault announcement")?,
             find.at(
-                &|line| {
-                    line.starts_with("init[1]: segfault at 0 ip 0000000000")
-                        && line.contains(" error 4 in init[")
-                        && line.ends_with("] likely on CPU 0 (core 0, socket 0)")
-                },
+                &|line| segfault_line_matches(line, init),
                 "Linux segfault line",
             )?,
             find.exact(&format!("{DEATH}0x0000000b"), "init death panic")?,
@@ -5420,7 +5455,7 @@ mod tests {
         fixture::Expected {
             archive_counts: COUNTS.to_owned(),
             init: fixture::ElfFacts {
-                executable_segments: Vec::new(),
+                executable_segments: vec![(0x20_47b0, 0x20_c000)],
                 loads: 2,
                 interpreters: 0,
                 dynamics: 0,
@@ -5669,6 +5704,20 @@ mod tests {
             )
             .0
         );
+        // The VMA bracket is bound to the ELF's executable segment.
+        for wrong in [
+            "init[4a27,204000+7000]",
+            "init[4a27,203000+9000]",
+            "init[4a27,204000+8000",
+        ] {
+            let bad = serial.replace("init[4a27,204000+8000]", wrong);
+            assert!(
+                !validate(case("init-segfault"), &exit(35), &bad).0,
+                "{wrong}"
+            );
+        }
+        let outside = serial.replace("ip 0000000000205a27", "ip 0000000000300000");
+        assert!(!validate(case("init-segfault"), &exit(35), &outside).0);
         assert!(
             !validate(
                 case("init-segfault"),
