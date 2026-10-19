@@ -987,13 +987,22 @@ fn reject_build_overrides(root: &Path) -> io::Result<()> {
             )));
         }
     }
+    reject_inherited_cargo_config(root)
+}
+
+// Cargo merges every `.cargo/config*` from the working directory upwards. The only
+// one accepted is the reviewed host source replacement, byte-identical, at the
+// root or in an enclosing checkout (e.g. a worktree nested under the main checkout's
+// `target/`). That is safe: its relative `directory = "vendor"` resolves against
+// the file's own directory, the deeper (root) config takes precedence for the same
+// keys, and build-std builds override `crates-io` with the per-run `--config`
+// file anyway. Anything else, including a legacy `.cargo/config`, is rejected.
+fn reject_inherited_cargo_config(root: &Path) -> io::Result<()> {
     for directory in root.ancestors() {
         for name in [".cargo/config", ".cargo/config.toml"] {
             let config = directory.join(name);
             match fs::symlink_metadata(&config) {
-                Ok(metadata)
-                    if metadata.is_file() && directory == root && name == ".cargo/config.toml" =>
-                {
+                Ok(metadata) if metadata.is_file() && name == ".cargo/config.toml" => {
                     let text = fs::read(&config).map_err(|error| contextual(&config, &error))?;
                     if text != PROJECT_CARGO_CONFIG.as_bytes() {
                         return Err(invalid(format!(
@@ -4266,6 +4275,27 @@ mod tests {
         fs::remove_file(scratch.0.join("xtask/new-module.rs"))?;
         fs::remove_file(scratch.0.join("kernel/main.rs"))?;
         assert!(require_unchanged(&before, &snapshot()?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn enclosing_checkout_config_is_accepted_only_when_identical() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let outer = &scratch.0;
+        let root = outer.join("target/worktrees/inner");
+        fs::create_dir_all(root.join(".cargo"))?;
+        fs::create_dir_all(outer.join(".cargo"))?;
+        fs::write(root.join(".cargo/config.toml"), PROJECT_CARGO_CONFIG)?;
+        fs::write(outer.join(".cargo/config.toml"), PROJECT_CARGO_CONFIG)?;
+        reject_inherited_cargo_config(&root)?;
+        fs::write(
+            outer.join(".cargo/config.toml"),
+            "[build]\nrustflags = []\n",
+        )?;
+        assert!(reject_inherited_cargo_config(&root).is_err());
+        fs::remove_file(outer.join(".cargo/config.toml"))?;
+        fs::write(outer.join(".cargo/config"), PROJECT_CARGO_CONFIG)?;
+        assert!(reject_inherited_cargo_config(&root).is_err());
         Ok(())
     }
 

@@ -530,7 +530,10 @@ unsafe fn install_idt() {
             _ => None,
         };
         // SAFETY: every handler is one of our entry stubs, which obey the CPU
-        // interrupt-gate contract (documented at the entry macro); set_handler_addr
+        // interrupt-gate contract (documented at the entry macro). The gates are
+        // typed `Entry<HandlerFunc>` although the error-code vectors point at naked
+        // stubs with a different signature: only the address is stored, the type
+        // parameter is a phantom and never used to call the handler. set_handler_addr
         // copies the CS loaded above, a valid 64-bit kernel code selector. IST slots
         // 0..=2 name the TSS stacks initialized above.
         unsafe {
