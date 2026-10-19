@@ -16,7 +16,7 @@ M1 is underway, not complete; no physical boot, full Linux compatibility or perf
 | [Architecture](architecture.md) | Accepted modular monolithic direction, bounded bootstrap, ownership/unsafe contexts and remaining full-scope design |
 | [Definition of done](definition-of-done.md) | Exhaustive per-unit, subsystem, milestone and full-kernel closure requirements; standing completion rule |
 | [Packaging](packaging.md) | Separate storage-free diagnostic handoff versus Linux-replacement prerequisites, actual boot formats and user-controlled recovery |
-| [Roadmap](roadmap.md) | Dependency-ordered M0–M8 work packages and correctness, performance, and physical-hardware exit gates |
+| [Roadmap](roadmap.md) | Complete porting program: idiomatic Rust architecture and abstractions, crate strategy, M0–M8 work packages with correctness/performance/physical exit gates, coverage map and risks |
 | [Decisions](decisions.md) | Original and later approved requirements, distinct engineering choices, unresolved blockers and change discipline |
 | [Compatibility](compatibility.md) | Exact Linux behavioral boundary, userspace ABI and configuration semantics |
 | [Coverage](coverage.md) | Pinned upstream inventory, longest-prefix routing, scope gaps, and limits of structural coverage |
