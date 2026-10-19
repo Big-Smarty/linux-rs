@@ -28,11 +28,21 @@ fn parse_error(error: &elf::ParseError) -> io::Error {
 pub(crate) struct ElfFacts {
     /// `[start, end)` virtual ranges of non-empty executable `PT_LOAD` segments.
     pub(crate) executable_segments: Vec<(u64, u64)>,
+    /// `[start, end)` file-backed extents (`p_vaddr..p_vaddr + p_filesz`) of the same segments:
+    /// what `print_vma_addr` reports, since the bss tail is an anonymous mapping.
+    pub(crate) executable_file_extents: Vec<(u64, u64)>,
     pub(crate) loads: u64,
     pub(crate) interpreters: u64,
     pub(crate) dynamics: u64,
     /// Undefined entries of `.symtab` (the mandatory null symbol excluded); 0 without one.
     pub(crate) undefined_symbols: u64,
+    /// `e_entry`, which the kernel reports as `AT_ENTRY`.
+    pub(crate) entry: u64,
+    /// `e_phnum`, `AT_PHNUM`.
+    pub(crate) phnum: u16,
+    /// `AT_PHDR`: the virtual address at which the segment containing `e_phoff` maps the
+    /// program-header table (`load_elf_binary`), 0 when no segment does.
+    pub(crate) phdr: u64,
 }
 
 pub(crate) fn elf_facts(bytes: &[u8]) -> io::Result<ElfFacts> {
@@ -47,14 +57,23 @@ pub(crate) fn elf_facts(bytes: &[u8]) -> io::Result<ElfFacts> {
     }
     let mut facts = ElfFacts {
         executable_segments: Vec::new(),
+        executable_file_extents: Vec::new(),
         loads: 0,
         interpreters: 0,
         dynamics: 0,
         undefined_symbols: 0,
+        entry: header.e_entry,
+        phnum: header.e_phnum,
+        phdr: 0,
     };
     for program in file.segments().into_iter().flatten() {
         match program.p_type {
             abi::PT_LOAD => {
+                if program.p_offset <= header.e_phoff
+                    && header.e_phoff < program.p_offset.wrapping_add(program.p_filesz)
+                {
+                    facts.phdr = (header.e_phoff - program.p_offset).wrapping_add(program.p_vaddr);
+                }
                 if program.p_filesz > program.p_memsz {
                     return Err(invalid("PT_LOAD file size exceeds its memory size"));
                 }
@@ -65,6 +84,9 @@ pub(crate) fn elf_facts(bytes: &[u8]) -> io::Result<ElfFacts> {
                 facts.loads += 1;
                 if program.p_flags & abi::PF_X != 0 && program.p_memsz > 0 {
                     facts.executable_segments.push((program.p_vaddr, end));
+                    facts
+                        .executable_file_extents
+                        .push((program.p_vaddr, program.p_vaddr + program.p_filesz));
                 }
             }
             abi::PT_INTERP => facts.interpreters += 1,
@@ -100,6 +122,35 @@ pub(crate) fn initramfs(init: &[u8]) -> io::Result<Vec<u8>> {
             .into_iter()
             .map(|(builder, data)| (builder, Cursor::new(data))),
         Vec::new(),
+    )
+}
+
+/// A deterministic newc archive without any `/init`: the kernel must end the boot the way Linux does
+/// when `rdinit=/init` fails and no root device is configured.
+pub(crate) fn initramfs_without_init() -> io::Result<Vec<u8>> {
+    write_cpio(
+        [(
+            NewcBuilder::new("dev").mode(0o040_755).nlink(2),
+            Cursor::new(&b""[..]),
+        )]
+        .into_iter(),
+        Vec::new(),
+    )
+}
+
+/// What the kernel must report for the generated archive and run `/init` (qemu64 constants).
+pub(crate) struct Expected {
+    pub(crate) archive_counts: String,
+    pub(crate) init: ElfFacts,
+}
+
+/// The summary line `user/init` prints for the pinned reference kernel, with the kernel's own
+/// `vdso=0`, no-RSEQ configuration under `-cpu qemu64`: the oracle line minus its two `AT_RSEQ_*`
+/// entries, with this binary's `AT_PHDR`/`AT_PHNUM`/`AT_ENTRY`. `argc` counts `/init` itself.
+pub(crate) fn init_summary(init: &ElfFacts, argc: usize) -> String {
+    format!(
+        "init: argc={argc} argv0=/init pid=1 rsp_mod16=0 auxv=AT_MINSIGSTKSZ:0x5a0,AT_HWCAP:0x78bfbfd,AT_PAGESZ:0x1000,AT_CLKTCK:0x64,AT_PHDR:{:#x},AT_PHENT:0x38,AT_PHNUM:{:#x},AT_BASE:0x0,AT_FLAGS:0x0,AT_ENTRY:{:#x},AT_UID:0x0,AT_EUID:0x0,AT_GID:0x0,AT_EGID:0x0,AT_SECURE:0x0,AT_RANDOM:*,AT_HWCAP2:0x0,AT_EXECFN:*,AT_PLATFORM:* execfn=/init platform=x86_64 envp=HOME=/,TERM=linux",
+        init.phdr, init.phnum, init.entry
     )
 }
 
@@ -245,6 +296,7 @@ mod tests {
             (1, 1, 0)
         );
         assert_eq!(facts.executable_segments, [(0x20_0000, 0x20_0020)]);
+        assert_eq!(facts.executable_file_extents, [(0x20_0000, 0x20_0010)]);
         assert!(
             elf_facts(&synthetic_elf(&[(1, 5, 0, 0, 0)], 3)).is_err(),
             "not x86-64"

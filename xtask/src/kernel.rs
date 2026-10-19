@@ -120,6 +120,8 @@ enum Module {
     Corrupt,
     /// A genuinely zero-byte module.
     Empty,
+    /// A valid archive with no `/init`.
+    NoInit,
 }
 
 impl Module {
@@ -128,11 +130,13 @@ impl Module {
             Self::Archive => "initramfs.cpio",
             Self::Corrupt => "initramfs-corrupt.cpio",
             Self::Empty => "initramfs-empty.cpio",
+            Self::NoInit => "initramfs-noinit.cpio",
         }
     }
 }
 
 const ARCHIVE_ONLY: &[Module] = &[Module::Archive];
+const NO_INIT_ONLY: &[Module] = &[Module::NoInit];
 const EMPTY_MODULE_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const EMPTY_MODULE_COUNTS: &str = "reserved=4096 bytes=0 records=0 files=0 regular=0 symlinks=0 trailers=0 skipped=0 elf=0 loads=0 interpreters=0 execution=false rootfs=false";
@@ -146,6 +150,30 @@ fn module_epoch_record(modules: usize) -> String {
     )
 }
 
+/// What the guest's `/init` must have done, checked by [`validate_userspace`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum User {
+    /// Never reached, or not asserted for this case.
+    None,
+    /// Runs to `init: ok` and `exit_group(0)`; the kernel then reports its death panic.
+    Ok {
+        /// `argc` as the init prints it (`/init` plus the words after `--`).
+        argc: usize,
+        /// The mode line the init prints before `init: ok`.
+        mode_line: Option<&'static str>,
+        /// Whether the whole summary line is compared (needs the `qemu64` constants).
+        exact_summary: bool,
+        /// CR4.SMEP / CR4.SMAP the kernel must report.
+        protection: (bool, bool),
+    },
+    /// Reads address 0 (`-- fault`): SIGSEGV kills init, exit code 0xb.
+    Segfault,
+    /// Calls `mmap`, which Linux implements and this slice does not: the kernel stops.
+    Unimplemented,
+    /// No `/init` in any archive: Linux's `prepare_namespace` failure text.
+    NoRoot,
+}
+
 #[derive(Clone, Copy)]
 struct DebugCase {
     name: &'static str,
@@ -155,7 +183,15 @@ struct DebugCase {
     required: &'static [&'static str],
     forbid_success: bool,
     modules: &'static [Module],
+    user: User,
 }
+
+const INIT_OK: User = User::Ok {
+    argc: 1,
+    mode_line: None,
+    exact_summary: true,
+    protection: (false, false),
+};
 
 const BUDDY_ORDER_RECORD: &str = "CHECK buddy-orders ok max_order=10 contiguous=true zeroed=true split=true coalesced=true fragmented=true aligned=131072 rollback=true";
 const IRQ_GUARD_RECORD: &str = "CHECK irq-guard ok nested=2 out_of_order=true saved_on=true saved_off=true exclusive=true blocked_wraps=2 blocked_delta=0 resumed=true";
@@ -183,7 +219,7 @@ const SUCCESS_MARKERS: &[&str] = &[
     "RESULT success",
 ];
 
-const DEBUG_CASES: [DebugCase; 12] = [
+const DEBUG_CASES: [DebugCase; 18] = [
     DebugCase {
         name: "success",
         cmdline: None,
@@ -192,6 +228,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: SUCCESS_MARKERS,
         forbid_success: false,
         modules: ARCHIVE_ONLY,
+        user: INIT_OK,
     },
     DebugCase {
         name: "panic",
@@ -201,6 +238,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: &["FAIL panic", "controlled panic case"],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
+        user: User::None,
     },
     DebugCase {
         name: "unexpected-fault",
@@ -210,6 +248,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: &["FAIL trap vector=6"],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
+        user: User::None,
     },
     DebugCase {
         name: "bad-map",
@@ -219,6 +258,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: &["EXPECTED failure bad-map rejected overflow"],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
+        user: User::None,
     },
     DebugCase {
         name: "cpu-without-pat",
@@ -228,6 +268,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: &["FAIL cpu error=Pat"],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
+        user: User::None,
     },
     DebugCase {
         name: "unexpected-breakpoint",
@@ -237,6 +278,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: &["FAIL trap vector=3"],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
+        user: User::None,
     },
     DebugCase {
         name: "unexpected-interrupt",
@@ -246,6 +288,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: &["FAIL trap vector=unknown-external"],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
+        user: User::None,
     },
     DebugCase {
         name: "unmasked-timer",
@@ -255,6 +298,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: &["FAIL assertion=timer-mask"],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
+        user: User::None,
     },
     DebugCase {
         name: "irq-restore-early",
@@ -264,6 +308,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: &["FAIL irq-guard error=InterruptGuard"],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
+        user: User::None,
     },
     DebugCase {
         name: "unexpected-page-fault",
@@ -273,6 +318,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: &["FAIL trap vector=14 error=0x0"],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
+        user: User::None,
     },
     DebugCase {
         name: "empty-module",
@@ -282,6 +328,7 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: SUCCESS_MARKERS,
         forbid_success: false,
         modules: &[Module::Archive, Module::Empty],
+        user: INIT_OK,
     },
     DebugCase {
         name: "bad-module",
@@ -291,6 +338,89 @@ const DEBUG_CASES: [DebugCase; 12] = [
         required: SUCCESS_MARKERS,
         forbid_success: false,
         modules: &[Module::Corrupt, Module::Archive],
+        user: INIT_OK,
+    },
+    DebugCase {
+        name: "init-segfault",
+        cmdline: Some("-- fault"),
+        cpu: "qemu64",
+        expected_exit: 35,
+        required: &[
+            "init: faulting on purpose",
+            "Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b",
+            "FAIL init exitcode=0x0000000b",
+        ],
+        forbid_success: true,
+        modules: ARCHIVE_ONLY,
+        user: User::Segfault,
+    },
+    DebugCase {
+        name: "no-init",
+        cmdline: None,
+        cpu: "qemu64",
+        expected_exit: 35,
+        required: &[
+            "Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)",
+            "FAIL no-root",
+        ],
+        forbid_success: true,
+        modules: NO_INIT_ONLY,
+        user: User::NoRoot,
+    },
+    DebugCase {
+        name: "unimplemented-syscall",
+        cmdline: Some("-- mmap"),
+        cpu: "qemu64",
+        expected_exit: 35,
+        required: &["init: calling mmap", "FAIL syscall unimplemented nr=9"],
+        forbid_success: true,
+        modules: ARCHIVE_ONLY,
+        user: User::Unimplemented,
+    },
+    DebugCase {
+        name: "sse",
+        cmdline: Some("-- sse"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some("init: sse ok"),
+            exact_summary: true,
+            protection: (false, false),
+        },
+    },
+    DebugCase {
+        name: "rseq",
+        cmdline: Some("-- rseq"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some("init: rseq enosys"),
+            exact_summary: true,
+            protection: (false, false),
+        },
+    },
+    DebugCase {
+        name: "cpu-max",
+        cmdline: Some("-- sse"),
+        cpu: "max",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some("init: sse ok"),
+            exact_summary: false,
+            protection: (true, true),
+        },
     },
 ];
 
@@ -2659,8 +2789,9 @@ struct Fixtures {
     dir: PathBuf,
     archive_sha256: String,
     corrupt_sha256: String,
-    /// The `CHECK image inspected` tail the generated archive must produce, by construction.
-    archive_counts: String,
+    noinit_sha256: String,
+    /// What the kernel must report for the generated archive and the built `/init`, by construction.
+    expected: fixture::Expected,
 }
 
 impl Fixtures {
@@ -2678,7 +2809,11 @@ impl Fixtures {
         Ok(Self {
             archive_sha256: write(Module::Archive, &archive)?,
             corrupt_sha256: write(Module::Corrupt, fixture::CORRUPT_MODULE)?,
-            archive_counts: fixture::archive_counts(archive.len(), &facts),
+            noinit_sha256: write(Module::NoInit, &fixture::initramfs_without_init()?)?,
+            expected: fixture::Expected {
+                archive_counts: fixture::archive_counts(archive.len(), &facts),
+                init: facts,
+            },
             dir,
         })
     }
@@ -2687,6 +2822,7 @@ impl Fixtures {
         match module {
             Module::Archive => &self.archive_sha256,
             Module::Corrupt => &self.corrupt_sha256,
+            Module::NoInit => &self.noinit_sha256,
             Module::Empty => EMPTY_MODULE_SHA256,
         }
     }
@@ -3080,7 +3216,7 @@ fn run_debug_case(
     command.args(&args).current_dir(root).stdin(Stdio::null());
     let process = run_with_logs(&mut command, &stdout, &stderr, timeout)?;
     let (markers_match, mut diagnostic) = match read_serial_log(&case_dir.join("serial.log")) {
-        Ok(serial) => validate_debug_case(case, &process, &serial, &tools.fixtures.archive_counts),
+        Ok(serial) => validate_debug_case(case, &process, &serial, &tools.fixtures.expected),
         Err(error) => (false, format!("unusable serial log: {error}")),
     };
     let disk_final = file_hash(root, &tools.sha256sum.path, &boot_image.disk)?;
@@ -3273,7 +3409,7 @@ fn validate_debug_case(
     case: DebugCase,
     process: &ProcessResult,
     serial: &str,
-    archive_counts: &str,
+    expected: &fixture::Expected,
 ) -> (bool, String) {
     if process.timed_out {
         return (false, "QEMU timed out; timeout is never a pass".to_owned());
@@ -3308,8 +3444,12 @@ fn validate_debug_case(
         );
     }
     if !case.forbid_success
-        && let Err(diagnostic) = validate_success_serial(&lines, case.modules, archive_counts)
+        && let Err(diagnostic) =
+            validate_success_serial(&lines, case.modules, &expected.archive_counts)
     {
+        return (false, diagnostic);
+    }
+    if let Err(diagnostic) = validate_userspace(&lines, case.user, &expected.init) {
         return (false, diagnostic);
     }
     if case.name == "unmasked-timer" {
@@ -3363,6 +3503,201 @@ fn validate_debug_case(
         true,
         "expected QEMU exit and serial assertions matched".to_owned(),
     )
+}
+
+/// Linux 6.18.57 with no `/init` and no root device (observed on the pinned reference kernel).
+fn validate_no_root(lines: &[&str]) -> Result<(), String> {
+    let mut previous = None;
+    for (record, what) in [
+        (
+            "check access for rdinit=/init failed: -2, ignoring",
+            "rdinit warning",
+        ),
+        ("/dev/root: Can't open blockdev", "blockdev line"),
+        (
+            "VFS: Cannot open root device \"\" or unknown-block(0,0): error -6",
+            "root device line",
+        ),
+        (
+            "Please append a correct \"root=\" boot option; here are the available partitions:",
+            "partition prompt",
+        ),
+        (
+            "Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)",
+            "VFS panic",
+        ),
+        ("FAIL no-root", "failure marker"),
+    ] {
+        let mut found = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == record);
+        let (position, _) = found.next().ok_or_else(|| format!("missing {what}"))?;
+        if found.next().is_some() || previous.is_some_and(|earlier| position <= earlier) {
+            return Err(format!("{what} duplicated or out of order"));
+        }
+        previous = Some(position);
+    }
+    if lines
+        .iter()
+        .any(|line| line.starts_with("Run /init") || line.starts_with("CHECK userspace exec"))
+    {
+        return Err("a boot without /init must not run one".to_owned());
+    }
+    Ok(())
+}
+
+/// Serial records located by predicate, each exactly once.
+struct Finder<'a> {
+    lines: &'a [&'a str],
+}
+
+impl Finder<'_> {
+    fn at(&self, wanted: &dyn Fn(&str) -> bool, what: &str) -> Result<usize, String> {
+        let mut found = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| wanted(line));
+        let (position, _) = found.next().ok_or_else(|| format!("missing {what}"))?;
+        if found.next().is_some() {
+            return Err(format!("{what} appears more than once"));
+        }
+        Ok(position)
+    }
+
+    fn exact(&self, text: &str, what: &str) -> Result<usize, String> {
+        self.at(&|line| line == text, what)
+    }
+}
+
+/// The records one run of the generated `/init` must produce, in order and exactly once.
+fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> Result<(), String> {
+    let find = Finder { lines };
+    let (argc, mode_line, exact_summary, (execute_protection, access_protection)) = match user {
+        User::None => return Ok(()),
+        User::NoRoot => return validate_no_root(lines),
+        User::Ok {
+            argc,
+            mode_line,
+            exact_summary,
+            protection,
+        } => (argc, mode_line, exact_summary, protection),
+        User::Segfault | User::Unimplemented => (2, None, true, (false, false)),
+    };
+    let audit = find.at(
+        &|line| line.starts_with("CHECK userspace-audit ok user_pages="),
+        "isolation audit",
+    )?;
+    if !lines[audit].ends_with("kernel_user_bits=0 above_task_size=0") {
+        return Err("isolation audit reported a user bit in the kernel half".to_owned());
+    }
+    let exec_prefix = format!(
+        "CHECK userspace exec path=/init entry={:#x} loads={} sp=0x7fffffff",
+        init.entry, init.loads
+    );
+    let exec_suffix = format!(" smep={execute_protection} smap={access_protection}");
+    let summary = fixture::init_summary(init, argc);
+    let summary_prefix = format!(
+        "init: argc={argc} argv0=/init pid=1 rsp_mod16=0 auxv=AT_MINSIGSTKSZ:0x5a0,AT_HWCAP:"
+    );
+    let mut positions = vec![
+        audit,
+        find.exact("Run /init as init process", "Run /init line")?,
+        find.at(
+            &|line| line.starts_with(&exec_prefix) && line.ends_with(&exec_suffix),
+            "userspace exec record",
+        )?,
+        find.exact("init: hello from userspace", "init's first line")?,
+        find.at(
+            &|line| {
+                if exact_summary {
+                    line == summary
+                } else {
+                    line.starts_with(&summary_prefix)
+                }
+            },
+            "init summary line",
+        )?,
+    ];
+    if let Some(mode_line) = mode_line {
+        positions.push(find.exact(mode_line, "init mode line")?);
+    }
+    positions.extend(user_tail(&find, user, init)?);
+    if positions.windows(2).all(|pair| pair[0] < pair[1]) {
+        Ok(())
+    } else {
+        Err("userspace records are out of order".to_owned())
+    }
+}
+
+/// `init[1]: segfault at 0 ip <ip> sp <sp> error 4 in init[<off>,<start>+<len>] likely on CPU 0
+/// (core 0, socket 0)` with the bracket bound to the ELF: `ip` lies in the page-rounded extent of
+/// an executable `PT_LOAD`'s file-backed extent (page-rounded `p_vaddr..p_vaddr + p_filesz`, as
+/// `print_vma_addr` reports; the bss tail is anonymous), and `start`/`len` are exactly that extent.
+fn segfault_line_matches(line: &str, init: &fixture::ElfFacts) -> bool {
+    let Some(rest) = line.strip_prefix("init[1]: segfault at 0 ip ") else {
+        return false;
+    };
+    let Some((ip, rest)) = rest.split_once(" sp ") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once(" error 4 in init[") else {
+        return false;
+    };
+    let Some((bracket, tail)) = rest.split_once(']') else {
+        return false;
+    };
+    let parse = |text: &str| u64::from_str_radix(text, 16).ok();
+    let (Some(ip), Some((_, extent))) = (parse(ip), bracket.split_once(',')) else {
+        return false;
+    };
+    let Some((start, length)) = extent
+        .split_once('+')
+        .and_then(|(start, length)| Some((parse(start)?, parse(length)?)))
+    else {
+        return false;
+    };
+    tail == " likely on CPU 0 (core 0, socket 0)"
+        && init.executable_file_extents.iter().any(|&(vaddr, end)| {
+            let first = vaddr & !4095;
+            start == first
+                && length == end.next_multiple_of(4096) - first
+                && (start..start + length).contains(&ip)
+        })
+}
+
+/// The records after the summary line, by what init did.
+fn user_tail(
+    find: &Finder<'_>,
+    user: User,
+    init: &fixture::ElfFacts,
+) -> Result<Vec<usize>, String> {
+    const DEATH: &str = "Kernel panic - not syncing: Attempted to kill init! exitcode=";
+    Ok(match user {
+        User::Ok { .. } => vec![
+            find.exact("init: ok", "init: ok")?,
+            find.exact(&format!("{DEATH}0x00000000"), "init death panic")?,
+            find.exact("RESULT success", "RESULT success")?,
+        ],
+        User::Segfault => vec![
+            find.exact("init: faulting on purpose", "fault announcement")?,
+            find.at(
+                &|line| segfault_line_matches(line, init),
+                "Linux segfault line",
+            )?,
+            find.exact(&format!("{DEATH}0x0000000b"), "init death panic")?,
+            find.exact("FAIL init exitcode=0x0000000b", "failure marker")?,
+        ],
+        User::Unimplemented => vec![
+            find.exact("init: calling mmap", "mmap announcement")?,
+            find.exact(
+                "FAIL syscall unimplemented nr=9",
+                "unimplemented-syscall stop",
+            )?,
+        ],
+        User::None | User::NoRoot => Vec::new(),
+    })
 }
 
 fn observed_irq_restore(lines: &[&str], acquired: bool) -> bool {
@@ -3665,7 +4000,17 @@ fn record_fixtures(
     manifest_value(
         values,
         "expected_image_record",
-        fixtures.archive_counts.clone(),
+        fixtures.expected.archive_counts.clone(),
+    );
+    manifest_value(
+        values,
+        "sha256_fixture_noinit_archive",
+        fixtures.noinit_sha256.clone(),
+    );
+    manifest_value(
+        values,
+        "expected_init_summary",
+        fixture::init_summary(&fixtures.expected.init, 1),
     );
     Ok(())
 }
@@ -4396,6 +4741,7 @@ fn capture_default_framebuffer(
             required: &[],
             forbid_success: false,
             modules: ARCHIVE_ONLY,
+            user: User::None,
         },
         tools,
     )?;
@@ -5106,8 +5452,25 @@ mod tests {
     // What the kernel prints for a generated archive; `physical=` varies per module.
     const COUNTS: &str = "reserved=8192 bytes=4500 records=4 files=3 regular=1 symlinks=1 trailers=1 skipped=0 elf=1 loads=2 interpreters=0 execution=false rootfs=false";
 
+    fn expected() -> fixture::Expected {
+        fixture::Expected {
+            archive_counts: COUNTS.to_owned(),
+            init: fixture::ElfFacts {
+                executable_segments: vec![(0x20_47b0, 0x20_c000)],
+                executable_file_extents: vec![(0x20_47b0, 0x20_c000)],
+                loads: 2,
+                interpreters: 0,
+                dynamics: 0,
+                undefined_symbols: 0,
+                entry: 0x20_4800,
+                phnum: 6,
+                phdr: 0x20_0040,
+            },
+        }
+    }
+
     fn validate(case: DebugCase, process: &ProcessResult, serial: &str) -> (bool, String) {
-        validate_debug_case(case, process, serial, COUNTS)
+        validate_debug_case(case, process, serial, &expected())
     }
 
     fn case(name: &str) -> DebugCase {
@@ -5124,6 +5487,7 @@ mod tests {
                     Module::Archive => format!("CHECK image inspected module={index} physical={physical:#x} {COUNTS}"),
                     Module::Empty => format!("CHECK image inspected module={index} physical={physical:#x} {EMPTY_MODULE_COUNTS}"),
                     Module::Corrupt => format!("WARN Initramfs unpacking failed: module={index} {CORRUPT_MODULE_WARNING}"),
+                    Module::NoInit => unreachable!("only negative cases boot without /init"),
                 }
             })
             .collect::<Vec<_>>()
@@ -5218,6 +5582,202 @@ mod tests {
         );
     }
 
+    fn exit(code: i32) -> ProcessResult {
+        ProcessResult {
+            exit_code: Some(code),
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn userspace_records_are_required_exactly_once_and_in_order() {
+        let serial = success_serial();
+        let ok = exit(33);
+        assert!(validate(case("success"), &ok, &serial).0);
+        let summary = fixture::init_summary(&expected().init, 1);
+        for (what, bad) in [
+            ("missing summary", serial.replace(&summary, "")),
+            (
+                "wrong AT_ENTRY",
+                serial.replace("AT_ENTRY:0x204800", "AT_ENTRY:0x204801"),
+            ),
+            (
+                "RSEQ auxv present",
+                serial.replace("AT_PLATFORM:*", "AT_PLATFORM:*,AT_RSEQ_ALIGN:0x20"),
+            ),
+            ("wrong hwcap", serial.replace("0x78bfbfd", "0x178bfbff")),
+            (
+                "stack below the user range",
+                serial.replace("sp=0x7fffffffee40 smep", "sp=0x1000 smep"),
+            ),
+            (
+                "protection mismatch",
+                serial.replace("smep=false smap=false", "smep=true smap=true"),
+            ),
+            (
+                "no death panic",
+                serial.replace(
+                    "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
+                    "",
+                ),
+            ),
+            (
+                "wrong exit code",
+                serial.replace("exitcode=0x00000000", "exitcode=0x00000100"),
+            ),
+            (
+                "audit found user bits",
+                serial.replace("kernel_user_bits=0", "kernel_user_bits=3"),
+            ),
+            ("no hello", serial.replace("init: hello from userspace", "")),
+            (
+                "Run line after the exec record",
+                serial.replace("Run /init as init process\n", "").replace(
+                    "init: hello from userspace",
+                    "Run /init as init process\ninit: hello from userspace",
+                ),
+            ),
+            (
+                "duplicate init: ok",
+                serial.replace("init: ok", "init: ok\ninit: ok"),
+            ),
+        ] {
+            assert!(!validate(case("success"), &ok, &bad).0, "{what}");
+        }
+    }
+
+    #[test]
+    fn userspace_modes_require_their_own_records() {
+        let base = success_serial();
+        // sse and rseq: argc=2 summary plus the mode line before `init: ok`.
+        for (name, line) in [("sse", "init: sse ok"), ("rseq", "init: rseq enosys")] {
+            let serial = base
+                .replace("argc=1", "argc=2")
+                .replace("\ninit: ok", &format!("\n{line}\ninit: ok"));
+            assert!(validate(case(name), &exit(33), &serial).0, "{name}");
+            assert!(
+                !validate(case(name), &exit(33), &serial.replace(line, "")).0,
+                "{name}"
+            );
+            assert!(
+                !validate(case("success"), &exit(33), &serial).0,
+                "argc=1 expected"
+            );
+        }
+        // cpu-max: protection must be reported on, the summary only by prefix.
+        let max = base
+            .replace("argc=1", "argc=2")
+            .replace("AT_HWCAP:0x78bfbfd", "AT_HWCAP:0xfcbfbfd")
+            .replace("smep=false smap=false", "smep=true smap=true")
+            .replace("\ninit: ok", "\ninit: sse ok\ninit: ok");
+        assert!(validate(case("cpu-max"), &exit(33), &max).0);
+        assert!(
+            !validate(
+                case("cpu-max"),
+                &exit(33),
+                &max.replace("smap=true", "smap=false")
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn failing_init_cases_require_linux_text_and_no_success() {
+        let prefix = success_serial()
+            .split("\nRESULT success")
+            .next()
+            .unwrap()
+            .replace("argc=1", "argc=2")
+            .replace(
+                "\ninit: ok\nKernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
+                "",
+            );
+        let segfault = format!(
+            "{prefix}\ninit: faulting on purpose\ninit[1]: segfault at 0 ip 0000000000205a27 sp 00007fffffffedd0 error 4 in init[4a27,204000+8000] likely on CPU 0 (core 0, socket 0)\nKernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b\nFAIL init exitcode=0x0000000b"
+        );
+        // The segfault case boots with `-- fault`: argc=2 and no RESULT success.
+        let serial = segfault.replace("\nRESULT success", "");
+        assert!(validate(case("init-segfault"), &exit(35), &serial).0);
+        assert!(
+            !validate(
+                case("init-segfault"),
+                &exit(35),
+                &serial.replace("error 4", "error 6")
+            )
+            .0
+        );
+        // The VMA bracket is bound to the ELF's executable segment.
+        for wrong in [
+            "init[4a27,204000+7000]",
+            "init[4a27,203000+9000]",
+            "init[4a27,204000+8000",
+        ] {
+            let bad = serial.replace("init[4a27,204000+8000]", wrong);
+            assert!(
+                !validate(case("init-segfault"), &exit(35), &bad).0,
+                "{wrong}"
+            );
+        }
+        let outside = serial.replace("ip 0000000000205a27", "ip 0000000000300000");
+        assert!(!validate(case("init-segfault"), &exit(35), &outside).0);
+        assert!(
+            !validate(
+                case("init-segfault"),
+                &exit(35),
+                &format!("{serial}\nRESULT success")
+            )
+            .0
+        );
+        assert!(
+            !validate(
+                case("init-segfault"),
+                &exit(35),
+                &serial.replace("exitcode=0x0000000b", "exitcode=0x00000004")
+            )
+            .0
+        );
+
+        let unimplemented =
+            format!("{prefix}\ninit: calling mmap\nFAIL syscall unimplemented nr=9");
+        assert!(validate(case("unimplemented-syscall"), &exit(35), &unimplemented).0);
+        assert!(
+            !validate(
+                case("unimplemented-syscall"),
+                &exit(35),
+                &unimplemented.replace("nr=9", "nr=0")
+            )
+            .0
+        );
+
+        let no_root = "check access for rdinit=/init failed: -2, ignoring\n/dev/root: Can't open blockdev\nVFS: Cannot open root device \"\" or unknown-block(0,0): error -6\nPlease append a correct \"root=\" boot option; here are the available partitions:\nKernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)\nFAIL no-root";
+        assert!(validate(case("no-init"), &exit(35), no_root).0);
+        assert!(
+            !validate(
+                case("no-init"),
+                &exit(35),
+                &no_root.replace("error -6", "error -2")
+            )
+            .0
+        );
+        assert!(
+            !validate(
+                case("no-init"),
+                &exit(35),
+                &format!("Run /init as init process\n{no_root}")
+            )
+            .0
+        );
+        assert!(
+            !validate(
+                case("no-init"),
+                &exit(35),
+                &no_root.replace("FAIL no-root", "No working init found")
+            )
+            .0
+        );
+        assert!(!validate(case("no-init"), &exit(33), no_root).0);
+    }
+
     #[test]
     fn memory_provider_proof_rejects_incomplete_or_contradictory_records() {
         let serial = success_serial();
@@ -5271,6 +5831,14 @@ mod tests {
             "CHECK timer ok pit_wraps=2 gprs=15",
             "TIMER mask observation pit_wraps=2 irq_delta=0",
             "CHECKPOINT bootstrap-complete",
+            "CHECK userspace-audit ok user_pages=49 user_tables=6 kernel_entries=6420 kernel_user_bits=0 above_task_size=0",
+            "CHECK userspace-image ok entry=0x204800 sp=0x7fffffffee40 loads=2 brk=0x20d000 argc=1",
+            "Run /init as init process",
+            "CHECK userspace exec path=/init entry=0x204800 loads=2 sp=0x7fffffffee40 smep=false smap=false",
+            "init: hello from userspace",
+            &fixture::init_summary(&expected().init, 1),
+            "init: ok",
+            "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
             "RESULT success",
         ]
         .join("\n")

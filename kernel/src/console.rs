@@ -80,12 +80,17 @@ pub unsafe fn init(display: Option<Framebuffer>) -> bool {
 struct Console;
 impl Write for Console {
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        for byte in text.bytes() {
-            #[cfg(feature = "qemu-self-test")]
-            crate::cpu::serial_byte(byte);
-            pixel_byte(byte);
-        }
+        write_bytes(text.as_bytes());
         Ok(())
+    }
+}
+
+/// Raw bytes to the same sinks as `log!` (the init task's /dev/console).
+pub fn write_bytes(bytes: &[u8]) {
+    for &byte in bytes {
+        #[cfg(feature = "qemu-self-test")]
+        crate::cpu::serial_byte(byte);
+        pixel_byte(byte);
     }
 }
 

@@ -15,6 +15,7 @@ use linux_rs_runtime as _;
 mod console;
 mod cpu;
 mod paging;
+mod userspace;
 
 use boot::TestMode;
 use core::{panic::PanicInfo, ptr};
@@ -141,7 +142,7 @@ extern "C" fn kernel_main() -> ! {
     // trusted handoff, no DMA/AP/firmware mutation or competing allocator.
     let mut allocator = unwrap(unsafe { Allocator::new(&boot) }, "allocator");
     check_frame_ownership(&mut allocator);
-    let tables = unwrap(paging::Tables::build(&boot, &mut allocator), "tables-build");
+    let mut tables = unwrap(paging::Tables::build(&boot, &mut allocator), "tables-build");
     #[cfg(feature = "qemu-self-test")]
     {
         unwrap(
@@ -157,6 +158,10 @@ extern "C" fn kernel_main() -> ! {
         unwrap(tables.check_permissions(&boot), "permissions"),
         "table-permissions",
     );
+    // Kernel tables only; user mappings below are added to the same unpublished
+    // tree, so the published root is still written only before CR3 loads.
+    let table_pages = tables.pages;
+    let user = userspace::load(&boot, &mut allocator, &mut tables);
     // SAFETY: the fully constructed tree covers current image/stack, descriptor,
     // loader/firmware/metadata and framebuffer resources at unchanged addresses;
     // guard/image-alias holes are intentional; no SMP/PCID/global translations.
@@ -170,8 +175,8 @@ extern "C" fn kernel_main() -> ! {
         "stack-guard-unmapped",
     );
     log!(
-        "CHECK paging ok tables={} wx=separated guards=4 image_alias=absent\n",
-        tables.pages
+        "CHECK paging ok tables={} wx=separated guards=5 image_alias=absent\n",
+        table_pages
     );
     check_exceptions(&boot, &mut allocator);
     #[cfg(feature = "qemu-self-test")]
@@ -216,13 +221,8 @@ extern "C" fn kernel_main() -> ! {
         allocator.available(),
         tables.pages
     );
-    #[cfg(feature = "qemu-self-test")]
-    {
-        log!("RESULT success\n");
-        cpu::exit(true);
-    }
-    #[cfg(not(feature = "qemu-self-test"))]
-    cpu::halt()
+    // Diverges: init runs and its death ends the boot, or Linux's failure text.
+    userspace::run(user)
 }
 
 fn loader_handoff(framebuffer: bool) -> (boot::BootInfo, firmware::Acpi) {

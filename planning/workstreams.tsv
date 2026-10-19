@@ -361,7 +361,7 @@ ws-arch-x86-boot	arch/x86/boot	docs/subsystems/architectures.md	P0	not_started
 ws-arch-x86-coco	arch/x86/coco	docs/subsystems/architectures.md	P0	not_started
 ws-arch-x86-configs	arch/x86/configs	docs/subsystems/architectures.md	P0	not_started
 ws-arch-x86-crypto	arch/x86/crypto	docs/subsystems/architectures.md	P0	not_started
-ws-arch-x86-entry	arch/x86/entry	docs/subsystems/architectures.md	P0	not_started
+ws-arch-x86-entry	arch/x86/entry	docs/subsystems/architectures.md	P0	in_progress
 ws-arch-x86-events	arch/x86/events	docs/subsystems/architectures.md	P0	not_started
 ws-arch-x86-hyperv	arch/x86/hyperv	docs/subsystems/architectures.md	P0	not_started
 ws-arch-x86-ia32	arch/x86/ia32	docs/subsystems/architectures.md	P0	not_started
@@ -1371,7 +1371,7 @@ ws-drivers-thermal-tegra	drivers/thermal/tegra	docs/subsystems/drivers.md	P1	not
 ws-drivers-thermal-testing	drivers/thermal/testing	docs/subsystems/drivers.md	P1	not_started
 ws-drivers-thermal-ti-soc-thermal	drivers/thermal/ti-soc-thermal	docs/subsystems/drivers.md	P1	not_started
 ws-drivers-thunderbolt	drivers/thunderbolt	docs/subsystems/drivers.md	P2	not_started
-ws-drivers-tty	drivers/tty	docs/subsystems/drivers.md	P0	not_started
+ws-drivers-tty	drivers/tty	docs/subsystems/drivers.md	P0	in_progress
 ws-drivers-tty-hvc	drivers/tty/hvc	docs/subsystems/drivers.md	P0	not_started
 ws-drivers-tty-ipwireless	drivers/tty/ipwireless	docs/subsystems/drivers.md	P0	not_started
 ws-drivers-tty-serdev	drivers/tty/serdev	docs/subsystems/drivers.md	P0	not_started
@@ -1882,7 +1882,7 @@ ws-kernel-elfcorehdr-c	kernel/elfcorehdr.c	docs/subsystems/observability.md	P1	n
 ws-kernel-entry	kernel/entry	docs/subsystems/process.md	P0	not_started
 ws-kernel-events	kernel/events	docs/subsystems/observability.md	P0	not_started
 ws-kernel-exec-domain-c	kernel/exec_domain.c	docs/subsystems/process.md	P0	not_started
-ws-kernel-exit-c	kernel/exit.c	docs/subsystems/process.md	P0	not_started
+ws-kernel-exit-c	kernel/exit.c	docs/subsystems/process.md	P0	in_progress
 ws-kernel-exit-h	kernel/exit.h	docs/subsystems/process.md	P0	not_started
 ws-kernel-fork-c	kernel/fork.c	docs/subsystems/process.md	P0	not_started
 ws-kernel-futex	kernel/futex	docs/subsystems/ipc.md	P0	not_started
@@ -2030,7 +2030,7 @@ ws-mm-migrate-device-c	mm/migrate_device.c	docs/subsystems/memory.md	P0	not_star
 ws-mm-mincore-c	mm/mincore.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mlock-c	mm/mlock.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mm-init-c	mm/mm_init.c	docs/subsystems/memory.md	P0	not_started
-ws-mm-mmap-c	mm/mmap.c	docs/subsystems/memory.md	P0	not_started
+ws-mm-mmap-c	mm/mmap.c	docs/subsystems/memory.md	P0	in_progress
 ws-mm-mmap-lock-c	mm/mmap_lock.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mmu-gather-c	mm/mmu_gather.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mmu-notifier-c	mm/mmu_notifier.c	docs/subsystems/memory.md	P0	not_started

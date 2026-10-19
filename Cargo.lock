@@ -55,6 +55,7 @@ dependencies = [
  "font8x8",
  "linux-rs-runtime",
  "raw-cpuid",
+ "syscalls",
  "x86_64",
 ]
 

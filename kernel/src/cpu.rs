@@ -16,12 +16,17 @@ use x86_64::{
     PhysAddr, PrivilegeLevel, VirtAddr,
     instructions::{
         interrupts,
-        segmentation::{CS, DS, ES, SS, Segment},
+        segmentation::{CS, DS, ES, FS, GS, SS, Segment},
         tables::{DescriptorTablePointer, lidt, load_tss},
     },
     registers::{
         control::{Cr0, Cr0Flags, Cr2, Cr3, Cr4, Cr4Flags},
-        model_specific::{ApicBase, ApicBaseFlags, Efer, EferFlags, Msr},
+        debug::{DebugAddressRegister, Dr0, Dr1, Dr2, Dr3, Dr7},
+        model_specific::{
+            ApicBase, ApicBaseFlags, Efer, EferFlags, FsBase, GsBase, KernelGsBase, LStar, Msr,
+            SFMask, Star,
+        },
+        rflags::RFlags,
     },
     structures::{
         gdt::{Descriptor, DescriptorFlags, GlobalDescriptorTable, SegmentSelector},
@@ -52,13 +57,17 @@ pub static mut BOOT_STACK: Stack = Stack::ZERO;
 static mut DOUBLE_STACK: Stack = Stack::ZERO;
 static mut NMI_STACK: Stack = Stack::ZERO;
 static mut MACHINE_STACK: Stack = Stack::ZERO;
+// Linux `IST_INDEX_DB` (arch/x86/kernel/idt.c:105): #DB can be taken in the
+// SYSCALL entry window on the user's RSP, so it gets its own stack.
+static mut DEBUG_STACK: Stack = Stack::ZERO;
 
-pub fn guards() -> [u64; 4] {
+pub fn guards() -> [u64; 5] {
     [
         ptr::addr_of!(BOOT_STACK) as u64,
         ptr::addr_of!(DOUBLE_STACK) as u64,
         ptr::addr_of!(NMI_STACK) as u64,
         ptr::addr_of!(MACHINE_STACK) as u64,
+        ptr::addr_of!(DEBUG_STACK) as u64,
     ]
 }
 
@@ -127,6 +136,17 @@ pub fn validate() -> Result<(), Error> {
         || cr4.intersects(Cr4Flags::L5_PAGING | Cr4Flags::PAGE_GLOBAL | Cr4Flags::PCID)
     {
         return Err(Error::Paging);
+    }
+    // No XSAVE state management exists (`noxsave`), so CR4.OSXSAVE is cleared
+    // if a loader set it: with it clear XSETBV/XGETBV/XSAVE are #UD and AVX is
+    // unavailable, so no YMM/ZMM upper state can be read or written by ring 3
+    // (as Linux `noxsave`). SAFETY below: CPL0, IF=0, one reserved-free bit.
+    if cr4.contains(Cr4Flags::OSXSAVE) {
+        // SAFETY: only OSXSAVE is removed; paging, PGE and PCIDE were checked
+        // clear above, so the translation state is unchanged.
+        unsafe {
+            Cr4::update(|flags| flags.remove(Cr4Flags::OSXSAVE));
+        }
     }
     let base = ptr::addr_of!(BOOT_STACK) as u64;
     if rsp < base + 4096 || rsp >= base + core::mem::size_of::<Stack>() as u64 {
@@ -399,6 +419,7 @@ pub unsafe fn install_descriptors() {
     unsafe {
         install_gdt();
         install_idt();
+        scrub_debug_registers();
     }
 }
 
@@ -423,7 +444,7 @@ unsafe fn install_gdt() {
             top(ptr::addr_of!(DOUBLE_STACK)),
             top(ptr::addr_of!(NMI_STACK)),
             top(ptr::addr_of!(MACHINE_STACK)),
-            VirtAddr::zero(),
+            top(ptr::addr_of!(DEBUG_STACK)),
             VirtAddr::zero(),
             VirtAddr::zero(),
             VirtAddr::zero(),
@@ -522,11 +543,13 @@ unsafe fn install_idt() {
             None if index == 32 => timer_entry as *const (),
             None => unexpected_entry as *const (),
         };
-        // Zero-based IST slots (the crate adds the hardware +1): #DF 1, NMI 2, #MC 3.
+        // Zero-based IST slots (the crate adds the hardware +1): #DF 1, NMI 2,
+        // #MC 3, #DB 4 (Linux idt.c `ISTG` list).
         let ist = match index {
             8 => Some(0),
             2 => Some(1),
             18 => Some(2),
+            1 => Some(3),
             _ => None,
         };
         // SAFETY: every handler is one of our entry stubs, which obey the CPU
@@ -540,6 +563,10 @@ unsafe fn install_idt() {
             let options = gate.set_handler_addr(VirtAddr::new(handler as u64));
             if let Some(slot) = ist {
                 options.set_stack_index(slot);
+            }
+            // Linux `SYSG`: INT3 and INTO may be executed by ring 3 (idt.c).
+            if index == 3 || index == 4 {
+                options.set_privilege_level(PrivilegeLevel::Ring3);
             }
         }
     }
@@ -643,6 +670,13 @@ static FAULT_ERROR: AtomicU64 = AtomicU64::new(0);
 static FAULT_ARMED: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: u64) {
+    // Any ring-3 CS (64-bit 0x33 or compatibility 0x23, RPL 3).
+    if frame.cs & 3 == 3 {
+        // Any exception raised by init is fatal to it (no signal handlers exist
+        // yet). CR2 is read first, before anything that could fault.
+        let address = if vector == 14 { Cr2::read_raw() } else { 0 };
+        crate::userspace::exception(vector, error, frame.rip, frame.rsp, address);
+    }
     if frame.cs != u64::from(KERNEL_CS.0) {
         unexpected(frame, vector, error, 0);
     }
@@ -1140,3 +1174,419 @@ pub fn unexpected_interrupt() -> ! {
         asm!("int 0x40", options(noreturn));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ring 3 for the first-userspace slice (decision A18).
+//
+// Kernel stack: ring-3 -> ring-0 transitions of every kind (exception, IRQ and
+// SYSCALL) run on the top of BOOT_STACK, which is also TSS.RSP0. kernel_main's
+// frame is abandoned by `enter_user` (it never returns) and everything the
+// syscall/fault paths use lives in statics, so reusing that stack is sound; it
+// keeps its 4 KiB unmapped guard page, and the deepest path (a 2 KiB tty chunk
+// plus formatting) is far below its 64 KiB. NMI, #DF and #MC keep their IST
+// stacks.
+
+/// Linux `struct pt_regs` (arch/x86/include/asm/ptrace.h, GPL-2.0), lowest
+/// address first: the layout `syscall_entry` builds and `iretq` consumes.
+#[repr(C)]
+pub struct PtRegs {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub bp: u64,
+    pub bx: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub ax: u64,
+    pub cx: u64,
+    pub dx: u64,
+    pub si: u64,
+    pub di: u64,
+    pub orig_ax: u64,
+    pub ip: u64,
+    pub cs: u64,
+    pub flags: u64,
+    pub sp: u64,
+    pub ss: u64,
+}
+const _: () = assert!(core::mem::size_of::<PtRegs>() == 21 * 8);
+
+/// Linux `MSR_SYSCALL_MASK` (arch/x86/kernel/cpu/common.c `syscall_init`):
+/// CF PF AF ZF SF TF IF DF OF IOPL NT RF AC ID are cleared on SYSCALL.
+const SYSCALL_MASK: u64 = 0x1
+    | 0x4
+    | 0x10
+    | 0x40
+    | 0x80
+    | 0x100
+    | 0x200
+    | 0x400
+    | 0x800
+    | 0x3000
+    | 0x4000
+    | 0x1_0000
+    | 0x4_0000
+    | 0x20_0000;
+const ENOSYS: i32 = 38;
+const USER_CS_RAW: u16 = USER_CS.0;
+const USER_DS_RAW: u16 = USER_DS.0;
+// IA32_CSTAR: the target of SYSCALL from compatibility mode (AMD only).
+const MSR_CSTAR: u32 = 0xc000_0083;
+const MSR_SYSENTER_CS: u32 = 0x174;
+const MSR_SYSENTER_ESP: u32 = 0x175;
+const MSR_SYSENTER_EIP: u32 = 0x176;
+
+/// Single-CPU scratch for the user RSP between SYSCALL and the stack switch.
+/// shortcut: Linux keeps this per CPU behind SWAPGS; upgrade with SMP.
+static mut USER_RSP: u64 = 0;
+
+// 64-bit SYSCALL target (IA32_LSTAR).
+//
+// Why asm: SYSCALL leaves the user RSP live and changes no stack, so the stack
+// switch and the register frame must be built before any Rust code can run.
+// Prerequisites: EFER.SCE, STAR/LSTAR/SFMASK programmed by `enable_syscalls`;
+// reached only from CPL3 (CPL0 never executes SYSCALL). On entry: CPL0,
+// CS/SS = KERNEL_CS/DS from STAR, RCX = user RIP, R11 = user RFLAGS, RAX =
+// number, RDI/RSI/RDX/R10/R8/R9 = arguments, RIP-relative static addressing,
+// IF/DF/TF/AC/NT cleared by SFMASK so no maskable interrupt can intervene and
+// DF=0 holds for the C ABI (NMI, #MC, #DF and #DB run on IST stacks and never
+// touch the user RSP, so the window before the stack switch is safe). Registers: RSP is replaced by the BOOT_STACK top
+// (16-aligned); 21 pushes build a Linux `pt_regs` (168 bytes), then `sub 8`
+// makes RSP%16==0 at the CALL. RDI = &mut pt_regs (the number is
+// `pt_regs.orig_ax`, truncated to `int` by the dispatcher); the C-ABI handler preserves RBX/RBP/R12-R15 and may write
+// `pt_regs.ax`. Clobbers: all caller-saved registers (restored from pt_regs),
+// flags (restored by IRETQ). Memory: writes the scratch slot and the kernel
+// stack; the handler may access any memory, so no `nomem`. The return is
+// IRETQ with the saved user RIP/CS/RFLAGS/RSP/SS, not SYSRET (shortcut: the
+// SYSRET fast path needs canonical-RIP and RCX/R11 checks). No red zone, no
+// unwinding (the handler never unwinds; panic=abort). The user RSP may be
+// non-canonical; IRETQ does not check it and a bad value faults in ring 3.
+// Not reentrant: nothing in ring 0 executes SYSCALL.
+#[unsafe(naked)]
+unsafe extern "C" fn syscall_entry() {
+    naked_asm!(
+        "mov [rip + {user_rsp}], rsp",
+        "lea rsp, [rip + {stack} + {size}]",
+        "push {ss}",
+        "push qword ptr [rip + {user_rsp}]",
+        "push r11",
+        "push {cs}",
+        "push rcx",
+        "push rax",
+        "push rdi", "push rsi", "push rdx", "push rcx",
+        "push -{enosys}",
+        "push r8", "push r9", "push r10", "push r11",
+        "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+        "mov rdi, rsp",
+        "sub rsp, 8",
+        "call {handler}",
+        "add rsp, 8",
+        "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
+        "pop r11", "pop r10", "pop r9", "pop r8",
+        "pop rax", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
+        "add rsp, 8",
+        "iretq",
+        user_rsp = sym USER_RSP,
+        stack = sym BOOT_STACK,
+        size = const core::mem::size_of::<Stack>(),
+        ss = const USER_DS_RAW,
+        cs = const USER_CS_RAW,
+        enosys = const ENOSYS,
+        handler = sym crate::userspace::syscall,
+    );
+}
+
+// IA32_CSTAR target: Linux `entry_SYSCALL32_ignore` (arch/x86/entry/entry_64_compat.S).
+//
+// Why asm: SYSRETL is the only way back to compatibility mode. Reached only
+// by SYSCALL executed in compatibility mode on AMD CPUs (Intel raises #UD
+// instead): RCX = next EIP, R11 = EFLAGS, user stack untouched. Sets EAX =
+// -ENOSYS and returns with 32-bit SYSRET (CS = STAR[63:48] = USER32_CS, SS =
+// +8, EIP = ECX, EFLAGS = R11; Intel-syntax `sysret` assembles to 0F 07
+// without REX.W, i.e. SYSRETD). No memory, stack or unwind effects; flags
+// are restored from R11. Without it CSTAR would be zero and a user could make
+// ring 0 jump to address 0.
+#[unsafe(naked)]
+unsafe extern "C" fn syscall32_ignore() {
+    naked_asm!("mov eax, -{enosys}", "sysret", enosys = const ENOSYS);
+}
+
+/// Program EFER.SCE, STAR, LSTAR, CSTAR, the SYSENTER MSRs and SFMASK as Linux's
+/// `idt_syscall_init` does for a kernel without compat entry points.
+///
+/// # Errors
+/// [`Error::Cpu`] when CPUID does not report SYSCALL/SYSRET.
+///
+/// # Safety
+/// CPL0 on the BSP with IF clear, after `install_descriptors` (the GDT has
+/// Linux's selector layout, pinned by the const assertions above, and TSS.RSP0
+/// names the `BOOT_STACK` top). `syscall_entry` is only correct while no other
+/// kernel code uses `USER_RSP` and while the CPU is on this single stack
+/// discipline.
+pub unsafe fn enable_syscalls() -> Result<(), Error> {
+    if !CpuId::new()
+        .get_extended_processor_and_feature_identifiers()
+        .is_some_and(|features| features.has_syscall_sysret())
+    {
+        return Err(Error::Cpu);
+    }
+    // SAFETY: CPUID.80000001H:EDX.SYSCALL was checked; setting SCE only makes
+    // SYSCALL/SYSRET legal and every other EFER bit is preserved by `update`.
+    unsafe {
+        Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
+    }
+    // STAR: SYSCALL loads CS=KERNEL_CS, SS=KERNEL_CS+8 (KERNEL_DS); 64-bit
+    // SYSRET (unused: we return by IRETQ) would load CS=USER32_CS+16, SS=+8.
+    // `write` validates that the four selectors have exactly that relation.
+    Star::write(USER_CS, USER_DS, KERNEL_CS, KERNEL_DS).map_err(|_| Error::Cpu)?;
+    LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
+    let cpuid = CpuId::new();
+    // Linux `wrmsrq_cstar`: Intel CPUs ignore 32-bit SYSCALL (it is #UD) and a
+    // write is a #VE in a TDX guest, so only other vendors get the stub.
+    let intel = cpuid
+        .get_vendor_info()
+        .is_some_and(|vendor| vendor.as_str() == "GenuineIntel");
+    if !intel {
+        // SAFETY: a non-Intel CPU with SYSCALL has IA32_CSTAR; the target is
+        // the reviewed stub above.
+        unsafe {
+            Msr::new(MSR_CSTAR).write(syscall32_ignore as *const () as u64);
+        }
+    }
+    // Linux `idt_syscall_init` (`ia32_enabled()` false branch): SYSENTER_CS/ESP/EIP
+    // are zeroed, so SYSENTER from ring 3 raises #GP and never enters ring 0
+    // at a stale target left by firmware or the loader.
+    if cpuid
+        .get_feature_info()
+        .is_some_and(|features| features.has_sysenter_sysexit())
+    {
+        for msr in [MSR_SYSENTER_CS, MSR_SYSENTER_ESP, MSR_SYSENTER_EIP] {
+            // SAFETY: CPUID.1:EDX.SEP reports these three MSRs; zero is the
+            // architectural "disabled" value (a null CS selector).
+            unsafe { Msr::new(msr).write(0) };
+        }
+    }
+    SFMask::write(RFlags::from_bits_retain(SYSCALL_MASK));
+    Ok(())
+}
+
+/// Result of [`enable_user_protection`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserProtection {
+    pub smep: bool,
+    pub smap: bool,
+    pub umip: bool,
+}
+
+/// Enable CR4.SMEP and CR4.SMAP when CPUID.7.0:EBX reports them, and report
+/// what CR4 actually holds afterwards.
+///
+/// SMAP needs no `STAC`/`CLAC`: the kernel reaches user memory only through the
+/// direct-map alias of the frame (`usercopy`), never through a user virtual
+/// address. shortcut: EFLAGS.AC is cleared by SFMASK for SYSCALL but not by
+/// exception delivery; ring 3 may set AC, which only disarms SMAP for kernel
+/// accesses to user pages, and there are none by construction. Add `CLAC` at
+/// exception entry if a direct user-access path is ever introduced.
+///
+/// # Safety
+/// CPL0 on the BSP before ring 3 runs. The kernel image and all kernel
+/// mappings are supervisor pages, so no running kernel code is affected.
+#[must_use]
+pub unsafe fn enable_user_protection() -> UserProtection {
+    let features = CpuId::new().get_extended_feature_info();
+    let execute = features
+        .as_ref()
+        .is_some_and(raw_cpuid::ExtendedFeatures::has_smep);
+    let access = features
+        .as_ref()
+        .is_some_and(raw_cpuid::ExtendedFeatures::has_smap);
+    // Linux enables UMIP so ring 3 cannot read the IDT/GDT/TSS addresses with
+    // SGDT/SIDT/STR/SMSW. shortcut: Linux then emulates SGDT/SIDT/SMSW with
+    // dummy values (`fixup_umip_exception`); here those instructions kill init
+    // with SIGSEGV. Upgrade with the emulation.
+    let umip = features
+        .as_ref()
+        .is_some_and(raw_cpuid::ExtendedFeatures::has_umip);
+    // SAFETY: each flag is set only if its CPUID bit is set, so no reserved bit
+    // is written; other CR4 bits are preserved by `update`.
+    unsafe {
+        Cr4::update(|flags| {
+            flags.set(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION, execute);
+            flags.set(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION, access);
+            flags.set(Cr4Flags::USER_MODE_INSTRUCTION_PREVENTION, umip);
+        });
+    }
+    let cr4 = Cr4::read();
+    UserProtection {
+        smep: cr4.contains(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION),
+        smap: cr4.contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION),
+        umip: cr4.contains(Cr4Flags::USER_MODE_INSTRUCTION_PREVENTION),
+    }
+}
+
+/// `nofsgsbase`: nothing in this kernel sets CR4.FSGSBASE, and `AT_HWCAP2 = 0`
+/// (no `HWCAP2_FSGSBASE`) is only true while it stays clear.
+#[must_use]
+pub fn fsgsbase_enabled() -> bool {
+    Cr4::read().contains(Cr4Flags::FSGSBASE)
+}
+
+/// Linux `start_thread` for a new 64-bit task, then IRETQ to ring 3.
+///
+/// # Safety
+/// BSP at CPL0; `install_descriptors` and `enable_syscalls` done; the active
+/// tree maps `rip` executable and `sp` writable for the user; no Rust object
+/// in the current stack frame is used afterwards (the frame is abandoned);
+/// everything the syscall/fault paths need is in statics.
+pub unsafe fn enter_user(rip: u64, sp: u64) -> ! {
+    let null = SegmentSelector::new(0, PrivilegeLevel::Ring0);
+    // SAFETY: CPL0. Null selectors are legal for DS/ES/FS/GS in 64-bit mode;
+    // zero bases make user FS/GS start at 0 as in Linux (no SWAPGS is ever
+    // executed by the kernel, so KERNEL_GS_BASE is just zeroed as well).
+    unsafe {
+        DS::set_reg(null);
+        ES::set_reg(null);
+        FS::set_reg(null);
+        GS::set_reg(null);
+    }
+    FsBase::write(VirtAddr::zero());
+    GsBase::write(VirtAddr::zero());
+    KernelGsBase::write(VirtAddr::zero());
+    // SAFETY: forwarded contract.
+    unsafe { iret_to_user(rip, sp) }
+}
+
+// Why asm: IRETQ is the only way to enter CPL3 with an exact RIP/RSP/CS/SS/
+// RFLAGS and all GPRs known. Inputs: RDI = user RIP, RSI = user RSP (both
+// validated by the caller as mapped user addresses). Prerequisites: CPL0,
+// TSS.RSP0 valid for the next ring-3 event, GDT with USER_CS/USER_DS.
+// Effects: CLI first (IF is restored from the pushed RFLAGS = 0x202: IF set,
+// IOPL 0, TF/NT/RF/AC/VM clear, bit 1 fixed); pushes the five-word frame on
+// the current stack (consumed by IRETQ, never unwound; the stack is abandoned
+// afterwards); zeroes every GPR like Linux's `elf_common_init`; clobbers all
+// registers and flags; does not return. Memory: only the stack pushes; no
+// `nomem` claim needed because the function never returns to Rust.
+#[unsafe(naked)]
+unsafe extern "C" fn iret_to_user(rip: u64, sp: u64) -> ! {
+    naked_asm!(
+        "cli",
+        "push {ss}",
+        "push rsi",
+        "push 0x202",
+        "push {cs}",
+        "push rdi",
+        "xor eax, eax", "xor ebx, ebx", "xor ecx, ecx", "xor edx, edx",
+        "xor esi, esi", "xor edi, edi", "xor ebp, ebp",
+        "xor r8d, r8d", "xor r9d, r9d", "xor r10d, r10d", "xor r11d, r11d",
+        "xor r12d, r12d", "xor r13d, r13d", "xor r14d, r14d", "xor r15d, r15d",
+        "iretq",
+        ss = const USER_DS_RAW,
+        cs = const USER_CS_RAW,
+    );
+}
+
+/// Linux's initial FPU image for a new task (`fpstate_init_fxstate`, arch/x86/
+/// kernel/fpu/core.c:536-540): FCW 0x37f, MXCSR 0x1f80 (`MXCSR_DEFAULT`),
+/// everything else zero (x87 empty, XMM0-15 zero). FXSAVE layout: FCW at 0,
+/// MXCSR at 24.
+#[repr(C, align(16))]
+struct FxImage([u8; 512]);
+static INIT_FXSTATE: FxImage = {
+    let mut bytes = [0u8; 512];
+    bytes[0] = 0x7f;
+    bytes[1] = 0x03;
+    bytes[24] = 0x80;
+    bytes[25] = 0x1f;
+    FxImage(bytes)
+};
+
+/// `FXRSTOR` of [`INIT_FXSTATE`]. The only FP/SIMD instruction in the kernel:
+/// the kernel itself stays soft-float, so user FP state is never touched by
+/// ring 0 and needs no context switch while a single task runs.
+///
+/// # Safety
+/// CPUID.1:EDX.FXSR, CR4.OSFXSR=1 and CR0.EM=0 (else #UD/#NM); CPL0.
+#[target_feature(enable = "fxsr")]
+unsafe fn load_initial_fpu_state() {
+    // SAFETY: the image is 512 bytes, 16-byte aligned, immutable and valid
+    // FXSAVE contents (no reserved MXCSR bits set); the caller gives the CPU
+    // state FXRSTOR requires.
+    unsafe { core::arch::x86_64::_fxrstor64(ptr::addr_of!(INIT_FXSTATE).cast()) };
+}
+
+/// Make x87/SSE usable from ring 3 the way Linux does with `noxsave`
+/// (`fpu__init_cpu_generic`: CR4.OSFXSR|OSXMMEXCPT, CR0.TS=EM=0; arch/x86/
+/// kernel/fpu/init.c) and give init Linux's initial FP state, so no firmware
+/// or loader residue is visible to it. `#MF`/`#XM` then reach ring 3 as SIGFPE
+/// through `exec::report`.
+///
+/// shortcut: one task and a soft-float kernel, so there is no FP context
+/// switch, no lazy restore and no signal-frame FP state; upgrade with the
+/// scheduler.
+///
+/// # Errors
+/// [`Error::Cpu`] without FPU, FXSR, SSE and SSE2.
+///
+/// # Safety
+/// CPL0 on the BSP, IF clear, before ring 3 runs.
+pub unsafe fn init_user_fpu() -> Result<(), Error> {
+    let supported = CpuId::new().get_feature_info().is_some_and(|features| {
+        features.has_fpu()
+            && features.has_fxsave_fxstor()
+            && features.has_sse()
+            && features.has_sse2()
+    });
+    if !supported {
+        return Err(Error::Cpu);
+    }
+    // On AMD, EFER.FFXSR makes FXRSTOR at CPL0 skip the XMM registers, so
+    // firmware XMM values would survive into ring 3: clear it first.
+    // SAFETY: CPL0; `update` preserves every other EFER bit and FFXSR is
+    // only an optimisation of FXSAVE/FXRSTOR.
+    unsafe {
+        Efer::update(|flags| flags.remove(EferFlags::FAST_FXSAVE_FXRSTOR));
+    }
+    // SAFETY: the CPUID bits above were checked; OSFXSR/OSXMMEXCPT are
+    // reserved-free CR4 bits when FXSR/SSE exist; other bits are preserved.
+    unsafe {
+        Cr4::update(|flags| {
+            flags.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
+        });
+        // MP and NE (native x87 error reporting, `#MF`) as Linux's CR0 state;
+        // EM and TS cleared so ring 3 never takes `#NM`.
+        Cr0::update(|flags| {
+            flags.remove(Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED);
+            flags.insert(Cr0Flags::MONITOR_COPROCESSOR | Cr0Flags::NUMERIC_ERROR);
+        });
+        // SAFETY: OSFXSR set, EM clear, FXSR checked.
+        load_initial_fpu_state();
+    }
+    Ok(())
+}
+
+/// Linux `initialize_debug_regs`: no stale hardware breakpoint from the
+/// loader/firmware can fire in ring 0 or in ring 3.
+///
+/// # Safety
+/// CPL0 on the BSP, IF clear.
+pub unsafe fn scrub_debug_registers() {
+    Dr7::write_raw(0);
+    Dr0::write(0);
+    Dr1::write(0);
+    Dr2::write(0);
+    Dr3::write(0);
+    // Linux `DR6_RESERVED`: the architectural reset value, with no stale
+    // status bits (BS, B0-B3...) left by firmware or the loader. The crate has
+    // no DR6 writer, and there is no intrinsic for `mov dr6`: one `asm!` site,
+    // CPL0 only, a single register input, no memory, stack or flags effect.
+    // SAFETY: CPL0; writing DR6 changes no execution state and no breakpoint
+    // is armed (DR7 was cleared above).
+    unsafe {
+        asm!("mov dr6, {}", in(reg) DR6_RESET, options(nomem, nostack, preserves_flags));
+    }
+}
+
+const DR6_RESET: u64 = 0xffff_0ff0;

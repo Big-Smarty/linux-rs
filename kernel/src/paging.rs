@@ -8,9 +8,11 @@ use crate::{
     memory::{Allocator, Error as MemoryError, PAGE, PAGE_BYTES, Physical, Virtual},
 };
 use core::ptr;
+use kernel::usercopy::{TASK_SIZE_MAX, UserPages};
 
 const PRESENT: u64 = 1;
 const WRITE: u64 = 2;
+const USER: u64 = 4;
 const HUGE: u64 = 1 << 7;
 const NX: u64 = 1 << 63;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
@@ -22,6 +24,9 @@ pub enum Error {
     Address,
     Conflict,
     Overflow,
+    /// The isolation audit found a user bit in the kernel half or a user
+    /// mapping at or above `TASK_SIZE_MAX`.
+    Audit,
 }
 impl core::fmt::Debug for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -31,6 +36,7 @@ impl core::fmt::Debug for Error {
             Self::Address => f.write_str("Address"),
             Self::Conflict => f.write_str("Conflict"),
             Self::Overflow => f.write_str("Overflow"),
+            Self::Audit => f.write_str("Audit"),
         }
     }
 }
@@ -52,6 +58,26 @@ unsafe extern "C" {
     static __rodata_end: u8;
     static __data_start: u8;
     static __kernel_end: u8;
+}
+
+fn entry_pointer(direct_map: u64, physical: Physical, index: usize) -> Result<*mut u64, Error> {
+    if physical.0 & (PAGE - 1) != 0 || index >= 512 {
+        return Err(Error::Address);
+    }
+    let address = direct_map
+        .checked_add(physical.0)
+        .and_then(|n| n.checked_add(index as u64 * 8))
+        .ok_or(Error::Overflow)?;
+    Ok(ptr::with_exposed_provenance_mut(
+        usize::try_from(address).map_err(|_| Error::Overflow)?,
+    ))
+}
+fn read_entry(direct_map: u64, physical: Physical, index: usize) -> Result<u64, Error> {
+    let pointer = entry_pointer(direct_map, physical, index)?;
+    // SAFETY: root/child ownership originates from live allocated 4KiB RAM;
+    // indices <=511, HHDM mapped, u64 aligned/valid. Volatile observes hardware
+    // A/D changes without creating references. No software mutator races.
+    Ok(unsafe { ptr::read_volatile(pointer) })
 }
 
 pub struct Tables {
@@ -216,24 +242,10 @@ impl Tables {
     }
 
     fn pointer(&self, physical: Physical, index: usize) -> Result<*mut u64, Error> {
-        if physical.0 & (PAGE - 1) != 0 || index >= 512 {
-            return Err(Error::Address);
-        }
-        let address = self
-            .direct_map
-            .checked_add(physical.0)
-            .and_then(|n| n.checked_add(index as u64 * 8))
-            .ok_or(Error::Overflow)?;
-        Ok(ptr::with_exposed_provenance_mut(
-            usize::try_from(address).map_err(|_| Error::Overflow)?,
-        ))
+        entry_pointer(self.direct_map, physical, index)
     }
     fn read(&self, physical: Physical, index: usize) -> Result<u64, Error> {
-        let pointer = self.pointer(physical, index)?;
-        // SAFETY: root/child ownership originates from live allocated 4KiB RAM;
-        // indices <=511, HHDM mapped, u64 aligned/valid. Volatile observes hardware
-        // A/D changes without creating references. No software mutator races.
-        Ok(unsafe { ptr::read_volatile(pointer) })
+        read_entry(self.direct_map, physical, index)
     }
     fn map(
         &mut self,
@@ -276,17 +288,54 @@ impl Tables {
                 // zeroed before its owning physical address is published in PTE.
                 unsafe {
                     self.pointer(table, index)?
-                        .write_volatile(child.0 | PRESENT | WRITE);
+                        .write_volatile(child.0 | PRESENT | WRITE | (flags & USER));
                 }
                 table = child;
             } else {
-                if old & HUGE != 0 {
+                // A user leaf below a supervisor-only table would be unreachable.
+                if old & HUGE != 0 || (flags & USER != 0 && old & USER == 0) {
                     return Err(Error::Conflict);
                 }
                 table = Physical(old & ADDRESS);
             }
         }
         Err(Error::Address)
+    }
+
+    /// Map one 4 KiB user page below `TASK_SIZE_MAX`: U/S set at every level,
+    /// writable and executable only as requested (NX otherwise). Like every
+    /// table write, this happens before CR3 publication.
+    ///
+    /// # Errors
+    /// Rejects unaligned or out-of-range addresses, an already mapped page, a
+    /// non-user table on the path, and allocation failure.
+    pub fn map_user(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        address: u64,
+        frame: Physical,
+        write: bool,
+        exec: bool,
+    ) -> Result<(), Error> {
+        if address >= TASK_SIZE_MAX {
+            return Err(Error::Address);
+        }
+        let flags = PRESENT | USER | if write { WRITE } else { 0 } | if exec { 0 } else { NX };
+        self.map(allocator, Virtual(address), frame, flags, false)
+    }
+
+    /// The kernel's only way to reach user memory (see `usercopy`).
+    ///
+    /// # Safety
+    /// At most one `UserSpace` may be used at a time, and only while no other
+    /// Rust reference to a user frame exists (frames mapped by `map_user` are
+    /// never exposed otherwise). The tree must stay published and its user
+    /// frames unfreed for the lifetime of the handle.
+    pub unsafe fn user_space(&self) -> UserSpace {
+        UserSpace {
+            root: self.root,
+            direct_map: self.direct_map,
+        }
     }
 
     /// # Safety
@@ -356,5 +405,151 @@ impl Tables {
             && rodata & (WRITE | NX) == NX
             && alias.is_none()
             && guards_absent)
+    }
+}
+
+/// Resolves user pages by walking the tree in software and aliasing the frame
+/// through the direct map, so no user virtual address is ever dereferenced.
+pub struct UserSpace {
+    root: Physical,
+    direct_map: u64,
+}
+
+impl UserSpace {
+    /// The frame of the user page at page-aligned `address`; present, user at
+    /// every level, and writable at every level when `write`.
+    fn translate(&self, address: u64, write: bool) -> Option<Physical> {
+        if address >= TASK_SIZE_MAX {
+            return None;
+        }
+        let required = PRESENT | USER | if write { WRITE } else { 0 };
+        let mut table = self.root;
+        for shift in [39, 30, 21, 12] {
+            let index = usize::try_from((address >> shift) & 511).ok()?;
+            let entry = read_entry(self.direct_map, table, index).ok()?;
+            if entry & required != required {
+                return None;
+            }
+            if shift == 12 {
+                return Some(Physical(entry & ADDRESS));
+            }
+            if entry & HUGE != 0 {
+                return None;
+            }
+            table = Physical(entry & ADDRESS);
+        }
+        None
+    }
+}
+
+/// What [`UserSpace::audit`] counted.
+#[derive(Clone, Copy, Debug)]
+pub struct UserAudit {
+    pub user_pages: u64,
+    pub user_tables: u64,
+    pub kernel_entries: u64,
+}
+
+impl UserSpace {
+    /// Executed isolation audit of the published tree: in the upper half (PML4
+    /// index >= 256, where every kernel mapping lives) no entry at any level
+    /// may carry the user bit; in the lower half every present entry must be a
+    /// user entry, leaves must be 4 KiB pages, and none may reach
+    /// `TASK_SIZE_MAX`.
+    ///
+    /// # Errors
+    /// [`Error::Audit`] on the first violation, or a table-read error.
+    pub fn audit(&self) -> Result<UserAudit, Error> {
+        let mut audit = UserAudit {
+            user_pages: 0,
+            user_tables: 0,
+            kernel_entries: 0,
+        };
+        for top in 0..512usize {
+            let entry = read_entry(self.direct_map, self.root, top)?;
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            if top >= 256 {
+                self.audit_kernel(Physical(entry & ADDRESS), entry, 1, &mut audit)?;
+            } else {
+                if entry & USER == 0 {
+                    return Err(Error::Audit);
+                }
+                audit.user_tables += 1;
+                self.audit_user(Physical(entry & ADDRESS), (top as u64) << 39, 1, &mut audit)?;
+            }
+        }
+        Ok(audit)
+    }
+
+    fn audit_kernel(
+        &self,
+        table: Physical,
+        entry: u64,
+        level: u32,
+        audit: &mut UserAudit,
+    ) -> Result<(), Error> {
+        audit.kernel_entries += 1;
+        if entry & USER != 0 {
+            return Err(Error::Audit);
+        }
+        // `level` numbers the table `entry` maps (PDPT 1, PD 2, PT 3; 4 means
+        // `entry` is a 4 KiB PTE). Leaves: 1 GiB/2 MiB pages and PTEs.
+        if level >= 4 || (level >= 2 && entry & HUGE != 0) {
+            return Ok(());
+        }
+        for index in 0..512usize {
+            let child = read_entry(self.direct_map, table, index)?;
+            if child & PRESENT != 0 {
+                self.audit_kernel(Physical(child & ADDRESS), child, level + 1, audit)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn audit_user(
+        &self,
+        table: Physical,
+        base: u64,
+        level: u32,
+        audit: &mut UserAudit,
+    ) -> Result<(), Error> {
+        let shift = 39 - 9 * level;
+        for index in 0..512usize {
+            let entry = read_entry(self.direct_map, table, index)?;
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            let address = base | ((index as u64) << shift);
+            if entry & USER == 0 || address >= TASK_SIZE_MAX || (level < 3 && entry & HUGE != 0) {
+                return Err(Error::Audit);
+            }
+            if level == 3 {
+                audit.user_pages += 1;
+            } else {
+                audit.user_tables += 1;
+                self.audit_user(Physical(entry & ADDRESS), address, level + 1, audit)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl UserPages for UserSpace {
+    fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+        let physical = self.translate(page, write)?;
+        let address = usize::try_from(self.direct_map.checked_add(physical.0)?).ok()?;
+        let pointer = ptr::with_exposed_provenance_mut::<[u8; PAGE_BYTES]>(address);
+        // SAFETY: `translate` found a present user leaf, which only `map_user`
+        // installs, from an allocator frame (order zero, or one page of the
+        // order-two argument block) that is never freed or mapped twice, so the
+        // 4 KiB frame is live, initialized (allocator zeroing, then plain bytes)
+        // and 4 KiB aligned (a page of a naturally aligned block). The direct map covers all
+        // usable RAM read-write (checked by `Allocator::new`). `user_space`'s
+        // contract excludes other references, the returned borrow is tied to
+        // `&mut self`, and user code does not run (one CPU) while the kernel
+        // holds it. Any byte pattern is a valid `[u8; N]`.
+        Some(unsafe { &mut *pointer })
     }
 }
