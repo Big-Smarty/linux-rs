@@ -28,6 +28,9 @@ fn parse_error(error: &elf::ParseError) -> io::Error {
 pub(crate) struct ElfFacts {
     /// `[start, end)` virtual ranges of non-empty executable `PT_LOAD` segments.
     pub(crate) executable_segments: Vec<(u64, u64)>,
+    /// `[start, end)` file-backed extents (`p_vaddr..p_vaddr + p_filesz`) of the same segments:
+    /// what `print_vma_addr` reports, since the bss tail is an anonymous mapping.
+    pub(crate) executable_file_extents: Vec<(u64, u64)>,
     pub(crate) loads: u64,
     pub(crate) interpreters: u64,
     pub(crate) dynamics: u64,
@@ -54,6 +57,7 @@ pub(crate) fn elf_facts(bytes: &[u8]) -> io::Result<ElfFacts> {
     }
     let mut facts = ElfFacts {
         executable_segments: Vec::new(),
+        executable_file_extents: Vec::new(),
         loads: 0,
         interpreters: 0,
         dynamics: 0,
@@ -80,6 +84,9 @@ pub(crate) fn elf_facts(bytes: &[u8]) -> io::Result<ElfFacts> {
                 facts.loads += 1;
                 if program.p_flags & abi::PF_X != 0 && program.p_memsz > 0 {
                     facts.executable_segments.push((program.p_vaddr, end));
+                    facts
+                        .executable_file_extents
+                        .push((program.p_vaddr, program.p_vaddr + program.p_filesz));
                 }
             }
             abi::PT_INTERP => facts.interpreters += 1,
@@ -289,6 +296,7 @@ mod tests {
             (1, 1, 0)
         );
         assert_eq!(facts.executable_segments, [(0x20_0000, 0x20_0020)]);
+        assert_eq!(facts.executable_file_extents, [(0x20_0000, 0x20_0010)]);
         assert!(
             elf_facts(&synthetic_elf(&[(1, 5, 0, 0, 0)], 3)).is_err(),
             "not x86-64"

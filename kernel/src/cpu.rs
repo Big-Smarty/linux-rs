@@ -96,9 +96,6 @@ pub enum Error {
     Pat,
     Paging,
     Stack,
-    /// CR4.OSXSAVE is set: XSAVE state (YMM upper halves) is not managed here
-    /// and would reach ring 3 uncleared.
-    Xsave,
     Cpu,
     Apic,
     TimerCounter,
@@ -140,10 +137,16 @@ pub fn validate() -> Result<(), Error> {
     {
         return Err(Error::Paging);
     }
-    // No XSAVE state management exists (`noxsave`): a loader that enabled it
-    // would leave YMM/ZMM upper state that ring 3 could read.
+    // No XSAVE state management exists (`noxsave`), so CR4.OSXSAVE is cleared
+    // if a loader set it: with it clear XSETBV/XGETBV/XSAVE are #UD and AVX is
+    // unavailable, so no YMM/ZMM upper state can be read or written by ring 3
+    // (as Linux `noxsave`). SAFETY below: CPL0, IF=0, one reserved-free bit.
     if cr4.contains(Cr4Flags::OSXSAVE) {
-        return Err(Error::Xsave);
+        // SAFETY: only OSXSAVE is removed; paging, PGE and PCIDE were checked
+        // clear above, so the translation state is unchanged.
+        unsafe {
+            Cr4::update(|flags| flags.remove(Cr4Flags::OSXSAVE));
+        }
     }
     let base = ptr::addr_of!(BOOT_STACK) as u64;
     if rsp < base + 4096 || rsp >= base + core::mem::size_of::<Stack>() as u64 {

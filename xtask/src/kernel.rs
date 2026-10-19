@@ -3633,7 +3633,8 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
 
 /// `init[1]: segfault at 0 ip <ip> sp <sp> error 4 in init[<off>,<start>+<len>] likely on CPU 0
 /// (core 0, socket 0)` with the bracket bound to the ELF: `ip` lies in the page-rounded extent of
-/// an executable `PT_LOAD` (`print_vma_addr`), and `start`/`len` are exactly that extent.
+/// an executable `PT_LOAD`'s file-backed extent (page-rounded `p_vaddr..p_vaddr + p_filesz`, as
+/// `print_vma_addr` reports; the bss tail is anonymous), and `start`/`len` are exactly that extent.
 fn segfault_line_matches(line: &str, init: &fixture::ElfFacts) -> bool {
     let Some(rest) = line.strip_prefix("init[1]: segfault at 0 ip ") else {
         return false;
@@ -3658,7 +3659,7 @@ fn segfault_line_matches(line: &str, init: &fixture::ElfFacts) -> bool {
         return false;
     };
     tail == " likely on CPU 0 (core 0, socket 0)"
-        && init.executable_segments.iter().any(|&(vaddr, end)| {
+        && init.executable_file_extents.iter().any(|&(vaddr, end)| {
             let first = vaddr & !4095;
             start == first
                 && length == end.next_multiple_of(4096) - first
@@ -5456,6 +5457,7 @@ mod tests {
             archive_counts: COUNTS.to_owned(),
             init: fixture::ElfFacts {
                 executable_segments: vec![(0x20_47b0, 0x20_c000)],
+                executable_file_extents: vec![(0x20_47b0, 0x20_c000)],
                 loads: 2,
                 interpreters: 0,
                 dynamics: 0,
