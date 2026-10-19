@@ -4,6 +4,7 @@
 
 ### Post-publication continuation
 
+- First-userspace slice, phase 2: ring 3 runs `/init` under QEMU. `cpu.rs` gains the `SYSCALL` entry (Linux `pt_regs`, `STAR`/`LSTAR`/`CSTAR`/`SFMASK`), `iretq` ring-3 entry, SMEP/SMAP enabling and routing of ring-3 exceptions to the Linux-exact signal/segfault text; init's state is in statics; Linux `Run /init as init process`, `CHECK userspace exec`, init-death panic and `NO_INIT` paths; manual QEMU evidence with `user/init` (retained 11-case catalog unchanged at 11/11; the harness-generated `/init` is a separate change).
 - First-userspace slice, kernel side (phase 1): `/init` discovery across boot modules, Linux-ordered ELF load plan, `create_elf_tables` stack/auxv, `usercopy`, a `write`/`getpid`/`exit`/`exit_group` syscall slice using `syscalls =0.8.1`, init-death/segfault text, and a loader that maps `/init` into the owned tables before CR3 publication; ring-3 entry is phase 2. Routes four more workstreams `in_progress` (14 of 2,623); see [implementation](docs/implementation.md#first-userspace-slice-kernel-side).
 
 - Host-tool audit fixes: `xtask` children die with xtask (`setpriv --pdeathsig KILL`), the QMP socket lives in a short private `$XDG_RUNTIME_DIR`/`/tmp` directory, the guest serial log is bounded, the boot disk is read-only with before/after hashes, `check` skips only root `.git`/`target`, plus manifest/PATH/Limine-version/`/proc` read-cap hardening and dead-code removal.

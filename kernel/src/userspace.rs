@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Freestanding half of the first-userspace exec path (decision A18): it owns
-//! the frames and the page tables, and feeds them from the pure plan in
-//! `exec`. Nothing here enters ring 3.
+//! the frames and the page tables, feeds them from the pure plan in `exec`,
+//! then runs init: ring-3 entry, the syscall and exception handlers called by
+//! `cpu.rs`, and init's death.
+//!
+//! State used after ring 3 starts lives in statics (`STATE`), never in
+//! `kernel_main`'s frame, whose stack is reused as init's kernel stack.
 //!
 //! Context: BSP, interrupts off, before the owned CR3 is published. The module
 //! payloads are only readable while the loader mapping epoch is active, so the
@@ -18,11 +22,13 @@
 
 use crate::{
     boot::{BootError, BootInfo},
+    console, cpu,
     memory::{Allocator, Error as MemoryError, PAGE, Physical},
     paging::{self, Tables, UserSpace},
 };
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
+    cell::UnsafeCell,
     iter,
 };
 use kernel::{
@@ -30,9 +36,13 @@ use kernel::{
         args::{ArgsError, InitArgv, Word},
         find::{FindError, InitSearch},
         plan::{LoadError, LoadPlan, Vmas},
+        report::{self, ExecFailed, InitDeath, NO_INIT, Segfault, TrapLine},
         stack::{self, ARG_PAGES, Aux, ENVP, EXPAND_PAGES, STACK_START, STACK_TOP, StackError},
     },
     image::cpio::FileType,
+    sync::RawSpinLock,
+    syscall::{self, Console, Outcome},
+    usercopy,
 };
 use syscalls::Errno;
 
@@ -249,4 +259,241 @@ pub fn load(
         // physical addresses); the tree is published by the caller and kept.
         space: unsafe { tables.user_space() },
     })
+}
+
+/// What the syscall and fault paths need once init runs.
+struct State {
+    space: UserSpace,
+    vmas: Vmas,
+}
+
+/// A `State` shared with entry code. Single CPU: the only accessors are the
+/// syscall handler and the fatal exception handler, which cannot interleave
+/// (a syscall runs with IF/TF cleared and ring 0 takes no user exception);
+/// `LOCK` makes that explicit and keeps the access sound if that changes.
+struct Shared(UnsafeCell<Option<State>>);
+// SAFETY: every access goes through `with`/`install`, which hold `LOCK`.
+unsafe impl Sync for Shared {}
+static LOCK: RawSpinLock = RawSpinLock::new();
+static STATE: Shared = Shared(UnsafeCell::new(None));
+
+fn install(state: State) {
+    let _owner = LOCK.lock();
+    // SAFETY: `LOCK` is held, so this is the only access to the cell.
+    unsafe { *STATE.0.get() = Some(state) };
+}
+
+fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
+    let _owner = LOCK.lock();
+    // SAFETY: `LOCK` is held, so this is the only access to the cell.
+    unsafe { (*STATE.0.get()).as_mut().map(f) }
+}
+
+/// init's `/dev/console`: the same sinks as `log!`.
+struct Tty;
+impl Console for Tty {
+    fn write(&mut self, bytes: &[u8]) {
+        console::write_bytes(bytes);
+    }
+}
+
+/// `kernel/exit.c`: init exiting for any reason panics. In a `qemu-self-test`
+/// build the result mirrors the exit code; the default build halts.
+fn init_died(code: u32) -> ! {
+    crate::log!("{}\n", InitDeath(code));
+    #[cfg(feature = "qemu-self-test")]
+    {
+        if code == 0 {
+            crate::log!("RESULT success\n");
+            cpu::exit(true);
+        }
+        crate::log!("FAIL init exitcode={:#010x}\n", code);
+        cpu::exit(false);
+    }
+    #[cfg(not(feature = "qemu-self-test"))]
+    cpu::halt()
+}
+
+/// Called by `syscall_entry` with the saved registers; writes the result into
+/// `regs.ax`. Interrupts are off and the CPU is on the `BOOT_STACK` top.
+pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
+    let args = [regs.di, regs.si, regs.dx, regs.r10, regs.r8, regs.r9];
+    let Some(outcome) =
+        with(|state| syscall::dispatch(&mut state.space, &mut Tty, regs.orig_ax, args))
+    else {
+        crate::log!("FAIL syscall before init state\n");
+        crate::fail();
+    };
+    match outcome {
+        Outcome::Return(value) => regs.ax = value.cast_unsigned(),
+        Outcome::Exit(code) => init_died(code),
+        Outcome::Unimplemented(number) => {
+            crate::log!("FAIL syscall unimplemented nr={}\n", number);
+            crate::fail();
+        }
+    }
+}
+
+/// Called by the IDT entry for an exception raised in ring 3. Fatal to init:
+/// no signal handler can exist yet, so the signal's default action (terminate)
+/// runs, the exit code is the signal number, and init's death panics.
+pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) -> ! {
+    let Some(vmas) = with(|state| state.vmas) else {
+        crate::log!("FAIL user exception before init state vector={}\n", vector);
+        crate::fail();
+    };
+    if vector == 14 {
+        let line = Segfault {
+            address,
+            ip,
+            sp,
+            error,
+            vmas: &vmas,
+        };
+        crate::log!("{}\n", line);
+        init_died(report::signal_exit_code(report::SIGSEGV));
+    }
+    let signal = u8::try_from(vector).ok().and_then(report::user_exception);
+    let Some(signal) = signal else {
+        crate::log!(
+            "FAIL user exception vector={} error={:#x} rip={:#x}\n",
+            vector,
+            error,
+            ip
+        );
+        crate::fail();
+    };
+    if let Some((kind, desc)) = signal.message {
+        let line = TrapLine {
+            kind,
+            desc,
+            ip,
+            sp,
+            error,
+            vmas: &vmas,
+        };
+        crate::log!("{}\n", line);
+    }
+    init_died(report::signal_exit_code(signal.signal));
+}
+
+/// Exercise the one user-copy mechanism on the real owned tables.
+fn check_user_image(init: &mut Loaded) {
+    let mut word = [0u8; 8];
+    crate::require(
+        usercopy::copy_from_user(&mut init.space, &mut word, init.sp) == 0,
+        "user-stack-readable",
+    );
+    crate::require(u64::from_le_bytes(word) == init.argc, "user-argc");
+    // Writable-path walk: store the value that is already there.
+    crate::require(
+        usercopy::copy_to_user(&mut init.space, init.sp, &word) == 0,
+        "user-stack-writable",
+    );
+    crate::require(
+        usercopy::copy_from_user(&mut init.space, &mut word, STACK_START - 8) == 8
+            && word == [0; 8],
+        "user-below-stack-unmapped",
+    );
+    crate::require(
+        usercopy::copy_from_user(&mut init.space, &mut word, usercopy::TASK_SIZE_MAX - 4) == 8,
+        "user-range-limit",
+    );
+    crate::require(
+        init.vmas.find(init.entry).is_some(),
+        "user-entry-file-backed",
+    );
+    crate::log!(
+        "CHECK userspace-image ok entry={:#x} sp={:#x} loads={} brk={:#x} argc={}\n",
+        init.entry,
+        init.sp,
+        init.loads,
+        init.brk,
+        init.argc
+    );
+}
+
+/// `init/main.c` `run_init_process` for the fallbacks after `/init` failed.
+fn try_fallbacks() -> ! {
+    for path in ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"] {
+        crate::log!("Run {} as init process\n", path);
+    }
+    crate::log!("{}\n", NO_INIT);
+    #[cfg(feature = "qemu-self-test")]
+    {
+        crate::log!("FAIL no-init\n");
+        cpu::exit(false);
+    }
+    #[cfg(not(feature = "qemu-self-test"))]
+    cpu::halt()
+}
+
+/// Start init, or end the boot the way Linux does when it cannot. Returns only
+/// in a `qemu-self-test` build without any `/init` (see below).
+///
+/// shortcut: the pre-generated external QEMU fixtures carry no `/init`, and
+/// their cases expect `RESULT success` after the bootstrap checkpoint, so that
+/// one condition logs a warning and returns there. It must go once the
+/// harness supplies `/init`: the default (physical) build already panics with
+/// Linux's text.
+pub fn run(user: Result<Loaded, Error>) {
+    match user {
+        Ok(init) => start(init),
+        Err(Error::NoInit) => no_init(),
+        Err(Error::Exec(errno) | Error::Load(LoadError::Errno(errno))) => {
+            exec_failed(errno.into_raw());
+        }
+        Err(error) => {
+            crate::log!("FAIL userspace error={:?}\n", error);
+            crate::fail();
+        }
+    }
+}
+
+fn no_init() {
+    #[cfg(feature = "qemu-self-test")]
+    crate::log!("WARN userspace: no /init in any boot module, skipping ring 3\n");
+    // Linux: `init_eaccess("/init")` fails, then the fallbacks.
+    #[cfg(not(feature = "qemu-self-test"))]
+    {
+        crate::log!("check access for rdinit=/init failed: -2, ignoring\n");
+        try_fallbacks()
+    }
+}
+
+/// `kernel_init`: `Failed to execute /init (error N)` then the fallbacks.
+fn exec_failed(errno: i32) -> ! {
+    crate::log!("Run /init as init process\n");
+    crate::log!("{}\n", ExecFailed(-errno));
+    try_fallbacks()
+}
+
+fn start(mut init: Loaded) -> ! {
+    check_user_image(&mut init);
+    crate::log!("Run /init as init process\n");
+    // SAFETY: BSP, CPL0, IF clear (nothing since the timer test re-enabled it
+    // except the guarded sections, which restore it off), descriptors installed
+    // in `kernel_main` before this point.
+    let enabled = unsafe { cpu::enable_syscalls() };
+    crate::unwrap(enabled, "syscall-msrs");
+    // SAFETY: as above; only supervisor mappings exist besides init's pages.
+    let protection = unsafe { cpu::enable_user_protection() };
+    crate::log!(
+        "CHECK userspace exec path=/init entry={:#x} loads={} sp={:#x} smep={} smap={}\n",
+        init.entry,
+        init.loads,
+        init.sp,
+        protection.smep,
+        protection.smap
+    );
+    let (entry, sp) = (init.entry, init.sp);
+    install(State {
+        space: init.space,
+        vmas: init.vmas,
+    });
+    // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
+    // is active and maps `entry` (executable) and `sp` (writable, user); all
+    // state used by the syscall/fault paths is in `STATE`; `kernel_main`'s
+    // frame is abandoned, its stack top is TSS.RSP0.
+    unsafe { cpu::enter_user(entry, sp) }
 }
