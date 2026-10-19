@@ -6,6 +6,10 @@
 
 - Recorded user decisions A18–A20 (checkpoint close-out plus first-userspace slice, full roadmap, branch-and-PR flow preferring audited crates) and updated the authority paragraphs; the structural auditor now accepts Symposium-synced skill copies.
 
+### Kernel audit fixes
+
+- Early framebuffer console before any fallible step, bounded raw command line with `test=` parsing gated on `qemu-self-test`, exposed-provenance pixel stores, CR4.PGE/PCIDE rejection, skip-and-warn for a module that fails inspection, one duplicate buddy validation removed; see [implementation](docs/implementation.md#audit-fixes-2026-10-19).
+
 ### Bounded publication checkpoint
 
 - Applied the then-current user wrap-up/push boundary without declaring the full pinned kernel complete. Landed the authorized single indexed buddy backend, whole-block ownership and real mixed-order/fragmentation/zero/coalescence consumers; removed obsolete cyclic-selection code/verdicts.
