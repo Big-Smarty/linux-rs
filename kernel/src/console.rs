@@ -10,6 +10,7 @@ use core::{
     ptr,
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
+use font8x8::legacy::BASIC_LEGACY;
 
 static ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static PITCH: AtomicUsize = AtomicUsize::new(0);
@@ -118,15 +119,18 @@ fn pixel_byte(byte: u8) {
     let cell = CURSOR.fetch_add(1, Ordering::Relaxed) % (width * height);
     let x = cell % width * 8;
     let y = cell / width * 16;
-    let glyph = glyph(byte.to_ascii_uppercase());
+    // font8x8 legacy table: bit `column` of each row byte is the pixel, LSB
+    // leftmost. Printable ASCII is exact; every other byte shows a visible '?'.
+    let glyph = BASIC_LEGACY[usize::from(if (b' '..=b'~').contains(&byte) {
+        byte
+    } else {
+        b'?'
+    })];
     let foreground = FOREGROUND.load(Ordering::Relaxed);
     for row in 0..16 {
         for column in 0..8 {
-            let white = row > 0
-                && row < 15
-                && column > 0
-                && column < 6
-                && glyph[(row - 1) / 2] & (1 << (5 - column)) != 0;
+            // Each 8x8 glyph row is drawn on two scanlines (8x16 cell).
+            let white = glyph[row / 2] & (1 << column) != 0;
             let address = base + (y + row) * pitch + (x + column) * 4;
             // SAFETY: init validated 32bpp layout, dimensions and whole resource
             // extent through BootInfo. Coordinates remain within that extent. The
@@ -141,56 +145,6 @@ fn pixel_byte(byte: u8) {
                 );
             };
         }
-    }
-}
-
-// Original compact 5x7 diagnostic glyphs, doubled vertically, no external font.
-fn glyph(byte: u8) -> [u8; 7] {
-    match byte {
-        b'A' => [14, 17, 17, 31, 17, 17, 17],
-        b'B' => [30, 17, 17, 30, 17, 17, 30],
-        b'C' => [14, 17, 16, 16, 16, 17, 14],
-        b'D' => [30, 17, 17, 17, 17, 17, 30],
-        b'E' => [31, 16, 16, 30, 16, 16, 31],
-        b'F' => [31, 16, 16, 30, 16, 16, 16],
-        b'G' => [14, 17, 16, 23, 17, 17, 15],
-        b'H' => [17, 17, 17, 31, 17, 17, 17],
-        b'I' => [14, 4, 4, 4, 4, 4, 14],
-        b'J' => [7, 2, 2, 2, 18, 18, 12],
-        b'K' => [17, 18, 20, 24, 20, 18, 17],
-        b'L' => [16, 16, 16, 16, 16, 16, 31],
-        b'M' => [17, 27, 21, 21, 17, 17, 17],
-        b'N' => [17, 25, 21, 19, 17, 17, 17],
-        b'O' => [14, 17, 17, 17, 17, 17, 14],
-        b'P' => [30, 17, 17, 30, 16, 16, 16],
-        b'Q' => [14, 17, 17, 17, 21, 18, 13],
-        b'R' => [30, 17, 17, 30, 20, 18, 17],
-        b'S' => [15, 16, 16, 14, 1, 1, 30],
-        b'T' => [31, 4, 4, 4, 4, 4, 4],
-        b'U' => [17, 17, 17, 17, 17, 17, 14],
-        b'V' => [17, 17, 17, 17, 17, 10, 4],
-        b'W' => [17, 17, 17, 21, 21, 27, 17],
-        b'X' => [17, 17, 10, 4, 10, 17, 17],
-        b'Y' => [17, 17, 10, 4, 4, 4, 4],
-        b'Z' => [31, 1, 2, 4, 8, 16, 31],
-        b'0' => [14, 17, 19, 21, 25, 17, 14],
-        b'1' => [4, 12, 4, 4, 4, 4, 14],
-        b'2' => [14, 17, 1, 2, 4, 8, 31],
-        b'3' => [30, 1, 1, 14, 1, 1, 30],
-        b'4' => [2, 6, 10, 18, 31, 2, 2],
-        b'5' => [31, 16, 16, 30, 1, 1, 30],
-        b'6' => [14, 16, 16, 30, 17, 17, 14],
-        b'7' => [31, 1, 2, 4, 8, 8, 8],
-        b'8' => [14, 17, 17, 14, 17, 17, 14],
-        b'9' => [14, 17, 17, 15, 1, 1, 14],
-        b'=' => [0, 0, 31, 0, 31, 0, 0],
-        b'-' => [0, 0, 0, 31, 0, 0, 0],
-        b':' => [0, 4, 4, 0, 4, 4, 0],
-        b'.' => [0, 0, 0, 0, 0, 4, 4],
-        b'/' => [1, 1, 2, 4, 8, 16, 16],
-        b'_' => [0, 0, 0, 0, 0, 0, 31],
-        b' ' => [0; 7],
-        _ => [31, 17, 5, 4, 4, 0, 4],
     }
 }
 
