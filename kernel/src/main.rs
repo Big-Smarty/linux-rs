@@ -8,12 +8,13 @@ compile_error!(
     "the kernel requires --target x86_64-unknown-none; host tools/tests do not enable freestanding"
 );
 
-use kernel::{boot, firmware, image, memory};
+use kernel::{boot, exec::stack, firmware, image, memory, usercopy};
 
 mod console;
 mod cpu;
 mod paging;
 mod runtime;
+mod userspace;
 
 use boot::TestMode;
 use core::{panic::PanicInfo, ptr};
@@ -58,6 +59,55 @@ fn inspect_boot_images(boot: &boot::BootInfo) {
             summary.interpreters
         );
     }
+}
+
+fn report_user_load(user: Result<userspace::Loaded, userspace::Error>) {
+    match user {
+        Ok(mut init) => check_user_image(&mut init),
+        Err(userspace::Error::NoInit) => {
+            log!("WARN userspace: no /init in any boot module, continuing without ring 3\n");
+        }
+        Err(error) => {
+            log!("FAIL userspace error={:?}\n", error);
+            fail();
+        }
+    }
+}
+
+/// Exercise the one user-copy mechanism on the real owned tables.
+fn check_user_image(init: &mut userspace::Loaded) {
+    let mut word = [0u8; 8];
+    require(
+        usercopy::copy_from_user(&mut init.space, &mut word, init.sp) == 0,
+        "user-stack-readable",
+    );
+    require(u64::from_le_bytes(word) == init.argc, "user-argc");
+    // Writable-path walk: store the value that is already there.
+    require(
+        usercopy::copy_to_user(&mut init.space, init.sp, &word) == 0,
+        "user-stack-writable",
+    );
+    require(
+        usercopy::copy_from_user(&mut init.space, &mut word, stack::STACK_START - 8) == 8
+            && word == [0; 8],
+        "user-below-stack-unmapped",
+    );
+    require(
+        usercopy::copy_from_user(&mut init.space, &mut word, usercopy::TASK_SIZE_MAX - 4) == 8,
+        "user-range-limit",
+    );
+    require(
+        init.vmas.find(init.entry).is_some(),
+        "user-entry-file-backed",
+    );
+    log!(
+        "CHECK userspace-image ok entry={:#x} sp={:#x} loads={} brk={:#x} argc={}\n",
+        init.entry,
+        init.sp,
+        init.loads,
+        init.brk,
+        init.argc
+    );
 }
 
 fn check_module_epoch(boot: &boot::BootInfo, tables: &paging::Tables) {
@@ -137,7 +187,7 @@ extern "C" fn kernel_main() -> ! {
     // trusted handoff, no DMA/AP/firmware mutation or competing allocator.
     let mut allocator = unwrap(unsafe { Allocator::new(&boot) }, "allocator");
     check_frame_ownership(&mut allocator);
-    let tables = unwrap(paging::Tables::build(&boot, &mut allocator), "tables-build");
+    let mut tables = unwrap(paging::Tables::build(&boot, &mut allocator), "tables-build");
     #[cfg(feature = "qemu-self-test")]
     {
         unwrap(
@@ -153,6 +203,10 @@ extern "C" fn kernel_main() -> ! {
         unwrap(tables.check_permissions(&boot), "permissions"),
         "table-permissions",
     );
+    // Kernel tables only; user mappings below are added to the same unpublished
+    // tree, so the published root is still written only before CR3 loads.
+    let table_pages = tables.pages;
+    let user = userspace::load(&boot, &mut allocator, &mut tables);
     // SAFETY: the fully constructed tree covers current image/stack, descriptor,
     // loader/firmware/metadata and framebuffer resources at unchanged addresses;
     // guard/image-alias holes are intentional; no SMP/PCID/global translations.
@@ -167,8 +221,11 @@ extern "C" fn kernel_main() -> ! {
     );
     log!(
         "CHECK paging ok tables={} wx=separated guards=4 image_alias=absent\n",
-        tables.pages
+        table_pages
     );
+    // TEMPORARY (phase 1): phase 2 replaces this with the ring-3 entry and, for
+    // `NoInit`, Linux's "No working init found" panic.
+    report_user_load(user);
     check_exceptions(&boot, &mut allocator);
     #[cfg(feature = "qemu-self-test")]
     check_allocator_recovery(&mut allocator);
