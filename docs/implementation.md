@@ -2,7 +2,7 @@
 
 ## Authority, boundary and current claims
 
-The latest user instruction is to **wrap up the already-authorized memory003 + corrected-image integration and publish the repository**, superseding indefinite continuation. This is a bounded task checkpoint, not a reduced definition of the whole port: Linux6.18.57 commit `2ff600d29ee478d0a8d46ef8a58afb5e038fe692`, every architecture/driver/protocol/filesystem/facility and all qualification obligations remain mandatory and unfinished. Existing planning inventories retain their structural meaning.
+The checkpoint below was published on 2026-10-19; the user then asked to continue with a first-userspace slice ([A18](decisions.md)). This is a bounded task checkpoint, not a reduced definition of the whole port: Linux6.18.57 commit `2ff600d29ee478d0a8d46ef8a58afb5e038fe692`, every architecture/driver/protocol/filesystem/facility and all qualification obligations remain mandatory and unfinished. Existing planning inventories retain their structural meaning.
 
 The first implementation cell is x86_64, little endian, 4 KiB pages, four-level paging, one executing bootstrap CPU, QEMU q35/TCG, UEFI OVMF and external Limine 12.9.3. No Linux userspace, syscall, scheduler, durable filesystem, networking or other-architecture claim follows. Physical execution, independent architecture/unsafe/security review and all reference performance gates remain mandatory and open. No host installation, boot-entry change, reboot, firmware change or raw-device operation is authorized.
 

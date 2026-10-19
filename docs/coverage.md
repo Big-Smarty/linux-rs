@@ -2,7 +2,7 @@
 
 ## Scope and current state
 
-This is the complete **structural inventory** of Linux **6.18.57**, retrieved on **2026-10-19**, not a compatibility or completion percentage. The bounded [publication checkpoint](implementation.md#publication-checkpoint) routes ten workstreams `in_progress`; 2,613 remain `not_started`. Actual source and consumer evidence, not directory counts, determine the narrow claims. Latest authority is wrap-up/publication; M0's unresolved gates and all M1–M8, physical and performance obligations remain open.
+This is the complete **structural inventory** of Linux **6.18.57**, retrieved on **2026-10-19**, not a compatibility or completion percentage. The bounded [publication checkpoint](implementation.md#publication-checkpoint) routes ten workstreams `in_progress`; 2,613 remain `not_started`. Actual source and consumer evidence, not directory counts, determine the narrow claims. Latest authority is the post-publication continuation in [A18–A20](decisions.md); M0's unresolved gates and all M1–M8, physical and performance obligations remain open.
 
 The three machine-readable inputs are:
 
