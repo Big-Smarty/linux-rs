@@ -4,6 +4,8 @@
 
 ### Post-publication continuation
 
+- First-userspace slice, kernel side (phase 1): `/init` discovery across boot modules, Linux-ordered ELF load plan, `create_elf_tables` stack/auxv, `usercopy`, a `write`/`getpid`/`exit`/`exit_group` syscall slice using `syscalls =0.8.1`, init-death/segfault text, and a loader that maps `/init` into the owned tables before CR3 publication; ring-3 entry is phase 2. Routes four more workstreams `in_progress` (14 of 2,623); see [implementation](docs/implementation.md#first-userspace-slice-kernel-side).
+
 - Recorded user decisions A18–A20 (checkpoint close-out plus first-userspace slice, full roadmap, branch-and-PR flow preferring audited crates) and updated the authority paragraphs; the structural auditor now accepts Symposium-synced skill copies.
 
 ### Kernel audit fixes
