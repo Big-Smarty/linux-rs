@@ -24,3 +24,6 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+syscalls = { version = "=0.8.1", default-features = false, features = ["x86_64"] }
