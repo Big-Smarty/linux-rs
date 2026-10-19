@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HELP: &str = "baremetal: bounded, non-destructive Linux functional smoke (NOT qualification)\n\nUsage:\n  baremetal run --output <new-directory> --label <label> --expect-release <exact-osrelease> --environment <reference|qemu|bare-metal>\n  baremetal --help\n  baremetal run --help\n\nAll run options are required once. No positional arguments or implicit environment.\nLabels: 1..80 ASCII letters/digits/dot/underscore/hyphen, starting with a letter/digit.\nThe release must exactly match /proc/sys/kernel/osrelease before output is created.\nEnvironment is the operator's assertion, not automatic physical-machine detection.\nOutput parent must already exist and be trusted; output itself must not exist.\nPreserves reports and a private bounded sandbox; does not clean up arbitrary paths.\nNever use root. No raw devices, mounts, external networking, boot or system changes.\nExit: 0=no failed cases (SKIP is not coverage), 1=failed cases/runtime error, 2=invalid CLI.\n";
 const LIMIT: u16 = 8192;
-// /proc/self/status grows with supplementary groups and CPU lists.
-const READ_LIMIT: u64 = 1024 * 1024;
+// Only /proc/self/status gets this larger cap: it grows with supplementary groups and CPU lists.
+const STATUS_LIMIT: u64 = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const CASE_TIMEOUT: Duration = Duration::from_secs(10);
 const CASES: &[&str] = &[
@@ -195,13 +195,15 @@ fn cell(value: &str) -> String {
 }
 
 fn read_bounded(path: &Path) -> io::Result<String> {
+    read_limited(path, u64::from(LIMIT))
+}
+
+fn read_limited(path: &Path, limit: u64) -> io::Result<String> {
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take(READ_LIMIT + 1)
-        .read_to_end(&mut bytes)?;
+    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
     require(
-        bytes.len() as u64 <= READ_LIMIT,
-        "input exceeds 1 MiB limit",
+        bytes.len() as u64 <= limit,
+        &format!("input exceeds {limit}-byte limit"),
     )?;
     String::from_utf8(bytes).map_err(|error| invalid(error.to_string()))
 }
@@ -233,7 +235,7 @@ fn new_output(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn refuse_root() -> io::Result<()> {
-    let status = read_bounded(Path::new("/proc/self/status"))?;
+    let status = read_limited(Path::new("/proc/self/status"), STATUS_LIMIT)?;
     let uids = status
         .lines()
         .find_map(|line| line.strip_prefix("Uid:"))
@@ -709,8 +711,8 @@ fn unix_socket() -> CaseResult {
     Ok(Observation::Pass("Unix stream socketpair; exact bidirectional payload and half-close EOF; no pathname length dependency".to_owned()))
 }
 
-fn optional_observation(path: &str) -> io::Result<Result<String, Observation>> {
-    match read_bounded(Path::new(path)) {
+fn optional_observation(path: &str, limit: u64) -> io::Result<Result<String, Observation>> {
+    match read_limited(Path::new(path), limit) {
         Ok(value) => Ok(Ok(value)),
         Err(error)
             if matches!(
@@ -794,7 +796,7 @@ fn validate_maps_prefix(prefix: &[u8]) -> CaseResult {
 }
 
 fn proc_status() -> CaseResult {
-    let value = match optional_observation("/proc/self/status")? {
+    let value = match optional_observation("/proc/self/status", STATUS_LIMIT)? {
         Ok(value) => value,
         Err(skip) => return Ok(skip),
     };
@@ -822,7 +824,7 @@ fn proc_status() -> CaseResult {
 }
 
 fn sysfs_online(path: &str) -> CaseResult {
-    let value = match optional_observation(path)? {
+    let value = match optional_observation(path, u64::from(LIMIT))? {
         Ok(value) => value,
         Err(skip) => return Ok(skip),
     };
