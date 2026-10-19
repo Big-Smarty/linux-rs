@@ -4,6 +4,7 @@
 
 ### Post-publication continuation
 
+- Host-tool audit fixes: `xtask` children die with xtask (`setpriv --pdeathsig KILL`), the QMP socket lives in a short private `$XDG_RUNTIME_DIR`/`/tmp` directory,, the guest serial log is bounded, the boot disk is read-only with before/after hashes, `check` skips only root `.git`/`target`, plus manifest/PATH/Limine-version/`/proc` read-cap hardening and dead-code removal.
 - Recorded user decisions A18–A20 (checkpoint close-out plus first-userspace slice, full roadmap, branch-and-PR flow preferring audited crates) and updated the authority paragraphs; the structural auditor now accepts Symposium-synced skill copies.
 
 ### Bounded publication checkpoint
