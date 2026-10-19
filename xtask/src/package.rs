@@ -615,6 +615,7 @@ fn verify_external_input(
         ("readelf_path", "sha256_readelf"),
         ("sha256sum_path", "sha256_sha256sum"),
         ("process_group_kill_path", "sha256_process_group_kill"),
+        ("setpriv_path", "sha256_setpriv"),
         ("harness_executable_path", "sha256_harness_executable"),
         ("local_cargo_config", "local_cargo_config_sha256"),
         ("vendored_std_inputs", "vendored_std_inputs_sha256"),
@@ -795,8 +796,16 @@ fn stage_case(
         "qemu.stderr.log",
         "limine.conf",
     ] {
+        // Guest-controlled, so bounded like the verdict's own serial read.
+        let log = directory.join(name);
+        if fs::metadata(&log)?.len() > crate::kernel::SERIAL_LOG_LIMIT {
+            return Err(invalid(format!(
+                "{} exceeds the evidence size limit",
+                log.display()
+            )));
+        }
         staging.capture(
-            &directory.join(name),
+            &log,
             &Path::new(DOCUMENTS)
                 .join("provenance/qemu/cases")
                 .join(case)
@@ -1339,6 +1348,7 @@ mod tests {
         check_elf, clean_path, debug_case_catalog, digest, file_hash, files_under, open_regular,
         package_buildinfo, package_metadata, parse_manifest, prepare_output, recipe_text,
         recorded_files, resolve_program, stage_case, validate_profile, validate_test_manifest,
+        verify_external_input,
     };
     use std::fs;
     use std::os::unix::{fs::symlink, net::UnixListener};
@@ -1366,6 +1376,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn setpriv_runtime_input_is_a_declared_external_input() {
+        let fixture = Fixture::new();
+        let output =
+            prepare_output(&fixture.0, Path::new("target/kernel-tooling/external")).unwrap();
+        let sha = resolve_program(Path::new("sha256sum")).unwrap();
+        let setpriv = fs::canonicalize("/usr/bin/setpriv").unwrap();
+        let hash = file_hash(&fixture.0, &sha, &setpriv).unwrap();
+        let mut manifest = Manifest::new();
+        // Every other declared input points elsewhere, as in a real build manifest.
+        for (key, hash_key) in [
+            ("cargo_path", "sha256_cargo"),
+            ("rustc_path", "sha256_rustc"),
+            ("rust_lld_path", "sha256_rust_lld"),
+            ("readelf_path", "sha256_readelf"),
+            ("sha256sum_path", "sha256_sha256sum"),
+            ("process_group_kill_path", "sha256_process_group_kill"),
+            ("harness_executable_path", "sha256_harness_executable"),
+            ("local_cargo_config", "local_cargo_config_sha256"),
+            ("vendored_std_inputs", "vendored_std_inputs_sha256"),
+            ("target_spec_path", "target_spec_sha256"),
+        ] {
+            manifest.insert(key.to_owned(), "/nonexistent/other".to_owned());
+            manifest.insert(hash_key.to_owned(), "0".repeat(64));
+        }
+        manifest.insert("setpriv_path".to_owned(), setpriv.display().to_string());
+        manifest.insert("sha256_setpriv".to_owned(), hash.clone());
+        let inputs = Inputs {
+            root: fixture.0.clone(),
+            build: fixture.0.clone(),
+            output: output.path,
+            manifest,
+            manifest_hash: "b".repeat(64),
+            elf_hash: "a".repeat(64),
+        };
+        let staging = Staging::new(&inputs, &sha).unwrap();
+        let sysroot = fixture.0.join("sysroot");
+        verify_external_input(&staging, &setpriv, &hash, &sysroot).unwrap();
+        assert!(verify_external_input(&staging, &setpriv, &"1".repeat(64), &sysroot).is_err());
     }
 
     #[test]
