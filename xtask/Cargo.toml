@@ -10,3 +10,6 @@ build = false
 
 [lints]
 workspace = true
+
+[dependencies]
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
