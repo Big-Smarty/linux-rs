@@ -1400,6 +1400,20 @@ pub(crate) fn verify_project_vendor(
         .collect()
 }
 
+fn record_locked(
+    inputs: &mut BTreeMap<String, String>,
+    prefix: &str,
+    package: &LockedRegistryPackage,
+) {
+    manifest_value(inputs, &format!("{prefix}_name"), &package.name);
+    manifest_value(inputs, &format!("{prefix}_version"), &package.version);
+    manifest_value(
+        inputs,
+        &format!("{prefix}_lock_checksum"),
+        &package.checksum,
+    );
+}
+
 fn link_vendored(merged: &Path, package: &Path) -> io::Result<()> {
     let name = package
         .file_name()
@@ -1407,6 +1421,25 @@ fn link_vendored(merged: &Path, package: &Path) -> io::Result<()> {
     // create_new semantics: a std/project name-version collision fails instead of shadowing.
     std::os::unix::fs::symlink(package, merged.join(name))
         .map_err(|error| contextual(&merged.join(name), &error))
+}
+
+fn check_rust_src_vendor(vendor_dir: &Path, source_config: &Path) -> io::Result<()> {
+    let vendor_metadata =
+        fs::symlink_metadata(vendor_dir).map_err(|error| contextual(vendor_dir, &error))?;
+    if vendor_metadata.file_type().is_symlink() || !vendor_metadata.is_dir() {
+        return Err(invalid(
+            "rust-src vendored dependency directory must be a real directory",
+        ));
+    }
+    let source_config_text =
+        fs::read_to_string(source_config).map_err(|error| contextual(source_config, &error))?;
+    let expected_config = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"";
+    if source_config_text.trim() != expected_config {
+        return Err(invalid(
+            "unexpected installed rust-src source replacement configuration",
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_vendored_std(
@@ -1422,21 +1455,7 @@ fn prepare_vendored_std(
     let vendor_dir = library.join("vendor");
     validate_input(&lock_file)?;
     validate_input(&source_config)?;
-    let vendor_metadata =
-        fs::symlink_metadata(&vendor_dir).map_err(|error| contextual(&vendor_dir, &error))?;
-    if vendor_metadata.file_type().is_symlink() || !vendor_metadata.is_dir() {
-        return Err(invalid(
-            "rust-src vendored dependency directory must be a real directory",
-        ));
-    }
-    let source_config_text =
-        fs::read_to_string(&source_config).map_err(|error| contextual(&source_config, &error))?;
-    let expected_config = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"";
-    if source_config_text.trim() != expected_config {
-        return Err(invalid(
-            "unexpected installed rust-src source replacement configuration",
-        ));
-    }
+    check_rust_src_vendor(&vendor_dir, &source_config)?;
     let packages = parse_std_registry_packages(&lock_file)?;
     let project = verify_project_vendor(root, sha256sum)?;
     let mut inputs = BTreeMap::new();
@@ -1489,13 +1508,7 @@ fn prepare_vendored_std(
         verify_vendor_checksums(&directory, package, hashes)?;
         link_vendored(&merged, &directory)?;
         let prefix = format!("package_{index:04}");
-        manifest_value(&mut inputs, &format!("{prefix}_name"), &package.name);
-        manifest_value(&mut inputs, &format!("{prefix}_version"), &package.version);
-        manifest_value(
-            &mut inputs,
-            &format!("{prefix}_lock_checksum"),
-            &package.checksum,
-        );
+        record_locked(&mut inputs, &prefix, package);
         manifest_value(
             &mut inputs,
             &format!("{prefix}_cargo_checksum_manifest_sha256"),
@@ -1509,14 +1522,7 @@ fn prepare_vendored_std(
     );
     for (index, (package, directory)) in project.iter().enumerate() {
         link_vendored(&merged, directory)?;
-        let prefix = format!("project_package_{index:04}");
-        manifest_value(&mut inputs, &format!("{prefix}_name"), &package.name);
-        manifest_value(&mut inputs, &format!("{prefix}_version"), &package.version);
-        manifest_value(
-            &mut inputs,
-            &format!("{prefix}_lock_checksum"),
-            &package.checksum,
-        );
+        record_locked(&mut inputs, &format!("project_package_{index:04}"), package);
     }
     let manifest = cargo_home.join("vendored-std-inputs.tsv");
     write_manifest(&manifest, inputs)?;
