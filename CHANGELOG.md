@@ -2,9 +2,13 @@
 
 ## Unreleased
 
+### Post-publication continuation
+
+- Recorded user decisions A18–A20 (checkpoint close-out plus first-userspace slice, full roadmap, branch-and-PR flow preferring audited crates) and updated the authority paragraphs; the structural auditor now accepts Symposium-synced skill copies.
+
 ### Bounded publication checkpoint
 
-- Applied the latest user wrap-up/push boundary without declaring the full pinned kernel complete. Landed the authorized single indexed buddy backend, whole-block ownership and real mixed-order/fragmentation/zero/coalescence consumers; removed obsolete cyclic-selection code/verdicts.
+- Applied the then-current user wrap-up/push boundary without declaring the full pinned kernel complete. Landed the authorized single indexed buddy backend, whole-block ownership and real mixed-order/fragmentation/zero/coalescence consumers; removed obsolete cyclic-selection code/verdicts.
 - Landed corrected borrowed CPIO/ELF inspection, one shared byte decoder, real Limine boot-module reservations and pre-/post-CR3 borrow/no-alias proof. Two hash-bound external archives and the genuine zero-byte third-module case are exercised; these ignored fixtures are not in Git, and fresh clones cannot run the full QEMU suite without them.
 - Retained009's genuine11/11 but provider-unqualified result after discovering avoidable compiler-builtins handwritten `memcpy`. Added only the necessary scalar Rust provider using `MaybeUninit` to preserve padding, aligned volatile word destinations and exact byte edges. Corrected range/source-reader contract and the director-observed tautological test comparison;010/011 stayed immutable and final012 binds the correction.
 - Final012 actually matched11/11 with272memset/4224memcpy boundary proofs, null/padding/same-allocation consumers,22 table-allocation rollback points, full RAM recovery, module epochs, PF/BP/IRQ15-GPR and genuine terminal-PF residue8. Director opened its actual default PNG/logs; fresh both-profile author review found only project/core/linker-data providers, no imported memory-provider assembly/FP/vector/defaultUART/f4, and unchanged008 error-entry contracts. Read-only independent memory/image/runtime delta reviews closed with no findings in scope.
