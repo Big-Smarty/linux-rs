@@ -8,12 +8,13 @@ compile_error!(
     "the kernel requires --target x86_64-unknown-none; host tools/tests do not enable freestanding"
 );
 
+// Links the scalar `memset`/`memcpy` providers the compiler emits calls to.
 use kernel::{boot, exec::stack, firmware, image, memory, usercopy};
+use linux_rs_runtime as _;
 
 mod console;
 mod cpu;
 mod paging;
-mod runtime;
 mod userspace;
 
 use boot::TestMode;
@@ -168,7 +169,10 @@ extern "C" fn kernel_main() -> ! {
     let framebuffer = unsafe { console::init(boot::BootInfo::take_framebuffer()) };
     log!("linux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
     #[cfg(feature = "qemu-self-test")]
-    require(runtime::self_test(), "scalar-rust-memory-boundaries");
+    require(
+        linux_rs_runtime::self_test(),
+        "scalar-rust-memory-boundaries",
+    );
     #[cfg(feature = "qemu-self-test")]
     log!(
         "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true\n"

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#![no_std]
+#![cfg(all(target_arch = "x86_64", target_os = "none"))]
 //! The linked image requires memset and memcpy. Supply scalar Rust rather than
 //! compiler-builtins x86 REP assembly optimizations: ordinary memory operations
 //! do not meet this project's unavoidable-assembly exception.
@@ -92,7 +94,8 @@ unsafe extern "C" fn memcpy(
     destination
 }
 
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "self-test")]
+#[must_use]
 pub fn self_test() -> bool {
     for offset in 0..8 {
         for count in 0..=33 {
@@ -126,7 +129,7 @@ pub fn self_test() -> bool {
     copy_self_test() && padded_copy_self_test() && disjoint_range_self_test()
 }
 
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "self-test")]
 fn copy_self_test() -> bool {
     let mut source = [0u8; 80];
     for (byte, value) in source.iter_mut().zip(0u8..) {
@@ -169,7 +172,7 @@ fn copy_self_test() -> bool {
         .all(|(&byte, value)| byte == value.wrapping_mul(37).wrapping_add(11))
 }
 
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "self-test")]
 fn padded_copy_self_test() -> bool {
     #[repr(C)]
     struct Padded {
@@ -194,7 +197,7 @@ fn padded_copy_self_test() -> bool {
     }
 }
 
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "self-test")]
 fn disjoint_range_self_test() -> bool {
     for (source_offset, destination_offset) in [(3, 43), (43, 3)] {
         let mut bytes = [0u8; 80];

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Isolated freestanding kernel builds and bounded QEMU evidence capture.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -16,12 +16,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TARGET: &str = "x86_64-unknown-none";
+// Reviewed host-build source replacement; kernel builds accept the checked-in file only if identical.
+const PROJECT_CARGO_CONFIG: &str = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"\n";
+// The only vendored build scripts: (package directory, script path). Review them again on any bump.
+const VENDOR_BUILD_SCRIPTS: [(&str, &str); 3] = [
+    ("const_fn-0.4.12", "build.rs"),
+    ("rustversion-1.0.23", "build/build.rs"),
+    // Only prints rerun-if-changed and a thumb-mode cfg for ARM targets (read in full); no process, network or file access.
+    ("syscalls-0.8.1", "build.rs"),
+];
 const BINARY: &str = "linux-rs-kernel";
 const REQUIRED_RUSTC_COMMIT: &str = "5c543b0b8c73c7b72bc8284ced4fb22ead15734d";
 const REQUIRED_CARGO_COMMIT: &str = "3d7cf6e937d6127d0f49881bf689c560b36d35c4";
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const KILL: &str = "/usr/bin/kill";
+const SETPRIV: &str = "/usr/bin/setpriv";
+pub(crate) const SERIAL_LOG_LIMIT: u64 = 4 * 1024 * 1024;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
 const FAT_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const OVMF_CODE: &str = "/usr/share/edk2/x64/OVMF_CODE.4m.fd";
@@ -235,6 +246,7 @@ struct BootImage {
     disk: PathBuf,
     vars_copy: PathBuf,
     vars_sha256_initial: String,
+    disk_sha256_initial: String,
     kernel_image_sha256: String,
     limine_image_sha256: String,
     module_image_sha256: Vec<String>,
@@ -300,8 +312,8 @@ impl ChildGuard {
 }
 
 fn kill_process_group(group: u32) -> io::Result<()> {
-    // This fixed, non-shell utility is the only signal boundary. The host crate
-    // forbids unsafe code; every ordinary child is placed in its own group.
+    // This fixed, non-shell utility is the only signal boundary; every
+    // ordinary child is placed in its own group.
     let mut signal = Command::new(KILL)
         .args(["--signal", "KILL", "--", &format!("-{group}")])
         .env_clear()
@@ -361,6 +373,42 @@ fn isolate_command(command: &mut Command) {
             command.env_remove(key);
         }
     }
+}
+
+/// Wrap a long-lived child so it gets SIGKILL when xtask's spawning thread dies
+/// (Ctrl-C, SIGTERM, an aborting panic), instead of being orphaned. `setpriv`
+/// sets `PR_SET_PDEATHSIG` and execs in place, keeping pid and process group.
+/// The signal follows the spawning thread: every caller spawns on the thread that
+/// waits for the child. shortcut: no `getppid` recheck, so a parent dying between
+/// fork and the `prctl` still orphans the child; closing that needs `unsafe`/a crate.
+fn supervised(program: &Path) -> Command {
+    let mut command = Command::new(SETPRIV);
+    command.args(["--pdeathsig", "KILL", "--"]).arg(program);
+    command
+}
+
+fn record_setpriv(
+    root: &Path,
+    sha256sum: &Path,
+    values: &mut BTreeMap<String, String>,
+) -> io::Result<()> {
+    // Canonical, like `process_group_kill_path`: package compares it with the hashed runtime input.
+    manifest_value(
+        values,
+        "setpriv_path",
+        display_path(&fs::canonicalize(SETPRIV)?)?,
+    );
+    manifest_value(
+        values,
+        "setpriv_version",
+        single_line(&tool_output(Path::new(SETPRIV), &["--version"], root)?),
+    );
+    manifest_value(
+        values,
+        "sha256_setpriv",
+        file_hash(root, sha256sum, Path::new(SETPRIV))?,
+    );
+    Ok(())
 }
 
 impl Drop for ChildGuard {
@@ -513,21 +561,13 @@ fn create_directory(path: &Path) -> io::Result<()> {
     fs::create_dir(path).map_err(|error| contextual(path, &error))
 }
 
-fn resolve_tool(name: &str, env_name: Option<&str>) -> io::Result<PathBuf> {
-    if let Some(env_name) = env_name
-        && let Some(value) = std::env::var_os(env_name)
-        && !value.is_empty()
-    {
-        return resolve_program(Path::new(&value));
-    }
-    resolve_program(Path::new(name))
-}
-
 pub(crate) fn resolve_program(program: &Path) -> io::Result<PathBuf> {
     let candidates = if program.components().count() > 1 || program.is_absolute() {
         vec![program.to_path_buf()]
     } else {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            // Empty and relative entries mean the current directory, which can hold planted tools.
+            .filter(|directory| directory.is_absolute())
             .map(|directory| directory.join(program))
             .collect()
     };
@@ -628,8 +668,8 @@ pub(crate) fn tool_output(path: &Path, args: &[&str], root: &Path) -> io::Result
     Ok(text.trim().to_owned())
 }
 
-fn tool(root: &Path, name: &str, env_name: Option<&str>, args: &[&str]) -> io::Result<Tool> {
-    let path = resolve_tool(name, env_name)?;
+fn tool(root: &Path, name: &str, args: &[&str]) -> io::Result<Tool> {
+    let path = resolve_program(Path::new(name))?;
     let version = tool_output(&path, args, root)?;
     Ok(Tool { path, version })
 }
@@ -707,10 +747,9 @@ fn capture_tool_version(
     root: &Path,
     output: &Path,
     name: &'static str,
-    env_name: Option<&str>,
     args: &[&str],
 ) -> io::Result<Tool> {
-    let tool = tool(root, name, env_name, args)?;
+    let tool = tool(root, name, args)?;
     let version_dir = create_log_dir(output)?;
     let version_path = version_dir.join(format!("{name}-version.txt"));
     write_new(&version_path, tool.version.as_bytes())?;
@@ -744,17 +783,17 @@ pub(crate) fn file_hash(root: &Path, sha256sum: &Path, path: &Path) -> io::Resul
 }
 
 fn write_manifest(path: &Path, values: BTreeMap<String, String>) -> io::Result<()> {
-    let mut file = create_new(path)?;
-    writeln!(file, "key\tvalue").map_err(|error| contextual(path, &error))?;
+    // Validate every row before creating the file, so a bad value leaves no partial manifest.
+    let mut text = String::from("key\tvalue\n");
     for (key, value) in values {
         if key.contains(['\t', '\n', '\r']) || value.contains(['\t', '\n', '\r']) {
             return Err(invalid(format!(
                 "manifest field contains a tab or newline: {key:?}"
             )));
         }
-        writeln!(file, "{key}\t{value}").map_err(|error| contextual(path, &error))?;
+        writeln!(text, "{key}\t{value}").map_err(|error| invalid(error.to_string()))?;
     }
-    Ok(())
+    write_new(path, text.as_bytes())
 }
 
 fn manifest_value(values: &mut BTreeMap<String, String>, key: &str, value: impl Into<String>) {
@@ -768,10 +807,12 @@ fn single_line(value: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("; ")
+        // Tabs and other controls would make write_manifest/parse_manifest reject the row.
+        .replace(char::is_control, " ")
 }
 
 fn git_value(root: &Path, args: &[&str]) -> String {
-    let Ok(git) = resolve_tool("git", None) else {
+    let Ok(git) = resolve_program(Path::new("git")) else {
         return "unavailable".to_owned();
     };
     let mut command = Command::new(git);
@@ -813,14 +854,27 @@ fn collect_source_tree(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result
     Ok(())
 }
 
+/// Every workspace member whose source is bound to a build and shipped as corresponding source.
+pub(crate) const SOURCE_MEMBERS: [&str; 5] = ["kernel", "rt", "user/init", "xtask", "baremetal"];
+
 fn source_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = vec![
         root.join("Cargo.toml"),
         root.join("Cargo.lock"),
         root.join("LICENSE"),
     ];
-    for directory in ["kernel", "xtask", "baremetal"] {
+    for directory in SOURCE_MEMBERS {
         collect_source_tree(&root.join(directory), &mut files)?;
+    }
+    // Optional: absent in a tree with no registry dependencies.
+    for optional in [".cargo/config.toml", "vendor"] {
+        let path = root.join(optional);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => collect_source_tree(&path, &mut files)?,
+            Ok(_) => files.push(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(contextual(&path, &error)),
+        }
     }
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
@@ -938,10 +992,30 @@ fn reject_build_overrides(root: &Path) -> io::Result<()> {
             )));
         }
     }
+    reject_inherited_cargo_config(root)
+}
+
+// Cargo merges every `.cargo/config*` from the working directory upwards. The only
+// one accepted is the reviewed host source replacement, byte-identical, at the
+// root or in an enclosing checkout (e.g. a worktree nested under the main checkout's
+// `target/`). That is safe: its relative `directory = "vendor"` resolves against
+// the file's own directory, the deeper (root) config takes precedence for the same
+// keys, and build-std builds override `crates-io` with the per-run `--config`
+// file anyway. Anything else, including a legacy `.cargo/config`, is rejected.
+fn reject_inherited_cargo_config(root: &Path) -> io::Result<()> {
     for directory in root.ancestors() {
         for name in [".cargo/config", ".cargo/config.toml"] {
             let config = directory.join(name);
             match fs::symlink_metadata(&config) {
+                Ok(metadata) if metadata.is_file() && name == ".cargo/config.toml" => {
+                    let text = fs::read(&config).map_err(|error| contextual(&config, &error))?;
+                    if text != PROJECT_CARGO_CONFIG.as_bytes() {
+                        return Err(invalid(format!(
+                            "{} differs from the reviewed source replacement",
+                            config.display()
+                        )));
+                    }
+                }
                 Ok(_) => {
                     return Err(invalid(format!(
                         "kernel builds reject inherited Cargo configuration: {}",
@@ -980,7 +1054,8 @@ fn runtime_source_files(sysroot: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-struct LockedRegistryPackage {
+#[derive(Debug)]
+pub(crate) struct LockedRegistryPackage {
     name: String,
     version: String,
     checksum: String,
@@ -1206,12 +1281,24 @@ fn verify_vendor_checksums(
     package: &LockedRegistryPackage,
     hashes: &BTreeMap<PathBuf, String>,
 ) -> io::Result<()> {
-    let path = directory.join(".cargo-checksum.json");
-    let (checksum, files) = vendor_checksums(&fs::read_to_string(&path)?)?;
+    let checksum_path = directory.join(".cargo-checksum.json");
+    let (checksum, files) = vendor_checksums(&fs::read_to_string(&checksum_path)?)?;
     if checksum != package.checksum || files.is_empty() {
         return Err(invalid(format!(
             "vendor integrity metadata does not match locked {}",
             package.name
+        )));
+    }
+    // Cargo itself only checks the listed files; an unlisted extra file would be unhashed source.
+    let actual = hashes
+        .keys()
+        .filter(|path| path.starts_with(directory) && *path != &checksum_path)
+        .count();
+    if actual != files.len() {
+        return Err(invalid(format!(
+            "vendor package {} has {actual} files but its checksum manifest lists {}",
+            package.name,
+            files.len()
         )));
     }
     for (relative, expected) in files {
@@ -1248,6 +1335,274 @@ fn toml_string(value: &str) -> String {
     quoted
 }
 
+/// Verifies the root `vendor/` directory against the root `Cargo.lock`: the exact locked
+/// registry package set, checksum manifests, no unlisted file and only reviewed build scripts.
+/// Returns `(package, directory)` pairs. A lock with no registry packages needs no `vendor/`.
+pub(crate) fn verify_project_vendor(
+    root: &Path,
+    sha256sum: &Path,
+) -> io::Result<Vec<(LockedRegistryPackage, PathBuf)>> {
+    let packages = parse_std_registry_packages(&root.join("Cargo.lock"))?;
+    let vendor = root.join("vendor");
+    let mut files = Vec::new();
+    match fs::symlink_metadata(&vendor) {
+        Ok(_) => collect_source_tree(&vendor, &mut files)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && packages.is_empty() => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(contextual(&vendor, &error)),
+    }
+    let hashes = hash_files(root, sha256sum, &files)?;
+    let expected = packages
+        .iter()
+        .map(|package| format!("{}-{}", package.name, package.version))
+        .collect::<BTreeSet<_>>();
+    let mut found = BTreeSet::new();
+    for entry in fs::read_dir(&vendor)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            return Err(invalid(format!(
+                "vendor/ may contain only package directories: {}",
+                entry.path().display()
+            )));
+        }
+        found.insert(entry.file_name().to_string_lossy().into_owned());
+    }
+    if found != expected {
+        return Err(invalid(format!(
+            "vendor/ does not match Cargo.lock; unexpected {:?}, missing {:?}",
+            found.difference(&expected).collect::<Vec<_>>(),
+            expected.difference(&found).collect::<Vec<_>>()
+        )));
+    }
+    for file in &files {
+        let relative = file
+            .strip_prefix(&vendor)
+            .map_err(|error| invalid(error.to_string()))?;
+        let is_script = relative.file_name().is_some_and(|name| name == "build.rs");
+        let allowed = VENDOR_BUILD_SCRIPTS
+            .iter()
+            .any(|(package, script)| relative == Path::new(package).join(script));
+        if is_script && !allowed {
+            return Err(invalid(format!(
+                "unreviewed vendored build script: vendor/{}",
+                relative.display()
+            )));
+        }
+    }
+    let verified = packages
+        .into_iter()
+        .map(|package| {
+            let directory = vendor.join(format!("{}-{}", package.name, package.version));
+            verify_vendor_checksums(&directory, &package, &hashes)?;
+            Ok((package, directory))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    verify_build_scripts(root)?;
+    Ok(verified)
+}
+
+fn cargo_program() -> io::Result<PathBuf> {
+    match std::env::var_os("CARGO").map(PathBuf::from) {
+        Some(path) if path.is_absolute() => Ok(path),
+        _ => resolve_program(Path::new("cargo")),
+    }
+}
+
+/// Asks Cargo itself which targets are build scripts (`custom-build`), whatever spelling the
+/// manifests use, and requires each to be a reviewed (name, version, path) entry. The reviewed
+/// source replacement is forced with `--config` so no user-level config can change resolution.
+fn verify_build_scripts(root: &Path) -> io::Result<()> {
+    let mut command = Command::new(cargo_program()?);
+    command
+        .args([
+            "metadata",
+            "--offline",
+            "--locked",
+            "--format-version",
+            "1",
+            "--config",
+            ".cargo/config.toml",
+        ])
+        .current_dir(root)
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "");
+    let output = capture_command(&mut command, METADATA_TIMEOUT)?;
+    let text = String::from_utf8(output)
+        .map_err(|error| invalid(format!("cargo metadata output was not UTF-8: {error}")))?;
+    for (name, version, source) in custom_build_targets(&text)? {
+        let package = format!("{name}-{version}");
+        let reviewed = VENDOR_BUILD_SCRIPTS.iter().any(|(reviewed, script)| {
+            *reviewed == package
+                && source.ends_with(Path::new("vendor").join(&package).join(script))
+        });
+        if !reviewed {
+            return Err(invalid(format!(
+                "unreviewed build script: {package} {}",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+enum Json {
+    String(String),
+    Array(Vec<Json>),
+    Object(BTreeMap<String, Json>),
+    Scalar,
+}
+
+impl Json {
+    fn field(&self, key: &str) -> io::Result<&Json> {
+        match self {
+            Self::Object(fields) => fields
+                .get(key)
+                .ok_or_else(|| invalid(format!("cargo metadata lacks {key:?}"))),
+            _ => Err(invalid("cargo metadata value is not an object")),
+        }
+    }
+
+    fn array(&self) -> io::Result<&[Json]> {
+        match self {
+            Self::Array(items) => Ok(items),
+            _ => Err(invalid("cargo metadata value is not an array")),
+        }
+    }
+
+    fn string(&self) -> io::Result<&str> {
+        match self {
+            Self::String(text) => Ok(text),
+            _ => Err(invalid("cargo metadata value is not a string")),
+        }
+    }
+}
+
+impl ChecksumJson<'_> {
+    fn value(&mut self, depth: u8) -> io::Result<Json> {
+        if depth == 0 {
+            return Err(invalid("cargo metadata JSON is nested too deeply"));
+        }
+        self.rest = self.rest.trim_start();
+        match self.rest.chars().next() {
+            Some('"') => Ok(Json::String(self.string()?)),
+            Some('[') => {
+                self.consume('[')?;
+                let mut items = Vec::new();
+                if self.rest.trim_start().starts_with(']') {
+                    self.consume(']')?;
+                    return Ok(Json::Array(items));
+                }
+                loop {
+                    items.push(self.value(depth - 1)?);
+                    if self.rest.trim_start().starts_with(']') {
+                        self.consume(']')?;
+                        return Ok(Json::Array(items));
+                    }
+                    self.consume(',')?;
+                }
+            }
+            Some('{') => {
+                self.consume('{')?;
+                let mut fields = BTreeMap::new();
+                if self.rest.trim_start().starts_with('}') {
+                    self.consume('}')?;
+                    return Ok(Json::Object(fields));
+                }
+                loop {
+                    let key = self.string()?;
+                    self.consume(':')?;
+                    if fields.insert(key, self.value(depth - 1)?).is_some() {
+                        return Err(invalid("duplicate cargo metadata key"));
+                    }
+                    if self.rest.trim_start().starts_with('}') {
+                        self.consume('}')?;
+                        return Ok(Json::Object(fields));
+                    }
+                    self.consume(',')?;
+                }
+            }
+            Some(_) => {
+                let end = self
+                    .rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+                    .unwrap_or(self.rest.len());
+                if end == 0 {
+                    return Err(invalid("unexpected character in cargo metadata JSON"));
+                }
+                self.rest = &self.rest[end..];
+                Ok(Json::Scalar)
+            }
+            None => Err(invalid("truncated cargo metadata JSON")),
+        }
+    }
+}
+
+/// `(name, version, src_path)` of every `custom-build` target in `cargo metadata` output.
+fn custom_build_targets(metadata: &str) -> io::Result<Vec<(String, String, PathBuf)>> {
+    let mut json = ChecksumJson { rest: metadata };
+    let document = json.value(32)?;
+    if !json.rest.trim().is_empty() {
+        return Err(invalid("trailing cargo metadata JSON"));
+    }
+    let mut found = Vec::new();
+    for package in document.field("packages")?.array()? {
+        for target in package.field("targets")?.array()? {
+            let mut kinds = target.field("kind")?.array()?.iter();
+            if kinds.any(|kind| kind.string().is_ok_and(|kind| kind == "custom-build")) {
+                found.push((
+                    package.field("name")?.string()?.to_owned(),
+                    package.field("version")?.string()?.to_owned(),
+                    PathBuf::from(target.field("src_path")?.string()?),
+                ));
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn record_locked(
+    inputs: &mut BTreeMap<String, String>,
+    prefix: &str,
+    package: &LockedRegistryPackage,
+) {
+    manifest_value(inputs, &format!("{prefix}_name"), &package.name);
+    manifest_value(inputs, &format!("{prefix}_version"), &package.version);
+    manifest_value(
+        inputs,
+        &format!("{prefix}_lock_checksum"),
+        &package.checksum,
+    );
+}
+
+fn link_vendored(merged: &Path, package: &Path) -> io::Result<()> {
+    let name = package
+        .file_name()
+        .ok_or_else(|| invalid("vendored package has no directory name"))?;
+    // create_new semantics: a std/project name-version collision fails instead of shadowing.
+    std::os::unix::fs::symlink(package, merged.join(name))
+        .map_err(|error| contextual(&merged.join(name), &error))
+}
+
+fn check_rust_src_vendor(vendor_dir: &Path, source_config: &Path) -> io::Result<()> {
+    let vendor_metadata =
+        fs::symlink_metadata(vendor_dir).map_err(|error| contextual(vendor_dir, &error))?;
+    if vendor_metadata.file_type().is_symlink() || !vendor_metadata.is_dir() {
+        return Err(invalid(
+            "rust-src vendored dependency directory must be a real directory",
+        ));
+    }
+    let source_config_text =
+        fs::read_to_string(source_config).map_err(|error| contextual(source_config, &error))?;
+    let expected_config = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"";
+    if source_config_text.trim() != expected_config {
+        return Err(invalid(
+            "unexpected installed rust-src source replacement configuration",
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_vendored_std(
     root: &Path,
     cargo_home: &Path,
@@ -1261,33 +1616,20 @@ fn prepare_vendored_std(
     let vendor_dir = library.join("vendor");
     validate_input(&lock_file)?;
     validate_input(&source_config)?;
-    let vendor_metadata =
-        fs::symlink_metadata(&vendor_dir).map_err(|error| contextual(&vendor_dir, &error))?;
-    if vendor_metadata.file_type().is_symlink() || !vendor_metadata.is_dir() {
-        return Err(invalid(
-            "rust-src vendored dependency directory must be a real directory",
-        ));
-    }
-    let source_config_text =
-        fs::read_to_string(&source_config).map_err(|error| contextual(&source_config, &error))?;
-    let expected_config = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"";
-    if source_config_text.trim() != expected_config {
-        return Err(invalid(
-            "unexpected installed rust-src source replacement configuration",
-        ));
-    }
+    check_rust_src_vendor(&vendor_dir, &source_config)?;
     let packages = parse_std_registry_packages(&lock_file)?;
+    let project = verify_project_vendor(root, sha256sum)?;
     let mut inputs = BTreeMap::new();
-    manifest_value(&mut inputs, "schema", "1");
+    manifest_value(&mut inputs, "schema", "2");
     manifest_value(
         &mut inputs,
         "source",
-        "installed rust-src library/vendor; no global Cargo cache or config copied",
+        "installed rust-src library/vendor plus project vendor/, merged by symlink; no global Cargo cache or config copied",
     );
     manifest_value(
         &mut inputs,
         "trust",
-        "installed qualified toolchain; checksum consistency is not independent cryptographic authentication",
+        "installed qualified toolchain and committed vendor/; checksum consistency is not independent cryptographic authentication",
     );
     manifest_value(
         &mut inputs,
@@ -1304,6 +1646,12 @@ fn prepare_vendored_std(
         "registry_package_count",
         packages.len().to_string(),
     );
+    // Cargo allows one directory behind a replaced source and build-std needs both sets.
+    let merged = cargo_home.join("vendor");
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&merged)
+        .map_err(|error| contextual(&merged, &error))?;
     for (index, package) in packages.iter().enumerate() {
         let directory = vendor_dir.join(format!("{}-{}", package.name, package.version));
         let metadata =
@@ -1319,26 +1667,30 @@ fn prepare_vendored_std(
         let checksum_manifest = directory.join(".cargo-checksum.json");
         validate_input(&checksum_manifest)?;
         verify_vendor_checksums(&directory, package, hashes)?;
+        link_vendored(&merged, &directory)?;
         let prefix = format!("package_{index:04}");
-        manifest_value(&mut inputs, &format!("{prefix}_name"), &package.name);
-        manifest_value(&mut inputs, &format!("{prefix}_version"), &package.version);
-        manifest_value(
-            &mut inputs,
-            &format!("{prefix}_lock_checksum"),
-            &package.checksum,
-        );
+        record_locked(&mut inputs, &prefix, package);
         manifest_value(
             &mut inputs,
             &format!("{prefix}_cargo_checksum_manifest_sha256"),
             file_hash(root, sha256sum, &checksum_manifest)?,
         );
     }
+    manifest_value(
+        &mut inputs,
+        "project_package_count",
+        project.len().to_string(),
+    );
+    for (index, (package, directory)) in project.iter().enumerate() {
+        link_vendored(&merged, directory)?;
+        record_locked(&mut inputs, &format!("project_package_{index:04}"), package);
+    }
     let manifest = cargo_home.join("vendored-std-inputs.tsv");
     write_manifest(&manifest, inputs)?;
     let local_config = cargo_home.join("config.toml");
     let config_text = format!(
-        "[source.crates-io]\nreplace-with = \"rust-src-vendored\"\n\n[source.rust-src-vendored]\ndirectory = {}\n",
-        toml_string(&display_path(&vendor_dir)?)
+        "[source.crates-io]\nreplace-with = \"kernel-vendored\"\n\n[source.kernel-vendored]\ndirectory = {}\n",
+        toml_string(&display_path(&merged)?)
     );
     write_new(&local_config, config_text.as_bytes())?;
     Ok(VendoredStdInputs {
@@ -1598,7 +1950,7 @@ fn build_command(
     lld: &Tool,
     qemu_self_test: bool,
 ) -> io::Result<Command> {
-    let mut command = Command::new(&cargo.path);
+    let mut command = supervised(&cargo.path);
     command
         .args([
             "-Zbuild-std=core,compiler_builtins",
@@ -1606,8 +1958,11 @@ fn build_command(
             "rustc",
             "--offline",
             "--locked",
-            "--target-dir",
+            "--config",
         ])
+        // Highest precedence: the checked-in host source replacement must not shadow the merged one.
+        .arg(output.join("cargo-home/config.toml"))
+        .arg("--target-dir")
         .arg(output.join("cargo-target"))
         .args([
             "-p",
@@ -1828,7 +2183,7 @@ fn record_build_sources(
 
 fn prepare_build(root: &Path, output: &Path, qemu_self_test: bool) -> io::Result<PreparedBuild> {
     create_directory(&output.join("cargo-target"))?;
-    let sha = capture_tool_version(root, output, "sha256sum", None, &["--version"])?;
+    let sha = capture_tool_version(root, output, "sha256sum", &["--version"])?;
     let Toolchain {
         cargo,
         rustc,
@@ -1836,7 +2191,7 @@ fn prepare_build(root: &Path, output: &Path, qemu_self_test: bool) -> io::Result
         lld,
         checked_hashes,
     } = toolchain(root, output, &sha.path)?;
-    let readelf = capture_tool_version(root, output, "readelf", None, &["--version"])?;
+    let readelf = capture_tool_version(root, output, "readelf", &["--version"])?;
     let target_spec = write_target_spec(root, output, &rustc.path)?;
     let cargo_home = output.join("cargo-home");
     create_directory(&cargo_home)?;
@@ -1853,6 +2208,7 @@ fn prepare_build(root: &Path, output: &Path, qemu_self_test: bool) -> io::Result
         fixed_inputs.push(fs::canonicalize(&tool.path)?);
     }
     fixed_inputs.push(fs::canonicalize(KILL)?);
+    fixed_inputs.push(fs::canonicalize(SETPRIV)?);
     let harness = fs::canonicalize(std::env::current_exe()?)?;
     fixed_inputs.push(harness.clone());
     runtime.extend(hash_files(root, &sha.path, &fixed_inputs)?);
@@ -1876,6 +2232,7 @@ fn prepare_build(root: &Path, output: &Path, qemu_self_test: bool) -> io::Result
     ] {
         record_build_tool(root, &sha.path, &mut manifest, name, tool)?;
     }
+    record_setpriv(root, &sha.path, &mut manifest)?;
     record_build_runtime(
         root,
         &sha.path,
@@ -2294,10 +2651,12 @@ fn make_fat_image(
     )?;
     let (kernel_image_sha256, limine_image_sha256, module_image_sha256) =
         verify_image_payloads(root, case_dir, &image_relative, build, tools, with_empty)?;
+    let disk_sha256_initial = file_hash(root, &tools.sha256sum.path, &image)?;
     Ok(BootImage {
         disk: image,
         vars_copy,
         vars_sha256_initial,
+        disk_sha256_initial,
         kernel_image_sha256,
         limine_image_sha256,
         module_image_sha256,
@@ -2469,6 +2828,22 @@ fn require_exit(
     Ok(())
 }
 
+/// Guest-controlled, so bounded; invalid UTF-8 is an error, not an empty log.
+fn read_serial_log(path: &Path) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(|error| contextual(path, &error))?
+        .take(SERIAL_LOG_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > SERIAL_LOG_LIMIT {
+        return Err(invalid(format!(
+            "{} exceeds {SERIAL_LOG_LIMIT} bytes",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|error| invalid(format!("{}: {error}", path.display())))
+}
+
 fn debug_qemu_args(
     root: &Path,
     case_dir: &Path,
@@ -2505,7 +2880,12 @@ fn debug_qemu_args(
             relative(vars_copy)?
         )),
         OsString::from("-drive"),
-        OsString::from(format!("if=ide,format=raw,file={}", relative(image)?)),
+        OsString::from(format!(
+            "if=none,id=boot,format=raw,readonly=on,file={}",
+            relative(image)?
+        )),
+        OsString::from("-device"),
+        OsString::from("virtio-blk-pci,drive=boot"),
         OsString::from("-boot"),
         OsString::from("order=c"),
         OsString::from("-device"),
@@ -2539,17 +2919,24 @@ fn run_debug_case(
     let args_text = command_args(&args)?;
     let stdout = case_dir.join("qemu.stdout.log");
     let stderr = case_dir.join("qemu.stderr.log");
-    let mut command = Command::new(&tools.qemu.path);
+    let mut command = supervised(&tools.qemu.path);
     command.args(&args).current_dir(root).stdin(Stdio::null());
     let process = run_with_logs(&mut command, &stdout, &stderr, timeout)?;
-    let serial = fs::read_to_string(case_dir.join("serial.log")).unwrap_or_default();
-    let (markers_match, mut diagnostic) = validate_debug_case(case, &process, &serial);
+    let (markers_match, mut diagnostic) = match read_serial_log(&case_dir.join("serial.log")) {
+        Ok(serial) => validate_debug_case(case, &process, &serial),
+        Err(error) => (false, format!("unusable serial log: {error}")),
+    };
+    let disk_final = file_hash(root, &tools.sha256sum.path, &boot_image.disk)?;
+    let disk_unchanged = disk_final == boot_image.disk_sha256_initial;
+    if !disk_unchanged {
+        diagnostic.push_str("; boot disk image changed during QEMU run");
+    }
     let elf_after = file_hash(root, &tools.sha256sum.path, &build.elf)?;
     let snapshot_unchanged = elf_after == build.elf_hash;
     if !snapshot_unchanged {
         diagnostic.push_str("; kernel ELF snapshot changed during QEMU run");
     }
-    let passed = markers_match && snapshot_unchanged;
+    let passed = markers_match && snapshot_unchanged && disk_unchanged;
     let vars_final = file_hash(root, &tools.sha256sum.path, &boot_image.vars_copy)?;
     let mut result = BTreeMap::new();
     manifest_value(&mut result, "schema", "1");
@@ -2580,6 +2967,7 @@ fn run_debug_case(
         &mut result,
         boot_image,
         vars_final,
+        disk_final,
     )?;
     write_manifest(&case_dir.join("result.tsv"), result)?;
     Ok(CaseResult {
@@ -2600,6 +2988,7 @@ fn record_debug_tools(
     args: &[String],
     result: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
+    record_setpriv(root, &tools.sha256sum.path, result)?;
     manifest_value(result, "qemu_path", display_path(&tools.qemu.path)?);
     manifest_value(result, "qemu_version", single_line(&tools.qemu.version));
     manifest_value(result, "qemu_arguments", args.join(" | "));
@@ -2652,12 +3041,14 @@ fn record_image_result(
     result: &mut BTreeMap<String, String>,
     image: BootImage,
     vars_final: String,
+    disk_final: String,
 ) -> io::Result<()> {
     manifest_value(
         result,
-        "sha256_disk_image",
-        file_hash(root, sha256sum, &image.disk)?,
+        "sha256_disk_image_initial",
+        image.disk_sha256_initial,
     );
+    manifest_value(result, "sha256_disk_image_after_run", disk_final);
     manifest_value(result, "sha256_image_kernel_elf", image.kernel_image_sha256);
     manifest_value(result, "sha256_image_limine_efi", image.limine_image_sha256);
     for (index, hash) in image.module_image_sha256.into_iter().enumerate() {
@@ -2995,19 +3386,19 @@ fn validate_success_serial(lines: &[&str], with_empty: bool) -> Result<(), Strin
 }
 
 fn capture_qemu_tools(root: &Path, output: &Path) -> io::Result<QemuTools> {
-    let qemu = capture_tool_version(root, output, "qemu-system-x86_64", None, &["--version"])?;
-    let limine = capture_tool_version(root, output, "limine", None, &["--version"])?;
-    if !limine.version.contains("12.9.3") {
+    let qemu = capture_tool_version(root, output, "qemu-system-x86_64", &["--version"])?;
+    let limine = capture_tool_version(root, output, "limine", &["--version"])?;
+    if limine.version.lines().next() != Some("Limine 12.9.3") {
         return Err(invalid(format!(
             "Limine 12.9.3 is required for the pinned base-revision contract; found {}",
             single_line(&limine.version)
         )));
     }
-    let mkfs_fat = resolve_tool("mkfs.fat", None)?;
-    let mdir = capture_tool_version(root, output, "mdir", None, &["--version"])?;
-    let mmd = capture_tool_version(root, output, "mmd", None, &["--version"])?;
-    let mcopy = capture_tool_version(root, output, "mcopy", None, &["--version"])?;
-    let sha256sum = capture_tool_version(root, output, "sha256sum", None, &["--version"])?;
+    let mkfs_fat = resolve_program(Path::new("mkfs.fat"))?;
+    let mdir = capture_tool_version(root, output, "mdir", &["--version"])?;
+    let mmd = capture_tool_version(root, output, "mmd", &["--version"])?;
+    let mcopy = capture_tool_version(root, output, "mcopy", &["--version"])?;
+    let sha256sum = capture_tool_version(root, output, "sha256sum", &["--version"])?;
     Ok(QemuTools {
         qemu,
         limine,
@@ -3230,12 +3621,10 @@ fn create_process(command: &mut Command) -> io::Result<ChildGuard> {
 }
 
 fn wait_qmp_socket(
-    root: &Path,
-    socket: &Path,
+    path: &Path,
     child: &mut ChildGuard,
     timeout: Duration,
 ) -> io::Result<UnixStream> {
-    let path = root.join(socket);
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -3244,12 +3633,12 @@ fn wait_qmp_socket(
                 status.code()
             )));
         }
-        match UnixStream::connect(&path) {
+        match UnixStream::connect(path) {
             Ok(stream) => return Ok(stream),
             Err(error)
                 if error.kind() == io::ErrorKind::ConnectionRefused
                     || error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(contextual(&path, &error)),
+            Err(error) => return Err(contextual(path, &error)),
         }
         if start.elapsed() >= timeout {
             return Err(invalid("QMP socket did not become ready before timeout"));
@@ -3447,18 +3836,51 @@ fn valid_image(path: &Path) -> io::Result<Option<&'static str>> {
     Ok(None)
 }
 
-fn default_qemu_args(
-    root: &Path,
-    case_dir: &Path,
-    image: &BootImage,
-) -> io::Result<(PathBuf, Vec<OsString>)> {
-    let socket = case_dir.join("qmp.sock");
-    if display_path(&root.join(&socket))?.len() >= 100 {
-        return Err(invalid(
-            "QMP Unix socket path is too long; use a shorter project root or output name",
+/// Private directory holding only the QMP socket. `sun_path` is ~108 bytes, so the
+/// socket cannot live in a deep run directory; the path is recorded in the case's
+/// `qemu_arguments`. Removed on drop.
+struct QmpDir(PathBuf);
+
+impl QmpDir {
+    fn create(output: &Path) -> io::Result<Self> {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let name = output
+            .file_name()
+            .ok_or_else(|| invalid("output directory has no name"))?;
+        let path = base.join(format!(
+            "linux-rs-qmp-{}-{}",
+            std::process::id(),
+            name.to_string_lossy()
         ));
+        let socket = display_path(&path.join("qmp.sock"))?;
+        // QEMU option syntax splits on commas; `sun_path` holds 107 bytes plus NUL.
+        if socket.contains(',') || socket.len() >= 100 {
+            return Err(invalid(format!("unusable QMP socket path {socket}")));
+        }
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|error| contextual(&path, &error))?;
+        Ok(Self(path))
     }
-    let socket_relative = display_path(&relative_path(root, &socket)?)?;
+
+    fn socket(&self) -> PathBuf {
+        self.0.join("qmp.sock")
+    }
+}
+
+impl Drop for QmpDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.socket());
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+fn default_qemu_args(root: &Path, socket: &Path, image: &BootImage) -> io::Result<Vec<OsString>> {
+    let socket_text = display_path(socket)?;
     let image_relative = display_path(&relative_path(root, &image.disk)?)?;
     let vars_relative = display_path(&relative_path(root, &image.vars_copy)?)?;
     let args = vec![
@@ -3486,13 +3908,17 @@ fn default_qemu_args(
         OsString::from("-drive"),
         OsString::from(format!("if=pflash,unit=1,format=raw,file={vars_relative}")),
         OsString::from("-drive"),
-        OsString::from(format!("if=ide,format=raw,file={image_relative}")),
+        OsString::from(format!(
+            "if=none,id=boot,format=raw,readonly=on,file={image_relative}"
+        )),
+        OsString::from("-device"),
+        OsString::from("virtio-blk-pci,drive=boot"),
         OsString::from("-boot"),
         OsString::from("order=c"),
         OsString::from("-qmp"),
-        OsString::from(format!("unix:{socket_relative},server=on,wait=off")),
+        OsString::from(format!("unix:{socket_text},server=on,wait=off")),
     ];
-    Ok((socket, args))
+    Ok(args)
 }
 
 fn observe_default_halt(
@@ -3641,6 +4067,7 @@ fn write_default_result(
         "qemu_version",
         single_line(&tools.qemu.version),
     );
+    record_setpriv(root, &tools.sha256sum.path, &mut manifest)?;
     manifest_value(&mut manifest, "qemu_path", display_path(&tools.qemu.path)?);
     manifest_value(&mut manifest, "qemu_arguments", args.join(" | "));
     manifest_value(
@@ -3655,12 +4082,15 @@ fn write_default_result(
         file_hash(root, &tools.sha256sum.path, &build.elf)?,
     );
     let vars_final = file_hash(root, &tools.sha256sum.path, &boot_image.vars_copy)?;
+    let disk_final = file_hash(root, &tools.sha256sum.path, &boot_image.disk)?;
+    let disk_unchanged = disk_final == boot_image.disk_sha256_initial;
     record_image_result(
         root,
         &tools.sha256sum.path,
         &mut manifest,
         boot_image,
         vars_final,
+        disk_final,
     )?;
     manifest_value(
         &mut manifest,
@@ -3668,6 +4098,9 @@ fn write_default_result(
         file_hash(root, &tools.sha256sum.path, Path::new(LIMINE_EFI))?,
     );
     write_manifest(&case_dir.join("result.tsv"), manifest)?;
+    if !disk_unchanged {
+        return Err(invalid("default-boot disk image changed during QEMU run"));
+    }
     Ok((screenshot, screenshot_format.to_owned(), cpu_state))
 }
 
@@ -3700,16 +4133,18 @@ fn capture_default_framebuffer(
             "default kernel ELF snapshot changed before QEMU launch",
         ));
     }
-    let (socket, args) = default_qemu_args(root, &case_dir, &boot_image)?;
+    let qmp_dir = QmpDir::create(output)?;
+    let socket = qmp_dir.socket();
+    let args = default_qemu_args(root, &socket, &boot_image)?;
     let qemu_stdout = case_dir.join("qemu.stdout.log");
     let qemu_stderr = case_dir.join("qemu.stderr.log");
-    let mut command = Command::new(&tools.qemu.path);
+    let mut command = supervised(&tools.qemu.path);
     command.args(&args).current_dir(root).stdin(Stdio::null());
     command.stdout(Stdio::from(create_new(&qemu_stdout)?));
     command.stderr(Stdio::from(create_new(&qemu_stderr)?));
     let start = Instant::now();
     let mut child = create_process(&mut command)?;
-    let stream = wait_qmp_socket(root, &socket, &mut child, timeout)?;
+    let stream = wait_qmp_socket(&socket, &mut child, timeout)?;
     let qmp_log = case_dir.join("qmp.log");
     let mut qmp = Qmp::new(stream, &qmp_log, start + timeout)?;
     let (cpu_state, status_response) =
@@ -3840,6 +4275,82 @@ mod tests {
     }
 
     #[test]
+    fn child_dies_when_spawning_thread_exits() -> io::Result<()> {
+        let exe = fs::canonicalize(std::env::current_exe()?)?;
+        let pid = thread::spawn(move || -> io::Result<u32> {
+            let mut command = supervised(&exe);
+            command
+                .args(["--exact", "kernel::tests::process_fixture"])
+                .env("LINUX_RS_PROCESS_FIXTURE", "leaf")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let child = create_process(&mut command)?;
+            let pid = child.child.as_ref().map_or(0, Child::id);
+            // setpriv must have exec'd (and so set the signal) before this thread exits.
+            let start = Instant::now();
+            while fs::read_link(format!("/proc/{pid}/exe"))? != exe {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "setpriv never exec'd"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Skip the guard's cleanup: only the death signal may end the child.
+            std::mem::forget(child);
+            Ok(pid)
+        })
+        .join()
+        .map_err(|_| invalid("spawn thread panicked"))??;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let live = fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|text| {
+                text.rsplit_once(") ")
+                    .is_some_and(|(_, state)| !state.starts_with(['Z', 'X']))
+            });
+            if !live {
+                return Ok(());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child outlived its spawning thread"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn serial_log_is_bounded_and_utf8() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let path = scratch.0.join("serial.log");
+        fs::write(&path, "ok\n")?;
+        assert_eq!(read_serial_log(&path)?, "ok\n");
+        fs::write(&path, [0xff])?;
+        assert!(read_serial_log(&path).is_err());
+        fs::write(
+            &path,
+            vec![b'x'; usize::try_from(SERIAL_LOG_LIMIT).unwrap() + 1],
+        )?;
+        assert!(read_serial_log(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_manifest_leaves_no_partial_file() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let path = scratch.0.join("result.tsv");
+        let mut values = BTreeMap::new();
+        manifest_value(&mut values, "key", "bad\tvalue");
+        assert!(write_manifest(&path, values).is_err());
+        assert!(!path.exists());
+        // Failure manifests build their error text with single_line, so they stay writable.
+        let mut failure = BTreeMap::new();
+        manifest_value(&mut failure, "error", single_line("a\tb\x1b[0m\nc"));
+        write_manifest(&path, failure)?;
+        assert!(fs::read_to_string(&path)?.ends_with("error\ta b [0m; c\n"));
+        Ok(())
+    }
+
+    #[test]
     fn metadata_capture_rejects_oversized_output() -> io::Result<()> {
         let mut command = Command::new(std::env::current_exe()?);
         command
@@ -3892,8 +4403,8 @@ mod tests {
     #[test]
     fn source_binding_detects_bytes_additions_and_removals() -> io::Result<()> {
         let scratch = Scratch::new()?;
-        for directory in ["kernel", "xtask", "baremetal"] {
-            fs::create_dir(scratch.0.join(directory))?;
+        for directory in SOURCE_MEMBERS {
+            fs::create_dir_all(scratch.0.join(directory))?;
         }
         for file in [
             "Cargo.toml",
@@ -3901,6 +4412,8 @@ mod tests {
             "LICENSE",
             "kernel/main.rs",
             "xtask/package.rs",
+            "rt/lib.rs",
+            "user/init/main.rs",
         ] {
             fs::write(scratch.0.join(file), b"initial\n")?;
         }
@@ -3916,7 +4429,177 @@ mod tests {
         fs::remove_file(scratch.0.join("xtask/new-module.rs"))?;
         fs::remove_file(scratch.0.join("kernel/main.rs"))?;
         assert!(require_unchanged(&before, &snapshot()?).is_err());
+        fs::write(scratch.0.join("kernel/main.rs"), b"initial\n")?;
+        require_unchanged(&before, &snapshot()?)?;
+        // The kernel links rt, and user/init is a workspace member: edits must be seen.
+        for file in ["rt/lib.rs", "user/init/main.rs"] {
+            fs::write(scratch.0.join(file), b"modified\n")?;
+            assert!(require_unchanged(&before, &snapshot()?).is_err(), "{file}");
+            fs::write(scratch.0.join(file), b"initial\n")?;
+        }
         Ok(())
+    }
+
+    #[test]
+    fn source_members_cover_every_workspace_member() -> io::Result<()> {
+        let manifest =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml"))?;
+        let members = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("members = ["))
+            .and_then(|rest| rest.strip_suffix(']'))
+            .ok_or_else(|| invalid("workspace members line not found"))?;
+        let mut declared = members
+            .split(',')
+            .map(|member| member.trim().trim_matches('"'))
+            .collect::<Vec<_>>();
+        declared.sort_unstable();
+        let mut bound = SOURCE_MEMBERS.to_vec();
+        bound.sort_unstable();
+        assert_eq!(declared, bound);
+        Ok(())
+    }
+
+    #[test]
+    fn enclosing_checkout_config_is_accepted_only_when_identical() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let outer = &scratch.0;
+        let root = outer.join("target/worktrees/inner");
+        fs::create_dir_all(root.join(".cargo"))?;
+        fs::create_dir_all(outer.join(".cargo"))?;
+        fs::write(root.join(".cargo/config.toml"), PROJECT_CARGO_CONFIG)?;
+        fs::write(outer.join(".cargo/config.toml"), PROJECT_CARGO_CONFIG)?;
+        reject_inherited_cargo_config(&root)?;
+        fs::write(
+            outer.join(".cargo/config.toml"),
+            "[build]\nrustflags = []\n",
+        )?;
+        assert!(reject_inherited_cargo_config(&root).is_err());
+        fs::remove_file(outer.join(".cargo/config.toml"))?;
+        fs::write(outer.join(".cargo/config"), PROJECT_CARGO_CONFIG)?;
+        assert!(reject_inherited_cargo_config(&root).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn checked_in_cargo_config_is_the_reviewed_constant() -> io::Result<()> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.cargo/config.toml");
+        assert_eq!(fs::read_to_string(path)?, PROJECT_CARGO_CONFIG);
+        Ok(())
+    }
+
+    // A one-dependency project whose vendored `demo` manifest is `manifest`.
+    fn vendor_fixture(scratch: &Scratch, manifest: &str) -> io::Result<PathBuf> {
+        let root = scratch.0.clone();
+        let sha = resolve_program(Path::new("sha256sum"))?;
+        let package = root.join("vendor/demo-1.0.0");
+        fs::create_dir_all(package.join("src"))?;
+        fs::create_dir_all(root.join(".cargo"))?;
+        fs::write(root.join(".cargo/config.toml"), PROJECT_CARGO_CONFIG)?;
+        fs::write(package.join("src/lib.rs"), b"pub fn f() {}\n")?;
+        fs::write(package.join("evil.rs"), b"fn main() {}\n")?;
+        fs::write(package.join("Cargo.toml"), manifest)?;
+        let files = ["Cargo.toml", "evil.rs", "src/lib.rs"].map(|name| package.join(name));
+        let hashes = hash_files(&root, &sha, &files)?;
+        let listed = files
+            .iter()
+            .zip(["Cargo.toml", "evil.rs", "src/lib.rs"])
+            .map(|(path, name)| format!("\"{name}\":\"{}\"", hashes[path]))
+            .collect::<Vec<_>>()
+            .join(",");
+        let checksum = "ab".repeat(32);
+        fs::write(
+            package.join(".cargo-checksum.json"),
+            format!("{{\"files\":{{{listed}}},\"package\":\"{checksum}\"}}"),
+        )?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndemo = \"=1.0.0\"\n\n[lib]\npath = \"lib.rs\"\n",
+        )?;
+        fs::write(root.join("lib.rs"), b"")?;
+        fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"demo\"]\n\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"
+            ),
+        )?;
+        Ok(root)
+    }
+
+    const DEMO: &str = "[package]\nname = \"demo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
+
+    #[test]
+    fn project_vendor_must_match_the_lock_exactly() -> io::Result<()> {
+        let scratch = Scratch::new()?;
+        let root = vendor_fixture(&scratch, &format!("{DEMO}build = false\n"))?;
+        let sha = resolve_program(Path::new("sha256sum"))?;
+        assert_eq!(verify_project_vendor(&root, &sha)?.len(), 1);
+
+        let package = root.join("vendor/demo-1.0.0");
+        let broken =
+            |name: &str, change: &dyn Fn() -> io::Result<()>, undo: &dyn Fn() -> io::Result<()>| {
+                change()?;
+                let failed = verify_project_vendor(&root, &sha).is_err();
+                undo()?;
+                assert!(failed, "{name} must be rejected");
+                io::Result::Ok(())
+            };
+        let lib = package.join("src/lib.rs");
+        broken(
+            "modified byte",
+            &|| fs::write(&lib, b"pub fn g() {}\n"),
+            &|| fs::write(&lib, b"pub fn f() {}\n"),
+        )?;
+        let extra = package.join("src/extra.rs");
+        broken("unlisted file", &|| fs::write(&extra, b""), &|| {
+            fs::remove_file(&extra)
+        })?;
+        let script = package.join("build.rs");
+        broken("build.rs file", &|| fs::write(&script, b""), &|| {
+            fs::remove_file(&script)
+        })?;
+        let stray = root.join("vendor/other-2.0.0");
+        broken("unlocked package", &|| fs::create_dir(&stray), &|| {
+            fs::remove_dir(&stray)
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_decides_which_manifest_spellings_are_build_scripts() -> io::Result<()> {
+        let sha = resolve_program(Path::new("sha256sum"))?;
+        // Each manifest is valid TOML that Cargo treats as naming an unreviewed script
+        // (the vendored checksum JSON is consistent: a coordinated edit).
+        for (name, manifest) in [
+            ("no spaces", format!("{DEMO}build=\"evil.rs\"\n")),
+            ("single quoted", format!("{DEMO}build = 'evil.rs'\n")),
+            (
+                "dotted key",
+                "package.name = \"demo\"\npackage.version = \"1.0.0\"\npackage.edition = \"2021\"\npackage.build = \"evil.rs\"\n".to_owned(),
+            ),
+        ] {
+            let scratch = Scratch::new()?;
+            let root = vendor_fixture(&scratch, &manifest)?;
+            let error = verify_project_vendor(&root, &sha).expect_err(name);
+            assert!(error.to_string().contains("unreviewed build script"), "{name}: {error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_custom_builds_are_extracted() {
+        let metadata = r#"{"packages":[{"name":"a","version":"1.0.0","dependencies":[],"targets":[{"kind":["lib"],"src_path":"/x/lib.rs","edition":"2021","doc":true},{"kind":["custom-build"],"src_path":"/x/build.rs","n":-1.5e3,"f":false,"z":null}]}],"workspace_members":[]}"#;
+        let found = custom_build_targets(metadata).unwrap();
+        assert_eq!(
+            found,
+            [(
+                "a".to_owned(),
+                "1.0.0".to_owned(),
+                PathBuf::from("/x/build.rs")
+            )]
+        );
+        assert!(custom_build_targets("{} x").is_err());
+        assert!(custom_build_targets(r#"{"packages":[{"name":"a"}]}"#).is_err());
     }
 
     #[test]

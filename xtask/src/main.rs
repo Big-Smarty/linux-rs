@@ -73,8 +73,10 @@ enum Command {
 struct Options {
     command: Command,
     root: PathBuf,
-    output: Option<PathBuf>,
-    build_output: Option<PathBuf>,
+    // Empty unless the command requires them; the parser rejects empty values and
+    // `validate_command_options` guarantees kernel commands supply them.
+    output: PathBuf,
+    build_output: PathBuf,
     timeout_seconds: u64,
 }
 
@@ -176,8 +178,8 @@ fn arguments_from(
     Ok(Some(Options {
         command,
         root: root.unwrap_or_else(|| PathBuf::from(".")),
-        output,
-        build_output,
+        output: output.unwrap_or_default(),
+        build_output: build_output.unwrap_or_default(),
         timeout_seconds: timeout_seconds.unwrap_or(15),
     }))
 }
@@ -230,25 +232,14 @@ fn main() -> ExitCode {
     };
     let result = match options.command {
         Command::Check | Command::Status => audit(&options),
-        Command::KernelBuild => match options.output.as_deref() {
-            Some(output) => kernel::build(&options.root, output),
-            None => Err(invalid("kernel-build requires --output")),
-        },
-        Command::KernelTest => match options.output.as_deref() {
-            Some(output) => kernel::test(
-                &options.root,
-                output,
-                std::time::Duration::from_secs(options.timeout_seconds),
-            ),
-            None => Err(invalid("kernel-test requires --output")),
-        },
+        Command::KernelBuild => kernel::build(&options.root, &options.output),
+        Command::KernelTest => kernel::test(
+            &options.root,
+            &options.output,
+            std::time::Duration::from_secs(options.timeout_seconds),
+        ),
         Command::KernelPackage => {
-            match (options.build_output.as_deref(), options.output.as_deref()) {
-                (Some(build), Some(output)) => package::create(&options.root, build, output),
-                _ => Err(invalid(
-                    "kernel-package requires --build-output and --output",
-                )),
-            }
+            package::create(&options.root, &options.build_output, &options.output)
         }
     };
     match result {
@@ -279,7 +270,11 @@ fn project_files(root: &Path) -> Result<BTreeSet<String>> {
                 )));
             }
             if metadata.is_dir() {
-                if entry.file_name() == ".git" || entry.file_name() == "target" {
+                // vendor/ is third-party source checked by `verify_project_vendor`, not Rust-only project code.
+                if [".git", "target", "vendor"]
+                    .iter()
+                    .any(|skipped| path == root.join(skipped))
+                {
                     continue;
                 }
                 if directory.strip_prefix(root).ok() == Some(Path::new(".agents/skills"))
@@ -965,9 +960,15 @@ fn audit(options: &Options) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(invalid("--root must name a real directory, not a symlink"));
     }
+    let mut vendored = 0;
     let root =
         fs::canonicalize(&options.root).map_err(|error| contextual(&options.root, &error))?;
     let files = project_files(&root)?;
+    if files.contains("Cargo.lock") || root.join("vendor").exists() {
+        let sha256sum = kernel::resolve_program(Path::new("sha256sum"))?;
+        let packages = kernel::verify_project_vendor(&root, &sha256sum)?;
+        vendored = packages.len();
+    }
     let reference_text = read_file(&root, &files, REFERENCE)?;
     let reference = reference(&reference_text)?;
     let workstream_text = read_file(&root, &files, WORKSTREAMS)?;
@@ -1013,20 +1014,18 @@ fn audit(options: &Options) -> Result<()> {
         markdown_count += 1;
     }
     let mut output = io::stdout().lock();
+    // `main` routes only check and status here.
     match options.command {
         Command::Check => writeln!(
             output,
-            "check: structural audit passed; {} pinned upstream entries, {} planned workstreams, {} skills, {markdown_count} Markdown files, {} local file links checked",
+            "check: structural audit passed; {} pinned upstream entries, {} planned workstreams, {} skills, {markdown_count} Markdown files, {} local file links checked, {vendored} vendored packages verified",
             inventory.kinds.len(),
             streams.len(),
             SKILLS.len(),
             links.local
         )?,
-        Command::Status => {
+        _ => {
             write_status(&mut output, &streams, &inventory)?;
-        }
-        Command::KernelBuild | Command::KernelTest | Command::KernelPackage => {
-            return Err(invalid("kernel commands must bypass the planning audit"));
         }
     }
     writeln!(
@@ -1092,6 +1091,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_root_target_git_and_vendor_are_skipped() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("linux-rs-audit-{}", std::process::id()));
+        for directory in [".git", "target", "vendor", "src/target"] {
+            fs::create_dir_all(root.join(directory))?;
+            fs::write(root.join(directory).join("evil.txt"), "")?;
+        }
+        let files = project_files(&root);
+        fs::write(root.join("src/target/evil.c"), "")?;
+        let rejected = project_files(&root);
+        fs::remove_dir_all(&root)?;
+        assert_eq!(
+            files?.into_iter().collect::<Vec<_>>(),
+            ["src/target/evil.txt"]
+        );
+        assert!(rejected.is_err());
+        Ok(())
+    }
+
+    #[test]
     fn tsv_rejects_bad_framing_and_duplicates() -> Result<()> {
         for input in ["wrong\tvalue\n", "key\tvalue\r\n", "key\tvalue"] {
             assert!(Tsv::<2>::new(REFERENCE, input, "key\tvalue").is_err());
@@ -1147,7 +1165,7 @@ mod tests {
         .map_err(invalid)?
         .ok_or_else(|| invalid("unexpected help response"))?;
         assert_eq!(parsed.command, Command::KernelPackage);
-        assert_eq!(parsed.output.as_deref(), Some(Path::new(output)));
+        assert_eq!(parsed.output, Path::new(output));
         let invalid_args: &[&[&str]] = &[
             &["kernel-package", "--output", output],
             &[

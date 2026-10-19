@@ -10,8 +10,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::kernel::{
-    Output, debug_case_catalog, file_hash, hash_files, prepare_output, resolve_program,
-    run_with_logs, tool_output,
+    Output, SOURCE_MEMBERS, debug_case_catalog, file_hash, hash_files, prepare_output,
+    resolve_program, run_with_logs, tool_output,
 };
 
 mod metadata;
@@ -462,32 +462,42 @@ fn write_new(path: &Path, content: &[u8]) -> io::Result<()> {
     file.write_all(content)
 }
 
-fn stage_project(staging: &mut Staging<'_>) -> io::Result<()> {
-    let inputs = staging.inputs;
-    let sources = recorded_files(&inputs.manifest)?;
+/// Files the corresponding-source tree must hold: the root manifests and every workspace member.
+fn expected_project_files(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
     let mut expected = BTreeSet::new();
     for name in ["Cargo.toml", "Cargo.lock", "LICENSE"] {
         expected.insert(PathBuf::from(name));
     }
-    for name in ["rust-toolchain", "rust-toolchain.toml"] {
-        match fs::symlink_metadata(inputs.root.join(name)) {
+    for name in [
+        "rust-toolchain",
+        "rust-toolchain.toml",
+        ".cargo/config.toml",
+    ] {
+        match fs::symlink_metadata(root.join(name)) {
             Ok(_) => {
-                real_path(&inputs.root.join(name), false)?;
+                real_path(&root.join(name), false)?;
                 expected.insert(PathBuf::from(name));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
-    for member in ["kernel", "xtask", "baremetal"] {
-        for path in files_under(&inputs.root.join(member))? {
+    for member in SOURCE_MEMBERS.into_iter().chain(["vendor"]) {
+        for path in files_under(&root.join(member))? {
             expected.insert(
-                path.strip_prefix(&inputs.root)
+                path.strip_prefix(root)
                     .map_err(|error| invalid(error.to_string()))?
                     .to_path_buf(),
             );
         }
     }
+    Ok(expected)
+}
+
+fn stage_project(staging: &mut Staging<'_>) -> io::Result<()> {
+    let inputs = staging.inputs;
+    let sources = recorded_files(&inputs.manifest)?;
+    let expected = expected_project_files(&inputs.root)?;
     let recorded = sources.keys().cloned().collect::<BTreeSet<_>>();
     if recorded != expected {
         return Err(invalid(
@@ -615,6 +625,7 @@ fn verify_external_input(
         ("readelf_path", "sha256_readelf"),
         ("sha256sum_path", "sha256_sha256sum"),
         ("process_group_kill_path", "sha256_process_group_kill"),
+        ("setpriv_path", "sha256_setpriv"),
         ("harness_executable_path", "sha256_harness_executable"),
         ("local_cargo_config", "local_cargo_config_sha256"),
         ("vendored_std_inputs", "vendored_std_inputs_sha256"),
@@ -795,8 +806,16 @@ fn stage_case(
         "qemu.stderr.log",
         "limine.conf",
     ] {
+        // Guest-controlled, so bounded like the verdict's own serial read.
+        let log = directory.join(name);
+        if fs::metadata(&log)?.len() > crate::kernel::SERIAL_LOG_LIMIT {
+            return Err(invalid(format!(
+                "{} exceeds the evidence size limit",
+                log.display()
+            )));
+        }
         staging.capture(
-            &directory.join(name),
+            &log,
             &Path::new(DOCUMENTS)
                 .join("provenance/qemu/cases")
                 .join(case)
@@ -951,9 +970,9 @@ fn stage_documentation(staging: &mut Staging<'_>) -> io::Result<()> {
     staging.text(&Path::new(DOCUMENTS).join("limine-entry.example.conf"), "# Example only. Never installed or selected by xtask.\n/linux-rs EXPERIMENTAL storage-free diagnostic\n    protocol: limine\n    path: boot():/linux-rs-bootstrap-diagnostic/linux-rs-kernel.elf\n    resolution: 1024x768x32\n")
 }
 
-const NOTICE: &str = "Experimental storage-free bootstrap diagnostic; NOT a Linux-replacement kernel.\n\nProject kernel and host sources: GPL-2.0-only, complete LICENSE and original\nsource comments retained. Selected Limine protocol definitions retain 0BSD\ncopyright/permission/warranty notices in kernel/src/boot.rs and notices/.\nNo Limine executable, OVMF, machine firmware, microcode, initramfs or Linux\nroot filesystem is redistributed. Existing external Limine must load the ELF.\n\nThe matching Rust core is MIT OR Apache-2.0; MIT is elected for its selected\ncode. COPYRIGHT-library.html preserves actual authorship and per-file terms;\nthe generic MIT.txt template is not an invented project copyright holder.\nUnicode and other per-file exceptions remain in the original source/notices.\nCompiler-builtins 0.1.160 retains MIT AND Apache-2.0 WITH LLVM-exception AND\n(MIT OR Apache-2.0); the optional MIT branch is elected, not a removal of the\nconjunctive LLVM-exception terms. Its complete LICENSE.txt and libm/LICENSE.txt\nremain in corresponding-source/rust-library/compiler-builtins/. The kernel\nsupplies the required scalar Rust memset; see its link map and actual runtime\naudit, not an assumption that every builtins archive member is linked.\n\nThe whole installed rust-src library workspace and vendor source are retained\nto reproduce Cargo's locked build-std resolution. Inactive targets, build-only\ndependencies, external upstream scripts and C/assembly test/reference sources\ninside that separate compiler-source bundle are NOT project-owned packaging\nlogic or claims of linked kernel implementation. Original copyright, NOTICE,\nlicense and checksum files are preserved without relabeling them GPL. Review\nthose file-specific terms for further distribution or changed build features.\n\nThis package is unsigned. No signing approval, approved SPDX/CycloneDX SBOM,\nindependent reproducibility result, legal release clearance, physical pass,\nsecurity certification, full M1 or Linux 6.18.57 compatibility is asserted.\nChecksums are local integrity/lineage evidence, not source authentication.\n";
+const NOTICE: &str = "Experimental storage-free bootstrap diagnostic; NOT a Linux-replacement kernel.\n\nProject kernel and host sources: GPL-2.0-only, complete LICENSE and original\nsource comments retained. Selected Limine protocol definitions retain 0BSD\ncopyright/permission/warranty notices in kernel/src/boot.rs and notices/.\nNo Limine executable, OVMF, machine firmware, microcode, initramfs or Linux\nroot filesystem is redistributed. Existing external Limine must load the ELF.\n\nThe matching Rust core is MIT OR Apache-2.0; MIT is elected for its selected\ncode. COPYRIGHT-library.html preserves actual authorship and per-file terms;\nthe generic MIT.txt template is not an invented project copyright holder.\nUnicode and other per-file exceptions remain in the original source/notices.\nCompiler-builtins 0.1.160 retains MIT AND Apache-2.0 WITH LLVM-exception AND\n(MIT OR Apache-2.0); the optional MIT branch is elected, not a removal of the\nconjunctive LLVM-exception terms. Its complete LICENSE.txt and libm/LICENSE.txt\nremain in corresponding-source/rust-library/compiler-builtins/. The kernel\nsupplies the required scalar Rust memset; see its link map and actual runtime\naudit, not an assumption that every builtins archive member is linked.\n\nThird-party crates in corresponding-source/project/vendor keep their own MIT,\nApache-2.0 or (syscalls, user/init only) BSD-2-Clause terms and notices; MIT is\nelected where dual. The whole installed rust-src library workspace and vendor source are retained\nto reproduce Cargo's locked build-std resolution. Inactive targets, build-only\ndependencies, external upstream scripts and C/assembly test/reference sources\ninside that separate compiler-source bundle are NOT project-owned packaging\nlogic or claims of linked kernel implementation. Original copyright, NOTICE,\nlicense and checksum files are preserved without relabeling them GPL. Review\nthose file-specific terms for further distribution or changed build features.\n\nThis package is unsigned. No signing approval, approved SPDX/CycloneDX SBOM,\nindependent reproducibility result, legal release clearance, physical pass,\nsecurity certification, full M1 or Linux 6.18.57 compatibility is asserted.\nChecksums are local integrity/lineage evidence, not source authentication.\n";
 
-const REPRODUCING: &str = "Corresponding source and reproduction boundary\n\ncorresponding-source/project contains the exact build-bound root Cargo.toml,\nCargo.lock, LICENSE and complete kernel, xtask and baremetal member trees.\nIt is not a root workspace pointing at omitted members. Build arguments,\nsource hashes, exact compiler/linker identities, target specification and map\nare under provenance/build. Source changes after build are refused, not\nsilently repackaged under an older ELF hash.\n\ncorresponding-source/rust-library is the complete build-bound installed\nrust-src library workspace, including vendor, Cargo.lock, .cargo configuration,\ncore, compiler-builtins and their workspace members. It is external compiler\nsource, not an admission of every archived provider for target linkage.\nUse the exact compiler commit in build-manifest.tsv and matching installed\nrust-src from this source set in a separate disposable development workspace.\nDo not overwrite a global toolchain or install a target as a packaging step.\nCompiler/tool executables are identified and checked, not included.\n\nFrom a writable copy of corresponding-source/project, with that exact already\navailable nightly toolchain and its matching rust-src library/vendor, run:\n\ncargo +1.88.0 run -p xtask --locked --offline -- kernel-build --output target/kernel-tooling/reproduce\n\nThe maintained build command creates a private Cargo home and target directory,\nuses locked offline build-std for core/compiler_builtins, and refuses compiler\ndrift. Compare the rebuilt ELF, map, target specification and source/runtime\ninput manifests to this package. Original build paths and debug information\nare recorded; changing absolute paths or toolchain layout can change bytes.\nNo independently reproduced or bit-identical result is claimed. The package\narchive additionally records its actual creation time; rebuilding the same\nELF does not promise a byte-identical package archive.\n\ncorresponding-source/PKGBUILD is the actual constant assignment-only recipe\nparsed and consumed by the Rust producer; BUILDINFO hashes those exact bytes.\nIt is not an executable makepkg/AUR recipe and is never sourced as shell.\nBUILDINFO describes package assembly: actual xtask version, directories, time\nand queried installed packages. Original kernel compilation has its separate\nbuild-bound compiler/runtime manifest; no past host inventory is fabricated.\nNo build.rs, shell installer, hooks or automatic boot selection is involved.\nSee diagnostic-handoff.md for inspection and user-only trial/recovery.\n";
+const REPRODUCING: &str = "Corresponding source and reproduction boundary\n\ncorresponding-source/project contains the exact build-bound root Cargo.toml,\nCargo.lock, LICENSE, .cargo/config.toml and complete kernel, rt, user/init, xtask,\nbaremetal and vendor trees. vendor/ is the checksum-verified third-party Rust source of\nevery locked registry crate linked into or used to build the kernel, with its\nlicense files; it is corresponding source, not project-owned code. It is not a root workspace pointing at omitted members. Build arguments,\nsource hashes, exact compiler/linker identities, target specification and map\nare under provenance/build. Source changes after build are refused, not\nsilently repackaged under an older ELF hash.\n\ncorresponding-source/rust-library is the complete build-bound installed\nrust-src library workspace, including vendor, Cargo.lock, .cargo configuration,\ncore, compiler-builtins and their workspace members. It is external compiler\nsource, not an admission of every archived provider for target linkage.\nUse the exact compiler commit in build-manifest.tsv and matching installed\nrust-src from this source set in a separate disposable development workspace.\nDo not overwrite a global toolchain or install a target as a packaging step.\nCompiler/tool executables are identified and checked, not included.\n\nFrom a writable copy of corresponding-source/project, with that exact already\navailable nightly toolchain and its matching rust-src library/vendor, run:\n\ncargo +1.88.0 run -p xtask --locked --offline -- kernel-build --output target/kernel-tooling/reproduce\n\nThe maintained build command creates a private Cargo home and target directory,\nuses locked offline build-std for core/compiler_builtins, and refuses compiler\ndrift. Compare the rebuilt ELF, map, target specification and source/runtime\ninput manifests to this package. Original build paths and debug information\nare recorded; changing absolute paths or toolchain layout can change bytes.\nNo independently reproduced or bit-identical result is claimed. The package\narchive additionally records its actual creation time; rebuilding the same\nELF does not promise a byte-identical package archive.\n\ncorresponding-source/PKGBUILD is the actual constant assignment-only recipe\nparsed and consumed by the Rust producer; BUILDINFO hashes those exact bytes.\nIt is not an executable makepkg/AUR recipe and is never sourced as shell.\nBUILDINFO describes package assembly: actual xtask version, directories, time\nand queried installed packages. Original kernel compilation has its separate\nbuild-bound compiler/runtime manifest; no past host inventory is fabricated.\nThe package has no shell installer, hooks or automatic boot selection. The kernel\nbuild itself runs two reviewed third-party host build scripts (vendor/const_fn-0.4.12/build.rs and\nvendor/rustversion-1.0.23/build/build.rs; each only queries rustc), unsandboxed as the build user.\nSee diagnostic-handoff.md for inspection and user-only trial/recovery.\n";
 
 fn manifest_text(values: &Manifest) -> io::Result<String> {
     let mut text = String::from("key\tvalue\n");
@@ -1336,9 +1355,10 @@ pub fn create(root: &Path, build_output: &Path, requested_output: &Path) -> io::
 mod tests {
     use super::{
         COMPILER_COMMIT, DOCUMENTS, Inputs, Manifest, NAME, RECIPE, Recipe, Staging, archive_list,
-        check_elf, clean_path, debug_case_catalog, digest, file_hash, files_under, open_regular,
-        package_buildinfo, package_metadata, parse_manifest, prepare_output, recipe_text,
-        recorded_files, resolve_program, stage_case, validate_profile, validate_test_manifest,
+        check_elf, clean_path, debug_case_catalog, digest, expected_project_files, file_hash,
+        files_under, open_regular, package_buildinfo, package_metadata, parse_manifest,
+        prepare_output, recipe_text, recorded_files, resolve_program, stage_case, validate_profile,
+        validate_test_manifest, verify_external_input,
     };
     use std::fs;
     use std::os::unix::{fs::symlink, net::UnixListener};
@@ -1366,6 +1386,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn setpriv_runtime_input_is_a_declared_external_input() {
+        let fixture = Fixture::new();
+        let output =
+            prepare_output(&fixture.0, Path::new("target/kernel-tooling/external")).unwrap();
+        let sha = resolve_program(Path::new("sha256sum")).unwrap();
+        let setpriv = fs::canonicalize("/usr/bin/setpriv").unwrap();
+        let hash = file_hash(&fixture.0, &sha, &setpriv).unwrap();
+        let mut manifest = Manifest::new();
+        // Every other declared input points elsewhere, as in a real build manifest.
+        for (key, hash_key) in [
+            ("cargo_path", "sha256_cargo"),
+            ("rustc_path", "sha256_rustc"),
+            ("rust_lld_path", "sha256_rust_lld"),
+            ("readelf_path", "sha256_readelf"),
+            ("sha256sum_path", "sha256_sha256sum"),
+            ("process_group_kill_path", "sha256_process_group_kill"),
+            ("harness_executable_path", "sha256_harness_executable"),
+            ("local_cargo_config", "local_cargo_config_sha256"),
+            ("vendored_std_inputs", "vendored_std_inputs_sha256"),
+            ("target_spec_path", "target_spec_sha256"),
+        ] {
+            manifest.insert(key.to_owned(), "/nonexistent/other".to_owned());
+            manifest.insert(hash_key.to_owned(), "0".repeat(64));
+        }
+        manifest.insert("setpriv_path".to_owned(), setpriv.display().to_string());
+        manifest.insert("sha256_setpriv".to_owned(), hash.clone());
+        let inputs = Inputs {
+            root: fixture.0.clone(),
+            build: fixture.0.clone(),
+            output: output.path,
+            manifest,
+            manifest_hash: "b".repeat(64),
+            elf_hash: "a".repeat(64),
+        };
+        let staging = Staging::new(&inputs, &sha).unwrap();
+        let sysroot = fixture.0.join("sysroot");
+        verify_external_input(&staging, &setpriv, &hash, &sysroot).unwrap();
+        assert!(verify_external_input(&staging, &setpriv, &"1".repeat(64), &sysroot).is_err());
     }
 
     #[test]
@@ -1548,6 +1609,35 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn project_source_covers_every_workspace_member() {
+        let fixture = Fixture::new();
+        for file in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "LICENSE",
+            "kernel/src/main.rs",
+            "rt/src/lib.rs",
+            "user/init/src/main.rs",
+            "xtask/src/main.rs",
+            "baremetal/src/main.rs",
+            "vendor/crate-1.0.0/src/lib.rs",
+        ] {
+            let path = fixture.0.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"x").unwrap();
+        }
+        let files = expected_project_files(&fixture.0).unwrap();
+        for member in ["rt/src/lib.rs", "user/init/src/main.rs"] {
+            assert!(files.contains(Path::new(member)), "{member}");
+        }
+        assert!(files.contains(Path::new("vendor/crate-1.0.0/src/lib.rs")));
+        assert_eq!(files.len(), 9);
+        // An absent member tree is an error, not a silently smaller package.
+        fs::remove_dir_all(fixture.0.join("rt")).unwrap();
+        assert!(expected_project_files(&fixture.0).is_err());
     }
 
     #[test]
