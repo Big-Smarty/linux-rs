@@ -72,7 +72,7 @@ cargo +1.88.0 run --offline --locked -p xtask -- kernel-test --output target/ker
 cargo +1.88.0 run --offline --locked -p xtask -- kernel-package --build-output target/kernel-tooling/test-001/freestanding-build --output target/kernel-tooling/package-001
 ```
 
-These are command examples using unused names, not observed transcripts. Choose fresh direct children of `target/kernel-tooling/`; existing paths are refused. Satisfy the exact installed compiler/tool prerequisites **and, for full `kernel-test`, the two unavailable-in-Git hash-bound external CPIO fixtures** in [kernel tooling](docs/kernel-tooling.md#external-module-fixture-prerequisites). A fresh clone can run host checks and, with the qualified toolchain, `kernel-build`; it cannot reproduce the full suite without those inputs. `kernel-package` consumes a real default build without rebuilding/installing it and does not grant physical clearance. Historical cell9/package003 evidence remains bound to its original bytes.
+These are command examples using unused names, not observed transcripts. Choose fresh direct children of `target/kernel-tooling/`; existing paths are refused. Satisfy the exact installed compiler/tool prerequisites (`kernel-test` also needs QEMU, OVMF, Limine and the FAT tools, but no external fixture: it builds `/init` and [generates its initramfs inputs](docs/kernel-tooling.md#generated-initramfs-fixtures)). A fresh clone with those prerequisites runs the host checks, `kernel-build` and the full `kernel-test` suite. `kernel-package` consumes a real default build without rebuilding/installing it and does not grant physical clearance. Historical cell9/package003 evidence remains bound to its original bytes.
 
 ### Host compiler versus kernel runtime compiler
 
