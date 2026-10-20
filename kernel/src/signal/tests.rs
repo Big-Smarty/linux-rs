@@ -1457,3 +1457,36 @@ fn sigreturn_restores_every_general_register() {
     assert!(!rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu).bad_frame);
     assert_eq!(ret, before);
 }
+
+/// `base` is the lowest byte of the alternate stack; everything mapped below
+/// it is filled with a canary and must survive a failed frame.
+fn altstack_overflow(size: u64, sp: u64) {
+    let base = STACK_LO + 0x4000;
+    let mut st = handler_state();
+    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
+    st.altstack = crate::signal::AltStack {
+        sp: base,
+        size,
+        flags: 0,
+    };
+    let (mut space, mut cpu) = (user_space(), FakeCpu::new());
+    fill(&mut space, STACK_LO, base, 0xaa);
+    let mut r = Regs { sp, ..regs() };
+    send(&mut st, SIGUSR1);
+    assert_eq!(
+        do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu),
+        Outcome::FrameFailed
+    );
+    let below = read(&mut space, STACK_LO, (base - STACK_LO) as usize);
+    assert!(below.iter().all(|&b| b == 0xaa), "frame written below base");
+}
+
+#[test]
+fn altstack_overflow_with_mapped_memory_below_fails_the_frame() {
+    // get_sigframe: `(nested || entering) && !on_sig_stack(sp)` (signal.c:150).
+    // (a) too small an altstack, entered from the normal stack.
+    altstack_overflow(0x100, STACK_LO + 0x7000);
+    // (b) already on the altstack, 0x300 above its base: the next frame would
+    // cross the base.
+    altstack_overflow(0x2000, STACK_LO + 0x4000 + 0x300);
+}
