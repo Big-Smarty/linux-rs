@@ -658,7 +658,8 @@ unsafe fn install_idt() {
 // callee sees RSP%16==8. Outputs/clobbers:
 // RDI = &mut PtRegs, ESI = vector, RDX = error code (0 in the non-error arm);
 // every GPR is restored from `PtRegs` (a handler may have changed any of them,
-// including the return CS/RIP/RFLAGS/RSP/SS) and flags come back from IRETQ.
+// including the return CS/RIP/RFLAGS/RSP/SS) and flags come back from IRETQ,
+// which every stub reaches by `jmp` to the one `iret_site` below.
 // CLD clears a live user DF for the C ABI. Memory: the stack stores/loads
 // above, the handler may touch anything, so no `nomem`. Stack: ring-3 and
 // ring-0 entries run on the current stack (BOOT_STACK for ring 3, IST for the
@@ -684,9 +685,10 @@ macro_rules! entry {
                 "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
                 "pop r11", "pop r10", "pop r9", "pop r8",
                 "pop rax", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
-                "add rsp, 8", "iretq",
+                "add rsp, 8", "jmp {iret}",
                 vector = const $vector,
                 handler = sym interrupt_handler,
+                iret = sym iret_site,
             );
         }
     };
@@ -705,12 +707,38 @@ macro_rules! entry {
                 "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
                 "pop r11", "pop r10", "pop r9", "pop r8",
                 "pop rax", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
-                "add rsp, 8", "iretq",
+                "add rsp, 8", "jmp {iret}",
                 vector = const $vector,
                 handler = sym interrupt_handler,
+                iret = sym iret_site,
             );
         }
     };
+}
+// The one `IRETQ` of every exception, interrupt and `SYSCALL` return (Linux's
+// `native_irq_return_iret`, arch/x86/entry/entry_64.S).
+//
+// Why asm: `IRETQ` is the only way to load CS:RIP, RFLAGS and SS:RSP at once and
+// change privilege level; no intrinsic or safe construct exists. Why one site:
+// the CPU validates the return frame only when `IRETQ` executes, in ring 0, and
+// the frame can be hostile (a handler rewrites it through its `rt_sigreturn`
+// frame or `rt_sigaction` address). Linux recognises that fault by the faulting
+// address (`.Lerror_bad_iret`, `fixup_bad_iret`) instead of predicting the CPU's
+// rules, and so does `fixup_bad_iret` below: exactly one address must exist.
+// Prerequisites: reached by `jmp` from a stub or `syscall_entry` with CPL0, IF=0
+// and every GPR already restored, RSP at the five-word frame (RIP, CS, RFLAGS,
+// RSP, SS). Inputs/outputs: no register is read or written by this code; the
+// registers are the user's. Clobbers: none (flags are loaded from the frame).
+// Memory: pops the frame from the kernel stack only. Stack: the pop is the whole
+// effect; no red zone, no unwinding (panic=abort). Control flow: does not return
+// to Rust. If the CPU refuses the frame it raises #GP/#NP/#SS at THIS address
+// with RSP unchanged, still pointing at the frame, which is what
+// `fixup_bad_iret` relies on (SDM Vol. 2, IRET: faults leave the machine state
+// as it was before the instruction). Privilege: CPL0 only. The function symbol
+// is the faulting address (a naked function is exactly its body).
+#[unsafe(naked)]
+unsafe extern "C" fn iret_site() -> ! {
+    naked_asm!("iretq");
 }
 entry!(v0, 0);
 entry!(v1, 1);
@@ -784,12 +812,72 @@ fn external_interrupt(vector: u64, user: bool) -> bool {
     true
 }
 
+/// Consecutive refused returns to ring 3 without an entry from ring 3 between.
+static BAD_IRET_DEPTH: AtomicU64 = AtomicU64::new(0);
+/// shortcut: Linux's `fixup_bad_iret` copies the user frame back to the top of
+/// the entry stack, so a handler that keeps returning to a refused frame
+/// (`SA_NODEFER` on a non-canonical handler address) loops forever there; this
+/// kernel nests one exception frame per refusal on the same stack and stops
+/// loudly at this depth. Upgrade by moving the frame to the stack top.
+const BAD_IRET_LIMIT: u64 = 16;
+
+/// `.Lerror_bad_iret` + `fixup_bad_iret` (arch/x86/entry/entry_64.S, arch/x86/
+/// kernel/traps.c): `iretq` to a frame the CPU refuses (a non-canonical RIP, a
+/// bad CS or SS selector, a compatibility RIP beyond its segment limit, ...)
+/// raises #GP/#NP/#SS in ring 0 at [`iret_site`], with RSP still at that
+/// frame. Make the exception look as if ring 3 had raised it: the user's own
+/// RIP/CS/RFLAGS/RSP/SS replace the kernel ones in `regs` (the GPRs in `regs`
+/// are already the user's, restored by the stub before `iretq`). The CPU, not
+/// a prediction of its rules, decides; the error code is the CPU's.
+///
+/// Returns false (and changes nothing) for every exception that is not that.
+fn fixup_bad_iret(regs: &mut PtRegs, vector: u64) -> bool {
+    if !(10..=13).contains(&vector)
+        || regs.cs != u64::from(KERNEL_CS.0)
+        || regs.ip != iret_site as *const () as u64
+    {
+        return false;
+    }
+    let low = ptr::addr_of!(BOOT_STACK) as u64 + 4096;
+    let frame = regs.sp;
+    if frame % 8 != 0 || frame < low || frame > low + STACK_BYTES as u64 - 5 * 8 {
+        return false;
+    }
+    // SAFETY: the fault happened at `iret_site`, which only runs with RSP at the
+    // five-word frame that a stub or `syscall_entry` pushed on `BOOT_STACK`
+    // (checked above to lie wholly inside its usable part, 8-aligned), and the
+    // exception left RSP unchanged; the CPU has pushed its own frame below it,
+    // so the words are intact and initialized. Nothing else writes that stack
+    // while this handler runs (interrupts are masked, single CPU).
+    let [ip, cs, flags, sp, ss] = unsafe { ptr::read_volatile(frame as *const [u64; 5]) };
+    if cs & 3 != 3 {
+        return false; // a ring-0 return that failed is a kernel bug
+    }
+    if BAD_IRET_DEPTH.fetch_add(1, Ordering::Relaxed) >= BAD_IRET_LIMIT {
+        crate::log!(
+            "FAIL bad iret loop depth={} rip={:#x}\n",
+            BAD_IRET_LIMIT,
+            ip
+        );
+        crate::fail();
+    }
+    (regs.ip, regs.cs, regs.flags, regs.sp, regs.ss) = (ip, cs, flags, sp, ss);
+    true
+}
+
 /// Rust half of every exception and interrupt entry; `regs` is the live
 /// `pt_regs` on the entry stack (see the `entry!` proof above), and whatever
 /// it holds on return is what `iretq` restores.
 extern "C" fn interrupt_handler(regs: &mut PtRegs, vector: u64, error: u64) {
     // `user_mode(regs)`: any ring-3 CS (64-bit 0x33 or compatibility 0x23).
-    let user = regs.cs & 3 == 3;
+    let mut user = regs.cs & 3 == 3;
+    if user {
+        BAD_IRET_DEPTH.store(0, Ordering::Relaxed);
+    } else if fixup_bad_iret(regs, vector) {
+        // The exception was raised by the `iretq` back to ring 3: from here on it
+        // is the user's exception (the signal's `ip`/`sp` are the refused frame's).
+        user = true;
+    }
     if external_interrupt(vector, user) {
         if user {
             // A tick can be the wake-up of an expired interval timer, and the
@@ -1251,10 +1339,11 @@ static mut USER_RSP: u64 = 0;
 // `pt_regs.ax`. Clobbers: all caller-saved registers (restored from pt_regs),
 // flags (restored by IRETQ). Memory: writes the scratch slot and the kernel
 // stack; the handler may access any memory, so no `nomem`. The return is
-// IRETQ with the saved user RIP/CS/RFLAGS/RSP/SS, not SYSRET (shortcut: the
-// SYSRET fast path needs canonical-RIP and RCX/R11 checks). No red zone, no
-// unwinding (the handler never unwinds; panic=abort). The user RSP may be
-// non-canonical; IRETQ does not check it and a bad value faults in ring 3.
+// IRETQ (through the shared `iret_site`) with the saved user RIP/CS/RFLAGS/RSP/SS,
+// not SYSRET (shortcut: the SYSRET fast path needs canonical-RIP and RCX/R11
+// checks). No red zone, no unwinding (the handler never unwinds; panic=abort).
+// The user RSP may be non-canonical; IRETQ does not check it and a bad value
+// faults in ring 3 (#SS on the first stack access).
 // Not reentrant: nothing in ring 0 executes SYSCALL.
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
@@ -1279,7 +1368,7 @@ unsafe extern "C" fn syscall_entry() {
         "pop r11", "pop r10", "pop r9", "pop r8",
         "pop rax", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
         "add rsp, 8",
-        "iretq",
+        "jmp {iret}",
         user_rsp = sym USER_RSP,
         stack = sym BOOT_STACK,
         size = const core::mem::size_of::<Stack>(),
@@ -1287,6 +1376,7 @@ unsafe extern "C" fn syscall_entry() {
         cs = const USER_CS_RAW,
         enosys = const ENOSYS,
         handler = sym crate::userspace::syscall,
+        iret = sym iret_site,
     );
 }
 
