@@ -101,6 +101,13 @@ static SCROLLS: AtomicUsize = AtomicUsize::new(0);
 static PAGER_MS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "baremetal-suite")]
 static PAGES: AtomicUsize = AtomicUsize::new(0);
+/// Identifies the run on every replay page header (build id and log digest).
+#[cfg(feature = "baremetal-suite")]
+const TAG_MAX: usize = 48;
+#[cfg(feature = "baremetal-suite")]
+static TAG: [AtomicU8; TAG_MAX] = [const { AtomicU8::new(0) }; TAG_MAX];
+#[cfg(feature = "baremetal-suite")]
+static TAG_LEN: AtomicUsize = AtomicUsize::new(0);
 /// Glyph index per cell (`0` = blank), row-major with stride `COLS`.
 static SHADOW: [AtomicU8; MAX_COLS * MAX_ROWS] = [const { AtomicU8::new(0) }; MAX_COLS * MAX_ROWS];
 
@@ -417,19 +424,17 @@ pub fn clear_screen() {
 /// Turn the pager on (`milliseconds != 0`) or off. While on, a screen that
 /// fills up stays visible for that long and is then replaced by a fresh page
 /// instead of scrolling, so each page can be photographed (the machine has no
-/// keyboard driver and no serial console). Needs the monotonic clock.
+/// keyboard driver and no serial console). `tag` (cut to [`TAG_MAX`] bytes)
+/// is printed on every page header so photographs of two runs cannot be mixed
+/// up. The wait is a raw-TSC spin (`timer::spin_ms`): it needs no clock.
 #[cfg(feature = "baremetal-suite")]
-pub fn set_pager(milliseconds: usize) {
-    PAGER_MS.store(milliseconds, Ordering::Relaxed);
-}
-
-/// Busy-wait `milliseconds` on the TSC clock (interrupts stay as they are).
-#[cfg(feature = "baremetal-suite")]
-fn pause(milliseconds: usize) {
-    let deadline = crate::timer::ktime_get_ns() + (milliseconds as u64) * 1_000_000;
-    while crate::timer::ktime_get_ns() < deadline {
-        core::hint::spin_loop();
+pub fn set_pager(milliseconds: usize, tag: &[u8]) {
+    let tag = &tag[..tag.len().min(TAG_MAX)];
+    for (slot, &byte) in TAG.iter().zip(tag) {
+        slot.store(byte, Ordering::Relaxed);
     }
+    TAG_LEN.store(tag.len(), Ordering::Relaxed);
+    PAGER_MS.store(milliseconds, Ordering::Relaxed);
 }
 
 /// Hold the current page, then start an empty one with a page header.
@@ -450,18 +455,18 @@ pub fn write_screen(bytes: &[u8]) {
 #[cfg(feature = "baremetal-suite")]
 fn page_break() {
     drain();
-    pause(PAGER_MS.load(Ordering::Relaxed));
+    crate::timer::spin_ms(PAGER_MS.load(Ordering::Relaxed) as u64);
     clear_screen();
     let page = PAGES.fetch_add(1, Ordering::Relaxed) + 2;
     // Header cells only: not captured and not on serial (it is not log text).
-    for byte in header_bytes("-- linux-rs suite, page ", page) {
+    for byte in header_bytes(page) {
         pixel_byte(byte);
     }
 }
 
-/// `prefix` followed by the decimal `number` and a newline, byte by byte.
+/// `-- linux-rs suite <tag> replay page <number>` and a newline, byte by byte.
 #[cfg(feature = "baremetal-suite")]
-fn header_bytes(prefix: &'static str, number: usize) -> impl Iterator<Item = u8> {
+fn header_bytes(number: usize) -> impl Iterator<Item = u8> {
     let mut digits = [0u8; 20];
     let mut length = 0;
     let mut rest = number;
@@ -473,8 +478,13 @@ fn header_bytes(prefix: &'static str, number: usize) -> impl Iterator<Item = u8>
             break;
         }
     }
-    prefix
-        .bytes()
+    let tag =
+        (0..TAG_LEN.load(Ordering::Relaxed).min(TAG_MAX)).map(|i| TAG[i].load(Ordering::Relaxed));
+    b"-- linux-rs suite "
+        .iter()
+        .copied()
+        .chain(tag)
+        .chain(b" replay page ".iter().copied())
         .chain((0..length).rev().map(move |i| digits[i]))
         .chain(core::iter::once(b'\n'))
 }
@@ -489,6 +499,18 @@ pub fn for_each_framebuffer(mut visit: impl FnMut(usize, usize, usize, usize, us
         let l = slot.load();
         visit(l.width, l.height, l.bytes * 8, cols, rows);
     }
+}
+
+/// Text rows still free below the cursor (a pending scroll counts as none);
+/// `usize::MAX` without a framebuffer, where nothing can scroll off.
+#[cfg(feature = "baremetal-suite")]
+pub fn rows_free() -> usize {
+    let (cols, rows) = grid();
+    if cols == 0 {
+        return usize::MAX;
+    }
+    // `CURSOR` is `fbtext`'s state: the cell number shifted left, plus a wrap bit.
+    rows.saturating_sub((CURSOR.load(Ordering::Relaxed) >> 1).div_ceil(cols))
 }
 
 /// The shared text grid `(columns, rows)`, `(0, 0)` without a framebuffer.

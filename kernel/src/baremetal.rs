@@ -27,11 +27,27 @@
 //!
 //! # Context and locking
 //! Everything here runs on the BSP with interrupts off, outside any group's
-//! syscall or fault locks. `RESULTS` and `ARCHIVES` are leaf locks taken
-//! only for short copies. A group ends from `init_exited` (syscall or fault
-//! path, after it dropped `PROCESS`/`TABLES`) or from `fatal` (a kernel stop:
-//! the group is ended only if `userspace::locks_free`, else the suite aborts
-//! with its results so far).
+//! syscall or fault locks (the timer interrupt, which enforces the per-group
+//! time bound, runs with IF clear too). Lock order (the shared DAG in
+//! `services`): `RESULTS` is a leaf taken only for short copies; `ARCHIVES` is
+//! held across `userspace::load_group`, so its order is `ARCHIVES` -> `TABLES`
+//! -> heap -> `FRAMES`, and nothing takes it while holding another lock. A
+//! group ends from `init_exited` (syscall or fault path, after it dropped
+//! `PROCESS`/`TABLES`), from `fatal` (a kernel stop) or from `timeout` (the
+//! group outran its bound): the latter two end the group only if
+//! `groups_lock_free` (`userspace::locks_free` and `ARCHIVES`, the locks the
+//! abandoned stack could still hold), else the suite aborts with its results
+//! so far. The summary takes none of those locks.
+//!
+//! # Time bounds
+//! A group has `DEFAULT_TIMEOUT_S` (command line `suite_timeout_s=`) on the raw
+//! TSC (`expired`, checked by the timer tick and by every sleep): a loop or a
+//! sleep that never ends becomes a `timeout` result instead of a frozen
+//! screen. The replay pager busy-waits on the raw TSC too (`timer::spin_ms`),
+//! so neither needs the published clock; the `time` group, whose sleeps need
+//! it, is skipped (and reported so) when `timer::init` failed. A hang with the
+//! tick dead and no sleep involved is the one case left to the user (README:
+//! photograph a screen that stops, then reset).
 //!
 //! shortcut: the captured log is one 256 KiB buffer; longer logs keep their
 //! first 256 KiB and the summary says how many bytes were dropped. Upgrade with
@@ -48,7 +64,8 @@ use crate::{
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use kernel::suite::{
-    self, Fnv64, GROUPS, GroupReport, ORACLE_EXPECTED, Text, UNSUPPORTED, civil_from_unix, hex16,
+    self, Fnv64, GROUPS, GroupReport, ORACLE_EXPECTED, RowBudget, Text, UNSUPPORTED,
+    civil_from_unix, hex16,
 };
 use raw_cpuid::{CpuId, ExtendedFeatures, ExtendedProcessorFeatureIdentifiers};
 
@@ -61,6 +78,12 @@ const BUILD_ID: &str = match option_env!("LINUX_RS_BUILD_ID") {
 /// How long each replay page stays up when the command line has no
 /// `suite_pause_ms=` (the harness passes a small one).
 const DEFAULT_PAUSE_MS: usize = 6000;
+/// Wall-clock bound of one group; the slowest group runs well under a second
+/// in QEMU. A group's lines are only counted on the live screen (dots), so a
+/// slow framebuffer should not come near this.
+const DEFAULT_TIMEOUT_S: u64 = 120;
+/// Groups that sleep on the monotonic clock and so cannot run without it.
+const NEEDS_CLOCK: [&str; 1] = ["time"];
 const CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_PROOFS: usize = 40;
 /// Inventory facts the summary repeats: cpu, memory, platform, time, display, pci, adapters.
@@ -68,11 +91,11 @@ const KEYS: usize = 7;
 const NONE: usize = usize::MAX;
 const MAX_GROUPS: usize = 8;
 /// Extra `suite_groups=` words of the QEMU harness: `/init` modes that end a
-/// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not),
-/// proving that a bad group ends only itself. They have no expected output, so
+/// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not; a
+/// loop that never ends), proving that a bad group ends only itself. They have no expected output, so
 /// they always count as failed.
 #[cfg(feature = "qemu-self-test")]
-const PROBES: [&str; 2] = ["fault", "io_uring"];
+const PROBES: [&str; 3] = ["fault", "io_uring", "spin"];
 #[cfg(not(feature = "qemu-self-test"))]
 const PROBES: [&str; 0] = [];
 /// Longest log line kept whole by the replay and the stop-line search.
@@ -258,6 +281,10 @@ enum Cause {
     Exited(u32),
     /// A kernel stop (`FAIL ...`, panic, unimplemented syscall) ended the run.
     Stopped,
+    /// The group outran its time bound (`expired`).
+    TimedOut,
+    /// Not run: it needs the monotonic clock and `timer::init` failed.
+    NoClock,
 }
 
 impl Cause {
@@ -269,6 +296,8 @@ impl Cause {
             }
             Self::Exited(code) => Text::from_args(format_args!("init signal {}", code & 0x7f)),
             Self::Stopped => Text::from_args(format_args!("kernel stop")),
+            Self::TimedOut => Text::from_args(format_args!("timeout")),
+            Self::NoClock => Text::from_args(format_args!("skipped, no clock")),
         }
     }
 }
@@ -278,7 +307,7 @@ struct GroupRun {
     cause: Cause,
     /// `None` when the heap could not hold a copy of the output to compare.
     report: Option<GroupReport>,
-    /// The kernel's last `FAIL` line of the run when it was stopped.
+    /// The kernel's last `FAIL` line of the run when it was stopped or timed out.
     stop: Option<Text>,
     millis: u64,
 }
@@ -345,6 +374,9 @@ static RESULTS: IrqMutex<Results> = IrqMutex::new(Results::new());
 /// owned tables are active); each group unpacks them again.
 static ARCHIVES: IrqMutex<Vec<Vec<u8>>> = IrqMutex::new(Vec::new());
 static PAUSE_MS: AtomicUsize = AtomicUsize::new(DEFAULT_PAUSE_MS);
+static TIMEOUT_S: AtomicU64 = AtomicU64::new(DEFAULT_TIMEOUT_S);
+/// Raw TSC value at which the running group times out, 0 while none runs.
+static GROUP_END_TSC: AtomicU64 = AtomicU64::new(0);
 
 /// Record a boot proof's result (`PROOF <name> PASS|FAIL`) and return it.
 pub fn record_proof(name: &'static str, ok: bool) -> bool {
@@ -377,6 +409,14 @@ pub fn begin(boot: &BootInfo) {
     {
         PAUSE_MS.store(ms, Ordering::Relaxed);
     }
+    if let Some(seconds) = boot
+        .option_value(b"suite_timeout_s")
+        .and_then(|value| core::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&seconds| seconds > 0)
+    {
+        TIMEOUT_S.store(seconds, Ordering::Relaxed);
+    }
     let mut results = RESULTS.lock();
     match boot.option_value(b"suite_groups") {
         None => {
@@ -394,9 +434,10 @@ pub fn begin(boot: &BootInfo) {
         }
     }
     log!(
-        "SUITE start build={} pause_ms={} groups={}\n",
+        "SUITE start build={} pause_ms={} timeout_s={} groups={}\n",
         BUILD_ID,
         PAUSE_MS.load(Ordering::Relaxed),
+        TIMEOUT_S.load(Ordering::Relaxed),
         results.selected_count
     );
 }
@@ -757,17 +798,63 @@ pub fn run() -> ! {
 }
 
 fn start_next() -> ! {
-    let index = NEXT.fetch_add(1, Ordering::Relaxed);
-    let Some(group) = selected(index) else {
-        late_proofs();
-        summary(None)
-    };
-    log!("SUITE group {} start\n", group);
-    GROUP_START.store(stored(), Ordering::Relaxed);
-    GROUP_T0.store(timer::ktime_get_ns(), Ordering::Relaxed);
-    CURRENT.store(index, Ordering::Relaxed);
-    let loaded = userspace::load_group(&ARCHIVES.lock(), group);
-    userspace::run(loaded)
+    loop {
+        let index = NEXT.fetch_add(1, Ordering::Relaxed);
+        let Some(group) = selected(index) else {
+            late_proofs();
+            summary(None)
+        };
+        if NEEDS_CLOCK.contains(&group) && !timer::clock_published() {
+            // Its sleeps could never end: say so instead of hanging (`Time bounds`).
+            log!("SUITE group {} not run: the clock is not running\n", group);
+            let run = GroupRun {
+                cause: Cause::NoClock,
+                report: None,
+                stop: None,
+                millis: 0,
+            };
+            record(index, group, &run);
+            continue;
+        }
+        let uptime_s = timer::ktime_get_boottime_ns() / 1_000_000_000;
+        log!("SUITE group {} start uptime_s={}\n", group, uptime_s);
+        GROUP_START.store(stored(), Ordering::Relaxed);
+        GROUP_T0.store(timer::ktime_get_ns(), Ordering::Relaxed);
+        CURRENT.store(index, Ordering::Relaxed);
+        let loaded = userspace::load_group(&ARCHIVES.lock(), group, uptime_s);
+        let cycles = timer::tsc_khz_or_assumed()
+            .saturating_mul(1000)
+            .saturating_mul(TIMEOUT_S.load(Ordering::Relaxed));
+        GROUP_END_TSC.store(
+            timer::rdtsc().saturating_add(cycles).max(1),
+            Ordering::Relaxed,
+        );
+        userspace::run(loaded)
+    }
+}
+
+/// Whether the running group has outlived its bound (false while none runs).
+/// Lock-free; called from the timer interrupt and from every sleep.
+pub fn expired() -> bool {
+    let end = GROUP_END_TSC.load(Ordering::Relaxed);
+    end != 0 && timer::rdtsc() >= end
+}
+
+/// Store a group's result and print its `SUITE group ... result=` record.
+fn record(index: usize, group: &'static str, run: &GroupRun) {
+    RESULTS.lock().groups[index] = Some(*run);
+    let report = run.report.as_ref();
+    log!(
+        "SUITE group {} result={} cause=\"{}\" matched={} expected={} observed={} mismatches={} millis={}\n",
+        group,
+        if run.passed() { "pass" } else { "fail" },
+        run.cause.describe(),
+        report.map_or(0, |r| r.matched),
+        report.map_or(0, |r| r.expected),
+        report.map_or(0, |r| r.observed),
+        report.map_or(0, |r| r.mismatch_count),
+        run.millis
+    );
 }
 
 /// `/init` of the running group exited or was killed (`code` is Linux's
@@ -777,6 +864,7 @@ pub fn init_exited(code: u32) -> ! {
 }
 
 fn group_ended(cause: Cause) -> ! {
+    GROUP_END_TSC.store(0, Ordering::Relaxed);
     let index = CURRENT.swap(NONE, Ordering::Relaxed);
     // A run cut off mid-line still shows what it had printed.
     flush_held(|byte| console::write_screen(&[byte]));
@@ -791,8 +879,8 @@ fn group_ended(cause: Cause) -> ! {
     let report =
         copy_range(start, end).map(|output| suite::compare_group(ORACLE_EXPECTED, group, &output));
     let stop = match cause {
-        Cause::Stopped => last_line_with(start, end, b"FAIL"),
-        Cause::Exited(_) => None,
+        Cause::Stopped | Cause::TimedOut => last_line_with(start, end, b"FAIL"),
+        Cause::Exited(_) | Cause::NoClock => None,
     };
     let run = GroupRun {
         cause,
@@ -800,35 +888,42 @@ fn group_ended(cause: Cause) -> ! {
         stop,
         millis,
     };
-    RESULTS.lock().groups[index] = Some(run);
-    log!(
-        "SUITE group {} result={} cause=\"{}\" matched={} expected={} observed={} mismatches={} millis={}\n",
-        group,
-        if run.passed() { "pass" } else { "fail" },
-        cause.describe(),
-        report.map_or(0, |r| r.matched),
-        report.map_or(0, |r| r.expected),
-        report.map_or(0, |r| r.observed),
-        report.map_or(0, |r| r.mismatch_count),
-        millis
-    );
+    record(index, group, &run);
     userspace::teardown();
     start_next()
+}
+
+/// Whether every lock the abandoned stack of a stopped group could still hold
+/// is free: the ones its teardown takes, and `ARCHIVES` (held while loading).
+fn groups_lock_free() -> bool {
+    userspace::locks_free() && ARCHIVES.try_lock().is_some()
+}
+
+/// End the running group, or the suite when its locks are still held.
+fn stop(cause: Cause) -> ! {
+    if CURRENT.load(Ordering::Relaxed) != NONE && groups_lock_free() {
+        group_ended(cause)
+    }
+    summary(Some(last_line_with(0, stored(), b"FAIL").unwrap_or_else(
+        || Text::from_args(format_args!("kernel stop")),
+    )))
 }
 
 /// A kernel stop (`fail`): ends the running group when its locks are free (the
 /// abandoned stack can no longer release them), else the suite.
 pub fn fatal() -> ! {
-    if CURRENT.load(Ordering::Relaxed) != NONE && userspace::locks_free() {
-        group_ended(Cause::Stopped)
-    }
-    if ENTERED.swap(true, Ordering::Relaxed) {
-        // A stop inside the summary itself: nothing more can be shown.
-        cpu::halt()
-    }
-    summary(Some(last_line_with(0, stored(), b"FAIL").unwrap_or_else(
-        || Text::from_args(format_args!("kernel stop")),
-    )))
+    stop(Cause::Stopped)
+}
+
+/// The running group outlived its bound (`expired`): ends like a kernel stop.
+/// Context: timer interrupt or a sleep, IF clear, BSP.
+pub fn timeout() -> ! {
+    GROUP_END_TSC.store(0, Ordering::Relaxed);
+    log!(
+        "FAIL group timeout after {} s\n",
+        TIMEOUT_S.load(Ordering::Relaxed)
+    );
+    stop(Cause::TimedOut)
 }
 
 /// The proofs that would disturb the groups' timing or need no process:
@@ -849,13 +944,19 @@ const REPLAY_SKIP: [&[u8]; 3] = [
     b"Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
 ];
 
-fn replay() {
+fn replay(digest: u64) {
     let pause = PAUSE_MS.load(Ordering::Relaxed);
+    // Every page header names the run (build and digest, as the summary does).
+    let tag = Text::from_args(format_args!(
+        "{} {}",
+        BUILD_ID,
+        core::str::from_utf8(&hex16(digest)).unwrap_or("?")
+    ));
     console::clear_screen();
-    console::write_screen(
-        b"-- linux-rs suite log replay, page 1 (pages advance by themselves) --\n",
-    );
-    console::set_pager(pause);
+    console::write_screen(b"-- linux-rs suite ");
+    console::write_screen(tag.as_bytes());
+    console::write_screen(b" replay page 1 (pages advance by themselves) --\n");
+    console::set_pager(pause, tag.as_bytes());
     for_each_line(0, stored(), |line| {
         // Passing test lines are the bulk of the log and carry no news; the
         // group reports and the summary count them. Failing ones stay.
@@ -870,14 +971,18 @@ fn replay() {
         }
     });
     console::page_hold();
-    console::set_pager(0);
+    console::set_pager(0, b"");
 }
 
 fn summary(abort: Option<Text>) -> ! {
+    if ENTERED.swap(true, Ordering::Relaxed) {
+        // A stop inside the summary itself: nothing more can be shown.
+        cpu::halt()
+    }
     FROZEN.store(true, Ordering::Relaxed);
     let digest = digest();
     let (stored, dropped) = (stored(), dropped());
-    replay();
+    replay(digest);
     console::clear_screen();
     // One blank row keeps the first line off a monitor's overscan edge (screen
     // only: the serial transcript's digest range ends at the heading).
@@ -928,7 +1033,6 @@ fn summary(abort: Option<Text>) -> ! {
         ),
     }
     summary_groups(&results);
-    summary_failures(&results);
     summary_proofs(&results);
     log!(
         "log: {} bytes captured, {} dropped, up {} s, digest {}\n",
@@ -945,6 +1049,7 @@ fn summary(abort: Option<Text>) -> ! {
         proofs_passed,
         proofs
     );
+    summary_failures(&results);
     log!("{}\n", FINAL_LINE);
     finish(ok)
 }
@@ -976,42 +1081,85 @@ fn summary_groups(results: &Results) {
     }
 }
 
-/// Why each failed group failed: the kernel's stop line, init's own failure
-/// line and the first mismatching lines (wanted and got).
-fn summary_failures(results: &Results) {
-    for (name, run) in results.runs() {
-        let Some(run) = run else { continue };
-        if run.passed() {
-            continue;
+/// Screen rows `args` takes when printed (long lines wrap).
+fn rows_of(args: core::fmt::Arguments<'_>) -> usize {
+    struct Count(usize);
+    impl core::fmt::Write for Count {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            self.0 += text.len();
+            Ok(())
         }
+    }
+    let mut count = Count(0);
+    let _ = core::fmt::write(&mut count, args);
+    suite::rows_for(count.0, console::grid().0)
+}
+
+/// Print one failure-detail row if the budget has room (else it is counted).
+fn detail_row(budget: &mut RowBudget, args: core::fmt::Arguments<'_>) {
+    if budget.take(rows_of(args)) {
+        log!("{}\n", args);
+    }
+}
+
+/// Why each failed group failed: the kernel's stop line, init's own failure
+/// line and the first mismatching lines (wanted and got), as many as the rows
+/// below the cursor allow (the replay pages hold the rest). Last on the
+/// screen, before the final line, so it can never push the rest off the top.
+fn summary_failures(results: &Results) {
+    let shown = |run: &GroupRun| !run.passed() && run.cause != Cause::NoClock;
+    let failing = results
+        .runs()
+        .filter(|(_, run)| run.as_ref().is_some_and(shown))
+        .count();
+    if failing == 0 {
+        return;
+    }
+    // One row each for this heading, the omission note and the final line.
+    let rows = console::rows_free().saturating_sub(3);
+    log!("FAILURE DETAIL (first rows only; the replay pages hold the rest)\n");
+    let mut budget = RowBudget::new(rows, failing);
+    for (name, run) in results.runs() {
+        let Some(run) = run.filter(shown) else {
+            continue;
+        };
+        budget.group();
         if let Some(stop) = run.stop {
-            log!("  {} stopped: {}\n", name, stop);
+            detail_row(&mut budget, format_args!("  {name} stopped: {stop}"));
         }
         let Some(report) = run.report else {
-            log!("  {} output not compared (heap full)\n", name);
+            detail_row(
+                &mut budget,
+                format_args!("  {name} output not compared (heap full)"),
+            );
             continue;
         };
         if let Some(failure) = report.init_failure {
-            log!("  {} init: {}\n", name, failure);
+            detail_row(&mut budget, format_args!("  {name} init: {failure}"));
         }
         for mismatch in &report.mismatches[..report.mismatch_count.min(suite::MAX_MISMATCHES)] {
-            log!(
-                "  {} #{} want {}\n  {} #{} got  {}\n",
-                name,
-                mismatch.position,
-                mismatch.expected,
-                name,
-                mismatch.position,
-                mismatch.got
-            );
+            let want = format_args!("  {name} #{} want {}", mismatch.position, mismatch.expected);
+            let got = format_args!("  {name} #{} got  {}", mismatch.position, mismatch.got);
+            // A pair is shown whole or not at all.
+            if budget.fits(rows_of(want) + rows_of(got)) {
+                detail_row(&mut budget, want);
+                detail_row(&mut budget, got);
+            } else {
+                budget.omit(2);
+            }
         }
         if report.mismatch_count > suite::MAX_MISMATCHES {
-            log!(
-                "  {} ... {} more mismatches\n",
-                name,
-                report.mismatch_count - suite::MAX_MISMATCHES
+            detail_row(
+                &mut budget,
+                format_args!(
+                    "  {name} ... {} more mismatches",
+                    report.mismatch_count - suite::MAX_MISMATCHES
+                ),
             );
         }
+    }
+    if budget.omitted() > 0 {
+        log!("  ... {} more detail row(s) not shown\n", budget.omitted());
     }
 }
 

@@ -257,6 +257,79 @@ pub fn compare_group(table: &[u8], group: &str, output: &[u8]) -> GroupReport {
     report
 }
 
+/// Screen rows a text of `len` bytes takes on a grid `columns` wide (long lines
+/// wrap); `columns == 0` (no framebuffer) is one row, as nothing can scroll.
+#[must_use]
+pub fn rows_for(len: usize, columns: usize) -> usize {
+    match columns {
+        0 => 1,
+        columns => len.div_ceil(columns).max(1),
+    }
+}
+
+/// The row budget of the summary's failure detail. The lines above it are
+/// fixed, so the detail may use only the rows left below them (less the final
+/// line and an omission note): an overflow would scroll the heading, digest
+/// and RESULT line off the one screen the user photographs. The whole budget
+/// is shared by the failing groups ([`RowBudget::group`]); what does not fit
+/// is counted, not printed.
+#[derive(Clone, Copy, Debug)]
+pub struct RowBudget {
+    left: usize,
+    group_left: usize,
+    share: usize,
+    omitted: usize,
+}
+
+impl RowBudget {
+    /// `rows` for the whole detail, split between `groups` failing groups
+    /// (each at least two rows, so its stop line and first fact show).
+    #[must_use]
+    pub fn new(rows: usize, groups: usize) -> Self {
+        Self {
+            left: rows,
+            group_left: 0,
+            share: (rows / groups.max(1)).max(2),
+            omitted: 0,
+        }
+    }
+
+    /// Start the next group's share.
+    pub fn group(&mut self) {
+        self.group_left = self.share;
+    }
+
+    /// Whether `rows` rows still fit this group and the whole; takes them when
+    /// they do, counts one omitted row when they do not.
+    pub fn take(&mut self, rows: usize) -> bool {
+        if rows <= self.left.min(self.group_left) {
+            self.left -= rows;
+            self.group_left -= rows;
+            true
+        } else {
+            self.omitted += 1;
+            false
+        }
+    }
+
+    /// Whether `rows` rows fit, without taking them or counting an omission.
+    #[must_use]
+    pub fn fits(&self, rows: usize) -> bool {
+        rows <= self.left.min(self.group_left)
+    }
+
+    /// Rows that did not fit.
+    #[must_use]
+    pub fn omitted(&self) -> usize {
+        self.omitted
+    }
+
+    /// Count `rows` that were dropped without trying them.
+    pub fn omit(&mut self, rows: usize) {
+        self.omitted += rows;
+    }
+}
+
 /// FNV-1a, 64 bit: the digest printed on the summary so that photographs can be
 /// matched to a log. Not a security hash.
 #[derive(Clone, Copy, Debug)]
@@ -591,5 +664,36 @@ mod tests {
         assert_eq!(pci_class(0x7e, 0), "");
         assert_eq!(pci_vendor(0x1022), "AMD");
         assert_eq!(pci_vendor(0xdead), "");
+    }
+
+    #[test]
+    fn long_lines_wrap_and_the_budget_is_shared() {
+        assert_eq!(rows_for(0, 80), 1);
+        assert_eq!(rows_for(80, 80), 1);
+        assert_eq!(rows_for(81, 80), 2);
+        assert_eq!(rows_for(500, 0), 1);
+        // Nine rows for three failing groups: three each.
+        let mut budget = RowBudget::new(9, 3);
+        let mut shown = [0usize; 3];
+        for slot in &mut shown {
+            budget.group();
+            while budget.take(1) {
+                *slot += 1;
+            }
+        }
+        assert_eq!(shown, [3, 3, 3]);
+        assert_eq!(budget.omitted(), 3);
+        // A pair that does not fit is dropped whole and counted.
+        let mut budget = RowBudget::new(3, 1);
+        budget.group();
+        assert!(budget.take(2));
+        assert!(!budget.fits(2));
+        budget.omit(2);
+        assert_eq!(budget.omitted(), 2);
+        // The minimum share is two rows, but never more than the whole.
+        let mut budget = RowBudget::new(1, 4);
+        budget.group();
+        assert!(budget.take(1));
+        assert!(!budget.take(1));
     }
 }

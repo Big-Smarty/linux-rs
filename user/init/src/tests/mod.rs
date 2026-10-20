@@ -45,6 +45,29 @@ pub mod time;
 
 pub type R = Result<usize, Errno>;
 
+/// Kernel uptime in whole seconds when the bare-metal suite started this group
+/// (`argv[2]`, see `docs/bare-metal-suite.md`); `u64::MAX` outside the suite
+/// (the oracle reference and the harness cells pass no such word).
+static SUITE_START_S: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Record the `argv[2]` word of a suite group: decimal seconds, else ignored.
+pub fn set_suite_start(word: &[u8]) {
+    if let Some(seconds) = core::str::from_utf8(word)
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+    {
+        SUITE_START_S.store(seconds, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The suite's group start uptime in seconds; `None` when not run by the suite.
+pub fn suite_start() -> Option<u64> {
+    match SUITE_START_S.load(core::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => None,
+        seconds => Some(seconds),
+    }
+}
+
 pub const PAGE: usize = 4096;
 /// Highest user address + 1 on x86-64 with 4-level paging (`TASK_SIZE_MAX`).
 pub const TASK_SIZE: usize = 0x7fff_ffff_f000;

@@ -394,7 +394,17 @@ fn run(stack: &Stack) {
         }
     }
 
+    if let Some(word) = stack.argv.iter().nth(2) {
+        tests::set_suite_start(word);
+    }
     match stack.argv.iter().nth(1) {
+        // A group that never ends: only the bare-metal suite's time bound stops it.
+        Some(b"spin") => {
+            out!("init: spinning on purpose");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         Some(b"fault") => {
             out!("init: faulting on purpose");
             // SAFETY: not sound, deliberately: the read of address 0 must raise SIGSEGV.

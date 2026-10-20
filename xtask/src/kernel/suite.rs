@@ -26,8 +26,14 @@ pub(super) const TIMEOUT: Duration = Duration::from_secs(180);
 /// The groups of a normal run, in the kernel's order, all expected to pass.
 pub(super) const ALL_PASS: &[(&str, bool)] =
     &[("ids", true), ("time", true), ("mm", true), ("fs", true)];
-/// A run that selects two probes ending abnormally, then one real group.
-pub(super) const STOPS: &[(&str, bool)] = &[("fault", false), ("io_uring", false), ("ids", true)];
+/// A run that selects three probes ending abnormally (a SIGSEGV, an unimplemented
+/// syscall, a loop that outruns the one-second group bound), then one real group.
+pub(super) const STOPS: &[(&str, bool)] = &[
+    ("fault", false),
+    ("io_uring", false),
+    ("spin", false),
+    ("ids", true),
+];
 
 /// Boot proofs the kernel records on the QEMU q35 cells, in order.
 const PROOFS: [&str; 23] = [
@@ -103,7 +109,19 @@ pub(super) fn validate(
         groups.len(),
         n = PROOFS.len()
     );
-    position(lines, cursor, &complete)?;
+    let complete_at = position(lines, cursor, &complete)?;
+    // The failure detail is the last block of the screen: a stopped group's stop line is in it.
+    for &(group, must_pass) in groups {
+        let prefix = format!("  {group} stopped: FAIL ");
+        if !must_pass
+            && matches!(group, "io_uring" | "spin")
+            && !lines[complete_at..]
+                .iter()
+                .any(|line| line.starts_with(&prefix))
+        {
+            return Err(format!("summary has no `{prefix}...` failure detail row"));
+        }
+    }
     let result_line = if ok {
         format!(
             "RESULT: ALL PASS ({} groups, {} self-tests)",
@@ -146,7 +164,12 @@ fn check_group(
     must_pass: bool,
     cursor: usize,
 ) -> Result<usize, String> {
-    let start = position(lines, cursor, &format!("SUITE group {group} start"))?;
+    let started = format!("SUITE group {group} start uptime_s=");
+    let start = lines[cursor..]
+        .iter()
+        .position(|line| line.starts_with(&started))
+        .map(|offset| offset + cursor)
+        .ok_or_else(|| format!("missing or out of order: {started}<seconds>"))?;
     let prefix = format!("SUITE group {group} result=");
     let end = lines[start..]
         .iter()
@@ -161,6 +184,7 @@ fn check_group(
     let cause = match group {
         "fault" => "init signal 11",
         "io_uring" => "kernel stop",
+        "spin" => "timeout",
         _ => "init exit 0",
     };
     if !result.contains(&format!("cause=\"{cause}\"")) {
@@ -169,6 +193,9 @@ fn check_group(
     let body = &lines[start + 1..end];
     if group == "io_uring" && !body.contains(&"FAIL syscall unimplemented nr=425") {
         return Err("io_uring probe must end in the unimplemented-syscall stop".to_owned());
+    }
+    if group == "spin" && !body.contains(&"FAIL group timeout after 1 s") {
+        return Err("spin probe must end in the group time bound".to_owned());
     }
     if group == "fault"
         && !body
@@ -302,19 +329,33 @@ WHAT THIS IS
 WHAT IT NEVER DOES
   It has no disk, USB-storage, network or sound driver and calls no firmware
   runtime service, so it writes nothing anywhere: no disk, no NVRAM, no EFI
-  variables, no BIOS settings. It touches PCI only by reading vendor, device
-  and class registers (it writes only the 0xCF8 address register). Your
-  CachyOS install, its ESP and its boot entries are not read or changed.
+  variables, no BIOS settings. Besides the CPU, its own page tables and the
+  framebuffers it draws on, it uses the timers every boot of this kernel uses
+  (TSC calibration against the PIT, the HPET and the ACPI PM-timer port when
+  the firmware describes them; the local APIC and IOAPIC timer/interrupt
+  registers; the legacy 8259 and RTC), and it touches PCI only by reading
+  vendor, device and class registers (it writes only the 0xCF8 address
+  register). Your CachyOS install, its ESP and its boot entries are not read
+  or changed.
 
 WHAT YOU DO (the tool never writes to a block device; you do the copy)
   1. Take a spare USB stick whose contents you do not need. Formatting
-     DESTROYS everything on it. Check the device name twice (lsblk) -- picking
-     the wrong device erases the wrong disk. Do NOT use any internal drive.
-  2. Format it as FAT32 with one partition (GPT or MBR both work for UEFI), for
-     example, with /dev/sdX1 the partition of the STICK:
+     DESTROYS everything on it. Check the device name twice -- picking the
+     wrong device erases the wrong disk. Do NOT use any internal drive. Before
+     any sudo command run
+         lsblk -o NAME,SIZE,MODEL,TRAN,MOUNTPOINTS
+     and continue only if the device you mean shows TRAN=usb and the size and
+     model of the stick (internal NVMe/SATA drives show nvme/sata).
+  2. If the desktop mounted the stick automatically, unmount it first
+     (MOUNTPOINTS must be empty for the stick's partitions). Format it as
+     FAT32 with one partition (GPT or MBR both work for UEFI), for example,
+     with /dev/sdX1 the partition of the STICK:
          sudo mkfs.fat -F 32 -n LINUXRS /dev/sdX1
-  3. Mount it and copy the tree (this directory's contents, keeping the
-     EFI/BOOT/ folder), then check the files:
+     A desktop may automount it again after formatting: unmount that mount
+     before step 3 (or use its mount point instead of /mnt below).
+  3. Mount it and, from inside this directory (the one holding EFI/,
+     limine.conf, linux-rs-kernel and initramfs.cpio), copy the tree and
+     check the files:
          sudo mount /dev/sdX1 /mnt
          sudo cp -r EFI limine.conf linux-rs-kernel initramfs.cpio /mnt/
          sync
@@ -335,8 +376,11 @@ WHAT YOU DO (the tool never writes to a block device; you do the copy)
   7. Hard-reset (reset button, or hold the power button for 5 seconds), remove
      the stick and boot your usual system.
   8. Send the photos back (page order matters; the summary's 'log digest' ties
-     the pages to one run). If the screen stops mid-way and stays unchanged for
-     10 minutes, photograph it and hard-reset: that is a result too.
+     the pages to one run; every replay page header carries the build id and
+     the digest too). Each test group has a 120 second bound and the
+     kernel reports a group that outruns it, so a screen that stays unchanged
+     for 10 minutes is an unexpected hang: photograph it and hard-reset, that
+     is a result too.
 
 IF NOTHING APPEARS
   The kernel draws on every framebuffer the firmware offers. If the monitor
@@ -787,7 +831,7 @@ mod tests {
         }
         let mut passed = 0;
         for &(group, must_pass) in groups {
-            writeln!(log, "SUITE group {group} start").unwrap();
+            writeln!(log, "SUITE group {group} start uptime_s=3").unwrap();
             if must_pass {
                 let rows = oracle_rows(group).map(|(_, line)| line).collect::<Vec<_>>();
                 for line in &rows {
@@ -799,6 +843,9 @@ mod tests {
             } else if group == "fault" {
                 writeln!(log, "init[1]: segfault at 0 ip 0000000000243a3d sp 00007fffffffed80 error 4 in init[42a3d,20a000+47000] likely on CPU 0 (core 0, socket 0)").unwrap();
                 writeln!(log, "SUITE group {group} result=fail cause=\"init signal 11\" matched=0 expected=0 observed=0 mismatches=0 millis=1").unwrap();
+            } else if group == "spin" {
+                writeln!(log, "FAIL group timeout after 1 s").unwrap();
+                writeln!(log, "SUITE group {group} result=fail cause=\"timeout\" matched=0 expected=0 observed=0 mismatches=0 millis=1000").unwrap();
             } else {
                 writeln!(log, "FAIL syscall unimplemented nr=425").unwrap();
                 writeln!(log, "SUITE group {group} result=fail cause=\"kernel stop\" matched=0 expected=0 observed=0 mismatches=0 millis=1").unwrap();
@@ -833,6 +880,23 @@ mod tests {
             groups.len()
         )
         .unwrap();
+        if !ok {
+            writeln!(
+                log,
+                "FAILURE DETAIL (first rows only; the replay pages hold the rest)"
+            )
+            .unwrap();
+            for &(group, must_pass) in groups {
+                let stop = match group {
+                    "io_uring" => "FAIL syscall unimplemented nr=425",
+                    "spin" => "FAIL group timeout after 1 s",
+                    _ => continue,
+                };
+                if !must_pass {
+                    writeln!(log, "  {group} stopped: {stop}").unwrap();
+                }
+            }
+        }
         writeln!(log, "{FINAL_LINE}").unwrap();
         log
     }
@@ -871,6 +935,10 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("ids"), "{error}");
         assert!(judge(&log.replace(FINAL_LINE, "done"), ALL_PASS).is_err());
+        // A stopped group's stop line must be in the failure detail at the end of the screen.
+        let stops = log_of(STOPS);
+        let error = judge(&stops.replace("  spin stopped: FAIL", "  spin x"), STOPS).unwrap_err();
+        assert!(error.contains("failure detail"), "{error}");
     }
 
     #[test]

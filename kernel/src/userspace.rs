@@ -1617,22 +1617,40 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
 }
 
 /// The bare-metal suite's group load (decision A21): a fresh rootfs from the
-/// retained archive copies, then `/init` with `-- <group>` as its arguments.
+/// retained archive copies, then `/init` with `-- <group> <uptime_s>` as its
+/// arguments (`uptime_s`: whole seconds of boot time at the group's start, so
+/// the group's uptime bounds count from there).
 /// The module payloads are unreadable once the owned tables are active, so the
 /// suite keeps heap copies (`baremetal::retain_archives`).
 ///
 /// Context: BSP, IF clear, no group running, no lock held. Locks `TABLES`
 /// for the load (`TABLES` -> heap -> `FRAMES`, the documented order).
 #[cfg(feature = "baremetal-suite")]
-pub fn load_group(archives: &[Vec<u8>], group: &str) -> Result<Loaded, Error> {
+pub fn load_group(archives: &[Vec<u8>], group: &str, uptime_s: u64) -> Result<Loaded, Error> {
     let mut rootfs = new_rootfs()?;
     for (index, bytes) in archives.iter().enumerate() {
         rootfs.unpack(index, bytes);
     }
+    // "-- <group> <decimal uptime>", at most 20 digits.
+    let mut digits = [0u8; 20];
+    let (mut start, mut rest) = (digits.len(), uptime_s);
+    loop {
+        start -= 1;
+        digits[start] = b'0' + u8::try_from(rest % 10).unwrap_or(0);
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
     let mut line = Vec::new();
-    line.try_reserve_exact(3 + group.len())
+    line.try_reserve_exact(4 + group.len() + digits.len() - start)
         .map_err(|_| Error::Vfs(Errno::ENOMEM))?;
-    for &byte in b"-- ".iter().chain(group.as_bytes()) {
+    for &byte in b"-- "
+        .iter()
+        .chain(group.as_bytes())
+        .chain(b" ")
+        .chain(&digits[start..])
+    {
         let _ = line.push_within_capacity(byte);
     }
     let mut tables = services::TABLES.lock();

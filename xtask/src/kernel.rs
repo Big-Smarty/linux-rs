@@ -845,11 +845,12 @@ const SUITE_CASES: &[DebugCase] = &[
             ..Q35_TCG
         },
     },
-    // A segfaulting /init and a syscall Linux has and this kernel does not end only their own
-    // group runs; the group after them still runs and passes, and the suite reports failure.
+    // A segfaulting /init, a syscall Linux has and this kernel does not, and an /init that
+    // loops forever (ended by the one-second group bound) end only their own group runs; the
+    // group after them still runs and passes, and the suite reports failure.
     DebugCase {
         name: "baremetal-suite-stops",
-        cmdline: Some("suite_pause_ms=50 suite_groups=fault,io_uring,ids"),
+        cmdline: Some("suite_pause_ms=50 suite_timeout_s=1 suite_groups=fault,io_uring,spin,ids"),
         cpu: "qemu64",
         expected_exit: 35,
         required: &["CHECKPOINT bootstrap-complete"],

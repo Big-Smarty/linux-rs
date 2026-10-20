@@ -85,6 +85,41 @@ fn udelay(us: u64) {
     }
 }
 
+/// TSC rate the suite assumes for its busy-waits when calibration produced
+/// none (2 GHz: within 0.4x to 2.5x of every x86-64 part, so a page stays up
+/// for a readable time instead of flashing past).
+#[cfg(feature = "baremetal-suite")]
+const FALLBACK_TSC_KHZ: u64 = 2_000_000;
+
+/// The calibrated TSC rate, or [`FALLBACK_TSC_KHZ`] before/without calibration.
+#[cfg(feature = "baremetal-suite")]
+#[must_use]
+pub fn tsc_khz_or_assumed() -> u64 {
+    match TSC_KHZ.load(Ordering::Relaxed) {
+        0 => FALLBACK_TSC_KHZ,
+        khz => khz,
+    }
+}
+
+/// Busy-wait `ms` milliseconds on the raw TSC: needs neither the published
+/// clock nor any interrupt, so the suite's screens work after a timer failure.
+#[cfg(feature = "baremetal-suite")]
+pub fn spin_ms(ms: u64) {
+    let cycles = tsc_khz_or_assumed().saturating_mul(ms);
+    let start = rdtsc();
+    while rdtsc().wrapping_sub(start) < cycles {
+        core::hint::spin_loop();
+    }
+}
+
+/// Whether `init` published the monotonic clock (false after a calibration
+/// failure: `ktime_get_ns` is then a constant and no sleep can end).
+#[cfg(feature = "baremetal-suite")]
+#[must_use]
+pub fn clock_published() -> bool {
+    CLOCK_MUL.load(Ordering::Relaxed) != 0
+}
+
 // ---------------------------------------------------------------------------
 // Published state
 
@@ -331,6 +366,11 @@ pub fn lapic_timer_interrupt(user: bool) {
     tick_bookkeeping(now, user);
     cpu::irq_lock_probe();
     rearm(now);
+    // After the EOI and the re-arm: a timed-out group abandons this frame.
+    #[cfg(feature = "baremetal-suite")]
+    if crate::baremetal::expired() {
+        crate::baremetal::timeout();
+    }
 }
 
 /// Vector 0x30 body: ISA IRQ0, delivered by the 8259 (legacy path) or the IOAPIC.
@@ -345,6 +385,10 @@ pub fn isa_irq0_interrupt(user: bool) {
         TICKS.fetch_add(1, Ordering::Relaxed);
         crate::userspace::account_ticks(user, 1);
         cpu::irq_lock_probe();
+    }
+    #[cfg(feature = "baremetal-suite")]
+    if crate::baremetal::expired() {
+        crate::baremetal::timeout();
     }
 }
 
@@ -399,6 +443,12 @@ fn idle() {
 /// (`wait_for_ticks`, `poll_periods`), which is what the boot proofs do.
 pub fn wait_until_ns(deadline_ns: u64) {
     while ktime_get_ns() < deadline_ns {
+        // The suite's per-group bound ends a sleep that the clock never wakes.
+        #[cfg(feature = "baremetal-suite")]
+        if crate::baremetal::expired() {
+            DEADLINE_NS.store(u64::MAX, Ordering::Relaxed);
+            crate::baremetal::timeout();
+        }
         cpu::timer_transaction(|| {
             DEADLINE_NS.store(deadline_ns, Ordering::Relaxed);
             rearm(ktime_get_ns());

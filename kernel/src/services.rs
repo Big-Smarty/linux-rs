@@ -35,6 +35,11 @@
 //! that needs process state (an IRQ that wakes a reader, a VFS completion)
 //! must queue the work and let the waking task take the lock.
 //!
+//! The bare-metal suite (`baremetal-suite` only) adds `baremetal::ARCHIVES`
+//! in front of the chain: it is held across `userspace::load_group`, so the
+//! order is `ARCHIVES` -> [`TABLES`] -> `heap` -> [`FRAMES`]; nothing takes it
+//! while holding any of them. `baremetal::RESULTS` is a leaf.
+//!
 //! # The rule that is easy to break
 //! [`FRAMES`] is a leaf, and the heap takes it to grow. So **never allocate
 //! from the heap (`Vec::try_reserve`, `Box::try_new`, ...) while holding a
