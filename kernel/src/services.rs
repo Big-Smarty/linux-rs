@@ -162,6 +162,22 @@ impl<T: Send> Service<T> {
         ServiceGuard(guard)
     }
 
+    /// Remove the installed value so the service can be installed again. Only
+    /// the bare-metal suite uses it (one fresh process per test group); the
+    /// caller drops the value after the lock is released.
+    #[cfg(feature = "baremetal-suite")]
+    pub fn take(&self) -> Option<T> {
+        self.0.lock().take()
+    }
+
+    /// Whether the lock is free right now (an uninstalled service is free). The
+    /// suite asks before it ends a group after a kernel stop: a lock still held
+    /// by the abandoned stack could never be released.
+    #[cfg(feature = "baremetal-suite")]
+    pub fn is_free(&self) -> bool {
+        self.0.try_lock().is_some()
+    }
+
     /// Whether a value was installed. A held lock means it was (the holder
     /// found it installed), so this never spins and never panics.
     pub fn is_installed(&self) -> bool {

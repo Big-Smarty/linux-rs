@@ -636,12 +636,11 @@ fn misc(t: &mut T) {
     );
     t.holds(
         "sysinfo-ram",
-        si.totalram > 64 << 20
-            && si.totalram <= 512 << 20
-            && si.freeram <= si.totalram
-            && si.freeram > 0,
+        // No upper bound: the reference VM has 512 MiB, the bare-metal suite
+        // (docs/bare-metal-suite.md) runs on whatever RAM the machine has.
+        si.totalram > 64 << 20 && si.freeram <= si.totalram && si.freeram > 0,
         (si.totalram, si.freeram),
-        "64 MiB < total <= 512 MiB, 0 < free <= total",
+        "64 MiB < total, 0 < free <= total",
     );
     t.eq("sysinfo-mem_unit", si.mem_unit, 1);
     t.eq("sysinfo-no-swap", (si.totalswap, si.freeswap), (0, 0));

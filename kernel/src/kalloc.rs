@@ -138,7 +138,13 @@ unsafe impl GlobalAlloc for KernelAlloc {
 #[global_allocator]
 static HEAP: KernelAlloc = KernelAlloc(IrqMutex::new(KernelHeap::new(FrameChunks)));
 
-#[cfg(feature = "qemu-self-test")]
+/// Whether the heap lock is free right now (see `Service::is_free`).
+#[cfg(feature = "baremetal-suite")]
+pub fn lock_free() -> bool {
+    HEAP.0.try_lock().is_some()
+}
+
+#[cfg(feature = "boot-proofs")]
 fn stats() -> kernel::heap::HeapStats {
     HEAP.0.lock().stats()
 }
@@ -146,7 +152,7 @@ fn stats() -> kernel::heap::HeapStats {
 /// Executed heap proof on the real allocator: fallible Vec/Box, alignment,
 /// growth from buddy frames, injected frame exhaustion (clean failure, no
 /// state change, recovery), the size cap and exact accounting.
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "boot-proofs")]
 pub fn self_test() -> Result<(), &'static str> {
     use alloc::{alloc::alloc, alloc::dealloc, boxed::Box, vec::Vec};
     const BIG: usize = 4 << 20;

@@ -51,6 +51,8 @@ pub struct Warning {
     pub problem: Problem,
 }
 pub const MAX_WARNINGS: usize = 16;
+/// XSDT entries whose signature is remembered for the inventory.
+pub const MAX_SIGNATURES: usize = 64;
 
 pub struct Acpi {
     /// XSDT entries read successfully (including bad-checksum ones).
@@ -67,8 +69,16 @@ pub struct Acpi {
     warning_count: usize,
     /// Warnings beyond [`MAX_WARNINGS`].
     pub warnings_dropped: usize,
+    signatures: [[u8; 4]; MAX_SIGNATURES],
+    signature_count: usize,
 }
 impl Acpi {
+    /// Signatures of the readable XSDT children in table order (at most
+    /// [`MAX_SIGNATURES`]; `tables` counts all of them).
+    #[must_use]
+    pub fn signatures(&self) -> &[[u8; 4]] {
+        &self.signatures[..self.signature_count]
+    }
     #[must_use]
     pub fn warnings(&self) -> &[Warning] {
         &self.warnings[..self.warning_count]
@@ -617,6 +627,8 @@ fn walk_root<'a>(pointers: &[u8], mut read: impl FnMut(u64) -> Result<&'a [u8], 
         }; MAX_WARNINGS],
         warning_count: 0,
         warnings_dropped: 0,
+        signatures: [[0; 4]; MAX_SIGNATURES],
+        signature_count: 0,
     };
     for pointer in pointers.as_chunks::<8>().0 {
         let address = u64::from_le_bytes(*pointer);
@@ -630,6 +642,10 @@ fn walk_root<'a>(pointers: &[u8], mut read: impl FnMut(u64) -> Result<&'a [u8], 
         };
         acpi.tables += 1;
         let signature = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if let Some(slot) = acpi.signatures.get_mut(acpi.signature_count) {
+            *slot = signature;
+            acpi.signature_count += 1;
+        }
         if !checksum(bytes) {
             acpi.warn(signature, Problem::Checksum);
         }
@@ -691,13 +707,13 @@ pub unsafe fn discover(boot: &BootInfo) -> Result<Acpi, Error> {
     }))
 }
 
-#[cfg(any(test, feature = "qemu-self-test"))]
+#[cfg(any(test, feature = "boot-proofs"))]
 fn repair_checksum(bytes: &mut [u8], offset: usize) {
     bytes[offset] = 0;
     bytes[offset] = 0u8.wrapping_sub(bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b)));
 }
 
-#[cfg(any(test, feature = "qemu-self-test"))]
+#[cfg(any(test, feature = "boot-proofs"))]
 #[must_use]
 pub fn regression_checks() -> bool {
     let mut rsdp = [0u8; 36];

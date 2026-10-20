@@ -141,13 +141,11 @@ fn clocks(t: &mut T) {
         last = n;
     }
     t.eq("monotonic-never-goes-back", monotonic_ok, true);
+    // The coarse clock is read first: read after `mono`, a tick between the two
+    // reads (likely on a slow emulated CPU) puts it ahead of `mono` on Linux too.
+    let coarse = now(MONOTONIC_COARSE);
     let (mono, raw, boot) = (now(MONOTONIC), now(MONOTONIC_RAW), now(BOOTTIME));
-    let (coarse, rt, rt_coarse, tai) = (
-        now(MONOTONIC_COARSE),
-        now(REALTIME),
-        now(REALTIME_COARSE),
-        now(TAI),
-    );
+    let (rt, rt_coarse, tai) = (now(REALTIME), now(REALTIME_COARSE), now(TAI));
     t.holds(
         "boottime-ge-monotonic",
         boot >= mono - 1_000_000,

@@ -80,7 +80,7 @@ pub struct Allocator<'a> {
     boot: &'a BootInfo,
     buddy: Buddy<'a>,
     metadata_length: u64,
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     allocation_budget: Option<usize>,
 }
 
@@ -224,7 +224,7 @@ impl<'a> Allocator<'a> {
             boot,
             buddy,
             metadata_length: length,
-            #[cfg(feature = "qemu-self-test")]
+            #[cfg(feature = "boot-proofs")]
             allocation_budget: None,
         })
     }
@@ -278,7 +278,7 @@ impl<'a> Allocator<'a> {
         if alignment < PAGE || !alignment.is_power_of_two() {
             return Err(Error::Alignment);
         }
-        #[cfg(feature = "qemu-self-test")]
+        #[cfg(feature = "boot-proofs")]
         if self.allocation_budget == Some(0) {
             return Err(Error::NoMemory);
         }
@@ -294,7 +294,7 @@ impl<'a> Allocator<'a> {
         // extent; no other owner/reference/CPU/DMA access exists. Raw zeroing
         // initializes every byte before Frame can form a reference to the extent.
         unsafe { ptr::write_bytes(pointer, 0, byte_count) };
-        #[cfg(feature = "qemu-self-test")]
+        #[cfg(feature = "boot-proofs")]
         if let Some(remaining) = &mut self.allocation_budget {
             *remaining -= 1;
         }
@@ -367,7 +367,7 @@ impl<'a> Allocator<'a> {
         unsafe { self.buddy.split_reserved(physical.0 / PAGE, order) }
     }
 
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     pub fn set_allocation_budget(&mut self, budget: Option<usize>) {
         self.allocation_budget = budget;
     }
@@ -375,7 +375,7 @@ impl<'a> Allocator<'a> {
     /// # Safety
     /// `first` heads the exclusive initialized order-zero reservation chain made
     /// by `test_exhaustion`. Pop transfers its head with no remaining alias.
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     unsafe fn pop_test_reservation(&self, first: &mut u64) -> Result<Frame, Error> {
         // SAFETY: caller owns this exact live chain head and transfers its token.
         let block = unsafe { self.buddy.reserved_block(*first / PAGE, 0)? };
@@ -391,7 +391,7 @@ impl<'a> Allocator<'a> {
     /// Requires one naturally aligned order-10 block in this QEMU cell.
     /// # Errors
     /// Fails on any allocation/content/alignment/reservation/accounting mismatch.
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     pub fn test_orders(&mut self) -> Result<u32, Error> {
         let before = self.allocated();
         for order in 0..=MAX_ORDER {
@@ -447,7 +447,7 @@ impl<'a> Allocator<'a> {
     /// # Errors
     /// Reports real allocation/address or conservation failures. A controlled
     /// guest failure stops rather than recycling a partially recovered ledger.
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     pub fn test_exhaustion(&mut self) -> Result<usize, Error> {
         let before = self.available();
         let mut whole = self.allocate_order(4)?;
