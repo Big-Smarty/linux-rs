@@ -13,6 +13,9 @@ use crate::{
     mm::{Env, Mm, VmFlags, tests::Fake},
     task::Attributes,
     usercopy::{UserPages, fake::Space},
+    signal::{
+        self, SIGALRM, SIGUSR1, SIGUSR2, State, frame::Sigreturn, info::SigInfo, state::Target,
+    },
     vfs::{FdTable, Timespec, Vfs},
 };
 extern crate std;
@@ -87,6 +90,17 @@ pub struct Task<P = Space, C = Sink> {
     /// Private copies of file pages a kernel access faulted in (the binary's
     /// `user_fault` for `NeedsFile`: `Vfs::fault_page`, then a private frame).
     pub file_pages: BTreeMap<u64, Box<[u8; 4096]>>,
+    /// The signal state: a non-init process whose `SIGUSR1`, `SIGUSR2` and
+    /// `SIGALRM` have handlers, so sending them queues rather than kills.
+    pub state: State,
+    /// `CLOCK_MONOTONIC` of the fake wait.
+    pub now: u64,
+    /// Number of `Task::wait` calls.
+    pub waits: usize,
+    /// Signals the fake delivers to the process when the clock reaches `at`.
+    pub script: Vec<(u64, u8)>,
+    /// The value the fake `rt_sigreturn` reports.
+    pub sigreturn_ret: u64,
 }
 
 fn clock() -> Timespec {
@@ -102,6 +116,10 @@ impl<P, C> Task<P, C> {
         vfs.console_on_rootfs(&mut fdt).expect("console");
         let mut attrs = Attributes::init(1000);
         attrs.fs = vfs.new_fs_struct(0o022);
+        let mut state = State::new(1, 0, 1000);
+        for sig in [SIGUSR1, SIGUSR2, SIGALRM] {
+            state.actions[usize::from(sig) - 1].handler = 0x4000;
+        }
         Self {
             pages,
             sink,
@@ -123,7 +141,16 @@ impl<P, C> Task<P, C> {
             vfs,
             fdt,
             file_pages: BTreeMap::new(),
+            state,
+            now: 0,
+            waits: 0,
+            script: Vec::new(),
+            sigreturn_ret: 0,
         }
+    }
+
+    pub fn script_signal(&mut self, at: u64, sig: u8) {
+        self.script.push((at, sig));
     }
 }
 
@@ -232,5 +259,44 @@ impl<P, C> Clocks for Task<P, C> {
     }
     fn alarm_rtc(&self) -> bool {
         self.clocks.rtc
+    }
+}
+
+impl<P: UserPages, C> signal::Task for Task<P, C> {
+    type Pages = P;
+    fn parts(&mut self) -> (&mut State, &mut P) {
+        (&mut self.state, &mut self.pages)
+    }
+    fn now_ns(&self) -> u64 {
+        self.now
+    }
+    /// Advance the clock to the earliest of the deadline, the interval timer
+    /// and the scripted signals, then deliver the scripted ones that are due.
+    fn wait(&mut self, deadline_ns: Option<u64>) {
+        self.waits += 1;
+        let next = deadline_ns
+            .into_iter()
+            .chain(self.state.itimer.next_event())
+            .chain(self.script.iter().map(|&(at, _)| at))
+            .min()
+            .expect("a wait with no wake-up source would hang the kernel");
+        self.now = self.now.max(next);
+        let now = self.now;
+        let (due, later): (Vec<_>, Vec<_>) = self.script.drain(..).partition(|&(at, _)| at <= now);
+        self.script = later;
+        for (_, sig) in due {
+            let _ = self
+                .state
+                .send_signal(sig, SigInfo::kernel(sig), Target::Process);
+        }
+    }
+    fn user_sp(&self) -> u64 {
+        0x7fff_0000
+    }
+    fn rt_sigreturn(&mut self) -> Sigreturn {
+        Sigreturn {
+            ret: self.sigreturn_ret,
+            bad_frame: false,
+        }
     }
 }

@@ -33,6 +33,7 @@ mod ids;
 mod io;
 mod memory;
 mod process;
+mod signal;
 #[cfg(test)]
 mod testing;
 mod time;
@@ -76,9 +77,10 @@ pub struct Files<'a> {
 }
 
 /// Everything a syscall may touch: the calling task's user memory (the one
-/// user-copy mechanism, `usercopy`) and its identity, devices and files. The
-/// binary implements it for its `Process`; host tests for a fake.
-pub trait Context: UserPages + Clocks {
+/// user-copy mechanism, `usercopy`), its signal state and sleeping
+/// ([`crate::signal::Task`]) and its identity, devices and files. The binary
+/// implements it for its `Process`; host tests for a fake.
+pub trait Context: UserPages + Clocks + crate::signal::Task {
     /// The console tty's byte sink (what `/dev/console` writes reach).
     fn console(&mut self) -> &mut dyn Console;
     /// `task_tgid_vnr(current)`: what `getpid` returns.
@@ -225,7 +227,8 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
         .or_else(|| ids::dispatch(ctx, sysno, args))
-        .or_else(|| time::dispatch(ctx, sysno, args));
+        .or_else(|| time::dispatch(ctx, sysno, args))
+        .or_else(|| signal::dispatch(ctx, sysno, args));
     // A write or truncate under a private copy of a mapped file page (see
     // `vfs::mapping`): the call has run, the kernel stops loudly rather than
     // let the copy and the file diverge from Linux's shared page.

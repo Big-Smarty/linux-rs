@@ -26,9 +26,10 @@
 //!   stop states belong to the scheduler step.
 
 use super::{
-    AltStack, KERNEL_IGNORE, KERNEL_STOP, NSIG, SA_IMMUTABLE, SIG_DFL, SIG_IGN, SIGCONT, SIGKILL,
-    SIGRTMIN, SYNCHRONOUS, SigAction, SigSet, in_mask,
+    AltStack, KERNEL_IGNORE, KERNEL_STOP, NSIG, SA_IMMUTABLE, SIG_DFL, SIG_IGN, SIGALRM, SIGCONT,
+    SIGKILL, SIGRTMIN, SYNCHRONOUS, SigAction, SigSet, in_mask,
     info::{Fault, Layout, SI_KERNEL, SI_USER, SigInfo},
+    itimer::RealTimer,
     sig_kernel_coredump, sig_kernel_only, sig_kernel_stop,
 };
 use syscalls::Errno;
@@ -132,6 +133,19 @@ impl Pending {
     }
 }
 
+/// `current->restart_block.fn`: what `restart_syscall` (219) runs.
+///
+/// A syscall that returns `-ERESTART_RESTARTBLOCK` stores its continuation
+/// here; every signal handler entry that reaches `rt_sigreturn` resets it
+/// (`restore_sigcontext`: `do_no_restart_syscall`). The time lane adds the
+/// `nanosleep` variant (`clockid`, absolute expiry) when `nanosleep` lands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RestartBlock {
+    /// `do_no_restart_syscall`: `restart_syscall` returns `-EINTR`.
+    #[default]
+    NoRestart,
+}
+
 /// `thread.{trap_nr,error_code,cr2}`: what the sigcontext reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ArchInfo {
@@ -147,6 +161,10 @@ pub struct State {
     pub actions: [SigAction; NSIG as usize],
     /// `current->blocked`; never contains SIGKILL or SIGSTOP.
     pub blocked: SigSet,
+    /// `current->real_blocked`: the mask `rt_sigtimedwait` temporarily
+    /// unblocks from; it only keeps those signals from being treated as
+    /// ignored (`sig_ignored`) while the task waits for them.
+    pub real_blocked: SigSet,
     /// `current->saved_sigmask` when `TIF_RESTORE_SIGMASK` is set.
     pub saved_sigmask: Option<SigSet>,
     /// `current->sas_ss_*`.
@@ -167,6 +185,13 @@ pub struct State {
     pub uid: u32,
     /// `RLIMIT_SIGPENDING` of the owner.
     pub rlimit_sigpending: u64,
+    /// `signal->real_timer` / `it_real_incr` (`ITIMER_REAL`).
+    pub itimer: RealTimer,
+    /// `current->restart_block`.
+    pub restart: RestartBlock,
+    /// `CLOCK_MONOTONIC` as of the last [`State::sync_timers`]: the `now` of
+    /// the interval-timer re-arm that `dequeue_signal` performs.
+    pub now_ns: u64,
     private: Pending,
     shared: Pending,
 }
@@ -181,6 +206,7 @@ impl State {
         Self {
             actions: [SigAction::default(); NSIG as usize],
             blocked: SigSet::EMPTY,
+            real_blocked: SigSet::EMPTY,
             saved_sigmask: None,
             altstack: AltStack::RESET,
             arch: ArchInfo::default(),
@@ -191,6 +217,9 @@ impl State {
             tgid: pid,
             uid,
             rlimit_sigpending,
+            itimer: RealTimer::default(),
+            restart: RestartBlock::NoRestart,
+            now_ns: 0,
             private: Pending::new(),
             shared: Pending::new(),
         }
@@ -272,9 +301,11 @@ impl State {
         action.ignored(sig)
     }
 
-    /// `sig_ignored`: blocked signals are never ignored.
+    /// `sig_ignored`: blocked signals (also `real_blocked` ones) are never ignored.
     fn ignores(&self, sig: u8, force: bool) -> bool {
-        !self.blocked.contains(sig) && self.task_ignores(sig, force)
+        !self.blocked.contains(sig)
+            && !self.real_blocked.contains(sig)
+            && self.task_ignores(sig, force)
     }
 
     /// `prepare_signal`: stop/continue side effects at generation time, then
@@ -440,14 +471,38 @@ impl State {
     /// `dequeue_signal(&current->blocked, ..)`: private queue first, then the
     /// shared one.
     pub fn dequeue_signal(&mut self) -> Option<(u8, SigInfo)> {
-        let blocked = self.blocked;
+        self.dequeue_signal_masked(self.blocked)
+    }
+
+    /// `dequeue_signal(mask, ..)`: `mask` is the set to skip (`rt_sigtimedwait`
+    /// passes the complement of the awaited set). A `SIGALRM` taken from the
+    /// shared queue restarts a fired interval timer
+    /// (`posixtimer_rearm_itimer`).
+    pub fn dequeue_signal_masked(&mut self, mask: SigSet) -> Option<(u8, SigInfo)> {
         for target in [Target::Thread, Target::Process] {
             let pending = self.pending_mut(target);
-            if let Some(sig) = pending.next_signal(blocked) {
-                return Some((sig, pending.collect(sig)));
+            if let Some(sig) = pending.next_signal(mask) {
+                let info = pending.collect(sig);
+                if target == Target::Process && sig == SIGALRM {
+                    self.itimer.rearm(self.now_ns);
+                }
+                return Some((sig, info));
             }
         }
         None
+    }
+
+    /// Bring the timers up to `now` (`CLOCK_MONOTONIC` ns): an expired
+    /// `ITIMER_REAL` sends `SIGALRM` to the process (`it_real_fn`:
+    /// `kill_pid_info(SIGALRM, SEND_SIG_PRIV)`, so `SI_KERNEL`, pid 0, uid 0).
+    /// Called on every kernel exit and after every wake-up, before the pending
+    /// set is examined.
+    pub fn sync_timers(&mut self, now: u64) {
+        self.now_ns = now;
+        if self.itimer.expire(now) {
+            // Only a real-time signal sent with `si_code < 0` can fail.
+            let _ = self.send_signal(SIGALRM, SigInfo::kernel(SIGALRM), Target::Process);
+        }
     }
 
     /// `sigdelset(&current->pending.signal, sig)`.

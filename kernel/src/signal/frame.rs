@@ -41,7 +41,7 @@ use super::{
     Cpu, MINSIGSTKSZ, Regs, SA_ONSTACK, SA_RESTORER, SA_SIGINFO, SIGSEGV, SS_ONSTACK, SigAction,
     SigSet, USER_CS, USER_DS,
     info::SigInfo,
-    state::State,
+    state::{RestartBlock, State},
     syscalls::{StackT, do_sigaltstack, get_user, put_user},
 };
 use crate::usercopy::{UserPages, access_ok};
@@ -312,8 +312,6 @@ fn restore_sigcontext<P: UserPages, C: Cpu>(
     pages: &mut P,
     cpu: &mut C,
 ) -> bool {
-    // (Linux first makes any pending restart_syscall return -EINTR; the
-    // restart block belongs to the timer syscalls, not modelled here.)
     let Some(sc) = get_user::<_, SC_READ>(pages, usc) else {
         return false;
     };
@@ -384,6 +382,9 @@ pub fn rt_sigreturn<P: UserPages, C: Cpu>(
             regs.sp,
             MINSIGSTKSZ,
         );
+        // restore_sigcontext's first line: any pending restarted system call
+        // now returns -EINTR.
+        state.restart = RestartBlock::NoRestart;
         restore_sigcontext(
             regs,
             frame + UC_MCONTEXT,
