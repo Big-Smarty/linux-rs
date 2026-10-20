@@ -340,7 +340,7 @@ pub trait Cpu {
     fn ss_is_valid_user_data(&self, ss: u16) -> bool;
 }
 
-pub use state::{RestartBlock, State};
+pub use state::State;
 
 /// The task the signal syscalls and the blocking waits run for: the binary's
 /// process (and the host tests' fake). `parts` hands out the two disjoint

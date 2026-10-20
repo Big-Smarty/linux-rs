@@ -23,7 +23,7 @@ use crate::signal::{
         sys_kill, sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo,
         sys_rt_tgsigqueueinfo, sys_sigaltstack, sys_tgkill, sys_tkill,
     },
-    wait::{sys_pause, sys_restart_syscall, sys_rt_sigsuspend, sys_rt_sigtimedwait},
+    wait::{sys_pause, sys_rt_sigsuspend, sys_rt_sigtimedwait},
 };
 use syscalls::Sysno;
 
@@ -66,7 +66,6 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         Sysno::rt_sigsuspend => sys_rt_sigsuspend(ctx, a[0], a[1]),
         Sysno::rt_sigtimedwait => sys_rt_sigtimedwait(ctx, a[0], a[1], a[2], a[3]),
         Sysno::pause => sys_pause(ctx),
-        Sysno::restart_syscall => sys_restart_syscall(ctx.state()),
         Sysno::setitimer => return unimplemented(sys_setitimer(ctx, a[0], a[1], a[2])),
         Sysno::getitimer => return unimplemented(sys_getitimer(ctx, a[0], a[1])),
         Sysno::alarm => sys_alarm(ctx, a[0]),

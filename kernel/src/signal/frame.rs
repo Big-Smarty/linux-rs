@@ -41,7 +41,7 @@ use super::{
     Cpu, MINSIGSTKSZ, Regs, SA_ONSTACK, SA_RESTORER, SA_SIGINFO, SIGSEGV, SS_ONSTACK, SigAction,
     SigSet, USER_CS, USER_DS,
     info::SigInfo,
-    state::{RestartBlock, State},
+    state::State,
     syscalls::{StackT, do_sigaltstack, get_user, put_user},
 };
 use crate::usercopy::{UserPages, access_ok};
@@ -382,9 +382,9 @@ pub fn rt_sigreturn<P: UserPages, C: Cpu>(
             regs.sp,
             MINSIGSTKSZ,
         );
-        // restore_sigcontext's first line: any pending restarted system call
-        // now returns -EINTR.
-        state.restart = RestartBlock::NoRestart;
+        // restore_sigcontext's first line resets `restart_block.fn` to
+        // `do_no_restart_syscall`: the caller (`Task::rt_sigreturn`) owns the
+        // block (`Clocks::set_restart_block`).
         restore_sigcontext(
             regs,
             frame + UC_MCONTEXT,

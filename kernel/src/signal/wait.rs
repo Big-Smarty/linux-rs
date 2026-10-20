@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Linux 6.18.57 (commit 2ff600d29ee478d0a8d46ef8a58afb5e038fe692):
-// kernel/signal.c: `sys_restart_syscall`/`do_no_restart_syscall` 3253-3261,
-// `do_sigtimedwait` 3823-3874, `rt_sigtimedwait` 3882-3911, `pause`
+// kernel/signal.c: `do_sigtimedwait` 3823-3874, `rt_sigtimedwait` 3882-3911, `pause`
 // 4900-4907, `sigsuspend` 4909-4920, `rt_sigsuspend` 4930-4941;
 // include/linux/errno.h (`ERESTARTNOHAND`); include/linux/time64.h
 // (`timespec64_valid`); include/linux/ktime.h (`ktime_set`). All GPL-2.0.
@@ -9,8 +8,8 @@
 // [`Task::wait`] in a loop that re-checks the wake condition; the timer slack
 // (50 us) is not added to the deadline and the freezer is absent.
 #![forbid(unsafe_code)]
-//! The blocking signal syscalls: `pause`, `rt_sigsuspend`, `rt_sigtimedwait`,
-//! `restart_syscall`.
+//! The blocking signal syscalls: `pause`, `rt_sigsuspend`, `rt_sigtimedwait`.
+//! (`restart_syscall` runs the time lane's `restart_block`, `syscall::time`.)
 //!
 //! # Contract
 //! * Context: task context, interrupts masked; sleeping is [`Task::wait`],
@@ -28,7 +27,7 @@ use super::{
     SIGKILL, SIGSTOP, SigSet, Task,
     deliver::ERESTARTNOHAND,
     info::SigInfo,
-    state::{RestartBlock, State},
+    state::State,
     syscalls::{get_user, put_user},
 };
 use syscalls::Errno;
@@ -91,15 +90,6 @@ pub fn sleep_until<T: Task>(task: &mut T, deadline_ns: u64) -> Option<u64> {
             return Some(deadline_ns - now);
         }
         task.wait(Some(deadline_ns));
-    }
-}
-
-/// `restart_syscall`: runs the stored continuation; none exists, so
-/// `do_no_restart_syscall`'s `-EINTR`.
-#[must_use]
-pub fn sys_restart_syscall(state: &State) -> i64 {
-    match state.restart {
-        RestartBlock::NoRestart => err(Errno::EINTR),
     }
 }
 

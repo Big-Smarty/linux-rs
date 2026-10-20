@@ -241,6 +241,13 @@ impl<P, C> Clocks for Task<P, C> {
     fn set_restart_block(&mut self, block: RestartBlock) {
         self.clocks.restarts.push(block);
     }
+    fn restart_block(&self) -> RestartBlock {
+        self.clocks
+            .restarts
+            .last()
+            .copied()
+            .unwrap_or(RestartBlock::NONE)
+    }
     fn cpu_sample(&self) -> CpuSample {
         self.clocks.sample
     }

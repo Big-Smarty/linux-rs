@@ -141,19 +141,6 @@ impl Pending {
     }
 }
 
-/// `current->restart_block.fn`: what `restart_syscall` (219) runs.
-///
-/// A syscall that returns `-ERESTART_RESTARTBLOCK` stores its continuation
-/// here; every signal handler entry that reaches `rt_sigreturn` resets it
-/// (`restore_sigcontext`: `do_no_restart_syscall`). The time lane adds the
-/// `nanosleep` variant (`clockid`, absolute expiry) when `nanosleep` lands.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RestartBlock {
-    /// `do_no_restart_syscall`: `restart_syscall` returns `-EINTR`.
-    #[default]
-    NoRestart,
-}
-
 /// `thread.{trap_nr,error_code,cr2}`: what the sigcontext reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ArchInfo {
@@ -195,8 +182,6 @@ pub struct State {
     pub rlimit_sigpending: u64,
     /// `signal->real_timer` / `it_real_incr` (`ITIMER_REAL`).
     pub itimer: RealTimer,
-    /// `current->restart_block`.
-    pub restart: RestartBlock,
     /// `CLOCK_MONOTONIC` as of the last [`State::sync_timers`]: the `now` of
     /// the interval-timer re-arm that `dequeue_signal` performs.
     pub now_ns: u64,
@@ -226,7 +211,6 @@ impl State {
             uid,
             rlimit_sigpending,
             itimer: RealTimer::default(),
-            restart: RestartBlock::NoRestart,
             now_ns: 0,
             private: Pending::new(),
             shared: Pending::new(),
