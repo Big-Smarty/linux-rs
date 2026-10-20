@@ -2017,7 +2017,7 @@ ws-mm-memblock-c	mm/memblock.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-memcontrol-c	mm/memcontrol.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-memcontrol-v1-c	mm/memcontrol-v1.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-memfd-c	mm/memfd.c	docs/subsystems/memory.md	P0	not_started
-ws-mm-memory-c	mm/memory.c	docs/subsystems/memory.md	P0	not_started
+ws-mm-memory-c	mm/memory.c	docs/subsystems/memory.md	P0	in_progress
 ws-mm-memory-failure-c	mm/memory-failure.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-memory-hotplug-c	mm/memory_hotplug.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-memory-tiers-c	mm/memory-tiers.c	docs/subsystems/memory.md	P0	not_started
@@ -2035,7 +2035,7 @@ ws-mm-mmap-lock-c	mm/mmap_lock.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mmu-gather-c	mm/mmu_gather.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mmu-notifier-c	mm/mmu_notifier.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mmzone-c	mm/mmzone.c	docs/subsystems/memory.md	P0	not_started
-ws-mm-mprotect-c	mm/mprotect.c	docs/subsystems/memory.md	P0	not_started
+ws-mm-mprotect-c	mm/mprotect.c	docs/subsystems/memory.md	P0	in_progress
 ws-mm-mremap-c	mm/mremap.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mseal-c	mm/mseal.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-msync-c	mm/msync.c	docs/subsystems/memory.md	P0	not_started
@@ -2088,7 +2088,7 @@ ws-mm-truncate-c	mm/truncate.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-usercopy-c	mm/usercopy.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-userfaultfd-c	mm/userfaultfd.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-util-c	mm/util.c	docs/subsystems/memory.md	P0	not_started
-ws-mm-vma-c	mm/vma.c	docs/subsystems/memory.md	P0	not_started
+ws-mm-vma-c	mm/vma.c	docs/subsystems/memory.md	P0	in_progress
 ws-mm-vma-exec-c	mm/vma_exec.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-vma-init-c	mm/vma_init.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-vmalloc-c	mm/vmalloc.c	docs/subsystems/memory.md	P0	not_started
