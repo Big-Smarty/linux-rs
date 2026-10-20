@@ -314,6 +314,30 @@ mod tests {
     }
 
     #[test]
+    fn an_awaited_default_action_signal_neither_kills_nor_is_dropped() {
+        // SIGTERM is fatal by default; blocked and awaited it must be taken by
+        // the wait (`real_blocked`), also when init would otherwise ignore it.
+        for init in [false, true] {
+            let mut t = mapped();
+            if init {
+                t.state = crate::signal::State::new_init(1000);
+            }
+            let term = SigSet::bit(15);
+            t.state.set_blocked(SigSet(term));
+            put(&mut t, PAGE, &term.to_le_bytes());
+            t.script_signal(1_000, 15);
+            assert_eq!(
+                call(&mut t, Sysno::rt_sigtimedwait, &[PAGE, 0, 0, 8]),
+                Outcome::Return(15),
+                "init={init}"
+            );
+            assert_eq!(t.state.group_exit, None, "init={init}");
+            assert_eq!(t.state.blocked, SigSet(term));
+            assert_eq!(t.state.real_blocked, SigSet::EMPTY);
+        }
+    }
+
+    #[test]
     fn sigtimedwait_is_interrupted_by_another_unblocked_signal() {
         let mut t = mapped();
         put(&mut t, PAGE, &SigSet::bit(SIGUSR1).to_le_bytes());

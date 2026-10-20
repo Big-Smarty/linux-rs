@@ -336,7 +336,13 @@ impl State {
         if self.blocked.contains(sig) {
             return; // does not want it; it dequeues when unblocked
         }
-        if self.sig_fatal(sig) && self.group_exit.is_none() && !sig_kernel_coredump(sig) {
+        // `!sigismember(&t->real_blocked, sig)`: a signal `rt_sigtimedwait` is
+        // waiting for (blocked beforehand) never takes the group down.
+        if self.sig_fatal(sig)
+            && self.group_exit.is_none()
+            && !self.real_blocked.contains(sig)
+            && !sig_kernel_coredump(sig)
+        {
             // Start the group exit: the exit code is the signal itself.
             self.group_exit = Some(u32::from(sig));
             self.private.signal.add(SIGKILL);
