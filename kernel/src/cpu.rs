@@ -653,8 +653,9 @@ unsafe fn install_idt() {
 // overwrites with -1, as Linux's `error_entry` does so that `syscall_get_nr`
 // reports "not a syscall"), then DI SI DX CX AX R8-R11 BX BP R12-R15: 16
 // pushes in total, which is exactly `PtRegs` below the hardware frame. One more
-// `sub rsp, 8` makes RSP%16==0 at the CALL (both arms start from RSP%16==0
-// after their first push), so the SysV callee sees RSP%16==8. Outputs/clobbers:
+// `sub rsp, 8` makes RSP%16==0 at the CALL (RSP%16 is 0 once `orig_ax` is on the
+// stack in both arms: the pushed -1, or the hardware error code), so the SysV
+// callee sees RSP%16==8. Outputs/clobbers:
 // RDI = &mut PtRegs, ESI = vector, RDX = error code (0 in the non-error arm);
 // every GPR is restored from `PtRegs` (a handler may have changed any of them,
 // including the return CS/RIP/RFLAGS/RSP/SS) and flags come back from IRETQ.
