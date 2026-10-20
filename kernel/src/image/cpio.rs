@@ -350,7 +350,7 @@ fn disposition(metadata: Metadata, name: &[u8]) -> Result<Disposition, Error> {
 // simple_strntoul(base=16,max_chars=8): optional 0x, stop at the first
 // nonhex digit (including whitespace/sign), return zero if no digit. Do NOT
 // substitute strict from_str_radix: that rejects headers Linux consumes.
-fn hex_field(bytes: &[u8]) -> u32 {
+pub(crate) fn hex_field(bytes: &[u8]) -> u32 {
     let bytes = if bytes.starts_with(b"0x") || bytes.starts_with(b"0X") {
         &bytes[2..]
     } else {
@@ -369,7 +369,8 @@ fn hex_field(bytes: &[u8]) -> u32 {
     value
 }
 
-fn compression(bytes: &[u8]) -> Option<Compression> {
+#[must_use]
+pub fn compression(bytes: &[u8]) -> Option<Compression> {
     match bytes.get(..2)? {
         [0x1f, 0x8b | 0x9e] => Some(Compression::Gzip),
         [0x42, 0x5a] => Some(Compression::Bzip2),
