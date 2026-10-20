@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use syscalls::{Errno, Sysno};
 
+use super::signal::{KSigaction, SA_NOCLDWAIT, SA_RESTORER, SA_SIGINFO, bit, restorer};
 use super::{R, T, addr, addr_mut, die, fn_addr, getpid, sys};
 use crate::Strings;
 
@@ -36,21 +37,8 @@ const WCONTINUED: usize = 8;
 const WEXITED: usize = 4;
 const WNOWAIT: usize = 0x0100_0000;
 
-const SA_SIGINFO: u64 = 4;
-const SA_NOCLDWAIT: u64 = 2;
-const SA_RESTORER: u64 = 0x0400_0000;
-
 const O_NONBLOCK: usize = 0o4000;
 const O_CLOEXEC: usize = 0o2_000_000;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-struct KSigaction {
-    handler: u64,
-    flags: u64,
-    restorer: u64,
-    mask: u64,
-}
 
 static CHLD_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CHLD_INFO: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
@@ -64,13 +52,6 @@ extern "C" fn on_chld(_sig: i32, info: *const u64, _uc: *mut u64) {
     CHLD_INFO[1].store((words[1] & 0xffff_ffff) as usize, Relaxed); // si_pid
     CHLD_INFO[2].store((words[1] >> 32) as usize, Relaxed); // si_uid
     CHLD_INFO[3].store((words[2] & 0xffff_ffff) as usize, Relaxed); // si_status
-}
-
-/// `rt_sigreturn` trampoline for the handler above (a copy of the `signal` group's: this file
-/// is independently reviewable). Contract and assembly proof: `signal.rs::restorer`.
-#[unsafe(naked)]
-unsafe extern "C" fn restorer() -> ! {
-    core::arch::naked_asm!("mov eax, 15", "syscall", "ud2")
 }
 
 fn sigaction(sig: usize, handler: u64, flags: u64) -> R {
@@ -89,10 +70,6 @@ fn on_chld_ptr() -> u64 {
 
 fn block(mask: u64) {
     let _ = sys(Sysno::rt_sigprocmask, &[2, addr(&mask), 0, 8]);
-}
-
-fn bit(sig: usize) -> u64 {
-    1 << (sig - 1)
 }
 
 /// Forks; the child runs `f` and leaves with its return value as the exit status.
@@ -291,10 +268,11 @@ fn wait_errors(t: &mut T) {
         wait4(-99_999, 0).0,
         Err(Errno::ECHILD),
     );
+    // The pid argument is a 32-bit `pid_t`: the high word is dropped, leaving 0 (own group).
     t.eq(
-        "wait4-int-min",
-        sys(Sysno::wait4, &[0x8000_0000_0000_0000, 0, 0, 0]).is_err(),
-        true,
+        "wait4-pid-truncated-to-int",
+        sys(Sysno::wait4, &[0x8000_0000_0000_0000, 0, 0, 0]),
+        Err(Errno::ECHILD),
     );
     t.eq(
         "wait4-int-min-32",
@@ -344,10 +322,25 @@ fn waitid_checks(t: &mut T) {
         waitid(0, 0, WNOHANG).0,
         Err(Errno::EINVAL),
     );
+    // kernel/exit.c `waitid`: the siginfo pointer is checked after the wait, and EFAULT replaces
+    // even ECHILD (`user_write_access_begin` fails first) ...
     t.eq(
-        "waitid-fault",
-        sys(Sysno::waitid, &[0, 0, BAD, WEXITED, 0]).is_err(),
-        true,
+        "waitid-fault-no-children",
+        sys(Sysno::waitid, &[0, 0, BAD, WEXITED, 0]),
+        Err(Errno::EFAULT),
+    );
+    // ... while an already-reaped zombie stays reaped.
+    let zombie = spawn(|| 4);
+    nap(50);
+    t.eq(
+        "waitid-fault-with-zombie",
+        sys(Sysno::waitid, &[1, zombie, BAD, WEXITED, 0]),
+        Err(Errno::EFAULT),
+    );
+    t.eq(
+        "waitid-fault-reaped-anyway",
+        wait4(zombie as isize, 0).0,
+        Err(Errno::ECHILD),
     );
     let child = spawn(|| 5);
     // WNOWAIT leaves the zombie for a later wait.

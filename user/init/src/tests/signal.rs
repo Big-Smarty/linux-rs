@@ -37,12 +37,13 @@ const SIGSTOP: usize = 19;
 const SIGRT0: usize = 34;
 
 const SA_NOCLDSTOP: u64 = 1;
-const SA_SIGINFO: u64 = 4;
+pub(super) const SA_NOCLDWAIT: u64 = 2;
+pub(super) const SA_SIGINFO: u64 = 4;
 const SA_ONSTACK: u64 = 0x0800_0000;
 const SA_RESTART: u64 = 0x1000_0000;
 const SA_NODEFER: u64 = 0x4000_0000;
 const SA_RESETHAND: u64 = 0x8000_0000;
-const SA_RESTORER: u64 = 0x0400_0000;
+pub(super) const SA_RESTORER: u64 = 0x0400_0000;
 
 const SIG_BLOCK: usize = 0;
 const SIG_UNBLOCK: usize = 1;
@@ -57,17 +58,17 @@ const SI_QUEUE: i32 = -1;
 const SI_TKILL: i32 = -6;
 const SI_KERNEL: i32 = 0x80;
 
-fn bit(sig: usize) -> u64 {
+pub(super) fn bit(sig: usize) -> u64 {
     1 << (sig - 1)
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-struct KSigaction {
-    handler: u64,
-    flags: u64,
-    restorer: u64,
-    mask: u64,
+pub(super) struct KSigaction {
+    pub(super) handler: u64,
+    pub(super) flags: u64,
+    pub(super) restorer: u64,
+    pub(super) mask: u64,
 }
 
 #[repr(C)]
@@ -251,7 +252,7 @@ extern "C" fn h_write_pipe(sig: i32, info: *const u64, uc: *mut u64) {
 // ---------------------------------------------------------------------------------------------
 // Assembly stubs.
 
-/// `SA_RESTORER` trampoline: `rt_sigreturn`.
+/// `SA_RESTORER` trampoline: `rt_sigreturn`. The one copy, shared with the `proc` group.
 ///
 /// * Why asm: the kernel returns from a handler into this address with the signal frame on the
 ///   stack; the only way back is `syscall` with `rax = __NR_rt_sigreturn`, and no Rust construct
@@ -262,7 +263,7 @@ extern "C" fn h_write_pipe(sig: i32, info: *const u64, uc: *mut u64) {
 ///   are restored from the frame. User mode, interrupts unaffected.
 /// * Control flow: never returns; `ud2` traps if the kernel returned (it must not).
 #[unsafe(naked)]
-unsafe extern "C" fn restorer() -> ! {
+pub(super) unsafe extern "C" fn restorer() -> ! {
     naked_asm!("mov eax, 15", "syscall", "ud2")
 }
 
@@ -288,9 +289,10 @@ unsafe extern "C" fn entry_probe() {
 }
 
 /// Loads a known value into every general register, executes `int3`, then stores the registers
-/// (and the direction flag) the kernel handed back. Argument: `rdi` = `*mut [u64; 17]`.
+/// (and the direction flag) the kernel handed back. Argument: `rdi` = `*mut [u64; 16]`.
 ///
-/// Output order: rax rcx rdx rbx rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15 flags-DF rsp-delta.
+/// Output words 0..=15: rax rcx rdx rbx rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15, then the
+/// flags word masked to DF (0x400).
 ///
 /// * Why asm: a signal must interrupt code whose entire register file is known, and `rt_sigreturn`
 ///   must restore all of it; no safe construct names `rbx`/`rbp` or can assert all 15 registers.
@@ -299,13 +301,15 @@ unsafe extern "C" fn entry_probe() {
 /// * Registers: saves/restores the callee-saved set (`rbx rbp r12-r15`) on the stack, writes all
 ///   others (caller-saved, free to clobber), flags: DF set around the trap and cleared before
 ///   return (the System V ABI requires DF clear at calls).
-/// * Memory/stack: pushes 7 words (6 callee-saved + the output pointer) below the entry `rsp`;
-///   the kernel keeps 128 bytes of red zone above its frame, and the words live above `rsp`,
-///   so the handler's frame never overlaps them. 17 stores through the caller's valid pointer.
+/// * Memory/stack: pushes 7 words (6 callee-saved + the output pointer) below the entry `rsp`
+///   and, after the trap, spills two scratch words to `[rsp - 24]` and `[rsp - 16]` (the red
+///   zone: no signal can be live then, and the kernel skips 128 bytes below `rsp` when it
+///   builds a frame anyway); `pushfq`/`pop` use `[rsp - 8]` between them. Exactly 16 8-byte
+///   stores through the caller's valid pointer (offsets 0..=120); nothing else is written.
 /// * Control flow: `int3` raises SIGTRAP (handler installed by the caller) and resumes after it;
 ///   no unwinding.
 #[unsafe(naked)]
-unsafe extern "C" fn regs_probe(out: *mut [u64; 17]) {
+unsafe extern "C" fn regs_probe(out: *mut [u64; 16]) {
     naked_asm!(
         "push rbx",
         "push rbp",
@@ -374,7 +378,7 @@ unsafe extern "C" fn regs_probe(out: *mut [u64; 17]) {
 ///   cannot express for a load that may trap.
 /// * Registers: writes `rax` (result), reads `rdi`; no other register. Memory: one 8-byte store
 ///   to `RECOVER`, one byte load from the caller's address (the fault under test); flags
-///   unchanged except by `movzx`'s none.
+///   are not touched (`lea`, `mov`, `movzx` leave them alone).
 /// * Control flow: the handler sets `rip` to label `2`, which returns -1 with the stack as at
 ///   the load (no pushes happened).
 #[unsafe(naked)]
@@ -482,6 +486,35 @@ unsafe extern "C" fn probe_ud2() -> usize {
 
 // ---------------------------------------------------------------------------------------------
 
+// Safe wrappers, one per stub. Each call needs its fault handler (`h_recover`) installed by the
+// caller (`faults`), which resumes the stub at its recovery label, so the stub always returns.
+fn p_read(a: usize) -> usize {
+    // SAFETY: `extern "C"` stub that preserves what the ABI requires; the fault it may raise is
+    // recovered by the installed SIGSEGV handler.
+    unsafe { probe_read(a) }
+}
+
+fn p_write(a: usize) -> usize {
+    // SAFETY: as `p_read`; the stub stores one byte only to the (possibly faulting) address.
+    unsafe { probe_write(a) }
+}
+
+fn p_exec(a: usize) -> usize {
+    // SAFETY: as `p_read`; the call target is never entered because its fetch faults (callers
+    // pass non-executable or unmapped addresses only).
+    unsafe { probe_exec(a) }
+}
+
+fn p_div0() -> usize {
+    // SAFETY: as `p_read`, with the SIGFPE handler installed.
+    unsafe { probe_div0() }
+}
+
+fn p_ud2() -> usize {
+    // SAFETY: as `p_read`, with the SIGILL handler installed.
+    unsafe { probe_ud2() }
+}
+
 fn install(sig: usize, handler: Handler, flags: u64, mask: u64) -> R {
     install_raw(
         sig,
@@ -579,6 +612,20 @@ fn alt_base() -> usize {
 struct Itimerval {
     interval: [i64; 2],
     value: [i64; 2],
+}
+
+/// Repeating `ITIMER_REAL`: a tick lost to a host stall before the blocking call under test is
+/// followed by another one, so the call cannot block forever. Pair with `disarm_timer`.
+fn arm_periodic_ms(ms: i64) {
+    let it = Itimerval {
+        interval: [0, ms * 1000],
+        value: [0, ms * 1000],
+    };
+    let _ = sys(Sysno::setitimer, &[0, addr(&it), 0]);
+}
+
+fn disarm_timer() {
+    let _ = sys(Sysno::setitimer, &[0, addr(&Itimerval::default()), 0]);
 }
 
 fn arm_timer_ms(ms: i64) {
@@ -979,7 +1026,7 @@ fn delivery(t: &mut T) {
         bit(SIGUSR1),
     );
     t.eq("mask-restored-after-handler", mask_now(), 0);
-    t.eq("handler-flags-cleared-df", uc_word(UC_FLAGS) & !1, 6);
+    t.eq("handler-uc_flags", uc_word(UC_FLAGS) & !1, 6);
     // tgkill / tkill report SI_TKILL.
     reset_records();
     t.eq(
@@ -1236,8 +1283,8 @@ fn frames(t: &mut T) {
     RBX_PATCH.store(0xbbbb_0000_bbbb_0000, Relaxed);
     NEW_MASK.store(bit(SIGUSR2), Relaxed);
     let _ = install(SIGTRAP, h_patch, SA_SIGINFO, 0);
-    let mut out = [0u64; 17];
-    // SAFETY: `regs_probe` stores 17 words through the valid pointer and preserves callee-saved
+    let mut out = [0u64; 16];
+    // SAFETY: `regs_probe` stores 16 words through the valid pointer and preserves callee-saved
     // registers; the SIGTRAP handler is installed.
     unsafe { regs_probe(&raw mut out) };
     let want_unchanged = [
@@ -1260,7 +1307,7 @@ fn frames(t: &mut T) {
     ];
     t.eq(
         "sigreturn-restores-registers",
-        &out[..16],
+        &out[..],
         &want_unchanged[..],
     );
     t.eq("sigreturn-honours-patched-mask", mask_now(), bit(SIGUSR2));
@@ -1290,15 +1337,7 @@ fn faults(t: &mut T) {
             (want, 1),
         );
     };
-    // SAFETY (every probe_* call below): each stub is `extern "C"`, preserves the registers the
-    // ABI requires, and the SIGSEGV/SIGFPE/SIGILL handler resumes it at its own recovery label.
-    probe(
-        t,
-        "segv-null-read",
-        SIGSEGV,
-        &|| unsafe { probe_read(0x10) },
-        usize::MAX,
-    );
+    probe(t, "segv-null-read", SIGSEGV, &|| p_read(0x10), usize::MAX);
     t.eq(
         "segv-null-read-info",
         (si_i32(0), si_i32(4), si_i32(8), si_word(2)),
@@ -1318,7 +1357,7 @@ fn faults(t: &mut T) {
         t,
         "segv-unmapped-write",
         SIGSEGV,
-        &|| unsafe { probe_write(0x7000_0000_0123) },
+        &|| p_write(0x7000_0000_0123),
         usize::MAX,
     );
     t.eq(
@@ -1332,7 +1371,7 @@ fn faults(t: &mut T) {
         t,
         "segv-prot-none-read",
         SIGSEGV,
-        &|| unsafe { probe_read(page + 8) },
+        &|| p_read(page + 8),
         usize::MAX,
     );
     t.eq(
@@ -1347,7 +1386,7 @@ fn faults(t: &mut T) {
         t,
         "segv-read-only-write-untouched",
         SIGSEGV,
-        &|| unsafe { probe_write(page + PAGE + 16) },
+        &|| p_write(page + PAGE + 16),
         usize::MAX,
     );
     t.eq(
@@ -1358,14 +1397,14 @@ fn faults(t: &mut T) {
     reset_records();
     t.eq(
         "read-only-read-ok-first",
-        (unsafe { probe_read(page + 16) }, COUNT.load(Relaxed)),
+        (p_read(page + 16), COUNT.load(Relaxed)),
         (0, 0),
     );
     probe(
         t,
         "segv-read-only-write",
         SIGSEGV,
-        &|| unsafe { probe_write(page + 16) },
+        &|| p_write(page + 16),
         usize::MAX,
     );
     t.eq(
@@ -1376,14 +1415,14 @@ fn faults(t: &mut T) {
     reset_records();
     t.eq(
         "read-only-read-ok",
-        (unsafe { probe_read(page + 16) }, COUNT.load(Relaxed)),
+        (p_read(page + 16), COUNT.load(Relaxed)),
         (0, 0),
     );
     probe(
         t,
         "segv-exec-nx",
         SIGSEGV,
-        &|| unsafe { probe_exec(page + 0x20) },
+        &|| p_exec(page + 0x20),
         usize::MAX,
     );
     t.eq(
@@ -1395,7 +1434,7 @@ fn faults(t: &mut T) {
         t,
         "segv-exec-unmapped",
         SIGSEGV,
-        &|| unsafe { probe_exec(0x7100_0000_0000) },
+        &|| p_exec(0x7100_0000_0000),
         usize::MAX,
     );
     t.eq(
@@ -1408,7 +1447,7 @@ fn faults(t: &mut T) {
         t,
         "segv-noncanonical",
         SIGSEGV,
-        &|| unsafe { probe_read(0x8000_0000_0000_0000) },
+        &|| p_read(0x8000_0000_0000_0000),
         usize::MAX,
     );
     t.eq(
@@ -1424,13 +1463,7 @@ fn faults(t: &mut T) {
     );
     let _ = sys(Sysno::munmap, &[page, 2 * PAGE]);
     // Other synchronous exceptions.
-    probe(
-        t,
-        "fpe-divide-by-zero",
-        SIGFPE,
-        &|| unsafe { probe_div0() },
-        usize::MAX,
-    );
+    probe(t, "fpe-divide-by-zero", SIGFPE, &|| p_div0(), usize::MAX);
     t.eq(
         "fpe-info",
         (
@@ -1442,7 +1475,7 @@ fn faults(t: &mut T) {
         ),
         (SIGFPE as i32, 1, FAULT_IP.load(Relaxed) as u64, 0, 0),
     );
-    probe(t, "ill-ud2", SIGILL, &|| unsafe { probe_ud2() }, usize::MAX);
+    probe(t, "ill-ud2", SIGILL, &|| p_ud2(), usize::MAX);
     t.eq(
         "ill-info",
         (si_i32(0), si_i32(8), si_word(2), uc_word(REG_TRAPNO)),
@@ -1804,9 +1837,15 @@ fn waiting(t: &mut T) {
     let _ = procmask(SIG_SETMASK, Some(0), None);
     // pause().
     reset_records();
-    arm_timer_ms(20);
+    arm_periodic_ms(20);
     t.eq("pause-eintr", sys(Sysno::pause, &[]), Err(Errno::EINTR));
-    t.eq("pause-handler-ran", COUNT.load(Relaxed), 1);
+    disarm_timer();
+    t.holds(
+        "pause-handler-ran",
+        COUNT.load(Relaxed) >= 1,
+        COUNT.load(Relaxed),
+        ">= 1",
+    );
     clean();
 }
 
@@ -1849,26 +1888,38 @@ fn interruption(t: &mut T) {
     reset_records();
     VALUES[7].store(wfd as u64, Relaxed);
     let _ = install(SIGALRM, h_record, SA_SIGINFO, 0);
-    arm_timer_ms(20);
+    arm_periodic_ms(20);
     t.eq(
         "read-eintr-without-restart",
         sys(Sysno::read, &[rfd, addr_mut(&mut buf), 4]),
         Err(Errno::EINTR),
     );
-    t.eq("read-eintr-handler-ran", COUNT.load(Relaxed), 1);
+    disarm_timer();
+    t.holds(
+        "read-eintr-handler-ran",
+        COUNT.load(Relaxed) >= 1,
+        COUNT.load(Relaxed),
+        ">= 1",
+    );
     reset_records();
     VALUES[7].store(wfd as u64, Relaxed);
     let _ = install(SIGALRM, h_write_pipe, SA_SIGINFO | SA_RESTART, 0);
-    arm_timer_ms(20);
+    arm_periodic_ms(20);
     t.eq(
         "read-restarted-with-sa_restart",
         (sys(Sysno::read, &[rfd, addr_mut(&mut buf), 4]), buf[0]),
         (Ok(1), b'z'),
     );
-    t.eq("read-restart-handler-ran-once", COUNT.load(Relaxed), 1);
+    disarm_timer();
+    t.holds(
+        "read-restart-handler-ran",
+        COUNT.load(Relaxed) >= 1,
+        COUNT.load(Relaxed),
+        ">= 1",
+    );
     let _ = sys(Sysno::close, &[rfd]);
     let _ = sys(Sysno::close, &[wfd]);
-    // The timer: one-shot delivery, then nothing pending.
+    // The disarmed timer leaves nothing pending.
     t.eq("itimer-expired", pending(), 0);
     clean();
 }

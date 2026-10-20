@@ -123,6 +123,7 @@ fn brk_checks(t: &mut T) {
     t.eq("brk-into-wall", brk(wall), wall - PAGE);
     t.eq("brk-unaligned-into-wall", brk(wall - PAGE + 1), wall - PAGE);
     t.eq("brk-wall-unmap", sys(Sysno::munmap, &[wall, PAGE]), Ok(0));
+    // Refused because [oldbrk, newbrk + PAGE) overlaps the mappings made above, not by a TASK_SIZE rule.
     t.eq("brk-huge", brk(TASK_SIZE - PAGE), wall - PAGE);
     t.eq("brk-reset", brk(start), start);
     t.eq(
@@ -167,7 +168,8 @@ fn mmap_checks(t: &mut T, probe: &Probe) {
         "usable by read/write",
     );
 
-    // Hints are honoured when free, page-aligned up, and ignored below mmap_min_addr.
+    // Hints are honoured when free and rounded down to a page; an occupied hint falls back to the
+    // top-down search.
     let hint = 0x1000_0000;
     t.eq("mmap-hint", map(hint, PAGE, PROT_RW, ANON), Ok(hint));
     t.eq(
@@ -181,7 +183,11 @@ fn mmap_checks(t: &mut T, probe: &Probe) {
         map(hint + 0x1000_0123, PAGE, PROT_RW, ANON),
         Ok(hint + 0x1000_0000),
     );
-    // arch_get_unmapped_area* never consults mmap_min_addr; `security_mmap_addr` lets root pass.
+    // Environment: these two checks pin `mmap_min_addr == 4096` (the reference config's
+    // CONFIG_DEFAULT_MMAP_MIN_ADDR). `do_mmap` does consult it for non-fixed hints
+    // (`round_hint_to_min`, mm/mmap.c:219) and `security_mmap_addr` for fixed addresses, but a
+    // page-aligned hint of 0x1000 is not below 4096, so neither the raising of a low hint nor the
+    // CAP_SYS_RAWIO exemption is exercised; a kernel with the usual 65536 would differ here.
     t.eq(
         "mmap-hint-low",
         map(0x1000, PAGE, PROT_RW, ANON),

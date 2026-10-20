@@ -786,7 +786,8 @@ fn directories(t: &mut T) {
         Some(stat_path(b"/\0").1.ino),
     );
     let offs: [Option<i64>; 7] = [0, 1, 2, 3, 4, 5, 6].map(|i| entry(i).map(|e| e.off));
-    // tmpfs `d_off` is the entry's own stable offset (newest entry lowest) and LONG-ish at the end.
+    // tmpfs `d_off` is the offset of the *next* entry (`offset_readdir`), ending in DIR_OFFSET_EOD
+    // (`S32_MAX`); recorded as information, not matched by the future harness case.
     t.info("getdents-d_off", format_args!("{offs:?}"));
     t.eq(
         "getdents-d_off-cookie-seek",
