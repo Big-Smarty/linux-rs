@@ -704,4 +704,4 @@ Persistent services (BOOT/FRAMES/TABLES statics, safe `user_space`) - `publish_s
 
 ### Kernel services foundation evidence
 
-Recorded after the gate run; see the branch hand-off.
+Run on the author's workstation (same host, user and toolchain installation as earlier records; not independently attested), `target/gates.sh` with the updated target Clippy line, run name `fgate1`, logs `target/gates-foundation/` (untracked): fmt, host 1.88 Clippy and tests (xtask 72, baremetal 10), exact-nightly workspace Clippy and tests (kernel 128 with the six new heap tests, the split-reserved test and the identity test; xtask 72; baremetal 10; two doc tests), `kernel-test` **18/18** matched (`target/kernel-tooling/fgate1`; the `-- mmap` case still ends `FAIL syscall unimplemented nr=9`; `CHECK user-mm` and `CHECK heap` present in the success case), target Clippy for both kernel profiles with `--cfg=no_global_oom_handling` and build-std `alloc` (clean under `-D warnings`), `xtask check` (23 vendored packages verified) and `status`, all `exit=0`. Not run: physical hardware, SMP, performance comparison, independent review.
