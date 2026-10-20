@@ -180,7 +180,11 @@ extern "C" fn kernel_main() -> ! {
     // Kernel tables only; init's mappings below are added before CR3 loads,
     // which `paging`'s update rules allow but no longer require.
     let table_pages = tables.pages;
-    let user = userspace::load(boot, &mut allocator, &mut tables);
+    // The frame allocator becomes a service now: the rootfs is built and
+    // unpacked with the kernel heap before the module payloads disappear. From
+    // here on `FRAMES` is locked per use, never across a heap allocation.
+    services::FRAMES.install(allocator);
+    let user = userspace::load(boot, &mut tables);
     // Interrupt-controller and time device pages (LAPIC, IOAPICs, HPET) are
     // mapped uncached into the same unpublished tree; the APIC mode decision
     // reads only CPUID/IA32_APIC_BASE.
@@ -193,7 +197,7 @@ extern "C" fn kernel_main() -> ! {
     );
     let device_pages = timer::map_mmio(
         boot,
-        &mut allocator,
+        &mut services::FRAMES.lock(),
         &mut tables,
         &prepared,
         &acpi,
@@ -215,18 +219,18 @@ extern "C" fn kernel_main() -> ! {
         "CHECK paging ok tables={} wx=separated guards=5 image_alias=absent\n",
         table_pages
     );
-    check_exceptions(boot, &mut allocator);
+    check_exceptions(boot, &mut services::FRAMES.lock());
     #[cfg(feature = "qemu-self-test")]
-    check_allocator_recovery(&mut allocator);
+    check_allocator_recovery(&mut services::FRAMES.lock());
     #[cfg(feature = "qemu-self-test")]
-    check_user_mm(&mut tables, &mut allocator);
+    check_user_mm(&mut tables, &mut services::FRAMES.lock());
     clock_and_irq_checks(boot, &prepared, &acpi, &device_pages, options);
     log!(
         "CHECKPOINT bootstrap-complete free_pages={} owned_tables={}\n",
-        allocator.available(),
+        services::FRAMES.lock().available(),
         tables.pages
     );
-    publish_services(allocator, tables);
+    publish_services(tables);
     // Diverges: init runs and its death ends the boot, or Linux's failure text.
     userspace::run(user)
 }
@@ -234,8 +238,7 @@ extern "C" fn kernel_main() -> ! {
 /// The boot-phase locals end here: the frame allocator and the published tables
 /// move into their statics, since `kernel_main`'s frame becomes init's kernel
 /// stack and the syscall/fault paths allocate and edit tables from there.
-fn publish_services(allocator: Allocator<'static>, tables: paging::Tables) {
-    services::FRAMES.install(allocator);
+fn publish_services(tables: paging::Tables) {
     services::TABLES.install(tables);
     // The heap is usable from here on (it grows from `FRAMES`).
     #[cfg(feature = "qemu-self-test")]

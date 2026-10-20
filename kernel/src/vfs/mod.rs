@@ -71,6 +71,13 @@ pub type KResult<T> = Result<T, Errno>;
 /// A tmpfs inode (arena index; `Tmpfs::iget` pins it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InodeId(pub(crate) u32);
+impl InodeId {
+    /// The arena index: a stable identity while the inode is pinned.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
 /// An open file description (`struct file`; arena index in [`FileTable`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileId(pub(crate) u32);

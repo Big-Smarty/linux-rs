@@ -19,15 +19,23 @@
 //! when `execve` of a second process exists.
 //! shortcut: the file's owner and setuid/setgid bits are ignored; init always
 //! runs with uid/gid 0 and no secure-exec (a root-owned initramfs).
+//! shortcut: `/init` is read whole into a temporary vector and copied into
+//! frames (Linux maps page-cache pages); upgrade with file-backed `mmap`.
+//!
+//! The rootfs (`vfs`) is built and unpacked here, before the owned tables are
+//! activated (the module payloads are only readable then), so its timestamps
+//! carry `vfs::tmpfs::UNSET_TIME` until `start` fixes them with the running
+//! clock.
 
 use crate::{
     boot::{BootError, BootInfo},
     console, cpu,
-    memory::{Allocator, Error as MemoryError, PAGE, PAGE_BYTES, Physical},
-    paging::{self, LoadSpace, Tables, UserSpace},
+    memory::{Error as MemoryError, PAGE, PAGE_BYTES, Physical},
+    paging::{self, Tables, UserSpace},
     services::{self, Service},
     timer,
 };
+use alloc::vec::Vec;
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
     iter,
@@ -36,7 +44,6 @@ use kernel::{
     cputime::{CpuAccount, CpuSample},
     exec::{
         args::{ArgsError, InitArgv, Word},
-        find::{FindError, InitEntry, Search},
         load::{exec_file, insert_stack, map_segments},
         plan::{LoadError, LoadPlan, Unsupported},
         report::{
@@ -46,15 +53,19 @@ use kernel::{
         script,
         stack::{self, ARG_PAGES, Aux, ENVP, STACK_START, STACK_TOP, StackError},
     },
-    image::{cpio::FileType, elf::Elf},
+    image::elf::Elf,
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     syscall::{
-        self, AddressSpace, ClockState, Clocks, Console, Context, Machine, Outcome, RestartBlock,
-        RestartFn,
+        self, AddressSpace, ClockState, Clocks, Console, Context, Files, Machine, Outcome,
+        RestartBlock, RestartFn,
     },
     task::{self, Attributes},
     usercopy::{self, UserPages},
+    vfs::{
+        self, FdTable, MAY_EXEC, O_LARGEFILE, O_RDONLY, Timespec, Vfs, initramfs::Unpacker,
+        ops::OpenFlags, path::LOOKUP_FOLLOW,
+    },
 };
 use syscalls::Errno;
 
@@ -63,11 +74,10 @@ pub const FILENAME: &[u8] = b"/init";
 const _: () = assert!(ARG_PAGES == 4);
 
 pub enum Error {
-    /// No archive provides `/init`: Linux ends in `NO_INIT`.
+    /// The rootfs has no `/init`: Linux ends in `NO_INIT`.
     NoInit,
-    HardLink(FindError),
-    /// `/init` is a symlink; resolving it is outside this slice.
-    Symlink,
+    /// The rootfs itself could not be built (`default_rootfs` failed or no memory).
+    Vfs(Errno),
     /// Linux `execve` failure; the errno is what `Failed to execute` prints.
     Exec(Errno),
     /// `/init` failed to execute and one of Linux's fallback inits exists in
@@ -88,8 +98,7 @@ impl core::fmt::Debug for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NoInit => f.write_str("NoInit"),
-            Self::HardLink(error) => f.debug_tuple("HardLink").field(error).finish(),
-            Self::Symlink => f.write_str("Symlink"),
+            Self::Vfs(errno) => f.debug_tuple("Vfs").field(errno).finish(),
             Self::Exec(errno) => f.debug_tuple("Exec").field(errno).finish(),
             Self::Fallback { errno, path } => f
                 .debug_struct("Fallback")
@@ -139,6 +148,8 @@ impl From<ArgsError> for Error {
 /// Everything later stages need once `/init` is mapped. Plain data; the mapped
 /// pages live in the tables, which belong in `services::TABLES` before ring 3.
 pub struct Loaded {
+    /// The unpacked rootfs; moves into [`Process`] when init starts.
+    pub vfs: Vfs,
     pub entry: u64,
     pub sp: u64,
     pub loads: usize,
@@ -181,105 +192,125 @@ fn random_bytes() -> [u8; 16] {
 /// # Errors
 /// [`Error::NoInit`] when absent (the caller reproduces Linux's panic), the
 /// Linux `execve` errno or an explicit unsupported case otherwise.
-pub fn load(
-    boot: &BootInfo,
-    allocator: &mut Allocator<'_>,
-    tables: &mut Tables,
-) -> Result<Loaded, Error> {
-    let fallback = first_fallback(boot);
-    match load_init(boot, allocator, tables) {
+pub fn load(boot: &BootInfo, tables: &mut Tables) -> Result<Loaded, Error> {
+    let vfs = build_rootfs(boot)?;
+    let fallback = first_fallback(&vfs);
+    match load_init(boot, vfs, tables) {
+        Ok(loaded) => Ok(loaded),
         Err(Error::Exec(errno) | Error::Load(LoadError::Errno(errno))) if fallback.is_some() => {
             Err(Error::Fallback {
                 errno: errno.into_raw(),
                 path: fallback.unwrap_or_default(),
             })
         }
-        other => other,
+        Err(error) => Err(error),
     }
 }
 
 /// `kernel_init`'s fallbacks after a failed `/init` (init/main.c:1499-1502).
 const FALLBACKS: [&[u8]; 4] = [b"/sbin/init", b"/etc/init", b"/bin/init", b"/bin/sh"];
 
-/// The latest archive entry for `path`, across all boot modules.
-fn locate(boot: &BootInfo, path: &[u8]) -> Result<Option<InitEntry>, Error> {
-    let mut search = Search::new(path);
+/// The clock of the rootfs until timekeeping runs: every timestamp it hands out
+/// is [`vfs::tmpfs::UNSET_TIME`] and `start` replaces those with real time.
+fn early_clock() -> Timespec {
+    vfs::tmpfs::UNSET_TIME
+}
+
+/// The rootfs as `rootfs_initcall` leaves it: tmpfs (`init_rootfs`: no
+/// `root=`), the builtin initramfs (`/dev`, `/dev/console`, `/root`), then every
+/// boot module unpacked in order (`populate_rootfs`). A module the unpacker
+/// stops on keeps the entries before the stop, as in Linux; compressed modules
+/// are skipped (decompression is not ported; the boot log already warned).
+fn build_rootfs(boot: &BootInfo) -> Result<Vfs, Error> {
+    // shmem_default_max_blocks / _max_inodes: half the RAM and all of it.
+    let pages = services::FRAMES.lock().total() as u64;
+    let mut vfs = Vfs::new(pages / 2, pages, early_clock).map_err(Error::Vfs)?;
+    vfs.default_rootfs().map_err(Error::Vfs)?;
+    let mut unpacker = Unpacker::new();
     for index in 0..boot.module_count() {
         let span = boot.module_span(index)?;
         // SAFETY: trusted initialized immutable file storage, BSP only, no
-        // DMA/AP/firmware writer or reclaim, loader CR3 still active (callers
-        // run before the owned tables are activated). The borrow ends within
-        // this iteration.
+        // DMA/AP/firmware writer or reclaim, loader CR3 still active (`load`
+        // runs before the owned tables are activated). The borrow ends within
+        // this iteration; the unpacker copies what it keeps.
         let bytes = unsafe { boot.module_bytes(span) }?;
-        search.scan(index, bytes).map_err(Error::HardLink)?;
+        if let Some(message) = unpacker.unpack(&mut vfs, bytes) {
+            // CONFIG_BLK_DEV_RAM=n (`do_populate_rootfs`): the unpacker's own
+            // message; the entries before the failure stay in the tree.
+            crate::log!("Initramfs unpacking failed: {}\n", message);
+        }
     }
-    Ok(search.entry())
+    Ok(vfs)
 }
 
-/// The first fallback init present in the archives; an untrackable entry
-/// counts as present (it is reported, never silently skipped).
-fn first_fallback(boot: &BootInfo) -> Option<&'static [u8]> {
+/// The kernel thread's view of the rootfs for `init_*` and `kernel_execve`.
+fn exec_open() -> OpenFlags {
+    // open_exec_flags: O_LARGEFILE | O_RDONLY, MAY_EXEC, LOOKUP_FOLLOW.
+    OpenFlags {
+        flags: O_LARGEFILE | O_RDONLY,
+        mode: 0,
+        acc_mode: MAY_EXEC,
+        follow: true,
+        directory: false,
+        cloexec: false,
+    }
+}
+
+/// `do_open_execat` + `kernel_read` of the whole file.
+fn open_exec(vfs: &mut Vfs, path: &[u8]) -> Result<(Vec<u8>, u64), Errno> {
+    let env = vfs.kernel_env();
+    let file = vfs.open(&env, path, &exec_open())?;
+    let inode = vfs.files.get(file).inode;
+    let bytes = match inode {
+        Some(inode) if vfs.fs.inode(inode).is_reg() => {
+            vfs.fs.read_all(inode).map(|bytes| (bytes, u64::from(inode.index())))
+        }
+        // do_open_execat: only regular files execute.
+        _ => Err(Errno::EACCES),
+    };
+    vfs.fput(file);
+    bytes
+}
+
+/// The first fallback init present in the rootfs.
+fn first_fallback(vfs: &Vfs) -> Option<&'static [u8]> {
+    let env = vfs.kernel_env();
     FALLBACKS
         .into_iter()
-        .find(|path| !matches!(locate(boot, path), Ok(None)))
-}
-
-/// Why `exec` of a regular-file candidate fails before the ELF is read.
-fn check_executable(entry: &InitEntry) -> Result<(), Error> {
-    match entry.kind {
-        FileType::Regular => {}
-        FileType::Symlink => return Err(Error::Symlink),
-        // do_open_execat: only regular files execute.
-        _ => return Err(Error::Exec(Errno::EACCES)),
-    }
-    // root passes DAC for exec only when some execute bit is set.
-    if entry.mode & 0o111 == 0 {
-        return Err(Error::Exec(Errno::EACCES));
-    }
-    Ok(())
+        .find(|path| vfs.lookup(&env, path, LOOKUP_FOLLOW).is_ok())
 }
 
 /// `load_script`: `-ENOENT` when the interpreter is not in the rootfs (what
 /// `open_exec` returns), otherwise an explicit unsupported failure.
-fn script_failure(boot: &BootInfo, interpreter: &[u8]) -> Error {
-    interpreter_failure(boot, interpreter, Unsupported::Script)
+fn script_failure(vfs: &mut Vfs, interpreter: &[u8]) -> Error {
+    interpreter_failure(vfs, interpreter, Unsupported::Script)
 }
 
 /// The shared tail of `load_script` and `load_elf_binary`'s `PT_INTERP` scan:
-/// `open_exec(interpreter)` fails `-ENOENT` (or the access error) exactly as
-/// Linux does; an interpreter that exists is `unsupported`.
-fn interpreter_failure(boot: &BootInfo, interpreter: &[u8], unsupported: Unsupported) -> Error {
+/// `open_exec(interpreter)` fails with its `errno` exactly as Linux does; an
+/// interpreter that opens is `unsupported`.
+fn interpreter_failure(vfs: &mut Vfs, interpreter: &[u8], unsupported: Unsupported) -> Error {
     if interpreter.is_empty() {
         return Error::Exec(Errno::ENOENT);
     }
-    match locate(boot, interpreter) {
-        Ok(None) => Error::Exec(Errno::ENOENT),
-        Ok(Some(entry)) => match check_executable(&entry) {
-            Err(error) => error,
-            Ok(()) => Error::Load(LoadError::Unsupported(unsupported)),
-        },
-        Err(error) => error,
+    match open_exec(vfs, interpreter) {
+        Err(errno) => Error::Exec(errno),
+        Ok(_) => Error::Load(LoadError::Unsupported(unsupported)),
     }
 }
 
-fn load_init(
-    boot: &BootInfo,
-    allocator: &mut Allocator<'_>,
-    tables: &mut Tables,
-) -> Result<Loaded, Error> {
-    let init = locate(boot, FILENAME)?.ok_or(Error::NoInit)?;
-    check_executable(&init)?;
-
-    let span = boot.module_span(init.module)?;
-    // SAFETY: as in `locate`; the slice and `file` end before this function returns.
-    let module = unsafe { boot.module_bytes(span) }?;
-    let file = module
-        .get(init.offset..)
-        .and_then(|rest| rest.get(..init.length))
-        .ok_or(BootError::Address)?;
+fn load_init(boot: &BootInfo, mut vfs: Vfs, tables: &mut Tables) -> Result<Loaded, Error> {
+    // kernel_init_freeable: `init_eaccess(ramdisk_execute_command)` failing sends
+    // Linux to `prepare_namespace`; any lookup failure counts.
+    let env = vfs.kernel_env();
+    if vfs.lookup(&env, FILENAME, LOOKUP_FOLLOW).is_err() {
+        return Err(Error::NoInit);
+    }
+    let (file_bytes, inode_id) = open_exec(&mut vfs, FILENAME).map_err(Error::Exec)?;
+    let file = file_bytes.as_slice();
     match script::interpreter(file) {
         Err(errno) => return Err(Error::Exec(errno)),
-        Ok(Some(interpreter)) => return Err(script_failure(boot, interpreter)),
+        Ok(Some(interpreter)) => return Err(script_failure(&mut vfs, interpreter)),
         Ok(None) => {}
     }
     let plan = match LoadPlan::new(file) {
@@ -290,25 +321,38 @@ fn load_init(
                 .ok()
                 .and_then(|elf| elf.interpreter().ok().flatten())
                 .unwrap_or_default();
-            return Err(interpreter_failure(boot, path, Unsupported::Interpreter));
+            return Err(interpreter_failure(
+                &mut vfs,
+                path,
+                Unsupported::Interpreter,
+            ));
         }
         other => other?,
     };
 
     // The address space is built by the one mapping-rule mechanism (`mm`):
     // the shared zero page, the stack VMA, then every `PT_LOAD` (the loader
-    // installs the file pages it owns as it goes). The model's vectors come
-    // from the boot arena (`kalloc`): `FRAMES` does not exist yet.
-    tables.init_zero_page(allocator)?;
-    let env = Env::init(allocator.total() as u64, 0);
+    // installs the file pages it owns as it goes). The model's vectors are
+    // reserved from the heap before each `FRAMES` guard, which the table view
+    // takes per operation (`services`).
+    let total_pages = services::FRAMES.lock().total() as u64;
+    tables.init_zero_page(&mut services::FRAMES.lock())?;
+    let env = Env::init(total_pages, 0);
     let mut mm = Mm::new(&env);
     insert_stack(&mut mm, &env, plan.exec_stack)?;
-    let mut space = LoadSpace {
-        tables: &mut *tables,
-        allocator: &mut *allocator,
-    };
-    map_segments(&plan, file, &exec_file(1), &mut mm, &env, &mut space)?;
+    map_segments(
+        &plan,
+        file,
+        &exec_file(inode_id),
+        &mut mm,
+        &env,
+        &mut tables.user_space(),
+    )?;
 
+    // No heap allocation while `FRAMES` is held (`services`): everything that
+    // grows a vector happened above.
+    let mut allocator = services::FRAMES.lock();
+    let allocator = &mut *allocator;
     // The argument block lives in the top ARG_PAGES pages: one contiguous
     // frame so `stack::build` can write it as a single window.
     let mut top = allocator.allocate_order(2)?;
@@ -341,6 +385,7 @@ fn load_init(
     // `setup_arg_pages` expands the VMA, it does not fault the pages in).
 
     Ok(Loaded {
+        vfs,
         entry: plan.entry,
         sp: built.sp,
         loads: plan.segments().len(),
@@ -383,6 +428,12 @@ pub struct Process {
     /// shortcut: fixed `INIT_RLIMITS`; `setrlimit`/`prlimit64` must update it
     /// (or derive it from the credentials group's limits) when they land.
     pub env: Env,
+    /// The mounted rootfs, open files and pipes.
+    /// shortcut: one process, so the system-wide VFS lives here; with tasks it
+    /// becomes its own service (lock class `vfs` between `PROCESS` and `TABLES`).
+    pub vfs: Vfs,
+    /// `current->files`.
+    pub fdt: FdTable,
 }
 
 static PROCESS: Service<Process> = Service::new();
@@ -569,6 +620,14 @@ impl Clocks for Syscall<'_> {
     fn alarm_rtc(&self) -> bool {
         timer::rtc_present()
     }
+    fn files(&mut self) -> Files<'_> {
+        let process = &mut *self.process;
+        Files {
+            vfs: &mut process.vfs,
+            fdt: &mut process.fdt,
+            fs: &mut process.attrs.fs,
+        }
+    }
 }
 
 /// init's `/dev/console`: the same sinks as `log!`.
@@ -623,6 +682,11 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
         Outcome::Exit(code) => init_died(code),
         Outcome::Unimplemented(number) => {
             crate::log!("FAIL syscall unimplemented nr={}\n", number);
+            crate::fail();
+        }
+        Outcome::Blocked(number) => {
+            // Linux would sleep and nothing can wake the only task.
+            crate::log!("FAIL syscall would block forever nr={}\n", number);
             crate::fail();
         }
     }
@@ -1131,7 +1195,7 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
     }
 }
 
-fn start(init: Loaded) -> ! {
+fn start(mut init: Loaded) -> ! {
     check_user_image(&init, &mut services::TABLES.lock().user_space());
     crate::log!("Run /init as init process\n");
     // SAFETY: BSP, CPL0, IF clear (nothing since the timer test re-enabled it
@@ -1167,11 +1231,22 @@ fn start(init: Loaded) -> ! {
     // (masked after the boot proofs) runs again so user/system time accrues.
     CPUTIME.start(timer::ktime_get_ns());
     timer::resume_tick();
+    // Timekeeping runs now: replace the placeholders of the unpack-time stamps,
+    // then follow the real wall clock.
+    init.vfs
+        .start_timekeeping(timer::ktime_get_real, timer::ktime_get_real());
+    let mut fdt = FdTable::default();
+    // console_on_rootfs: descriptors 0-2 are one /dev/console open file.
+    if init.vfs.console_on_rootfs(&mut fdt).is_err() {
+        crate::log!("Warning: unable to open an initial console.\n");
+    }
+    let mut attrs = Attributes::init(task::max_threads(managed_pages));
+    attrs.fs = init.vfs.new_fs_struct(0o022);
     PROCESS.install(Process {
         pid: 1,
         tgid: 1,
         mm: &services::TABLES,
-        attrs: Attributes::init(task::max_threads(managed_pages)),
+        attrs,
         load,
         restart: RestartBlock {
             func: RestartFn::None,
@@ -1181,6 +1256,8 @@ fn start(init: Loaded) -> ! {
         },
         space: init.mm,
         env: init.env,
+        vfs: init.vfs,
+        fdt,
     });
     #[cfg(feature = "qemu-self-test")]
     check_mm_usercopy();
