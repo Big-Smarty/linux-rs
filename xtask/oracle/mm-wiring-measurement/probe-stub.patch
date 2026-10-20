@@ -1,0 +1,47 @@
+diff --git a/user/init/src/tests/mod.rs b/user/init/src/tests/mod.rs
+index 9dc7c32..62ec713 100644
+--- a/user/init/src/tests/mod.rs
++++ b/user/init/src/tests/mod.rs
+@@ -215,11 +215,9 @@ pub struct Probe {
+ 
+ impl Probe {
+     pub fn new() -> Self {
+-        let mut fds = [0u32; 2];
+-        let _ = sys(Sysno::pipe2, &[addr_mut(&mut fds), 0o4000]);
+         Self {
+-            read_fd: fds[0] as usize,
+-            write_fd: fds[1] as usize,
++            read_fd: 0,
++            write_fd: 0,
+         }
+     }
+ 
+@@ -234,6 +232,7 @@ impl Probe {
+ 
+     /// `[a, a + len)` can be read by the kernel on the process's behalf (one byte per page).
+     pub fn readable(&self, a: usize, len: usize) -> bool {
++        return false;
+         let ok = (0..len.div_ceil(PAGE)).all(|page| {
+             let at = if page == 0 {
+                 a
+@@ -249,6 +248,7 @@ impl Probe {
+     /// `[a, a + len)` can be written by the kernel on the process's behalf (one byte per page).
+     /// Non-destructive: a readable byte is written back unchanged.
+     pub fn writable(&self, a: usize, len: usize) -> bool {
++        return false;
+         let ok = (0..len.div_ceil(PAGE)).all(|page| {
+             let at = if page == 0 {
+                 a
+diff --git a/xtask/src/kernel.rs b/xtask/src/kernel.rs
+index 96b7a20..54ed466 100644
+--- a/xtask/src/kernel.rs
++++ b/xtask/src/kernel.rs
+@@ -468,7 +468,7 @@ const DEBUG_CASES: [DebugCase; 26] = [
+     },
+     DebugCase {
+         name: "unimplemented-syscall",
+-        cmdline: Some("-- io_uring"),
++        cmdline: Some("-- mm"),
+         cpu: "qemu64",
+         expected_exit: 35,
+         required: &[

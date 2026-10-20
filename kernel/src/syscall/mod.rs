@@ -4,9 +4,9 @@
 // (`do_syscall_x64`: the number is an `int`, compared as `unsigned int`),
 // arch/x86/entry/syscalls/syscall_64.tbl. The per-group files carry their own
 // provenance (`io`: fs/read_write.c, drivers/tty; `memory`: mm/mmap.c,
-// mm/mprotect.c, mm/madvise.c; `process`: kernel/exit.c, kernel/sys.c). All GPL-2.0-only. Syscall names/numbers come from the
-// `syscalls` crate (BSD-2-Clause), whose x86_64 table was compared against the
-// pinned tbl.
+// mm/mprotect.c, mm/madvise.c; `process`: kernel/exit.c, kernel/sys.c). All
+// GPL-2.0-only. Syscall names/numbers come from the `syscalls` crate
+// (BSD-2-Clause), whose x86_64 table was compared against the pinned tbl.
 // Transformation: the VFS/tty stack is reduced to the one open file the init
 // process owns (/dev/console on fds 0-2) with its default termios.
 #![forbid(unsafe_code)]

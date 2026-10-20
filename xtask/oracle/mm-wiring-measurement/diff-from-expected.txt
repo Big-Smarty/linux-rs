@@ -1,0 +1,36 @@
+28c28
+< init: test mm.mmap-kernel-access ok
+---
+> init: test mm.mmap-kernel-access FAIL got="EFAULT" want=usable by read/write
+53c53
+< init: test mm.prot-read-only ok
+---
+> init: test mm.prot-read-only FAIL got="writable" want=readable, not writable
+79c79
+< init: test mm.munmap-split-kernel-view ok
+---
+> init: test mm.munmap-split-kernel-view FAIL got="mismatch" want=left readable, hole unreadable
+97c97
+< init: test mm.mprotect-split-access ok
+---
+> init: test mm.mprotect-split-access FAIL got=(false, false, false, false, Ok(0)) want=(true, false, false, true, Ok(0))
+99c99
+< init: test mm.mprotect-read-only-access ok
+---
+> init: test mm.mprotect-read-only-access FAIL got=(false, false) want=(true, false)
+113c113
+< init: test mm.mprotect-hole-no-effect ok
+---
+> init: test mm.mprotect-hole-no-effect FAIL got=false want=true
+115c115
+< init: test mm.mprotect-hole-after-partial ok
+---
+> init: test mm.mprotect-hole-after-partial FAIL got=(false, false) want=(false, true)
+120c120
+< init: test mm.mprotect-across-two-vmas-state ok
+---
+> init: test mm.mprotect-across-two-vmas-state FAIL got=(false, false) want=(false, true)
+122c122
+< init: tests mm passed=121 failed=0
+---
+> init: tests mm passed=113 failed=8
