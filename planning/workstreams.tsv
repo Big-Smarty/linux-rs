@@ -1911,7 +1911,7 @@ ws-kernel-livepatch	kernel/livepatch	docs/subsystems/extensions.md	P0	not_starte
 ws-kernel-locking	kernel/locking	docs/subsystems/core.md	P0	in_progress
 ws-kernel-module	kernel/module	docs/subsystems/extensions.md	P0	not_started
 ws-kernel-nsproxy-c	kernel/nsproxy.c	docs/subsystems/process.md	P0	not_started
-ws-kernel-pid-c	kernel/pid.c	docs/subsystems/process.md	P0	not_started
+ws-kernel-pid-c	kernel/pid.c	docs/subsystems/process.md	P0	in_progress
 ws-kernel-pid-namespace-c	kernel/pid_namespace.c	docs/subsystems/process.md	P0	not_started
 ws-kernel-pid-sysctl-h	kernel/pid_sysctl.h	docs/subsystems/process.md	P0	not_started
 ws-kernel-power	kernel/power	docs/subsystems/firmware.md	P0	not_started
