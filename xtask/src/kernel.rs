@@ -314,6 +314,25 @@ const SUCCESS_MARKERS: &[&str] = &[
     "RESULT success",
 ];
 
+/// Printed by `ktask::selftest::sched_switch` (self-test builds, `test=sched-switch` only): two
+/// kernel threads alternate through the real context switch 256 times with register and FP
+/// canaries; keyed, signal and spurious wake-ups; the timer queue wakes in expiry order; the stack
+/// pool is exhausted, refused, recycled and its handles go stale; every pool guard page is
+/// unmapped and a read of one faults at the exact instruction.
+const SCHED_SWITCH_RECORD: &str = "CHECK sched-switch ok threads=7 switches=ok regs=callee-saved fpu=isolated order=fifo timers=ordered wake=keyed,signal,spurious stacks=recycled pool=exhausted,reused guards=unmapped guard_fault=exact";
+
+/// The success markers plus the scheduler record.
+const SCHED_SWITCH_MARKERS: [&str; SUCCESS_MARKERS.len() + 1] = {
+    let mut markers = [""; SUCCESS_MARKERS.len() + 1];
+    let mut index = 0;
+    while index < SUCCESS_MARKERS.len() {
+        markers[index] = SUCCESS_MARKERS[index];
+        index += 1;
+    }
+    markers[index] = "CHECK sched-switch ok";
+    markers
+};
+
 /// One oracle syscall-test group run on this kernel: `-- <group>` on the command line, the normal
 /// success markers, and every `init: test|tests|info` line equal to `xtask/oracle/expected.tsv`
 /// ([`validate_oracle`]). Add one `oracle_case!(<group>)` line to [`DEBUG_CASES`] when the group's
@@ -739,6 +758,34 @@ const DEBUG_CASES: &[DebugCase] = &[
             tsc_sources: &["pit", "hpet"],
             ..Q35_TCG
         },
+    },
+    // The scheduler on kernel threads (`ktask::selftest`): the full success path plus the
+    // `CHECK sched-switch` record, checked exactly in `validate_debug_case`.
+    DebugCase {
+        name: "sched-switch",
+        cmdline: Some("test=sched-switch"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: &SCHED_SWITCH_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: INIT_OK,
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    // A kernel thread overflows its stack: the fault on the pool guard page, with no room left for
+    // the exception frame, becomes a double fault on its IST stack and the kernel stops loudly.
+    DebugCase {
+        name: "kstack-overflow",
+        cmdline: Some("test=kstack-overflow"),
+        cpu: "qemu64",
+        expected_exit: 35,
+        required: &["FAIL kernel stack overflow slot=0 vector=8"],
+        forbid_success: true,
+        modules: ARCHIVE_ONLY,
+        user: User::None,
+        framebuffers: 1,
+        plat: Q35_TCG,
     },
     oracle_case!(mm),
     oracle_case!(ids),
@@ -4081,6 +4128,55 @@ fn validate_platform(lines: &[&str], plat: Platform) -> Result<(), String> {
     Ok(())
 }
 
+/// The checks that belong to one named case beyond its `required` records.
+fn validate_named_case(case: DebugCase, lines: &[&str]) -> Result<(), String> {
+    if case.name == "sched-switch"
+        && !unique_exact_record(lines, "CHECK sched-switch", SCHED_SWITCH_RECORD)
+    {
+        return Err("the scheduler case must report the exact context-switch proof".to_owned());
+    }
+    if case.name == "unmasked-timer" {
+        let observed_irq = lines.iter().any(|line| {
+            let Some(rest) = line.strip_prefix("TIMER mask observation periods=2 irq_delta=")
+            else {
+                return false;
+            };
+            rest.split_ascii_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|delta| delta > 0)
+        });
+        if !observed_irq {
+            return Err("unmasked timer must report periods=2 and nonzero irq_delta".to_owned());
+        }
+    }
+    if case.name == "irq-restore-early"
+        && (!observed_irq_restore(lines, false)
+            || lines
+                .iter()
+                .any(|line| record_matches(line, "CHECK irq-guard")))
+    {
+        return Err(
+            "early IRQ restore must observe two tick periods, delivered IRQs and failed lock acquisition"
+                .to_owned(),
+        );
+    }
+    if case.name == "unexpected-page-fault"
+        && (!unique_exact_record(
+            lines,
+            "TRAP call-abi",
+            "TRAP call-abi vector=14 rsp_mod16=8",
+        ) || lines
+            .iter()
+            .any(|line| record_matches(line, "FAIL trap-call-abi")))
+    {
+        return Err(
+            "fatal page fault must observe the actual ordinary-call entry alignment".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_debug_case(
     case: DebugCase,
     process: &ProcessResult,
@@ -4141,8 +4237,8 @@ fn validate_debug_case(
     {
         return (false, diagnostic);
     }
-    if let Some(diagnostic) = named_case_failure(case.name, &lines) {
-        return (false, diagnostic.to_owned());
+    if let Err(diagnostic) = validate_named_case(case, &lines) {
+        return (false, diagnostic);
     }
     if case.forbid_success && lines.iter().any(|line| line.starts_with("RESULT success")) {
         return (false, "negative case emitted RESULT success".to_owned());
@@ -6418,6 +6514,54 @@ mod tests {
 
     fn case(name: &str) -> DebugCase {
         *DEBUG_CASES.iter().find(|case| case.name == name).unwrap()
+    }
+
+    #[test]
+    fn sched_switch_case_requires_the_one_exact_record() {
+        let process = ProcessResult {
+            timed_out: false,
+            exit_code: Some(33),
+        };
+        let sched = case("sched-switch");
+        let with = |record: &str| {
+            success_serial().replace(
+                "init: hello from userspace",
+                &format!("{record}\ninit: hello from userspace"),
+            )
+        };
+        assert!(validate(sched, &process, &with(SCHED_SWITCH_RECORD)).0);
+        // Absent, altered in any field, or printed twice: rejected.
+        assert!(!validate(sched, &process, &success_serial()).0);
+        for (from, to) in [
+            ("threads=7", "threads=6"),
+            ("regs=callee-saved", "regs=none"),
+            ("fpu=isolated", "fpu=shared"),
+            ("timers=ordered", "timers=unordered"),
+            ("guard_fault=exact", "guard_fault=none"),
+        ] {
+            assert!(
+                !validate(
+                    sched,
+                    &process,
+                    &with(&SCHED_SWITCH_RECORD.replace(from, to))
+                )
+                .0,
+                "{from}"
+            );
+        }
+        assert!(
+            !validate(
+                sched,
+                &process,
+                &with(&format!("{SCHED_SWITCH_RECORD}\n{SCHED_SWITCH_RECORD}"))
+            )
+            .0
+        );
+        // The plain success case does not need it, and the overflow case is a
+        // negative one that must not claim success.
+        assert!(validate(case("success"), &process, &success_serial()).0);
+        let overflow = case("kstack-overflow");
+        assert!(overflow.forbid_success && overflow.expected_exit == 35);
     }
 
     fn images(modules: &[Module]) -> String {
