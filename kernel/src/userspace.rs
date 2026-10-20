@@ -674,7 +674,6 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
         process
             .space
             .handle_user_fault(&process.env, &mut space, address, error | mm::PF_USER);
-    drop(space);
     drop(tables);
     match outcome {
         FaultOutcome::Handled => {}
@@ -736,6 +735,78 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
     }
 }
 
+/// The kernel-access cases of [`check_mm_usercopy`]: `a` is three writable
+/// anonymous pages whose last is `PROT_NONE`, `b` one untouched read-only page.
+#[cfg(feature = "qemu-self-test")]
+fn mm_usercopy_faults(context: &mut Syscall<'_>, a: u64, b: u64) {
+    use kernel::mm::{Pte, UserPages as _};
+    use kernel::usercopy::{copy_from_user, copy_to_user};
+
+    const P: u64 = PAGE;
+    // A write across two untouched writable pages faults both in (write fault
+    // on an absent page: a private zeroed frame each), then reads them back.
+    let pattern = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    crate::require(
+        copy_to_user(context, a + P - 4, &pattern) == 0,
+        "mm-usercopy-write",
+    );
+    let mut back = [0u8; 8];
+    crate::require(
+        copy_from_user(context, &mut back, a + P - 4) == 0,
+        "mm-usercopy-read",
+    );
+    crate::require(back == pattern, "mm-usercopy-readback");
+    crate::require(
+        context.space.lookup(a) == Pte::Anon { writable: true }
+            && context.space.lookup(a + P) == Pte::Anon { writable: true },
+        "mm-usercopy-private-frames",
+    );
+    // A read of an untouched readable page maps the shared zero page; a write
+    // to that read-only mapping is refused (EFAULT: nothing copied) and keeps it.
+    let mut zeros = [0xffu8; 8];
+    crate::require(
+        copy_from_user(context, &mut zeros, b) == 0,
+        "mm-usercopy-zero-read",
+    );
+    crate::require(
+        zeros == [0; 8] && context.space.lookup(b) == Pte::ZeroPage,
+        "mm-usercopy-zero-page",
+    );
+    crate::require(copy_to_user(context, b, &[1]) == 1, "mm-usercopy-readonly");
+    crate::require(
+        context.space.lookup(b) == Pte::ZeroPage,
+        "mm-usercopy-readonly-kept",
+    );
+    // The PROT_NONE page after the writable ones: the copy stops at the hole
+    // (bytes before it are copied, the rest is reported), and a read of the
+    // hole alone copies nothing and zero-fills the destination.
+    crate::require(
+        copy_to_user(context, a + 2 * P - 2, &[9; 6]) == 4,
+        "mm-usercopy-short-write",
+    );
+    let mut tail = [0xffu8; 6];
+    crate::require(
+        copy_from_user(context, &mut tail, a + 2 * P - 2) == 4,
+        "mm-usercopy-short-read",
+    );
+    crate::require(tail == [9, 9, 0, 0, 0, 0], "mm-usercopy-short-read-bytes");
+    let mut hole = [0xffu8; 8];
+    crate::require(
+        copy_from_user(context, &mut hole, a + 2 * P) == 8,
+        "mm-usercopy-hole",
+    );
+    crate::require(hole == [0; 8], "mm-usercopy-hole-zeroed");
+    crate::require(
+        copy_to_user(context, a + 2 * P, &[1]) == 1,
+        "mm-usercopy-hole-write",
+    );
+    // An address above TASK_SIZE_MAX is refused by the range check, not faulted.
+    crate::require(
+        copy_to_user(context, kernel::usercopy::TASK_SIZE_MAX - 1, &[1, 2]) == 2,
+        "mm-usercopy-range",
+    );
+}
+
 /// QEMU proof of the kernel-access page-fault path through the real syscall
 /// context, tables and frame allocator, without ring 3: the memory syscalls
 /// create the mappings, then the one user-copy mechanism faults pages in
@@ -743,10 +814,7 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
 /// short-copy results. Context: BSP, IF clear, `PROCESS` installed, no lock held.
 #[cfg(feature = "qemu-self-test")]
 fn check_mm_usercopy() {
-    use kernel::mm::{
-        MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE, Pte, UserPages as _,
-    };
-    use kernel::usercopy::{copy_from_user, copy_to_user};
+    use kernel::mm::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE};
     use syscalls::Sysno;
 
     const P: u64 = PAGE;
@@ -760,15 +828,14 @@ fn check_mm_usercopy() {
         process: &mut guard,
         tty: Tty,
     };
-    let mut call =
-        |context: &mut Syscall<'_>, number: Sysno, args: [u64; 6]| match syscall::dispatch(
-            context,
-            number as u64,
-            args,
-        ) {
-            Outcome::Return(value) => value,
-            _ => crate::unwrap(Err::<i64, _>("mm-usercopy-syscall"), "mm-usercopy"),
-        };
+    let call = |context: &mut Syscall<'_>, number: Sysno, args: [u64; 6]| match syscall::dispatch(
+        context,
+        number as u64,
+        args,
+    ) {
+        Outcome::Return(value) => value,
+        _ => crate::unwrap(Err::<i64, _>("mm-usercopy-syscall"), "mm-usercopy"),
+    };
     let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
     let a = call(
         &mut context,
@@ -794,71 +861,7 @@ fn check_mm_usercopy() {
         ) == 0,
         "mm-usercopy-mprotect",
     );
-    // A write across two untouched writable pages faults both in (write fault
-    // on an absent page: a private zeroed frame each), then reads them back.
-    let pattern = [1u8, 2, 3, 4, 5, 6, 7, 8];
-    crate::require(
-        copy_to_user(&mut context, a + P - 4, &pattern) == 0,
-        "mm-usercopy-write",
-    );
-    let mut back = [0u8; 8];
-    crate::require(
-        copy_from_user(&mut context, &mut back, a + P - 4) == 0,
-        "mm-usercopy-read",
-    );
-    crate::require(back == pattern, "mm-usercopy-readback");
-    crate::require(
-        context.space.lookup(a) == Pte::Anon { writable: true }
-            && context.space.lookup(a + P) == Pte::Anon { writable: true },
-        "mm-usercopy-private-frames",
-    );
-    // A read of an untouched readable page maps the shared zero page; a write
-    // to that read-only mapping is refused (EFAULT: nothing copied) and keeps it.
-    let mut zeros = [0xffu8; 8];
-    crate::require(
-        copy_from_user(&mut context, &mut zeros, b) == 0,
-        "mm-usercopy-zero-read",
-    );
-    crate::require(
-        zeros == [0; 8] && context.space.lookup(b) == Pte::ZeroPage,
-        "mm-usercopy-zero-page",
-    );
-    crate::require(
-        copy_to_user(&mut context, b, &[1]) == 1,
-        "mm-usercopy-readonly",
-    );
-    crate::require(
-        context.space.lookup(b) == Pte::ZeroPage,
-        "mm-usercopy-readonly-kept",
-    );
-    // The PROT_NONE page after the writable ones: the copy stops at the hole
-    // (bytes before it are copied, the rest is reported), and a read of the
-    // hole alone copies nothing and zero-fills the destination.
-    crate::require(
-        copy_to_user(&mut context, a + 2 * P - 2, &[9; 6]) == 4,
-        "mm-usercopy-short-write",
-    );
-    let mut tail = [0xffu8; 6];
-    crate::require(
-        copy_from_user(&mut context, &mut tail, a + 2 * P - 2) == 4,
-        "mm-usercopy-short-read",
-    );
-    crate::require(tail == [9, 9, 0, 0, 0, 0], "mm-usercopy-short-read-bytes");
-    let mut hole = [0xffu8; 8];
-    crate::require(
-        copy_from_user(&mut context, &mut hole, a + 2 * P) == 8,
-        "mm-usercopy-hole",
-    );
-    crate::require(hole == [0; 8], "mm-usercopy-hole-zeroed");
-    crate::require(
-        copy_to_user(&mut context, a + 2 * P, &[1]) == 1,
-        "mm-usercopy-hole-write",
-    );
-    // An address above TASK_SIZE_MAX is refused by the range check, not faulted.
-    crate::require(
-        copy_to_user(&mut context, kernel::usercopy::TASK_SIZE_MAX - 1, &[1, 2]) == 2,
-        "mm-usercopy-range",
-    );
+    mm_usercopy_faults(&mut context, a, b);
     crate::require(
         call(&mut context, Sysno::munmap, [a, 3 * P, 0, 0, 0, 0]) == 0,
         "mm-usercopy-munmap-a",
@@ -867,7 +870,6 @@ fn check_mm_usercopy() {
         call(&mut context, Sysno::munmap, [b, P, 0, 0, 0, 0]) == 0,
         "mm-usercopy-munmap-b",
     );
-    drop(context);
     crate::require(
         data_frames(&tables) == frames0 && guard.space.total_vm == vm0,
         "mm-usercopy-accounting",
