@@ -338,7 +338,7 @@ fn send_info(state: &mut State, sig: i32, info: SigInfo, thread: bool) -> Result
     } else {
         Target::Process
     };
-    state.send_signal(sig, info, target, false)
+    state.send_signal(sig, info, target)
 }
 
 /// `kill`/`tkill` source info (`prepare_kill_siginfo`) then [`send_info`].
@@ -626,16 +626,10 @@ mod tests {
             SIGUSR1,
             SigInfo::from_kill(10, false, 1, 0),
             Target::Process,
-            false,
         )
         .unwrap();
-        st.send_signal(
-            SIGHUP,
-            SigInfo::from_kill(1, false, 1, 0),
-            Target::Process,
-            false,
-        )
-        .unwrap();
+        st.send_signal(SIGHUP, SigInfo::from_kill(1, false, 1, 0), Target::Process)
+            .unwrap();
         let mut sp = space();
         let ign = SigAction {
             handler: crate::signal::SIG_IGN,
@@ -648,13 +642,8 @@ mod tests {
         // SIG_DFL on a default-ignored signal also discards it.
         st.blocked.add(crate::signal::SIGCHLD);
         st.actions[16].handler = 0x1234;
-        st.send_signal(
-            17,
-            SigInfo::from_kill(17, false, 1, 0),
-            Target::Process,
-            false,
-        )
-        .unwrap();
+        st.send_signal(17, SigInfo::from_kill(17, false, 1, 0), Target::Process)
+            .unwrap();
         assert!(st.pending_set().contains(17));
         put(&mut sp, 0x1000, &SigAction::default().to_bytes());
         assert_eq!(sys_rt_sigaction(&mut st, &mut sp, 17, 0x1000, 0, 8), 0);
@@ -732,8 +721,8 @@ mod tests {
         let mut st = State::new(5, 0, 100);
         st.blocked = SigSet(0xffff_ffff_ffff);
         let mk = |sig| SigInfo::from_kill(sig, false, 1, 0);
-        st.send_signal(10, mk(10), Target::Process, false).unwrap();
-        st.send_signal(40, mk(40), Target::Thread, false).unwrap();
+        st.send_signal(10, mk(10), Target::Process).unwrap();
+        st.send_signal(40, mk(40), Target::Thread).unwrap();
         st.blocked = SigSet(1 << 9); // only 10 blocked
         let mut sp = space();
         assert_eq!(sys_rt_sigpending(&st, &mut sp, 0x1000, 9), EINVAL);

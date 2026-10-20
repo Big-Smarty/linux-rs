@@ -239,7 +239,9 @@ impl SigInfo {
 /// `cr2` is `Some` only for page faults; other faults leave the old value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fault {
-    pub info: SigInfo,
+    /// `None` for a spurious `#MF`/`#XM`: Linux updates `trap_nr`/`error_code`
+    /// (`math_error`) and returns without a signal.
+    pub info: Option<SigInfo>,
     pub trap_nr: u64,
     pub error_code: u64,
     pub cr2: Option<u64>,
@@ -307,7 +309,7 @@ pub fn fpu_exception_code(trap_nr: u8, cwd: u16, swd: u16, mxcsr: u32) -> i32 {
 /// instruction pointer (`regs->ip`, no uprobes here); `error_code` is the
 /// hardware error code for vectors that push one; `dr6` is used by vector 1;
 /// `fpe_code` is [`fpu_exception_code`] for vectors 16 and 19. `None` for a
-/// vector that is not a plain user fault (and for a spurious FPU exception).
+/// vector that is not a plain user fault (and for a spurious FPU exception, which returns a [`Fault`] without `info`).
 #[must_use]
 pub fn exception(vector: u8, error_code: u64, ip: u64, dr6: u64, fpe_code: i32) -> Option<Fault> {
     // `do_trap`: a zero `sicode` is `force_sig` (SI_KERNEL), else `force_sig_fault`.
@@ -318,7 +320,7 @@ pub fn exception(vector: u8, error_code: u64, ip: u64, dr6: u64, fpe_code: i32) 
             SigInfo::fault(sig, code, addr)
         };
         Some(Fault {
-            info,
+            info: Some(info),
             trap_nr: u64::from(vector),
             error_code: ec,
             cr2: None,
@@ -337,6 +339,13 @@ pub fn exception(vector: u8, error_code: u64, ip: u64, dr6: u64, fpe_code: i32) 
         X86_TRAP_AC => trap(SIGBUS, BUS_ADRALN, 0, error_code),
         // math_error: error_code is 0 and si_addr the instruction pointer.
         X86_TRAP_MF | X86_TRAP_XF if fpe_code != 0 => trap(SIGFPE, fpe_code, ip, 0),
+        // Spurious: no signal, but `thread.trap_nr`/`error_code` are updated.
+        X86_TRAP_MF | X86_TRAP_XF => Some(Fault {
+            info: None,
+            trap_nr: u64::from(vector),
+            error_code: 0,
+            cr2: None,
+        }),
         _ => None,
     }
 }
@@ -364,7 +373,7 @@ pub fn page_fault(kind: PageFault, address: u64, error_code: u64) -> Fault {
         PageFault::Bus => SigInfo::fault(SIGBUS, BUS_ADRERR, address),
     };
     Fault {
-        info,
+        info: Some(info),
         trap_nr: u64::from(X86_TRAP_PF),
         error_code: error | PF_USER,
         cr2: Some(address),
@@ -487,52 +496,55 @@ mod tests {
     #[test]
     fn exceptions_map_as_in_traps_c() {
         let f = exception(X86_TRAP_DE, 0, 0x401000, 0, 0).unwrap();
-        assert_eq!(f.info, SigInfo::fault(SIGFPE, FPE_INTDIV, 0x401000));
+        assert_eq!(f.info, Some(SigInfo::fault(SIGFPE, FPE_INTDIV, 0x401000)));
         assert_eq!((f.trap_nr, f.error_code, f.cr2), (0, 0, None));
         let f = exception(X86_TRAP_UD, 0, 0x401002, 0, 0).unwrap();
-        assert_eq!(f.info, SigInfo::fault(SIGILL, ILL_ILLOPN, 0x401002));
+        assert_eq!(f.info, Some(SigInfo::fault(SIGILL, ILL_ILLOPN, 0x401002)));
         // int3 / overflow / bounds: force_sig -> SI_KERNEL.
         assert_eq!(
             exception(3, 0, 5, 0, 0).unwrap().info,
-            SigInfo::kernel(SIGTRAP)
+            Some(SigInfo::kernel(SIGTRAP))
         );
         assert_eq!(
             exception(4, 0, 5, 0, 0).unwrap().info,
-            SigInfo::kernel(SIGSEGV)
+            Some(SigInfo::kernel(SIGSEGV))
         );
         assert_eq!(
             exception(5, 0, 5, 0, 0).unwrap().info,
-            SigInfo::kernel(SIGSEGV)
+            Some(SigInfo::kernel(SIGSEGV))
         );
         // #GP carries the error code into the sigcontext.
         let f = exception(13, 0x18, 5, 0, 0).unwrap();
-        assert_eq!(f.info, SigInfo::kernel(SIGSEGV));
+        assert_eq!(f.info, Some(SigInfo::kernel(SIGSEGV)));
         assert_eq!((f.trap_nr, f.error_code), (13, 0x18));
         assert_eq!(
             exception(11, 9, 5, 0, 0).unwrap().info,
-            SigInfo::kernel(SIGBUS)
+            Some(SigInfo::kernel(SIGBUS))
         );
         assert_eq!(
             exception(12, 9, 5, 0, 0).unwrap().info,
-            SigInfo::kernel(SIGBUS)
+            Some(SigInfo::kernel(SIGBUS))
         );
         assert_eq!(
             exception(10, 9, 5, 0, 0).unwrap().info,
-            SigInfo::kernel(SIGSEGV)
+            Some(SigInfo::kernel(SIGSEGV))
         );
         let f = exception(17, 0, 5, 0, 0).unwrap();
-        assert_eq!(f.info, SigInfo::fault(SIGBUS, BUS_ADRALN, 0));
+        assert_eq!(f.info, Some(SigInfo::fault(SIGBUS, BUS_ADRALN, 0)));
         // #DB: si_code from dr6, addr = ip.
         assert_eq!(
             exception(1, 0, 0x77, DR_STEP, 0).unwrap().info,
-            SigInfo::fault(SIGTRAP, TRAP_TRACE, 0x77)
+            Some(SigInfo::fault(SIGTRAP, TRAP_TRACE, 0x77))
         );
         assert_eq!(debug_si_code(1), TRAP_HWBKPT);
         assert_eq!(debug_si_code(0), TRAP_BRKPT);
         // Math faults need a code; a spurious one raises nothing.
-        assert!(exception(16, 0, 5, 0, 0).is_none());
+        // Spurious: arch info is still updated (math_error), no signal.
+        let f = exception(16, 0, 5, 0, 0).unwrap();
+        assert_eq!((f.info, f.trap_nr, f.error_code), (None, 16, 0));
+        assert_eq!(exception(19, 0, 5, 0, 0).unwrap().info, None);
         let f = exception(19, 0, 0x99, 0, FPE_FLTDIV).unwrap();
-        assert_eq!(f.info, SigInfo::fault(SIGFPE, FPE_FLTDIV, 0x99));
+        assert_eq!(f.info, Some(SigInfo::fault(SIGFPE, FPE_FLTDIV, 0x99)));
         // NMI, #DF, #MC, #NM are not plain user faults.
         for v in [2, 7, 8, 18] {
             assert!(exception(v, 0, 0, 0, 0).is_none());
@@ -554,13 +566,13 @@ mod tests {
     #[test]
     fn page_faults() {
         let f = page_fault(PageFault::Segv(SEGV_MAPERR), 0x10, 0x6);
-        assert_eq!(f.info, SigInfo::fault(SIGSEGV, SEGV_MAPERR, 0x10));
+        assert_eq!(f.info, Some(SigInfo::fault(SIGSEGV, SEGV_MAPERR, 0x10)));
         assert_eq!((f.trap_nr, f.error_code, f.cr2), (14, 0x6, Some(0x10)));
         // Kernel addresses always look like protection faults, with the user bit.
         let f = page_fault(PageFault::Segv(SEGV_MAPERR), TASK_SIZE_MAX, 0x4);
         assert_eq!(f.error_code, 0x5);
         let f = page_fault(PageFault::Bus, 0x2000, 0x0);
-        assert_eq!(f.info, SigInfo::fault(SIGBUS, BUS_ADRERR, 0x2000));
+        assert_eq!(f.info, Some(SigInfo::fault(SIGBUS, BUS_ADRERR, 0x2000)));
         assert_eq!(f.error_code, 0x4);
     }
 }

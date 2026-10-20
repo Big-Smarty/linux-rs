@@ -27,7 +27,7 @@
 
 use super::{
     AltStack, KERNEL_IGNORE, KERNEL_STOP, NSIG, SA_IMMUTABLE, SIG_DFL, SIG_IGN, SIGCONT, SIGKILL,
-    SIGRTMIN, SYNCHRONOUS, SigAction, SigSet,
+    SIGRTMIN, SYNCHRONOUS, SigAction, SigSet, in_mask,
     info::{Fault, Layout, SI_KERNEL, SI_USER, SigInfo},
     sig_kernel_coredump, sig_kernel_only, sig_kernel_stop,
 };
@@ -172,8 +172,10 @@ pub struct State {
 }
 
 impl State {
-    /// A fresh process after `exec`: default actions, nothing blocked or
-    /// pending, altstack disabled (`flush_signal_handlers`, `sas_ss_reset`).
+    /// The signal state of a newly created process (init at boot, a forked
+    /// child before it inherits): default actions, nothing blocked or pending,
+    /// altstack disabled (`sas_ss_reset`). `execve` is [`State::flush_on_exec`],
+    /// not this.
     #[must_use]
     pub fn new(pid: i32, uid: u32, rlimit_sigpending: u64) -> Self {
         Self {
@@ -192,6 +194,24 @@ impl State {
             private: Pending::new(),
             shared: Pending::new(),
         }
+    }
+
+    /// What `execve` does to the signal state (`begin_new_exec`,
+    /// `flush_signal_handlers(me, 0)`): every handler goes back to `SIG_DFL`
+    /// except `SIG_IGN`, which is kept; flags, restorer and `sa_mask` are
+    /// cleared; the altstack address and size are zeroed (its flags are not).
+    /// The blocked mask, `saved_sigmask` and all pending signals are kept.
+    pub fn flush_on_exec(&mut self) {
+        for action in &mut self.actions {
+            if action.handler != SIG_IGN {
+                action.handler = SIG_DFL;
+            }
+            action.flags = 0;
+            action.restorer = 0;
+            action.mask = SigSet::EMPTY;
+        }
+        self.altstack.sp = 0;
+        self.altstack.size = 0;
     }
 
     /// The global init: pid 1, `SIGNAL_UNKILLABLE` (`copy_process`, child reaper).
@@ -273,8 +293,8 @@ impl State {
 
     /// `sig_fatal`.
     fn sig_fatal(&self, sig: u8) -> bool {
-        sig < SIGRTMIN
-            && SigSet::bit(sig) & (KERNEL_IGNORE | KERNEL_STOP) == 0
+        // `siginmask` is false for real-time signals: a default RT signal is fatal.
+        !in_mask(sig, KERNEL_IGNORE | KERNEL_STOP)
             && self.actions[usize::from(sig) - 1].handler == SIG_DFL
     }
 
@@ -293,19 +313,14 @@ impl State {
     }
 
     /// `send_signal_locked` / `__send_signal_locked`. `sig` is `1..=64`.
-    /// `special` is `SEND_SIG_NOINFO`/`SEND_SIG_PRIV` (kernel-internal sends),
-    /// which never count against `RLIMIT_SIGPENDING` for classic signals.
+    /// Kernel-internal senders (`SEND_SIG_NOINFO`, `SEND_SIG_PRIV`) pass the
+    /// equivalent concrete `info` (`SI_USER` from the sender, `SI_KERNEL`); both
+    /// have `si_code >= 0`, so they take the same rlimit-exempt path as in Linux.
     ///
     /// # Errors
     /// `EAGAIN` when a real-time signal sent with `si_code != SI_USER` cannot
     /// be queued (limit reached).
-    pub fn send_signal(
-        &mut self,
-        sig: u8,
-        info: SigInfo,
-        target: Target,
-        special: bool,
-    ) -> Result<(), Errno> {
+    pub fn send_signal(&mut self, sig: u8, info: SigInfo, target: Target) -> Result<(), Errno> {
         // send_signal_locked: SI_KERNEL signals with pid/uid layouts force.
         let force = matches!(info.layout(), Layout::Kill | Layout::Chld | Layout::Rt)
             && info.code == SI_KERNEL;
@@ -317,14 +332,14 @@ impl State {
             return Ok(());
         }
         if sig != SIGKILL {
-            let override_rlimit = sig < SIGRTMIN && (special || info.code >= 0);
+            let override_rlimit = sig < SIGRTMIN && info.code >= 0;
             let counted = (self.private.len + self.shared.len) as u64 + 1;
             let allowed = override_rlimit || counted <= self.rlimit_sigpending;
             let pending = self.pending_mut(target);
             if allowed && pending.len < QUEUE_CAPACITY {
                 pending.queue[pending.len] = info;
                 pending.len += 1;
-            } else if !special && sig >= SIGRTMIN && info.code != SI_USER {
+            } else if sig >= SIGRTMIN && info.code != SI_USER {
                 return Err(Errno::EAGAIN);
             }
             // else: silent loss of the siginfo, the signal is still sent.
@@ -360,7 +375,7 @@ impl State {
         }
         // Forced signals use PIDTYPE_PID; an `EAGAIN` can only come from
         // user-queued real-time signals, never from this path.
-        let _ = self.send_signal(sig, info, Target::Thread, false);
+        let _ = self.send_signal(sig, info, Target::Thread);
     }
 
     /// `force_sig`: `SI_KERNEL`.
@@ -396,7 +411,9 @@ impl State {
         if let Some(cr2) = fault.cr2 {
             self.arch.cr2 = cr2;
         }
-        self.force_sig_info(fault.info, Handler::Current);
+        if let Some(info) = fault.info {
+            self.force_sig_info(info, Handler::Current);
+        }
     }
 
     /// `dequeue_synchronous_signal`: a fault signal (positive `si_code`) from
@@ -477,25 +494,20 @@ mod tests {
         // legacy_queue: kernel/signal.c:1061.
         let mut s = plain();
         s.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+        s.actions[39].handler = 0x1000; // RT signals are fatal by default
         s.blocked.add(SIGUSR1);
-        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process, false)
+        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
         s.send_signal(
             SIGUSR1,
             SigInfo::kill(SIGUSR1, SI_TKILL, 9, 9),
             Target::Process,
-            false,
         )
         .unwrap();
         assert_eq!(s.shared.len, 1);
         for v in 0..3 {
-            s.send_signal(
-                40,
-                SigInfo::rt(40, SI_QUEUE, 1, 0, v),
-                Target::Process,
-                false,
-            )
-            .unwrap();
+            s.send_signal(40, SigInfo::rt(40, SI_QUEUE, 1, 0, v), Target::Process)
+                .unwrap();
         }
         assert_eq!(s.shared.len, 4);
         s.blocked = SigSet::EMPTY;
@@ -517,16 +529,13 @@ mod tests {
         s.blocked.add(40);
         s.blocked.add(41);
         let q = |v| SigInfo::rt(40, SI_QUEUE, 1, 0, v);
-        s.send_signal(40, q(1), Target::Process, false).unwrap();
-        s.send_signal(40, q(2), Target::Process, false).unwrap();
+        s.send_signal(40, q(1), Target::Process).unwrap();
+        s.send_signal(40, q(2), Target::Process).unwrap();
         // Third sigqueue()-style send: EAGAIN, nothing added.
-        assert_eq!(
-            s.send_signal(40, q(3), Target::Process, false),
-            Err(Errno::EAGAIN)
-        );
+        assert_eq!(s.send_signal(40, q(3), Target::Process), Err(Errno::EAGAIN));
         assert_eq!(s.shared.len, 2);
         // kill() of an RT signal (SI_USER) never fails: signal sent, info lost.
-        s.send_signal(41, user(41), Target::Process, false).unwrap();
+        s.send_signal(41, user(41), Target::Process).unwrap();
         assert!(s.shared.signal.contains(41));
         assert_eq!(s.shared.len, 2);
         s.blocked = SigSet::EMPTY;
@@ -538,7 +547,7 @@ mod tests {
         // Classic signals sent with si_code >= 0 bypass the limit.
         let mut s = State::new(5, 0, 0);
         s.blocked.add(SIGUSR1);
-        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process, false)
+        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
         assert_eq!(s.shared.len, 1);
         // SI_TKILL (< 0) does not bypass it: signal pending, info lost.
@@ -548,7 +557,6 @@ mod tests {
             SIGUSR1,
             SigInfo::from_kill(SIGUSR1, true, 5, 0),
             Target::Thread,
-            false,
         )
         .unwrap();
         assert_eq!(
@@ -565,15 +573,13 @@ mod tests {
         s.blocked.add(SIGSEGV);
         s.actions[usize::from(SIGSEGV) - 1].handler = 0x2000;
         s.actions[usize::from(SIGUSR1) - 1].handler = 0x2000;
-        s.send_signal(SIGHUP, user(SIGHUP), Target::Thread, false)
-            .unwrap();
-        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Thread, false)
+        s.send_signal(SIGHUP, user(SIGHUP), Target::Thread).unwrap();
+        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Thread)
             .unwrap();
         s.send_signal(
             SIGSEGV,
             SigInfo::fault(SIGSEGV, SEGV_MAPERR, 8),
             Target::Thread,
-            false,
         )
         .unwrap();
         s.blocked = SigSet::EMPTY;
@@ -585,9 +591,9 @@ mod tests {
         // Private before shared.
         s.actions[usize::from(SIGTERM) - 1].handler = 0x4000;
         s.actions[usize::from(SIGUSR1) - 1].handler = 0x4000;
-        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process, false)
+        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
-        s.send_signal(SIGTERM, user(SIGTERM), Target::Thread, false)
+        s.send_signal(SIGTERM, user(SIGTERM), Target::Thread)
             .unwrap();
         assert_eq!(s.dequeue_signal().unwrap().0, SIGTERM);
         assert_eq!(s.dequeue_signal().unwrap().0, SIGUSR1);
@@ -597,16 +603,16 @@ mod tests {
     fn ignored_signals_are_dropped_at_generation_unless_blocked() {
         let mut s = plain();
         // Default-ignored: SIGCHLD vanishes; blocked it stays pending.
-        s.send_signal(SIGCHLD, user(SIGCHLD), Target::Process, false)
+        s.send_signal(SIGCHLD, user(SIGCHLD), Target::Process)
             .unwrap();
         assert_eq!(s.pending_set(), SigSet::EMPTY);
         s.blocked.add(SIGCHLD);
-        s.send_signal(SIGCHLD, user(SIGCHLD), Target::Process, false)
+        s.send_signal(SIGCHLD, user(SIGCHLD), Target::Process)
             .unwrap();
         assert!(s.pending_set().contains(SIGCHLD));
         // SIG_IGN explicit.
         s.actions[usize::from(SIGUSR1) - 1].handler = SIG_IGN;
-        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process, false)
+        s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
         assert!(!s.pending_set().contains(SIGUSR1));
     }
@@ -616,31 +622,30 @@ mod tests {
         // sig_task_ignored: kernel/signal.c:84-103.
         let mut init = State::new_init(100);
         for sig in [SIGTERM, SIGHUP, SIGUSR1, SIGKILL, SIGSTOP, SIGTSTP] {
-            init.send_signal(sig, user(sig), Target::Process, false)
-                .unwrap();
+            init.send_signal(sig, user(sig), Target::Process).unwrap();
             assert_eq!(init.pending_set(), SigSet::EMPTY, "{sig}");
         }
         assert_eq!(init.group_exit, None);
         // With a handler installed the signal is queued; SIGKILL/SIGSTOP still not.
         init.actions[usize::from(SIGTERM) - 1].handler = 0x1000;
-        init.send_signal(SIGTERM, user(SIGTERM), Target::Process, false)
+        init.send_signal(SIGTERM, user(SIGTERM), Target::Process)
             .unwrap();
         assert!(init.pending_set().contains(SIGTERM));
-        init.send_signal(SIGKILL, user(SIGKILL), Target::Process, false)
+        init.send_signal(SIGKILL, user(SIGKILL), Target::Process)
             .unwrap();
         assert!(!init.pending_set().contains(SIGKILL));
         // Even SI_KERNEL (force) SIGKILL: is_global_init && sig_kernel_only wins.
-        init.send_signal(SIGKILL, SigInfo::kernel(SIGKILL), Target::Process, false)
+        init.send_signal(SIGKILL, SigInfo::kernel(SIGKILL), Target::Process)
             .unwrap();
         assert!(!init.pending_set().contains(SIGKILL));
         // A non-init process is killed immediately: group exit with the signal.
         let mut p = plain();
-        p.send_signal(SIGTERM, user(SIGTERM), Target::Process, false)
+        p.send_signal(SIGTERM, user(SIGTERM), Target::Process)
             .unwrap();
         assert_eq!(p.group_exit, Some(15));
         // Later signals are dropped while dying.
         p.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
-        p.send_signal(SIGUSR1, user(SIGUSR1), Target::Process, false)
+        p.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
         assert!(!p.pending_set().contains(SIGUSR1));
     }
@@ -688,13 +693,13 @@ mod tests {
         let mut s = plain();
         s.blocked.add(SIGCONT);
         s.blocked.add(SIGTSTP);
-        s.send_signal(SIGCONT, user(SIGCONT), Target::Process, false)
+        s.send_signal(SIGCONT, user(SIGCONT), Target::Process)
             .unwrap();
-        s.send_signal(SIGTSTP, user(SIGTSTP), Target::Process, false)
+        s.send_signal(SIGTSTP, user(SIGTSTP), Target::Process)
             .unwrap();
         assert!(!s.pending_set().contains(SIGCONT));
         assert!(s.pending_set().contains(SIGTSTP));
-        s.send_signal(SIGCONT, user(SIGCONT), Target::Process, false)
+        s.send_signal(SIGCONT, user(SIGCONT), Target::Process)
             .unwrap();
         assert!(!s.pending_set().contains(SIGTSTP));
         assert!(s.pending_set().contains(SIGCONT));

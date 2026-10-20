@@ -43,6 +43,8 @@ pub mod state;
 pub mod syscalls;
 
 #[cfg(test)]
+mod linux_frames;
+#[cfg(test)]
 mod tests;
 
 pub use crate::exec::report::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
@@ -113,10 +115,15 @@ pub struct SigSet(pub u64);
 impl SigSet {
     pub const EMPTY: Self = Self(0);
 
-    /// `sigmask(sig)`; `sig` must be in `1..=64`.
+    /// `sigmask(sig)`; 0 for a number outside `1..=64`, so that every set
+    /// operation is total (callers still range-check what user space sends).
     #[must_use]
     pub const fn bit(sig: u8) -> u64 {
-        1 << (sig - 1)
+        if sig == 0 || sig > NSIG {
+            0
+        } else {
+            1 << (sig - 1)
+        }
     }
     #[must_use]
     pub const fn contains(self, sig: u8) -> bool {
@@ -143,7 +150,7 @@ pub(crate) fn le<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
 }
 
 /// `siginmask(sig, mask)` for the `SIG_KERNEL_*` masks: only classic signals.
-const fn in_mask(sig: u8, mask: u64) -> bool {
+pub(crate) const fn in_mask(sig: u8, mask: u64) -> bool {
     sig > 0 && sig < SIGRTMIN && SigSet::bit(sig) & mask != 0
 }
 const KERNEL_ONLY: u64 = SigSet::bit(SIGKILL) | SigSet::bit(SIGSTOP);
@@ -309,17 +316,23 @@ pub const USER_DS: u64 = 0x2b;
 /// What the signal code needs from the CPU, supplied by the binary.
 pub trait Cpu {
     /// FXSAVE image (512 bytes) of the user FPU state, current registers
-    /// included (`fxsave_to_user_sigframe`). Bytes 464..512 are overwritten by
-    /// the caller, so their content is irrelevant.
+    /// included (`fxsave_to_user_sigframe`). Linux uses the 64-bit form
+    /// (`fxsaveq`, REX.W: 64-bit FIP/FDP), so implement it with
+    /// `core::arch::x86_64::_fxsave64`. Bytes 464..512 are overwritten by the
+    /// caller, so their content is irrelevant.
     fn fxsave(&mut self) -> [u8; 512];
     /// `mxcsr_feature_mask`: MXCSR bits the CPU accepts.
     fn mxcsr_mask(&self) -> u32;
-    /// FXRSTOR of a validated image (alignment and MXCSR already checked).
+    /// FXRSTOR of a validated image (alignment and MXCSR already checked); the
+    /// 64-bit form (`fxrstorq`, `_fxrstor64`), as Linux.
     fn fxrstor(&mut self, image: &[u8; 512]);
     /// `fpu__clear_user_states`: user FPU state back to the init state.
     fn fpu_reset(&mut self);
-    /// The `lar` test of `force_valid_ss`: is `ss` a present DPL-3 read-write
-    /// data segment (type 3 or 7, S and P set)?
+    /// The `lar` test of `force_valid_ss`. The access rights are masked with
+    /// `AR_DPL_MASK | AR_S | AR_P | AR_TYPE_MASK` (`AR_TYPE_MASK` = bits 9-11,
+    /// so the accessed bit is ignored) and must equal DPL 3, S, P with type
+    /// `RWDATA` (`1 << 9`) or `RWDATA_EXPDOWN` (`3 << 9`): raw descriptor types
+    /// 2, 3, 6 and 7. A failing `lar` (`ZF` clear) counts as access rights 0.
     fn ss_is_valid_user_data(&self, ss: u16) -> bool;
 }
 

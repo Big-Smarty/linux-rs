@@ -33,6 +33,7 @@ use super::{
     },
     frame::{FIX_EFLAGS, FRAME_SIZE, INFO, MAX_FRAME_SIZE, rt_sigreturn},
     info::{SEGV_MAPERR, SigInfo},
+    linux_frames,
     state::{State, Target},
     syscalls::StackT,
 };
@@ -107,6 +108,7 @@ fn constants_match_the_uapi_layout() {
     assert_eq!(offset_of!(MSigContext, fpstate), 184);
     assert_eq!(size_of::<MStackT>(), StackT::SIZE);
     assert_eq!(size_of::<MSigaction>(), SigAction::SIZE);
+    assert_eq!(FIX_EFLAGS, 0x50DD5); // AC|OF|DF|TF|SF|ZF|AF|PF|CF|RF
     // The worst-case frame equals the AT_MINSIGSTKSZ the oracle reports.
     assert_eq!(MAX_FRAME_SIZE, 0x5a0);
 }
@@ -116,6 +118,7 @@ struct FakeCpu {
     restored: Vec<[u8; 512]>,
     resets: usize,
     valid_ss: Vec<u16>,
+    mask: u32,
 }
 
 impl FakeCpu {
@@ -130,6 +133,7 @@ impl FakeCpu {
             restored: Vec::new(),
             resets: 0,
             valid_ss: vec![USER_DS as u16],
+            mask: 0xffbf,
         }
     }
 }
@@ -138,7 +142,7 @@ impl Cpu for FakeCpu {
         self.image
     }
     fn mxcsr_mask(&self) -> u32 {
-        0xffbf
+        self.mask
     }
     fn fxrstor(&mut self, image: &[u8; 512]) {
         self.restored.push(*image);
@@ -212,13 +216,8 @@ fn handler_state() -> State {
 }
 
 fn send(st: &mut State, sig: u8) {
-    st.send_signal(
-        sig,
-        SigInfo::from_kill(sig, false, 1, 77),
-        Target::Process,
-        false,
-    )
-    .unwrap();
+    st.send_signal(sig, SigInfo::from_kill(sig, false, 1, 77), Target::Process)
+        .unwrap();
 }
 
 /// Expected frame bytes from the mirror struct; `base` has the stale stack
@@ -359,7 +358,7 @@ fn handler_frame_is_byte_exact_and_sigreturn_restores() {
     assert_eq!((ret.cs, ret.ss, ret.orig_ax), (USER_CS, USER_DS, u64::MAX));
     // Flags: FIX_EFLAGS bits come from the frame (DF set again), the rest
     // (IF, IOPL, NT, ...) from the current regs.
-    assert_eq!(ret.flags, (0x3202 & !FIX_EFLAGS) | (0x646 & FIX_EFLAGS));
+    assert_eq!(ret.flags, (0x3202 & !0x50DD5) | (0x646 & 0x50DD5));
     assert_eq!(st.blocked, SigSet::EMPTY);
     assert_eq!(cpu.restored, vec![cpu.image_with_sw(&sw)]);
 }
@@ -717,7 +716,7 @@ fn sigreturn_validates_like_restore_sigcontext() {
     assert!(!rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu).bad_frame);
     // cs != USER_CS: not 64-bit mode, so force_valid_ss is skipped.
     assert_eq!((ret.cs, ret.ss), (0x13, 0x2b));
-    assert_eq!(ret.flags, 0x202 | FIX_EFLAGS);
+    assert_eq!(ret.flags, 0x202 | 0x50DD5);
 
     // UC_STRICT_RESTORE_SS clear and cs == USER_CS: an invalid ss becomes
     // USER_DS; with it set, ss is left alone.
@@ -1110,4 +1109,285 @@ fn pending_signals_stack_frames_newest_first() {
         assert_eq!(cpu.resets, frames);
         assert!(!st.signal_pending());
     }
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
+}
+
+/// Rebuild, with this model, the frame the pinned Linux 6.18.57 built for the
+/// probe in `target/linux-reference/sigframe-probe-001/` and compare every
+/// byte (frame and FXSAVE area), then `rt_sigreturn` the real frame.
+fn replay_linux_frame(frame_hex: &str, fp_hex: &str, frame_addr: u64, sig: u8, altstack: bool) {
+    let want = unhex(frame_hex);
+    let fp = unhex(fp_hex);
+    let q = |o: usize| u64::from_le_bytes(want[o..o + 8].try_into().unwrap());
+    let sc = 48;
+    // The interrupted context, from the real sigcontext.
+    let before = Regs {
+        r8: q(sc),
+        r9: q(sc + 8),
+        r10: q(sc + 16),
+        r11: q(sc + 24),
+        r12: q(sc + 32),
+        r13: q(sc + 40),
+        r14: q(sc + 48),
+        r15: q(sc + 56),
+        di: q(sc + 64),
+        si: q(sc + 72),
+        bp: q(sc + 80),
+        bx: q(sc + 88),
+        dx: q(sc + 96),
+        ax: q(sc + 104),
+        cx: q(sc + 112),
+        sp: q(sc + 120),
+        ip: q(sc + 128),
+        flags: q(sc + 136),
+        cs: u64::from(u16::from_le_bytes(
+            want[sc + 144..sc + 146].try_into().unwrap(),
+        )),
+        ss: u64::from(u16::from_le_bytes(
+            want[sc + 150..sc + 152].try_into().unwrap(),
+        )),
+        orig_ax: 62, // kill(2), returned 0: no restart
+    };
+    let mut st = State::new(1, 0, 15_000);
+    st.actions[usize::from(sig) - 1] = SigAction {
+        handler: 0x20_10a0,
+        flags: SA_SIGINFO | SA_RESTORER | if altstack { SA_ONSTACK } else { 0 },
+        restorer: q(0),
+        mask: SigSet(if altstack { 0 } else { 1 << 11 }),
+    };
+    st.blocked = SigSet(1); // the probe blocked SIGHUP
+    if altstack {
+        st.altstack = crate::signal::AltStack {
+            sp: q(24),
+            size: q(40),
+            flags: 0,
+        };
+    }
+    let mut space = Space::default();
+    for page in (0x20_0000..0x21_0000u64).step_by(0x1000) {
+        space.map(page, true);
+    }
+    for page in (0x7fff_ffff_d000u64..0x7fff_ffff_f000).step_by(0x1000) {
+        space.map(page, true);
+    }
+    let mut cpu = FakeCpu::new();
+    cpu.image.copy_from_slice(&fp);
+    cpu.mask = 0xffff; // MXCSR_MASK the real FXSAVE stored at bytes 28..32
+    let mut r = before;
+    st.send_signal(sig, SigInfo::from_kill(sig, false, 1, 0), Target::Process)
+        .unwrap();
+    assert_eq!(
+        handle_pending_signals(&mut st, &mut r, &mut space, &mut cpu),
+        Outcome::Handled
+    );
+    assert_eq!(r.sp, frame_addr);
+    assert_eq!(read(&mut space, frame_addr, 440), want, "rt_sigframe");
+    let fpstate = q(sc + 184);
+    assert_eq!(
+        read(&mut space, fpstate, 512),
+        fp,
+        "FXSAVE area incl. _fpx_sw_bytes"
+    );
+    assert_eq!(
+        (r.di, r.si, r.dx),
+        (u64::from(sig), frame_addr + 312, frame_addr + 8)
+    );
+
+    // The real frame returns exactly what was interrupted.
+    let mut back = Regs {
+        sp: frame_addr + 8,
+        ax: 0x99,
+        r15: 0xbad,
+        ..before
+    };
+    let out = rt_sigreturn(&mut st, &mut back, &mut space, &mut cpu);
+    assert_eq!(
+        out,
+        super::frame::Sigreturn {
+            ret: before.ax,
+            bad_frame: false
+        }
+    );
+    assert_eq!(
+        back,
+        Regs {
+            orig_ax: u64::MAX,
+            ..before
+        }
+    );
+    assert_eq!(st.blocked, SigSet(1));
+    assert_eq!(cpu.restored, vec![<[u8; 512]>::try_from(&fp[..]).unwrap()]);
+}
+
+#[test]
+fn model_reproduces_the_pinned_linux_frame_on_the_normal_stack() {
+    // uc_flags 6, _fpx_sw_bytes { 0x46505853, 516, xfeatures 0, 512 }, fpstate
+    // at round_down(sp - 640, 64), frame 440 bytes below, rsp % 16 == 8.
+    replay_linux_frame(
+        linux_frames::PLAIN_FRAME,
+        linux_frames::PLAIN_FPSTATE,
+        linux_frames::PLAIN_FRAME_ADDR,
+        10,
+        false,
+    );
+}
+
+#[test]
+fn model_reproduces_the_pinned_linux_frame_on_the_altstack() {
+    // Frame at the top of the altstack; uc_stack shows the armed stack with flags 0.
+    replay_linux_frame(
+        linux_frames::ALTSTACK_FRAME,
+        linux_frames::ALTSTACK_FPSTATE,
+        linux_frames::ALTSTACK_FRAME_ADDR,
+        12,
+        true,
+    );
+}
+
+#[test]
+fn linux_dump_pins_the_fp_facts() {
+    // Literal facts read off the dump (probe-tcg.log), independent of the code.
+    let f = unhex(linux_frames::PLAIN_FRAME);
+    let p = unhex(linux_frames::PLAIN_FPSTATE);
+    assert_eq!(&f[8..16], &6u64.to_le_bytes()); // uc_flags
+    assert_eq!(&p[464..468], &0x4650_5853u32.to_le_bytes());
+    assert_eq!(&p[468..472], &516u32.to_le_bytes());
+    assert_eq!(&p[472..480], &[0; 8]); // xfeatures
+    assert_eq!(&p[480..484], &512u32.to_le_bytes());
+    assert_eq!(&p[484..512], &[0; 28]);
+    assert_eq!(&p[24..28], &0x1f80u32.to_le_bytes()); // MXCSR
+}
+
+#[test]
+fn default_rt_signal_is_fatal_like_any_default_action() {
+    // sig_fatal uses siginmask(), which is false for real-time signals:
+    // include/linux/signal.h:451.
+    let mut st = State::new(5, 0, 100);
+    st.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+    st.blocked.add(SIGUSR1);
+    send(&mut st, SIGUSR1);
+    st.blocked = SigSet::EMPTY;
+    send(&mut st, 40);
+    assert_eq!(st.group_exit, Some(40));
+    // The pending handled signal never runs: the death mark comes first.
+    assert_eq!(
+        get_signal(&mut st),
+        GetSignal::Fatal {
+            exit_code: 40,
+            core: false
+        }
+    );
+    // Later signals are dropped.
+    let mut st = State::new(5, 0, 100);
+    send(&mut st, 33);
+    send(&mut st, SIGTERM);
+    assert_eq!(st.group_exit, Some(33));
+    // A caught or ignored RT signal is not fatal.
+    let mut st = State::new(5, 0, 100);
+    st.actions[39].handler = SIG_IGN;
+    send(&mut st, 40);
+    assert_eq!((st.group_exit, st.signal_pending()), (None, false));
+    // init ignores a default-action RT signal, unless it is blocked first.
+    let mut init = State::new_init(100);
+    send(&mut init, 40);
+    assert!(!init.signal_pending());
+    init.blocked.add(40);
+    send(&mut init, 40);
+    init.blocked = SigSet::EMPTY;
+    assert_eq!(get_signal(&mut init), GetSignal::None);
+}
+
+#[test]
+fn sig_fatal_by_class() {
+    // default action, per kernel/signal.c masks: ignore/stop signals are not
+    // fatal, everything else (incl. all real-time signals) is.
+    for sig in 1..=64u8 {
+        let mut st = State::new(5, 0, 100);
+        st.send_signal(sig, SigInfo::from_kill(sig, false, 1, 0), Target::Process)
+            .unwrap();
+        let ignored_or_stop = [SIGCHLD, 18, 23, 28, SIGSTOP, SIGTSTP, 21, 22].contains(&sig);
+        let want = if ignored_or_stop {
+            None
+        } else {
+            Some(u32::from(sig))
+        };
+        // SIGSEGV etc. are fatal too (their coredump flag only affects delivery).
+        let want = if matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
+            None
+        } else {
+            want
+        };
+        assert_eq!(st.group_exit, want, "signal {sig}");
+        if want.is_none() && !ignored_or_stop {
+            // coredump signals are not marked at generation, only at delivery
+            assert!(st.signal_pending(), "signal {sig}");
+        }
+    }
+}
+
+#[test]
+fn sigset_bit_is_total() {
+    assert_eq!(SigSet::bit(0), 0);
+    assert_eq!(SigSet::bit(65), 0);
+    assert_eq!(SigSet::bit(1), 1);
+    assert_eq!(SigSet::bit(64), 1 << 63);
+    let mut s = SigSet::EMPTY;
+    s.add(0);
+    s.add(200);
+    assert_eq!(s, SigSet::EMPTY);
+    assert!(!s.contains(0));
+}
+
+#[test]
+fn exec_keeps_ignored_blocked_and_pending() {
+    // flush_signal_handlers(me, 0) in begin_new_exec; fs/exec.c:1234,1275.
+    let mut st = handler_state();
+    st.actions[usize::from(SIGUSR1) - 1].handler = SIG_IGN;
+    st.actions[usize::from(SIGUSR1) - 1].flags = SA_RESTART;
+    st.actions[11].handler = 0x1234;
+    st.actions[11].mask = SigSet(5);
+    st.blocked = SigSet(0b1000);
+    st.send_signal(
+        SIGUSR1 + 1,
+        SigInfo::from_kill(SIGUSR1 + 1, false, 1, 0),
+        Target::Process,
+    )
+    .ok();
+    st.altstack = crate::signal::AltStack {
+        sp: 0x1000,
+        size: 0x2000,
+        flags: SS_AUTODISARM,
+    };
+    st.flush_on_exec();
+    assert_eq!(
+        st.actions[usize::from(SIGUSR1) - 1],
+        SigAction {
+            handler: SIG_IGN,
+            ..SigAction::default()
+        }
+    );
+    assert_eq!(st.actions[11], SigAction::default());
+    assert_eq!(st.blocked, SigSet(0b1000));
+    assert_eq!(
+        st.altstack,
+        crate::signal::AltStack {
+            sp: 0,
+            size: 0,
+            flags: SS_AUTODISARM
+        }
+    );
+}
+
+#[test]
+fn spurious_math_fault_updates_arch_info_without_a_signal() {
+    let mut st = State::new(5, 0, 100);
+    let f = crate::signal::info::exception(16, 0, 0x40, 0, 0).unwrap();
+    st.force_fault(&f);
+    assert_eq!((st.arch.trap_nr, st.arch.error_code), (16, 0));
+    assert!(!st.signal_pending());
 }
