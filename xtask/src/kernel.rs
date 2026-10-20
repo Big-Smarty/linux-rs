@@ -200,6 +200,8 @@ struct DebugCase {
     forbid_success: bool,
     modules: &'static [Module],
     user: User,
+    /// Display devices the guest must see: 1 (std VGA) or 2 (plus `ramfb`).
+    framebuffers: usize,
 }
 
 const INIT_OK: User = User::Ok {
@@ -249,6 +251,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: false,
         modules: ARCHIVE_ONLY,
         user: INIT_OK,
+        framebuffers: 2,
     },
     DebugCase {
         name: "panic",
@@ -259,6 +262,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::None,
+        framebuffers: 1,
     },
     DebugCase {
         name: "unexpected-fault",
@@ -269,6 +273,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::None,
+        framebuffers: 1,
     },
     DebugCase {
         name: "bad-map",
@@ -279,6 +284,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::None,
+        framebuffers: 1,
     },
     DebugCase {
         name: "cpu-without-pat",
@@ -289,6 +295,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::None,
+        framebuffers: 1,
     },
     DebugCase {
         name: "unexpected-breakpoint",
@@ -299,6 +306,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::None,
+        framebuffers: 1,
     },
     DebugCase {
         name: "unexpected-interrupt",
@@ -309,6 +317,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::None,
+        framebuffers: 1,
     },
     DebugCase {
         name: "unmasked-timer",
@@ -319,6 +328,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::None,
+        framebuffers: 1,
     },
     DebugCase {
         name: "irq-restore-early",
@@ -329,6 +339,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::None,
+        framebuffers: 1,
     },
     DebugCase {
         name: "unexpected-page-fault",
@@ -339,6 +350,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::None,
+        framebuffers: 1,
     },
     DebugCase {
         name: "empty-module",
@@ -349,6 +361,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: false,
         modules: &[Module::Archive, Module::Empty],
         user: INIT_OK,
+        framebuffers: 1,
     },
     DebugCase {
         name: "bad-module",
@@ -359,6 +372,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: false,
         modules: &[Module::Corrupt, Module::Archive],
         user: INIT_OK,
+        framebuffers: 1,
     },
     DebugCase {
         name: "init-segfault",
@@ -373,6 +387,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::Segfault,
+        framebuffers: 1,
     },
     DebugCase {
         name: "no-init",
@@ -386,6 +401,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: NO_INIT_ONLY,
         user: User::NoRoot,
+        framebuffers: 1,
     },
     DebugCase {
         name: "unimplemented-syscall",
@@ -396,6 +412,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::Unimplemented,
+        framebuffers: 1,
     },
     DebugCase {
         name: "sse",
@@ -411,6 +428,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
             exact_summary: true,
             protection: (false, false),
         },
+        framebuffers: 1,
     },
     DebugCase {
         name: "rseq",
@@ -426,6 +444,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
             exact_summary: true,
             protection: (false, false),
         },
+        framebuffers: 1,
     },
     DebugCase {
         name: "cpu-max",
@@ -441,6 +460,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
             exact_summary: false,
             protection: (true, true),
         },
+        framebuffers: 1,
     },
 ];
 
@@ -3185,7 +3205,7 @@ fn debug_qemu_args(
     case: DebugCase,
 ) -> io::Result<Vec<OsString>> {
     let relative = |path: &Path| display_path(&relative_path(root, path)?);
-    Ok(vec![
+    let mut args = vec![
         OsString::from("-machine"),
         OsString::from("q35,accel=tcg"),
         OsString::from("-cpu"),
@@ -3223,7 +3243,13 @@ fn debug_qemu_args(
         OsString::from("order=c"),
         OsString::from("-device"),
         OsString::from("isa-debug-exit,iobase=0xf4,iosize=0x04"),
-    ])
+    ];
+    if case.framebuffers == 2 {
+        // A second display: OVMF publishes a second GOP handle, so Limine
+        // reports two framebuffers and the console must draw on both.
+        args.extend([OsString::from("-device"), OsString::from("ramfb")]);
+    }
+    Ok(args)
 }
 
 fn run_debug_case(
@@ -3445,6 +3471,45 @@ fn unique_exact_record(lines: &[&str], prefix: &str, expected: &str) -> bool {
     records.next() == Some(&expected) && records.next().is_none()
 }
 
+/// The console self-test record: exactly one, as expected for the display count,
+/// and before the bootstrap checkpoint when that is reached.
+fn validate_console_record(lines: &[&str], framebuffers: usize) -> Result<(), String> {
+    let console = format!(
+        "CHECK console ok framebuffers={framebuffers} scrolled=true tail=true stale=false readback=true wrap=true"
+    );
+    // Exactly one console record (a second one could come from a later stage or
+    // userspace), and it precedes the bootstrap checkpoint when that is reached.
+    let console_lines = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("CHECK console"))
+        .collect::<Vec<_>>();
+    match console_lines.as_slice() {
+        [(position, line)] if **line == console.as_str() => {
+            if lines
+                .iter()
+                .position(|line| line.starts_with("CHECKPOINT"))
+                .is_some_and(|checkpoint| checkpoint < *position)
+            {
+                return Err("console record must precede CHECKPOINT".to_owned());
+            }
+        }
+        [] => return Err(format!("missing console record: {console}")),
+        [(_, line)] => {
+            return Err(format!(
+                "console record {line:?} differs from expected {console:?}"
+            ));
+        }
+        more => {
+            return Err(format!(
+                "expected exactly one console record, found {}",
+                more.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_debug_case(
     case: DebugCase,
     process: &ProcessResult,
@@ -3482,6 +3547,9 @@ fn validate_debug_case(
             false,
             format!("missing serial assertions: {}", missing.join(", ")),
         );
+    }
+    if let Err(diagnostic) = validate_console_record(&lines, case.framebuffers) {
+        return (false, diagnostic);
     }
     if !case.forbid_success
         && let Err(diagnostic) =
@@ -4788,6 +4856,7 @@ fn capture_default_framebuffer(
             forbid_success: false,
             modules: ARCHIVE_ONLY,
             user: User::None,
+            framebuffers: 1,
         },
         tools,
     )?;
@@ -5551,8 +5620,52 @@ mod tests {
         }
     }
 
+    fn console_record(framebuffers: usize) -> String {
+        format!(
+            "CHECK console ok framebuffers={framebuffers} scrolled=true tail=true stale=false readback=true wrap=true"
+        )
+    }
+
+    // Synthetic serials are written without the console record; add the one the
+    // case expects unless the test supplied its own.
     fn validate(case: DebugCase, process: &ProcessResult, serial: &str) -> (bool, String) {
-        validate_debug_case(case, process, serial, &expected())
+        let serial = if serial.contains("CHECK console") {
+            serial.to_owned()
+        } else {
+            format!("{}\n{serial}", console_record(case.framebuffers))
+        };
+        validate_debug_case(case, process, &serial, &expected())
+    }
+
+    #[test]
+    fn console_record_must_match_the_case_display_count() {
+        let process = ProcessResult {
+            timed_out: false,
+            exit_code: Some(33),
+        };
+        let serial = success_serial();
+        let success = case("success");
+        assert_eq!(success.framebuffers, 2);
+        assert!(validate(success, &process, &serial).0);
+        // One framebuffer reported where two were attached, a failed check and a
+        // missing record are all rejected.
+        for bad in [
+            console_record(1),
+            console_record(2).replace("scrolled=true", "scrolled=false"),
+            console_record(2).replace("readback=true", "readback=false"),
+        ] {
+            assert!(!validate(success, &process, &format!("{bad}\n{serial}")).0);
+        }
+        let (ok, why) = validate_debug_case(success, &process, &serial, &expected());
+        assert!(!ok && why.contains("missing console record"), "{why}");
+        // Exactly one record, before CHECKPOINT.
+        let good = console_record(2);
+        let twice = format!("{good}\n{good}\n{serial}");
+        let (ok, why) = validate_debug_case(success, &process, &twice, &expected());
+        assert!(!ok && why.contains("exactly one"), "{why}");
+        let late = format!("{serial}\n{good}");
+        let (ok, why) = validate_debug_case(success, &process, &late, &expected());
+        assert!(!ok && why.contains("precede CHECKPOINT"), "{why}");
     }
 
     fn case(name: &str) -> DebugCase {

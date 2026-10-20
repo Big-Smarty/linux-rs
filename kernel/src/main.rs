@@ -126,10 +126,12 @@ extern "C" fn kernel_main() -> ! {
     // loader mappings are active. Nothing fallible precedes this, so every later
     // failure reaches the screen. The framebuffer extent is a kind7 loader
     // reservation (checked against the not-yet-validated map, see
-    // take_framebuffer), mapped by the loader, never republished, and no Rust
+    // take_framebuffers), mapped by the loader, never republished, and no Rust
     // references to it are created.
-    let framebuffer = unsafe { console::init(boot::BootInfo::take_framebuffer()) };
+    let framebuffer = unsafe { console::init(&boot::BootInfo::take_framebuffers()) } > 0;
     log!("linux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
+    #[cfg(feature = "qemu-self-test")]
+    require(console::self_test(), "console-scroll");
     #[cfg(feature = "qemu-self-test")]
     require(
         linux_rs_runtime::self_test(),

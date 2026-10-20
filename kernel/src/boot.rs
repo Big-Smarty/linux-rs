@@ -261,6 +261,55 @@ pub struct Framebuffer {
     // Remaining revisioned fields are not read by this implementation.
 }
 
+/// Upper bound on loader framebuffers read (one per GOP handle).
+pub const MAX_FRAMEBUFFERS: usize = 8;
+
+/// Result of [`BootInfo::take_framebuffers`]; `None` marks an entry the loader
+/// listed that failed validation.
+pub struct Framebuffers {
+    pub entries: [Option<Framebuffer>; MAX_FRAMEBUFFERS],
+    /// The loader's own count, possibly above `MAX_FRAMEBUFFERS`.
+    pub reported: u64,
+}
+
+/// The per-entry logic of [`BootInfo::take_framebuffers`] with the memory
+/// accesses injected so host tests can drive it. `loader` / `framebuffer` say
+/// whether `[address, address + length)` lies in kind-5 / kind-7 memory;
+/// `slot(i)` reads pointer `i` of the response array and `read(pointer)` the
+/// struct it names. Neither reader is called before the matching range check.
+fn gather_framebuffers(
+    reported: u64,
+    array: u64,
+    loader: impl Fn(u64, u64) -> bool,
+    framebuffer: impl Fn(u64, u64) -> bool,
+    slot: impl Fn(usize) -> u64,
+    read: impl Fn(u64) -> Framebuffer,
+) -> Framebuffers {
+    let mut list = Framebuffers {
+        entries: [None; MAX_FRAMEBUFFERS],
+        reported,
+    };
+    let count = usize::try_from(reported).map_or(MAX_FRAMEBUFFERS, |n| n.min(MAX_FRAMEBUFFERS));
+    // The pointer array must lie inside reserved loader memory (count <= 8).
+    if count == 0 || !loader(array, 8 * count as u64) {
+        return list;
+    }
+    for (index, entry) in list.entries.iter_mut().enumerate().take(count) {
+        let pointer = slot(index);
+        if !loader(pointer, mem::size_of::<Framebuffer>() as u64) {
+            continue;
+        }
+        let display = read(pointer);
+        let Some(length) = display.pitch.checked_mul(display.height) else {
+            continue;
+        };
+        if framebuffer(display.address, length) {
+            *entry = Some(display);
+        }
+    }
+    list
+}
+
 fn aligned(address: u64, alignment: usize) -> bool {
     address != 0 && address & (alignment as u64 - 1) == 0 && address >= 0xffff_8000_0000_0000
 }
@@ -336,11 +385,13 @@ impl BootInfo {
         })
     }
 
-    /// The loader framebuffer, found before any other fallible step so that every
-    /// later failure can reach the screen. A missing or invalid display is
-    /// explicit (`None`), never fabricated.
+    /// Every loader framebuffer (one per GOP handle), found before any other
+    /// fallible step so that every later failure can reach the screen. Each
+    /// entry is validated independently: a bad entry is `None` and does not
+    /// affect the others. A missing response yields no entries, never a fabricated
+    /// display. At most `MAX_FRAMEBUFFERS` are read; `reported` is the loader's count.
     ///
-    /// The extent is checked against the still-unvalidated memory map: a union
+    /// Each extent is checked against the still-unvalidated memory map: a union
     /// of loader-declared kind7 entries is sound for that question whatever the
     /// order, and a malformed map only fails the later `take`.
     ///
@@ -349,25 +400,33 @@ impl BootInfo {
     /// and mappings stay reserved and immutable. May run before `take`, which
     /// remains the single consuming handoff.
     #[must_use]
-    pub unsafe fn take_framebuffer() -> Option<Framebuffer> {
+    pub unsafe fn take_framebuffers() -> Framebuffers {
+        let none = Framebuffers {
+            entries: [None; MAX_FRAMEBUFFERS],
+            reported: 0,
+        };
         // SAFETY: same contract as this function.
-        let info = unsafe { Self::mapped() }.ok()?;
+        let Ok(info) = (unsafe { Self::mapped() }) else {
+            return none;
+        };
         // SAFETY: same response lifetime, optional response is handled as failure.
-        let fb = unsafe { response(ptr::addr_of!(FRAMEBUFFER), 3) }.ok()?;
-        if fb[1] == 0 || !info.contains_virtual(fb[2], 8, 5) {
-            return None;
-        }
-        // SAFETY: the first array slot lies inside reserved loader memory; the
-        // protocol does not promise its alignment, so read it unaligned.
-        let pointer = unsafe { ptr::read_unaligned(fb[2] as *const *const Framebuffer) };
-        if !info.contains_virtual(pointer as u64, mem::size_of::<Framebuffer>() as u64, 5) {
-            return None;
-        }
-        // SAFETY: validated mapped loader storage; all fields integers.
-        let display = unsafe { ptr::read_unaligned(pointer) };
-        let length = display.pitch.checked_mul(display.height)?;
-        info.contains_virtual(display.address, length, 7)
-            .then_some(display)
+        let Ok(fb) = (unsafe { response(ptr::addr_of!(FRAMEBUFFER), 3) }) else {
+            return none;
+        };
+        let array = fb[2];
+        gather_framebuffers(
+            fb[1],
+            array,
+            |address, length| info.contains_virtual(address, length, 5),
+            |address, length| info.contains_virtual(address, length, 7),
+            // SAFETY (both readers): `gather_framebuffers` calls them only for
+            // slots/structs it has just proved lie inside bootloader-reclaimable
+            // memory (kind 5), which the loader keeps mapped and immutable (this
+            // function's contract). The protocol does not promise alignment, so
+            // read unaligned; every field is an integer.
+            |index| unsafe { ptr::read_unaligned((array as *const u64).wrapping_add(index)) },
+            |pointer| unsafe { ptr::read_unaligned(pointer as *const Framebuffer) },
+        )
     }
 
     /// The loader command line without its NUL, at most 2047 bytes.
@@ -864,6 +923,77 @@ pub fn canonical_range(address: u64, length: u64) -> bool {
             .checked_sub(1)
             .and_then(|last| address.checked_add(last))
             .is_some_and(|last| canonical(last) && (last >> 47) == (address >> 47))
+}
+
+#[cfg(test)]
+mod framebuffer_tests {
+    use super::*;
+
+    fn fb(address: u64) -> Framebuffer {
+        Framebuffer {
+            address,
+            width: 64,
+            height: 16,
+            pitch: 256,
+            bpp: 32,
+            model: 1,
+            red_size: 8,
+            red_shift: 16,
+            green_size: 8,
+            green_shift: 8,
+            blue_size: 8,
+            blue_shift: 0,
+        }
+    }
+
+    // Fake loader: structs live at 0x1000 * (i + 1) (kind 5), the pointer array at
+    // 0x100 (kind 5, 8 slots), framebuffer memory is [0x10_0000, 0x11_0000) (kind 7).
+    fn run(reported: u64, slots: &[u64], structs: &[(u64, Framebuffer)]) -> Framebuffers {
+        gather_framebuffers(
+            reported,
+            0x100,
+            |address, length| {
+                let end = address.checked_add(length).unwrap();
+                (0x100..=0x140).contains(&address) && end <= 0x140
+                    || structs.iter().any(|(at, _)| *at == address)
+            },
+            |address, length| address >= 0x10_0000 && address + length <= 0x11_0000,
+            |index| slots[index],
+            |pointer| structs.iter().find(|(at, _)| *at == pointer).unwrap().1,
+        )
+    }
+
+    #[test]
+    fn framebuffer_list_edge_cases() {
+        let a = (0x1000, fb(0x10_0000));
+        let b = (0x2000, fb(0x10_8000));
+        // Zero count: nothing, and the readers are never called (slots empty).
+        let list = run(0, &[], &[]);
+        assert!(list.entries.iter().all(Option::is_none) && list.reported == 0);
+        // Two good entries.
+        let list = run(2, &[0x1000, 0x2000], &[a, b]);
+        assert_eq!(list.entries.iter().flatten().count(), 2);
+        // A null slot and an out-of-memory framebuffer fail alone.
+        let bad = (0x3000, fb(0x20_0000));
+        let list = run(3, &[0, 0x3000, 0x2000], &[bad, b]);
+        let got = [0, 1, 2].map(|i| list.entries[i].is_some());
+        assert_eq!(got, [false, false, true]);
+        // An overflowing extent is rejected without panicking.
+        let mut huge = fb(0x10_0000);
+        huge.pitch = u64::MAX;
+        huge.height = 2;
+        let list = run(1, &[0x1000], &[(0x1000, huge)]);
+        assert!(list.entries[0].is_none());
+        // A count above the bound reads only MAX_FRAMEBUFFERS slots and keeps the
+        // loader's own number; 8 slots fit the fake array exactly, 9+ never read.
+        let slots = [0x1000; MAX_FRAMEBUFFERS];
+        let list = run(1000, &slots, &[a]);
+        assert_eq!(list.reported, 1000);
+        assert_eq!(list.entries.iter().flatten().count(), MAX_FRAMEBUFFERS);
+        // A response array outside loader memory yields nothing.
+        let list = gather_framebuffers(1, 0xdead_0000, |_, _| false, |_, _| true, |_| 0, |_| fb(0));
+        assert!(list.entries.iter().all(Option::is_none));
+    }
 }
 
 #[cfg(test)]
