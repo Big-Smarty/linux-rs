@@ -217,6 +217,9 @@ struct Platform {
     mode: &'static str,
     /// Tick clockevent: `lapic-oneshot`, `lapic-deadline` or `pit-periodic`.
     event: &'static str,
+    /// Why that mode was chosen (`CHECK apic reason=`): `default`, `hypervisor`,
+    /// `no-interrupt-remapping` or `nolapic`. Pins the decision, not just its result.
+    reason: &'static str,
     /// Whether PIT IRQ0 must be proven through the IOAPIC: `true`, `false` or `n/a`.
     ioapic_timer: &'static str,
     /// Whether the machine has an HPET (table, reference clock in `CHECK tsc`).
@@ -231,6 +234,7 @@ const Q35_TCG: Platform = Platform {
     machine: "q35",
     kvm: false,
     mode: "xapic",
+    reason: "default",
     event: "lapic-oneshot",
     ioapic_timer: "true",
     hpet: true,
@@ -534,7 +538,7 @@ const DEBUG_CASES: [DebugCase; 25] = [
         plat: Platform {
             machine: "q35,hpet=off",
             hpet: false,
-            tsc_sources: &["pit", "pmtimer"],
+            tsc_sources: &["pit"],
             ..Q35_TCG
         },
     },
@@ -567,6 +571,8 @@ const DEBUG_CASES: [DebugCase; 25] = [
         framebuffers: 1,
         plat: Platform {
             mode: "legacy-pic",
+            reason: "nolapic",
+            tsc_sources: &["pit"],
             event: "pit-periodic",
             ioapic_timer: "n/a",
             ..Q35_TCG
@@ -599,6 +605,7 @@ const DEBUG_CASES: [DebugCase; 25] = [
         framebuffers: 1,
         plat: Platform {
             mode: "x2apic",
+            reason: "hypervisor",
             ..Q35_TCG
         },
     },
@@ -612,7 +619,10 @@ const DEBUG_CASES: [DebugCase; 25] = [
         modules: ARCHIVE_ONLY,
         user: INIT_OK,
         framebuffers: 1,
-        plat: Q35_TCG,
+        plat: Platform {
+            reason: "no-interrupt-remapping",
+            ..Q35_TCG
+        },
     },
     DebugCase {
         name: "kvm",
@@ -632,6 +642,7 @@ const DEBUG_CASES: [DebugCase; 25] = [
         plat: Platform {
             kvm: true,
             mode: "x2apic",
+            reason: "hypervisor",
             event: "lapic-deadline",
             tsc_sources: &["pit", "hpet"],
             ..Q35_TCG
@@ -713,6 +724,9 @@ struct CaseResult {
     name: &'static str,
     cpu: &'static str,
     passed: bool,
+    /// The case could not be run on this host (e.g. no usable `/dev/kvm`): neither
+    /// a pass nor a failure, reported separately and never counted as matched.
+    unavailable: bool,
     expected_exit: i32,
     observed_exit: Option<i32>,
     timed_out: bool,
@@ -3445,6 +3459,22 @@ fn debug_qemu_args(
     Ok(args)
 }
 
+/// Whether this host can run a KVM case: `/dev/kvm` opens read/write.
+fn kvm_usable() -> bool {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+}
+
+/// Run one case. Two exceptions to "one launch per case", both recorded:
+/// - a KVM case on a host without usable KVM is `unavailable`, not run;
+/// - a case whose only mismatch is the TSC calibration *source* (the quick PIT
+///   calibration is timing sensitive and falls back to the HPET/PM timer under
+///   heavy host load, which is correct kernel behaviour) is run once more in
+///   `<name>-retry`; both attempts' logs stay, the second result decides, and
+///   the diagnostic names the first failure.
 fn run_debug_case(
     root: &Path,
     output: &Path,
@@ -3453,7 +3483,55 @@ fn run_debug_case(
     tools: &QemuTools,
     timeout: Duration,
 ) -> io::Result<CaseResult> {
-    let case_dir = output.join("cases").join(case.name);
+    if case.plat.kvm && !kvm_usable() {
+        let case_dir = output.join("cases").join(case.name);
+        ensure_real_directory(&output.join("cases"))?;
+        create_directory(&case_dir)?;
+        let mut result = BTreeMap::new();
+        manifest_value(&mut result, "schema", "1");
+        manifest_value(&mut result, "case", case.name);
+        manifest_value(&mut result, "status", "unavailable");
+        manifest_value(
+            &mut result,
+            "assertions",
+            "/dev/kvm is not usable read/write; case not run",
+        );
+        write_manifest(&case_dir.join("result.tsv"), result)?;
+        return Ok(CaseResult {
+            name: case.name,
+            cpu: case.cpu,
+            passed: false,
+            unavailable: true,
+            expected_exit: case.expected_exit,
+            observed_exit: None,
+            timed_out: false,
+            diagnostic: "unavailable: /dev/kvm is not usable read/write".to_owned(),
+            output: case_dir,
+        });
+    }
+    let first = run_debug_case_in(root, output, build, case, tools, timeout, case.name)?;
+    if first.passed || !first.diagnostic.starts_with("TSC calibration source") {
+        return Ok(first);
+    }
+    let retry_name = format!("{}-retry", case.name);
+    let mut second = run_debug_case_in(root, output, build, case, tools, timeout, &retry_name)?;
+    second.diagnostic = format!(
+        "retried once after `{}` (first attempt kept in cases/{}): {}",
+        first.diagnostic, case.name, second.diagnostic
+    );
+    Ok(second)
+}
+
+fn run_debug_case_in(
+    root: &Path,
+    output: &Path,
+    build: &Build,
+    case: DebugCase,
+    tools: &QemuTools,
+    timeout: Duration,
+    dir: &str,
+) -> io::Result<CaseResult> {
+    let case_dir = output.join("cases").join(dir);
     ensure_real_directory(&output.join("cases"))?;
     create_directory(&case_dir)?;
     let boot_image = make_fat_image(root, &case_dir, build, case, tools)?;
@@ -3532,6 +3610,7 @@ fn run_debug_case(
         name: case.name,
         cpu: case.cpu,
         passed,
+        unavailable: false,
         expected_exit: case.expected_exit,
         observed_exit: process.exit_code,
         timed_out: process.timed_out,
@@ -3753,6 +3832,10 @@ fn validate_platform(lines: &[&str], plat: Platform) -> Result<(), String> {
                 .to_owned(),
         );
     }
+    // A PIT-calibrated TSC must say how many quick-PIT attempts it took (1..=3).
+    if source == "pit" && !number(tsc, "pit_tries").is_some_and(|n| (1..=3).contains(&n)) {
+        return Err("source=pit requires pit_tries in 1..=3".to_owned());
+    }
     let tables = unique_record(lines, "CHECK time-tables")?;
     if (record_field(tables, "hpet").is_some_and(|v| v != "0x0")) != plat.hpet {
         return Err("CHECK time-tables hpet does not match the machine".to_owned());
@@ -3762,8 +3845,13 @@ fn validate_platform(lines: &[&str], plat: Platform) -> Result<(), String> {
         return Err("CHECK madt must describe one CPU and one IOAPIC".to_owned());
     }
     let apic = unique_record(lines, "CHECK apic ok")?;
-    if record_field(apic, "mode") != Some(plat.mode) {
-        return Err(format!("CHECK apic must report mode={}", plat.mode));
+    if record_field(apic, "mode") != Some(plat.mode)
+        || record_field(apic, "reason") != Some(plat.reason)
+    {
+        return Err(format!(
+            "CHECK apic must report mode={} reason={}",
+            plat.mode, plat.reason
+        ));
     }
     let timer = unique_record(lines, "CHECK timer ok")?;
     // 16 ticks counted from an arbitrary phase span 15..16 periods of 1 ms;
@@ -4335,7 +4423,13 @@ fn record_case(
     manifest_value(
         values,
         &format!("{prefix}_status"),
-        if case.passed { "matched" } else { "failed" },
+        if case.passed {
+            "matched"
+        } else if case.unavailable {
+            "unavailable"
+        } else {
+            "failed"
+        },
     );
     manifest_value(values, &format!("{prefix}_cpu"), case.cpu);
     manifest_value(
@@ -4443,7 +4537,20 @@ fn write_top_manifest(output: &Output, run: &TestRun) -> io::Result<()> {
     manifest_value(
         &mut values,
         "automated_cases_failed",
-        cases.iter().filter(|case| !case.passed).count().to_string(),
+        cases
+            .iter()
+            .filter(|case| !case.passed && !case.unavailable)
+            .count()
+            .to_string(),
+    );
+    manifest_value(
+        &mut values,
+        "automated_cases_unavailable",
+        cases
+            .iter()
+            .filter(|case| case.unavailable)
+            .count()
+            .to_string(),
     );
     for case in cases {
         record_case(&mut values, output, case)?;
@@ -4500,12 +4607,25 @@ pub fn test(root: &Path, requested: &Path, timeout: Duration) -> io::Result<()> 
         Ok(run) => {
             write_top_manifest(&output, &run)?;
             let (cases, screenshot) = (&run.cases, &run.screenshot);
-            let failures = cases.iter().filter(|case| !case.passed).collect::<Vec<_>>();
+            let failures = cases
+                .iter()
+                .filter(|case| !case.passed && !case.unavailable)
+                .collect::<Vec<_>>();
+            let unavailable = cases
+                .iter()
+                .filter(|case| case.unavailable)
+                .collect::<Vec<_>>();
             println!(
                 "kernel-test: {}/{} debug-exit cases matched; default framebuffer capture requires human review",
-                cases.len() - failures.len(),
+                cases.iter().filter(|case| case.passed).count(),
                 cases.len()
             );
+            for case in &unavailable {
+                println!(
+                    "UNAVAILABLE (not run, not a pass): {}: {}",
+                    case.name, case.diagnostic
+                );
+            }
             println!(
                 "Framebuffer capture: {}",
                 display_path(&relative_path(&output.root, screenshot)?)?
@@ -6300,7 +6420,7 @@ mod tests {
             USER_MM_RECORD,
             HEAP_RECORD,
             "CHECK apic ok mode=xapic reason=default",
-            "CHECK tsc ok khz=3000000 source=pit hpet_hz=100000000 rtc=true",
+            "CHECK tsc ok khz=3000000 source=pit pit_tries=1 hpet_hz=100000000 rtc=true",
             "CHECK clockevent ok event=lapic-oneshot",
             "CHECK interrupt-controllers ok mode=xapic event=lapic-oneshot ioapic_timer=true",
             IRQ_GUARD_RECORD,
@@ -6342,6 +6462,9 @@ mod tests {
             ),
             ("ioapic_timer=true", "ioapic_timer=false"),
             ("source=pit", "source=pmtimer"),
+            ("pit_tries=1", "pit_tries=0"),
+            ("pit_tries=1", "pit_tries=4"),
+            ("reason=default", "reason=hypervisor"),
             ("hpet_hz=100000000", "hpet_hz=0"),
             ("rtc=true", "rtc=false"),
             ("khz=3000000", "khz=1000"),
@@ -6362,7 +6485,15 @@ mod tests {
                 "{from} -> {to}"
             );
         }
-        // Each variant case accepts exactly its own path.
+    }
+
+    #[test]
+    fn each_platform_case_accepts_exactly_its_own_path() {
+        let success = ProcessResult {
+            exit_code: Some(33),
+            timed_out: false,
+        };
+        let serial = success_serial();
         let case = |name| {
             DEBUG_CASES
                 .iter()
@@ -6375,13 +6506,33 @@ mod tests {
                 "mode=xapic event=lapic-oneshot ioapic_timer=true",
                 "mode=legacy-pic event=pit-periodic ioapic_timer=n/a",
             )
-            .replace("CHECK apic ok mode=xapic", "CHECK apic ok mode=legacy-pic");
+            .replace(
+                "CHECK apic ok mode=xapic reason=default",
+                "CHECK apic ok mode=legacy-pic reason=nolapic",
+            );
         assert!(validate(case("nolapic"), &success, &legacy).0);
+        // nolapic and hpet-off require the quick-PIT source (one harness retry).
+        assert!(
+            !validate(
+                case("nolapic"),
+                &success,
+                &legacy.replace("source=pit", "source=hpet")
+            )
+            .0
+        );
         assert!(!validate(case("nolapic"), &success, &serial).0);
         let no_hpet = serial
             .replace("hpet_hz=100000000", "hpet_hz=0")
             .replace("hpet=0xfed00000", "hpet=0x0");
         assert!(validate(case("hpet-off"), &success, &no_hpet).0);
+        assert!(
+            !validate(
+                case("hpet-off"),
+                &success,
+                &no_hpet.replace("source=pit", "source=pmtimer")
+            )
+            .0
+        );
         assert!(!validate(case("hpet-off"), &success, &serial).0);
         let no_pit = serial
             .replace("ioapic_timer=true", "ioapic_timer=false")
@@ -6394,7 +6545,10 @@ mod tests {
                 "mode=xapic event=lapic-oneshot",
                 "mode=x2apic event=lapic-deadline",
             )
-            .replace("CHECK apic ok mode=xapic", "CHECK apic ok mode=x2apic")
+            .replace(
+                "CHECK apic ok mode=xapic reason=default",
+                "CHECK apic ok mode=x2apic reason=hypervisor",
+            )
             .replace("smep=false smap=false", "smep=true smap=true");
         assert!(validate(case("kvm"), &success, &kvm).0);
         assert!(
@@ -6406,8 +6560,28 @@ mod tests {
             .0
         );
         assert!(!validate(case("kvm"), &success, &serial).0);
-        // The mutation cases never reach the platform check.
-        assert_eq!(case("x2apic-firmware").plat, Q35_TCG);
+        // x2apic-firmware must show the decision (mode xapic *because* the firmware
+        // x2APIC was switched back), not just the same mode as the base case.
+        let firmware = serial.replace("reason=default", "reason=no-interrupt-remapping");
+        assert!(validate(case("x2apic-firmware"), &success, &firmware).0);
+        assert!(!validate(case("x2apic-firmware"), &success, &serial).0);
+        // x2apic-forced needs the x2APIC backend and the hypervisor rule.
+        let forced = serial.replace(
+            "mode=xapic event=lapic-oneshot",
+            "mode=x2apic event=lapic-oneshot",
+        );
+        assert!(!validate(case("x2apic-forced"), &success, &forced).0);
+        assert!(
+            validate(
+                case("x2apic-forced"),
+                &success,
+                &forced.replace(
+                    "CHECK apic ok mode=xapic reason=default",
+                    "CHECK apic ok mode=x2apic reason=hypervisor"
+                )
+            )
+            .0
+        );
     }
 
     #[test]
