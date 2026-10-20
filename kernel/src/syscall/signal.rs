@@ -252,7 +252,10 @@ mod tests {
         // The interval timer interrupts a sleep too.
         let mut t = mapped();
         put(&mut t, PAGE, &itimerval((0, 0), (0, 3)));
-        assert_eq!(call(&mut t, Sysno::setitimer, &[0, PAGE, 0]), Outcome::Return(0));
+        assert_eq!(
+            call(&mut t, Sysno::setitimer, &[0, PAGE, 0]),
+            Outcome::Return(0)
+        );
         assert_eq!(sleep_until(&mut t, 1_000_000), Some(1_000_000 - 3_000));
     }
 
