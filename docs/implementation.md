@@ -1042,7 +1042,7 @@ Per-syscall summary (all numbers are x86-64): `getuid`/`geteuid`/`getgid`/`geteg
 | Item | Evidence | Status |
 | --- | --- | --- |
 | Every `ids` check passes with Linux's exact output | `oracle-ids`: 157 `init: test ids.*` lines plus the summary equal `expected.tsv` one for one | done (QEMU TCG `qemu64` only) |
-| Errno and check order per syscall (argument truncation, `EFAULT`/`ESRCH`/`EINVAL` precedence, store-before-copyout in `prlimit64`, partial stores) | 13 host tests in `syscall/ids.rs`, 3 in `task.rs`, 2 in `usercopy.rs` | done for the exercised and the neighbouring cases; no differential fuzz |
+| Errno and check order per syscall (argument truncation, `EFAULT`/`ESRCH`/`EINVAL` precedence, store-before-copyout in `prlimit64`, partial stores) | 14 host tests in `syscall/ids.rs`, 3 in `task.rs`, 2 in `usercopy.rs` | done for the exercised and the neighbouring cases; no differential fuzz |
 | `prctl`/`arch_prctl` options Linux implements but this slice does not stop loudly; undefined numbers are `-EINVAL` | `prctl_options_names_and_unknown_numbers`, `arch_prctl_matches_process_64`, `a_finite_cpu_limit_stops_instead_of_storing` | done |
 | Harness: one generic exact-line validator, one line per group | `oracle_case!`, `validate_oracle`; unit tests `oracle_case_requires_every_expected_line_exactly_in_order`, `oracle_info_rows_match_by_name_only` | done |
 | Behaviour on real hardware, KVM, other QEMU CPU models, `sysinfo` uptime against a real clock | not run | not done |
