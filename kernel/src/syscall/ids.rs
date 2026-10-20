@@ -585,9 +585,8 @@ fn prctl<C: Context>(ctx: &mut C, option: i32, args: [u64; 4]) -> Res {
             Ok(0)
         }
         // `PR_TIMING_STATISTICAL` (0) is the only timing method.
-        PR_GET_TIMING => Ok(0),
         PR_SET_TIMING if args[0] != 0 => Err(Errno::EINVAL.into()),
-        PR_SET_TIMING => Ok(0),
+        PR_GET_TIMING | PR_SET_TIMING => Ok(0),
         option if prctl_is_plain_einval(option) => Err(Errno::EINVAL.into()),
         option if known_prctl_option(option) => Err(Stop::Unimplemented),
         _ => Err(Errno::EINVAL.into()),
