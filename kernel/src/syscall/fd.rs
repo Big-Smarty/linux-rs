@@ -46,7 +46,10 @@ use syscalls::{Errno, Sysno};
 use super::{Context, MAX_RW_COUNT, Outcome, Stop, Sys, io, outcome};
 use crate::{
     sched::{PIPE_KEY, WaitKey},
-    signal::{SIGPIPE, SIGXFSZ, wait::wait_event_interruptible},
+    signal::{
+        SIGPIPE, SIGXFSZ,
+        wait::{ERESTARTSYS, wait_event_interruptible},
+    },
     task::RLIM_INFINITY,
     usercopy::{access_ok, copy_from_user, copy_to_user},
     vfs::{
@@ -333,10 +336,8 @@ fn read_kind<C: Context>(ctx: &mut C, view: &View, dest: &mut Dest, pos: Option<
             } else {
                 // `n_tty_read`: `signal_pending` -> `-ERESTARTSYS`. Nothing ever
                 // delivers console input, so only a signal ends the sleep.
-                match wait_event_interruptible(ctx, WaitKey::NONE, |_| false) {
-                    Err(restart) => Ok(restart),
-                    Ok(()) => unreachable!("the condition never holds"),
-                }
+                Ok(wait_event_interruptible(ctx, WaitKey::NONE, |_| false)
+                    .map_or_else(|restart| restart, |()| -ERESTARTSYS))
             }
         }
         FileKind::Pipe {
