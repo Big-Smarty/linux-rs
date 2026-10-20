@@ -9,26 +9,30 @@
 //! | --- | --- | --- | --- |
 //! | [`BOOT`] | the immutable loader handoff | `kernel_main`, once | any context, lock-free |
 //! | [`FRAMES`] | the physical frame allocator (`'static`: it borrows [`BOOT`]) | task context | task context |
-//! | [`TABLES`] | the published page tables (the one address space) | task context | task context |
+//! | [`TABLES`] | the kernel-only page tables: the template every task's tree copies its kernel half from, and the tree CR3 holds while no task's may be | `userspace::start`, once | task context |
+//! | `userspace::PROCESS` | what every task shares: the task list and the VFS | task context | task context |
+//! | `userspace::LOCALS` | the page tables, memory model, descriptor table and attributes of each task, reached only by that task | the task itself (its creator before it runs) | the task itself |
 //! | `ktask::RQ` | the run queue: task states, wait keys, FIFO order (`kernel::sched::Rq`) | task context, tick/timer hardirq | task context, hardirq |
 //! | `ktask::TIMERQ` | absolute wake-up times of sleeping tasks (`kernel::sched::timerq`) | task context, timer hardirq | task context, hardirq |
 //!
 //! # Lock order (the shared DAG; acquire left to right, never the reverse)
-//! `userspace::PROCESS` -> [`TABLES`] -> `heap` -> [`FRAMES`], and `PROCESS` ->
-//! `TIMER_HW` (a leaf: the clockevent programming of `timer::set_itimer_ns`,
-//! called with `PROCESS` held). The scheduler adds two classes (`ktask`):
+//! `userspace::PROCESS` -> `heap` -> [`FRAMES`], and `PROCESS` -> `TIMER_HW` (a
+//! leaf: the clockevent programming of `timer::set_itimer_ns`, called with
+//! `PROCESS` held). [`TABLES`] is taken alone (a copy of its kernel half, a
+//! group load) and before [`FRAMES`]. The scheduler adds two classes (`ktask`):
 //! `RQ` is a **leaf that may be taken under any lock and from hardirq** (it only
 //! mutates the queue and returns; wakers call out of nothing), and `TIMERQ` ->
 //! `TIMER_HW` (arming the clockevent for the queue head under the queue lock).
 //! `TIMERQ` and `RQ` are never held together: the expiry drains due entries
 //! under `TIMERQ`, releases it, then wakes under `RQ`. So the edges are
-//! `PROCESS`/`TABLES`/`heap` -> `RQ`, `PROCESS` -> `TIMERQ` -> `TIMER_HW`, and
-//! no edge leaves `RQ`. [`FRAMES`] is a
-//! leaf: it calls nothing that locks. A table operation takes the frame
-//! allocator as an argument, so callers lock [`TABLES`] first and pass the
-//! [`FRAMES`] guard. `PROCESS` and [`TABLES`] ARE held across a user-memory
-//! copy: the copy resolves each page first (`usercopy`), and a non-resident
-//! one is faulted in on the spot (`userspace::Syscall::page` ->
+//! `PROCESS`/`heap` -> `RQ`, `PROCESS` -> `TIMERQ` -> `TIMER_HW`, and no edge
+//! leaves `RQ`. [`FRAMES`] is a leaf: it calls nothing that locks. A table
+//! operation takes the frame allocator as an argument, so callers pass the
+//! [`FRAMES`] guard; the tables a task edits are its own (`TaskLocal`, no lock:
+//! nobody else touches them), and a copy of them for a fork is made by the
+//! parent with `FRAMES` held and no heap allocation. `PROCESS` is held across a
+//! user-memory copy: the copy resolves each page first (`usercopy`), and a
+//! non-resident one is faulted in on the spot (`userspace::Syscall::page` ->
 //! `handle_user_fault`), which reserves heap storage, then takes [`FRAMES`] as
 //! the leaf, i.e. the order above and nothing else (the kernel never
 //! dereferences a user address, so no hardware fault occurs under a lock). No
@@ -37,13 +41,14 @@
 //! # Lock-order DAG for the task lane (designed before the code that needs it)
 //! The task list ([`kernel::task::Tasklist`]: tasks, pids, process groups,
 //! sessions, credential snapshots, the signal objects of every task) is
-//! today **inside** `PROCESS` and has no lock of its own, so it takes part in
+//! **inside** `PROCESS` and has no lock of its own, so it takes part in
 //! the order above as part of `PROCESS`. The order the design in
 //! `docs/subsystems/process.md#lock-order-and-non-parity-table-for-the-task-lane`
 //! commits to, which every later task/scheduler/VFS change extends, is:
 //!
 //! ```text
-//! TASKLIST -> VFS -> TABLES -> heap -> FRAMES  (TASKLIST = tasklist_lock + siglock + pidmap_lock)
+//! TASKLIST -> VFS -> heap -> FRAMES        (TASKLIST = tasklist_lock + siglock + pidmap_lock)
+//! TABLES -> FRAMES                          (the kernel template tree; a task's own tables are no lock)
 //! TASKLIST -> TIMERQ -> TIMER_HW
 //! any lock -> RQ                           (RQ: scheduler run queue, a leaf, callable from hardirq)
 //! ```
@@ -60,20 +65,20 @@
 //! the parent's `wait_chldexit` key and `signal_wake` wakes the task, both
 //! through `ktask` (`RQ` only).
 //!
-//! One exception, the blocking system calls (`pause`, `rt_sigsuspend`,
-//! `rt_sigtimedwait`, `nanosleep`, later blocking `read`): `Task::wait` calls
-//! `ktask::sleep_current`, which `schedule()`s with `PROCESS` and `TABLES`
-//! held. The task's guards live on its own kernel stack and the next task is
-//! the idle loop (`sti; hlt`) or a kernel thread, so interrupts are enabled
-//! while two `IrqMutex` guards are alive. That is sound only because **no other
-//! task and no interrupt or exception handler that can run in ring 0 takes
-//! `PROCESS`, `TABLES`, the heap or `FRAMES`**: the timer, spurious and error
-//! vectors touch only atomics, the clockevent (`TIMER_HW`) and the scheduler
-//! queues, and `exit_to_user` is reached only from CPL3 entries, where no kernel
-//! lock is held. A handler that needs process state (an IRQ that wakes a
-//! reader, a VFS completion) must queue the work and let the waking task take
-//! the lock. The task-model lane removes this exception: no guard may be alive
-//! across `schedule()` once a second user task exists.
+//! **No guard is alive across `schedule()`.** A system call takes `PROCESS`
+//! lazily (`userspace::Shared`) and `Task::wait` drops it before the task
+//! leaves the CPU (`sleep_current`), so another task can run system calls while
+//! this one sleeps; the next access takes it again and re-reads everything, as
+//! Linux's `wait_event` does. The borrow checker enforces it: every view of the
+//! shared state borrows the `Syscall` mutably and `wait` takes `&mut self`. What
+//! only the running task touches (`TaskLocal`) is not under any lock, and its
+//! per-slot busy flag turns a second simultaneous access into a loud stop. No
+//! interrupt or exception handler that can run in ring 0 takes `PROCESS`, the
+//! heap or [`FRAMES`]: the timer, spurious and error vectors touch only atomics,
+//! the clockevent (`TIMER_HW`) and the scheduler queues, and `exit_to_user` is
+//! reached only from CPL3 entries, where no kernel lock is held. A handler that
+//! needs process state (an IRQ that wakes a reader, a VFS completion) must queue
+//! the work and let the waking task take the lock.
 //!
 //! The bare-metal suite (`baremetal-suite` only) adds `baremetal::ARCHIVES`
 //! in front of the chain: it is held across `userspace::load_group`, so the
@@ -207,10 +212,10 @@ impl<T: Send> Service<T> {
         ServiceGuard(guard)
     }
 
-    /// Remove the installed value so the service can be installed again. Only
-    /// the bare-metal suite uses it (one fresh process per test group); the
-    /// caller drops the value after the lock is released.
-    #[cfg(feature = "baremetal-suite")]
+    /// Remove the installed value so the service can be installed again: the
+    /// bare-metal suite (one fresh process per test group) and `userspace::start`
+    /// (the published page tables become init's own). The caller drops the
+    /// value after the lock is released.
     pub fn take(&self) -> Option<T> {
         self.0.lock().take()
     }

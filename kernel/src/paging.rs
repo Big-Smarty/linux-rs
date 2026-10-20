@@ -36,8 +36,15 @@
 //!   ([`Tables::init_zero_page`]), mapped read-only by any number of PTEs and
 //!   never reclaimed: `mm_unmap` recognises it by address.
 //! * Intermediate user tables are never freed before address-space teardown.
-//!   shortcut: no teardown exists (one process, init's death ends the boot);
-//!   upgrade with `exit`/`execve` (Linux `free_pgtables`).
+//!   Teardown is [`Tables::destroy_user`] (`exit_mmap` + `free_pgtables` +
+//!   `pgd_free`): the whole user half of a tree that is not the active one.
+//!   `execve` keeps its tree (it unmaps the old image and builds the new one
+//!   in place); the tables it leaves behind are reused.
+//! * Every task has its own tree (`pgd_alloc`: [`Tables::fork_template`] or
+//!   [`Tables::fork_user`]), whose upper half is a copy of the PML4 entries of
+//!   the tree it came from. The kernel half is immutable after
+//!   publication (above), so the shared lower-level tables never change under
+//!   any of the copies.
 //! * shortcut: SMP needs a TLB shootdown (IPI `invlpg` to every CPU that ran the
 //!   address space, acknowledged before the frame is freed) in place of the
 //!   local `invlpg`; the unfreed-frame ordering stays as above.
@@ -60,6 +67,8 @@ use x86_64::{VirtAddr, instructions::tlb};
 const PRESENT: u64 = 1;
 const WRITE: u64 = 2;
 const USER: u64 = 4;
+const ACCESSED: u64 = 1 << 5;
+const DIRTY: u64 = 1 << 6;
 const PWT: u64 = 1 << 3;
 const PCD: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
@@ -647,6 +656,145 @@ impl Tables {
         Ok(())
     }
 
+    /// The physical address of this tree's PML4 (what CR3 holds when it is
+    /// the active one).
+    #[must_use]
+    pub fn root_address(&self) -> u64 {
+        self.root.0
+    }
+
+    /// `pgd_alloc`: a new tree with an empty user half whose kernel half is
+    /// this tree's (the PML4 entries above `TASK_SIZE_MAX` are copied; the
+    /// lower-level tables are shared, which the immutability of the kernel
+    /// half permits). It shares the zero page. The caller owns the result and
+    /// returns it with [`Tables::destroy_user`].
+    ///
+    /// # Errors
+    /// Frame exhaustion; nothing was kept.
+    pub fn fork_template(&self, allocator: &mut Allocator<'_>) -> Result<Self, Error> {
+        let root = allocator.allocate()?.into_reserved();
+        let child = Self {
+            root,
+            direct_map: self.direct_map,
+            pages: 1,
+            zero: self.zero,
+        };
+        for top in 256..512 {
+            let entry = self.read(self.root, top)?;
+            if entry != 0 {
+                // SAFETY: `root` is a fresh, zeroed, order-zero reservation
+                // that no CPU has loaded and nothing else references; `top` is
+                // below 512 and the direct map covers it. The entry is copied
+                // from a kernel-half slot, which is immutable after
+                // publication, and shares the lower tables it points to.
+                unsafe { child.pointer(root, top)?.write_volatile(entry) };
+            }
+        }
+        Ok(child)
+    }
+
+    /// `dup_mmap` -> `copy_page_range` (eager): a new tree ([`Tables::fork_template`])
+    /// with a private copy of every mapped user page of this one, same
+    /// protection. The shared zero page stays shared, a `PROT_NONE` page stays
+    /// `PROT_NONE` (its frame is copied), absent pages stay absent; accessed
+    /// and dirty bits are not carried. On failure everything made is freed and
+    /// this tree is unchanged.
+    ///
+    /// shortcut: copy-on-write is the upgrade (per-frame counts and a
+    /// write-protecting walk of this tree, plan S2); the eager copy is
+    /// observably the same and costs a frame per page.
+    ///
+    /// The caller holds the `FRAMES` guard `allocator` came from and has
+    /// reserved all heap storage it needs (this allocates none).
+    ///
+    /// # Errors
+    /// Frame exhaustion (`Error::Memory`).
+    pub fn fork_user(&self, allocator: &mut Allocator<'_>) -> Result<Self, Error> {
+        let mut child = self.fork_template(allocator)?;
+        let mut failure: Option<Error> = None;
+        let (zero, direct_map) = (self.zero, self.direct_map);
+        self.for_each_user_slot(0, TASK_SIZE_MAX / PAGE, |address, slot| {
+            if failure.is_some() {
+                return;
+            }
+            // SAFETY: `slot` is a PTE of this tree (see `for_each_user_slot`);
+            // a volatile read creates no reference and sees hardware A/D bits.
+            let entry = unsafe { ptr::read_volatile(slot) };
+            if entry & MAPPED == 0 || entry & USER == 0 {
+                return;
+            }
+            let frame = Physical(frame_bits(entry));
+            let flags = entry & !ADDRESS & !(ACCESSED | DIRTY);
+            let outcome = if Some(frame) == zero {
+                child.map(allocator, Virtual(address), frame, flags, false)
+            } else {
+                allocator
+                    .allocate()
+                    .map_err(Error::from)
+                    .and_then(|mut copy| {
+                        let bytes = copy.bytes();
+                        let source = usize::try_from(direct_map + frame.0)
+                            .map_err(|_| Error::Overflow)
+                            .map(ptr::with_exposed_provenance::<u8>)?;
+                        // SAFETY: `frame` is the order-zero private frame
+                        // owned by this live user leaf (`mm_map_anon`,
+                        // `mm_install_page`, `map_user`: never the zero page,
+                        // excluded above), mapped in the direct map, 4 KiB
+                        // long and initialised; `&self` (the `TABLES` lock or
+                        // the task's own tree) excludes a writer, user code
+                        // does not run, and `bytes` is a different frame.
+                        let source = unsafe { core::slice::from_raw_parts(source, PAGE_BYTES) };
+                        bytes.copy_from_slice(source);
+                        let copy = copy.into_reserved();
+                        let mapped = child.map(allocator, Virtual(address), copy, flags, false);
+                        if mapped.is_err() {
+                            // SAFETY: `copy` is the order-zero reservation
+                            // made above, mapped nowhere (`map` failed
+                            // without writing the leaf).
+                            unsafe { allocator.reclaim_reserved(copy)? };
+                        }
+                        mapped
+                    })
+            };
+            if let Err(error) = outcome {
+                failure = Some(error);
+            }
+        });
+        match failure {
+            None => Ok(child),
+            Some(error) => {
+                child.destroy_user(allocator);
+                Err(error)
+            }
+        }
+    }
+
+    /// `exit_mmap` + `free_pgtables` + `pgd_free`: free every user page and
+    /// table of this tree and its root. The kernel half belongs to the tree it
+    /// was copied from and stays. Afterwards the tree no longer exists.
+    ///
+    /// # Panics
+    /// If the tree is the active one (CR3 must have moved to another tree
+    /// first: freeing live translation structures), or the allocator refuses a
+    /// table it owns (a broken ownership invariant, never silently leaked).
+    pub fn destroy_user(mut self, allocator: &mut Allocator<'_>) {
+        assert!(!self.is_active(), "destroying the active page tables");
+        self.mm_unmap(allocator, 0, TASK_SIZE_MAX / PAGE);
+        for top in 0..256 {
+            let entry = self.read(self.root, top).unwrap_or(0);
+            if entry & PRESENT != 0 {
+                let result = self.reclaim_unpublished(allocator, Physical(entry & ADDRESS), 1);
+                assert!(result.is_ok(), "destroy_user: table refused: {result:?}");
+            }
+        }
+        // SAFETY: the root is this tree's order-zero reservation
+        // (`fork_template`/`build`), no CPU has it loaded (asserted above),
+        // every table below it was just returned and no `UserSpace` view can
+        // exist (we consumed the only owner).
+        let result = unsafe { allocator.reclaim_reserved(self.root) };
+        assert!(result.is_ok(), "destroy_user: root refused: {result:?}");
+    }
+
     /// # Safety
     /// BSP IRQ-disabled; all currently used image/stack/descriptor/loader and
     /// framebuffer addresses must be covered by `build()`'s exact mappings. No
@@ -1083,6 +1231,18 @@ impl kernel::exec::load::Pager for UserSpace<'_> {
 /// lives, nothing can unmap, free or protect a page.
 pub struct UserSpace<'a> {
     tables: &'a mut Tables,
+}
+
+impl UserSpace<'_> {
+    /// The page-table half of a fork ([`Tables::fork_user`]) with the frame
+    /// allocator locked for the copy. The caller reserved its heap storage
+    /// first (`services`: no heap allocation under `FRAMES`).
+    ///
+    /// # Errors
+    /// Frame exhaustion.
+    pub fn fork_tables(&mut self) -> Result<Tables, Error> {
+        self.parts(|tables, frames| tables.fork_user(frames))
+    }
 }
 
 impl UserSpace<'_> {

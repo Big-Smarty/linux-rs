@@ -23,7 +23,7 @@
 pub const ORACLE_EXPECTED: &[u8] = include_bytes!("../../xtask/oracle/expected.tsv");
 
 /// Oracle groups the kernel can run today, in run order.
-pub const GROUPS: [&str; 5] = ["ids", "time", "mm", "fs", "signal"];
+pub const GROUPS: [&str; 6] = ["ids", "time", "mm", "fs", "signal", "fork"];
 
 /// Oracle groups that exist in `user/init` but are not run, with the reason
 /// that appears on the summary screen. `proc` leaves this list when procfs

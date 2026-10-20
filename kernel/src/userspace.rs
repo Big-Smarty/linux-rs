@@ -1,12 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Selected semantics from Linux 6.18.57, commit
+// 2ff600d29ee478d0a8d46ef8a58afb5e038fe692 (all GPL-2.0): kernel/fork.c
+// (`copy_process` 1934-2480, `kernel_clone` 2570, `dup_mm`/`dup_mmap`,
+// `copy_files`, `copy_fs`, `copy_sighand`, `copy_signal`), fs/file.c (`dup_fd`,
+// `close_files`), fs/fs_struct.c (`copy_fs_struct`, `exit_fs`), kernel/exit.c
+// (`do_exit`, `exit_mm`, `exit_notify`, `release_task`), kernel/sched/core.c
+// (`wake_up_new_task`, `do_task_dead`, `sched_cancel_fork`), arch/x86/mm/fault.c
+// (`show_signal_msg`), arch/x86/kernel/traps.c (`show_signal`), kernel/signal.c
+// (`unhandled_signal`).
+// Transformation: a task's state is split into what every task shares (the task
+// list and the VFS, under one lock taken on demand and dropped before a sleep)
+// and what only it touches (`TaskLocal`); `copy_process`' unwinding is the
+// sequence of undo steps in `Syscall::fork`; the address space is copied
+// eagerly (no copy-on-write); the kernel stack is a pool slot.
 //! Freestanding half of the first-userspace exec path (decision A18): it owns
 //! the frames and the page tables, feeds them from the pure plan in `exec`,
 //! then runs init: ring-3 entry, the syscall and exception handlers called by
 //! `cpu.rs`, and init's death.
 //!
-//! State used after ring 3 starts lives in statics (`PROCESS` here, `BOOT`,
-//! `FRAMES` and `TABLES` in `services`), never in `kernel_main`'s frame, whose
-//! stack is reused as init's kernel stack.
+//! State used after ring 3 starts lives in statics (`PROCESS`, `LOCALS` here,
+//! `BOOT`, `FRAMES` and `TABLES` in `services`), never in `kernel_main`'s
+//! frame, whose boot stack becomes the idle task's. What every task shares
+//! (the task list, the VFS) is under the `PROCESS` lock, taken on demand and
+//! never held while a task sleeps; what only the running task touches (its page
+//! tables, memory model, descriptor table, attributes) is its [`TaskLocal`].
 //!
 //! Context: BSP, interrupts off, before the owned CR3 is published. The module
 //! payloads are only readable while the loader mapping epoch is active, so the
@@ -34,16 +51,18 @@ use crate::{
     console, cpu, ktask,
     memory::{Error as MemoryError, PAGE, PAGE_BYTES, Physical},
     paging::{self, Tables, UserSpace},
-    services::{self, Service},
+    services::{self, Service, ServiceGuard},
     timer,
 };
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
+    cell::UnsafeCell,
     iter,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use kernel::{
-    cputime::{CpuAccount, CpuSample},
+    cputime::CpuSample,
     exec::{
         args::{ArgsError, InitArgv, Word},
         load::{Pager, exec_file, insert_stack, map_segments},
@@ -73,6 +92,8 @@ use kernel::{
     task::{
         self, Attributes, TaskId, Tasklist,
         exit::{ExitPrep, Waker, chldexit_key},
+        fork::ForkRequest,
+        tasklist::ForkParams,
     },
     usercopy::{self, UserPages},
     vfs::{
@@ -167,13 +188,18 @@ impl From<ArgsError> for Error {
 }
 
 /// Everything later stages need once `/init` is mapped. Plain data; the mapped
-/// pages live in the tables, which belong in `services::TABLES` before ring 3.
+/// pages live in the tables: the published ones (`services::TABLES`, taken by
+/// `start`) at boot, or `tables` when the loader built a tree of its own.
 pub struct Loaded {
     /// The unpacked rootfs; moves into [`Process`] when init starts.
     pub vfs: Vfs,
+    /// The page tables the loader mapped `/init` into, when it made its own
+    /// (the bare-metal suite: one fresh tree per group); `None` at boot, where
+    /// the published tree is init's.
+    pub tables: Option<Tables>,
     /// The open file `/init` was read from (`bprm->file`); the VMAs of its
     /// segments pin it when init starts; the reference itself then stays as
-    /// the process's `mm->exe_file` ([`Process::exec`]).
+    /// the task's `mm->exe_file` ([`Owned::exe_file`]).
     pub exec: FileId,
     pub entry: u64,
     pub sp: u64,
@@ -469,6 +495,7 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
 
     Ok(Loaded {
         vfs,
+        tables: None,
         exec,
         entry: plan.entry,
         sp: built.sp,
@@ -482,91 +509,56 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
 /// The task model's [`Waker`] on the scheduler's wait queues: `child_event` is
 /// `__wake_up_parent` (`__wake_up_sync_key` on the parent's `wait_chldexit`,
 /// `TASK_INTERRUPTIBLE`, one exclusive waiter), `signal_wake` is
-/// `signal_wake_up` on the task's scheduling handle. Both take `RQ`, a leaf
-/// that any lock may precede (`services`).
-/// shortcut: a table of one entry, because init is the only task (no `fork`
-/// yet); upgrade by storing the [`SchedId`] in the task model's per-task
-/// record when `copy_process` can create tasks.
-#[derive(Default)]
-struct SchedWaker {
-    init: Option<(TaskId, SchedId)>,
-}
+/// `signal_wake_up` on the task's scheduling handle (which the task list keeps,
+/// `Tasklist::set_sched`). Both take `RQ`, a leaf that any lock may precede
+/// (`services`).
+struct SchedWaker;
 
 impl Waker for SchedWaker {
     fn child_event(&mut self, parent: TaskId) {
         ktask::wake_up_key(chldexit_key(parent), WakeMode::Interruptible, 1);
     }
-    fn signal_wake(&mut self, task: TaskId) {
-        if let Some((_, sched)) = self.init.filter(|&(id, _)| id == task) {
+    fn signal_wake(&mut self, _task: TaskId, sched: Option<SchedId>) {
+        if let Some(sched) = sched {
             ktask::signal_wake_up(sched);
         }
     }
 }
 
-/// The one process: what the syscall and fault paths need once init runs
-/// (frames, boot info and the heap are in `services`/`kalloc`). Later syscall
-/// groups extend it (file table, credentials, signals, ...); exactly one is
-/// reachable until tasks exist.
+/// What every task shares: the task list (parentage, pids, groups, sessions,
+/// credential snapshots and the signal objects of all tasks) and the VFS (the
+/// mounted rootfs, open file descriptions, pipes, mapping pins). One lock,
+/// `PROCESS`, stands for `TASKLIST` and `VFS` of the lock-order DAG
+/// (`services`): `PROCESS` -> heap -> `FRAMES`, and `PROCESS` -> `TIMER_HW`
+/// (a leaf, the interval-timer programming of `exit_to_user`).
 ///
-/// Lock order: `PROCESS` -> `TABLES` -> heap -> `FRAMES` (`services`), and
-/// `PROCESS` -> `TIMER_HW` (a leaf, taken by `sleep_until`'s timer wait). The
-/// handler holds `PROCESS` for the whole syscall (a single task cannot
-/// re-enter), so a field needs no lock of its own.
+/// **No guard of it is alive across `schedule()`**: a [`Syscall`] takes it
+/// lazily ([`Shared`]) and its [`Context::wait`](signal::Task::wait) drops it
+/// before the task leaves the CPU, so another task can run a system call
+/// meanwhile. State only the running task touches is in [`TaskLocal`].
 pub struct Process {
-    /// The task list (parentage, pids, groups, sessions, credential
-    /// snapshots) and the signal objects of its tasks. Inside `PROCESS` until
-    /// the `TASKLIST` lock class exists (`services`).
+    /// The task list (see above).
     pub tasks: Tasklist,
-    /// `current`: init, the only task.
-    pub current: TaskId,
     /// Wake-ups of other tasks' sleepers, through the scheduler.
     wake: SchedWaker,
-    /// `mm->exe_file`: the open description the image was loaded from (its
-    /// `FileInfo::id` is `exec`).
-    exe_file: FileId,
-    /// The address space (`mm`): the published page tables.
-    pub mm: &'static Service<Tables>,
-    /// Credentials, rlimits, filesystem context, comm, personality and the
-    /// user pointers libc registers (`task::Attributes`, the identity group).
-    pub attrs: Attributes,
-    /// Load-average state at init start; `sysinfo` replays it to the boot
-    /// clock ([`LoadAvg::loads_at`]), so there is no tick hook and no lock.
-    pub load: LoadAvg,
-    /// `current->restart_block.nanosleep`, written by the sleeping syscalls and
-    /// run by `restart_syscall`.
-    pub restart: RestartBlock,
-    /// The VMA set, program break and statistics (`mm_struct`); the page
-    /// tables are behind `mm`. It reserves its `Vec` storage (heap) before any
-    /// `FRAMES` guard is taken (`services`).
-    pub space: Mm,
-    /// The rlimits and sysctls the mapping rules read (`Env`).
-    /// shortcut: fixed `INIT_RLIMITS`; `setrlimit`/`prlimit64` must update it
-    /// (or derive it from the credentials group's limits) when they land.
-    pub env: Env,
-    /// `FileInfo::id` of the open description `/init` was loaded from
-    /// (`mm->exe_file`): the only file whose name the fault report knows.
-    pub exec: u64,
     /// The mounted rootfs, open files and pipes.
-    /// shortcut: one process, so the system-wide VFS lives here; with tasks it
-    /// becomes its own service (lock class `vfs` between `PROCESS` and `TABLES`).
     pub vfs: Vfs,
-    /// `current->files`.
-    pub fdt: FdTable,
     /// `printk_ratelimit_state`: the limiter of the `show_unhandled_signals`
-    /// lines (global in Linux; one process here).
+    /// lines (global in Linux).
     printk_ratelimit: RateLimit,
 }
 
 static PROCESS: Service<Process> = Service::new();
 
-/// `nr_running + nr_uninterruptible` of the one CPU: init is always runnable
-/// (running or preempted by the tick) because no syscall blocks yet and the
-/// kernel never halts while init exists.
-/// shortcut: a constant, though `nanosleep`/`clock_nanosleep` now sleep (Linux
-/// counts a sleeping task in neither `nr_running` nor `nr_uninterruptible`, so
-/// `sysinfo` loads over-count while init sleeps); replace with the runqueue's
-/// counters when a second task or a blocking syscall (futex, wait4, I/O) exists.
-const NR_ACTIVE: i64 = 1;
+/// Load-average state at init start; `sysinfo` replays it to the boot clock
+/// ([`LoadAvg::loads_at`]), so there is no tick hook. A leaf lock of its own:
+/// [`Context::machine`] takes `&self`.
+static LOAD: Service<LoadAvg> = Service::new();
+
+/// The root of the kernel-only page tables ([`services::TABLES`] holds that
+/// tree for the life of the system): what CR3 holds while no task's address
+/// space may be loaded (`exit_mm`, a group teardown). 0 before `start`.
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 
 /// The boot clock in jiffies, the unit of the load-average windows. The
 /// periodic tick is masked before init starts, so `timer::ticks()` does not
@@ -592,16 +584,11 @@ fn cpuid_fault_absent() -> bool {
     amd && !gp_on_user_cpuid
 }
 
-/// CPU-time accounting of the (only) task. Lives outside `PROCESS` because the
-/// tick interrupt writes it while a syscall holds the `PROCESS` lock; it is all
-/// atomics (`cputime`). shortcut: one task; moves into the task struct with the
-/// scheduler.
-static CPUTIME: CpuAccount = CpuAccount::new();
-
-/// The tick found init running (`user`: in ring 3, else in the kernel on its
-/// behalf) for `periods` ticks; called from the timer interrupt.
+/// The tick found the running task in user mode (`user`) or in the kernel on
+/// its behalf, `periods` ticks long; called from the timer interrupt. The
+/// per-task accounts are in `ktask` (`CPU_TIME`), all atomics.
 pub fn account_ticks(user: bool, periods: u64) {
-    CPUTIME.tick(user, periods);
+    ktask::charge_tick(user, periods);
 }
 
 /// Ring-3 page faults the address-space model resolved (`page_fault`); the
@@ -610,12 +597,182 @@ pub fn account_ticks(user: bool, periods: u64) {
 #[cfg(all(feature = "qemu-self-test", not(feature = "baremetal-suite")))]
 static USER_FAULTS_HANDLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Syscall context: the process plus its user-memory view (a borrow of the
-/// locked tables, so no map/unmap can run mid-syscall), the entry registers
+/// What only the running task touches (`task_struct` fields that no other task
+/// reads, `mm`, `files`, `fs`): reached through [`current_local`] and never
+/// under a lock. Another task needing something of it would put it in
+/// [`Process`] (the credential snapshot, the signal objects and the process
+/// tree already are).
+pub struct TaskLocal {
+    /// `mm->pgd`: the task's page tables, whose root is its CR3.
+    tables: Tables,
+    own: Owned,
+}
+
+/// The part of [`TaskLocal`] that is not the page tables (kept apart so a
+/// system call can hold the user-memory view of the tables next to it).
+struct Owned {
+    /// `current`'s place in the task list, and its scheduling handle.
+    me: TaskId,
+    sched: SchedId,
+    /// `task_tgid_vnr` / `task_pid_vnr` (a one-thread group: equal).
+    tgid: u32,
+    tid: u32,
+    /// Credentials, rlimits, filesystem context, comm, personality and the
+    /// user pointers libc registers (`task::Attributes`, the identity group).
+    attrs: Attributes,
+    /// `current->restart_block.nanosleep`, written by the sleeping syscalls and
+    /// run by `restart_syscall`.
+    restart: RestartBlock,
+    /// The VMA set, program break and statistics (`mm_struct`); the page
+    /// tables are `TaskLocal::tables`. It reserves its `Vec` storage (heap)
+    /// before any `FRAMES` guard is taken (`services`).
+    space: Mm,
+    /// The rlimits and sysctls the mapping rules read (`Env`).
+    /// shortcut: fixed `INIT_RLIMITS`; `setrlimit`/`prlimit64` must update it
+    /// (or derive it from the credentials group's limits) when they land.
+    env: Env,
+    /// `mm->exe_file`: the open description the image was loaded from (its
+    /// `FileInfo::id` is `exec`).
+    exe_file: FileId,
+    /// `FileInfo::id` of that description: the only file whose name the fault
+    /// report knows.
+    exec: u64,
+    /// `current->files`.
+    fdt: FdTable,
+}
+
+impl Owned {
+    /// The key of this task's mapping pins in the VFS (`Vfs::pin`): the
+    /// scheduling slot, unique while the task lives.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a slot index is below the pool size"
+    )]
+    fn owner(&self) -> u32 {
+        self.sched.index() as u32
+    }
+}
+
+/// The [`TaskLocal`] of every scheduler slot that has a user task.
+struct Locals([LocalSlot; ktask::SLOTS]);
+
+struct LocalSlot {
+    cell: UnsafeCell<Option<Box<TaskLocal>>>,
+    /// A [`LocalGuard`] exists.
+    busy: AtomicBool,
+}
+
+// SAFETY: a cell is touched only (a) through the one `LocalGuard` that holds
+// `busy` (taken by `current_local`, so by the task running in that slot), (b)
+// by `install_local`/`take_local`, which assert `busy` is clear, and only the
+// creator of a task that is not runnable yet (before `wake_up_new_task`) or the
+// task itself (when it exits) or the group teardown with no task running call
+// them. The single CPU and IF=0 order everything else; a `TaskLocal` is not
+// shared between tasks, so `Send` is what moving it between stacks needs.
+unsafe impl Sync for Locals {}
+
+static LOCALS: Locals = Locals(
+    [const {
+        LocalSlot {
+            cell: UnsafeCell::new(None),
+            busy: AtomicBool::new(false),
+        }
+    }; ktask::SLOTS],
+);
+
+/// Exclusive access to the running task's [`TaskLocal`] for as long as it
+/// lives. A second one for the same task is a kernel bug and stops loudly.
+struct LocalGuard {
+    slot: usize,
+    local: &'static mut TaskLocal,
+}
+
+impl core::ops::Deref for LocalGuard {
+    type Target = TaskLocal;
+    fn deref(&self) -> &TaskLocal {
+        self.local
+    }
+}
+impl core::ops::DerefMut for LocalGuard {
+    fn deref_mut(&mut self) -> &mut TaskLocal {
+        self.local
+    }
+}
+impl Drop for LocalGuard {
+    fn drop(&mut self) {
+        LOCALS.0[self.slot].busy.store(false, Ordering::Release);
+    }
+}
+
+/// The running user task's [`TaskLocal`].
+///
+/// Context: task, from a kernel entry of a user task (system call, exception,
+/// interrupt from ring 3) or its exit path; every entry point takes it once
+/// and passes it down.
+fn current_local() -> LocalGuard {
+    let slot = ktask::current().index();
+    let entry = &LOCALS.0[slot];
+    if entry.busy.swap(true, Ordering::Acquire) {
+        crate::log!("FAIL task state entered twice slot={}\n", slot);
+        crate::fail();
+    }
+    // SAFETY: `busy` was clear and is now ours, so no other reference to this
+    // cell exists (see `Locals`); the box is never moved or freed while the
+    // guard lives (`take_local` asserts `busy` is clear). The `'static`
+    // lifetime is bounded by the guard's, which clears `busy` on drop.
+    let local = unsafe { (*entry.cell.get()).as_deref_mut() };
+    let Some(local) = local else {
+        entry.busy.store(false, Ordering::Release);
+        crate::log!("FAIL no task state for the running task slot={}\n", slot);
+        crate::fail();
+    };
+    LocalGuard { slot, local }
+}
+
+/// Publish the state of a task that cannot run yet (a forked child before
+/// `wake_up_new_task`, init before its first switch).
+fn install_local(slot: usize, local: Box<TaskLocal>) {
+    let entry = &LOCALS.0[slot];
+    assert!(!entry.busy.load(Ordering::Acquire), "task state in use");
+    // SAFETY: not busy (asserted) and the caller is the only flow that can
+    // name the slot (see `Locals`).
+    let old = unsafe { (*entry.cell.get()).replace(local) };
+    assert!(old.is_none(), "task state installed twice");
+}
+
+/// Take the state of the task that is exiting (or of any task at a group
+/// teardown), leaving the slot empty.
+fn take_local(slot: usize) -> Option<Box<TaskLocal>> {
+    let entry = &LOCALS.0[slot];
+    assert!(!entry.busy.load(Ordering::Acquire), "task state in use");
+    // SAFETY: as `install_local`.
+    unsafe { (*entry.cell.get()).take() }
+}
+
+/// The system-wide state a system call touches, taken on first use and
+/// dropped before the task sleeps (see [`Process`]). Taking it again after a
+/// sleep re-reads everything, as Linux's `wait_event` does.
+#[derive(Default)]
+struct Shared {
+    guard: Option<ServiceGuard<'static, Process>>,
+}
+
+impl Shared {
+    fn get(&mut self) -> &mut Process {
+        self.guard.get_or_insert_with(|| PROCESS.lock())
+    }
+    fn release(&mut self) {
+        self.guard = None;
+    }
+}
+
+/// Syscall context: the task's own state (`own`, and the user-memory view of
+/// its page tables), the shared state taken on demand, the entry registers
 /// and the console.
 struct Syscall<'a> {
-    process: &'a mut Process,
+    own: &'a mut Owned,
     space: UserSpace<'a>,
+    shared: Shared,
     regs: &'a mut cpu::PtRegs,
     tty: Tty,
 }
@@ -623,11 +780,13 @@ struct Syscall<'a> {
 /// `handle_mm_fault` for one user address: the model's decision, and for a
 /// page of a private file mapping (`NeedsFile`) `shmem_fault` + `do_cow_fault`:
 /// a private frame holding the file page ([`Vfs::fault_page`]; `SIGBUS` past
-/// `i_size`), mapped with the VMA's protection.
+/// `i_size`), mapped with the VMA's protection. `owner` is the faulting
+/// task's mapping-pin key.
 fn user_fault(
     mm: &mut Mm,
     env: &Env,
     vfs: &mut Vfs,
+    owner: u32,
     space: &mut UserSpace<'_>,
     address: u64,
     error: u64,
@@ -654,7 +813,7 @@ fn user_fault(
     };
     let mut bytes = [0u8; PAGE_BYTES];
     let pgoff = vma.pgoff + ((page - vma.start) >> 12);
-    match vfs.fault_page(file, pgoff, &mut bytes) {
+    match vfs.fault_page(owner, file, pgoff, &mut bytes) {
         Err(FileFault::Bus) => FaultOutcome::Bus { address },
         Ok(()) => match space.install(page, mm::page_prot(vma.flags), &bytes) {
             Ok(()) => FaultOutcome::Handled,
@@ -670,28 +829,25 @@ fn user_fault(
 /// succeed); any refusal is the exception-table fixup, i.e. a short copy and
 /// `-EFAULT`, with no signal (`__bad_area_nosemaphore` only signals in user
 /// mode; OOM, SIGBUS and the vsyscall page behave the same for a kernel-mode
-/// access). No lock is held across the fault that is not already held by the
-/// syscall (`PROCESS`, `TABLES`): the handler takes neither again and only
-/// `FRAMES` (a leaf) below them.
+/// access). No lock is taken here that the syscall does not already hold
+/// (`PROCESS`, taken by [`Shared::get`] for the VFS): only `FRAMES` (a leaf)
+/// below it.
 ///
-/// It borrows the fields of [`Process`] the fault needs, so the signal code
-/// (frame writes, `rt_sigreturn`, the signal syscalls) can hold it next to
-/// `&mut process.tasks`; [`Syscall`]'s own [`UserPages`] is the same view.
+/// It borrows the fields of the task's state the fault needs, so the signal
+/// code (frame writes, `rt_sigreturn`, the signal syscalls) can hold it next to
+/// the task list; [`Syscall`]'s own [`UserPages`] is the same view.
 struct FaultPages<'a, 'b> {
     mm: &'a mut Mm,
     env: &'a Env,
     vfs: &'a mut Vfs,
+    owner: u32,
     space: &'a mut UserSpace<'b>,
 }
 
-/// The `State` view of the current task's signal objects (`current` is in the
-/// task list for as long as it runs).
-fn signal_state(process: &mut Process) -> State<'_> {
-    current_signals(&mut process.tasks, process.current)
-}
-
-fn current_signals(tasks: &mut Tasklist, current: TaskId) -> State<'_> {
-    if let Some(state) = tasks.signal_state(current) {
+/// The `State` view of a task's signal objects (`me` is in the task list for as
+/// long as it runs).
+fn current_signals(tasks: &mut Tasklist, me: TaskId) -> State<'_> {
+    if let Some(state) = tasks.signal_state(me) {
         state
     } else {
         crate::log!("FAIL current task is not in the task list\n");
@@ -700,13 +856,19 @@ fn current_signals(tasks: &mut Tasklist, current: TaskId) -> State<'_> {
 }
 
 impl<'a, 'b> FaultPages<'a, 'b> {
-    fn of(process: &'a mut Process, space: &'a mut UserSpace<'b>) -> (State<'a>, Self) {
+    fn of(
+        process: &'a mut Process,
+        own: &'a mut Owned,
+        space: &'a mut UserSpace<'b>,
+    ) -> (State<'a>, Self) {
+        let owner = own.owner();
         (
-            current_signals(&mut process.tasks, process.current),
+            current_signals(&mut process.tasks, own.me),
             Self {
-                mm: &mut process.space,
-                env: &process.env,
+                mm: &mut own.space,
+                env: &own.env,
                 vfs: &mut process.vfs,
+                owner,
                 space,
             },
         )
@@ -718,7 +880,9 @@ impl<'a, 'b> FaultPages<'a, 'b> {
             // Present-but-read-only (write) is `X86_PF_PROT`, an absent page is
             // not; the model's decision does not depend on it for a write.
             let error = if write { PF_WRITE } else { 0 };
-            match user_fault(self.mm, self.env, self.vfs, self.space, page, error) {
+            match user_fault(
+                self.mm, self.env, self.vfs, self.owner, self.space, page, error,
+            ) {
                 FaultOutcome::Handled => {}
                 _ => return None,
             }
@@ -733,6 +897,7 @@ impl UserPages for FaultPages<'_, '_> {
             mm: &mut *self.mm,
             env: self.env,
             vfs: &mut *self.vfs,
+            owner: self.owner,
             space: &mut *self.space,
         }
         .into_page(page, write)
@@ -741,14 +906,211 @@ impl UserPages for FaultPages<'_, '_> {
 
 impl UserPages for Syscall<'_> {
     fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+        let owner = self.own.owner();
         FaultPages {
-            mm: &mut self.process.space,
-            env: &self.process.env,
-            vfs: &mut self.process.vfs,
+            mm: &mut self.own.space,
+            env: &self.own.env,
+            vfs: &mut self.shared.get().vfs,
+            owner,
             space: &mut self.space,
         }
         .into_page(page, write)
     }
+}
+
+/// Kernel-object leak check of the self-test builds (`-- forkleak`): the number
+/// of live objects a fork/exit/wait round must leave unchanged, sampled at the
+/// quiescent point of a `fork` entry (the previous child is gone, its stack slot
+/// released) after the warm-up rounds, and again when init dies. The free-RAM
+/// comparison of the init program sees only whole frames; this sees a leaked
+/// file reference, inode pin, task slot or heap byte too.
+#[cfg(feature = "qemu-self-test")]
+mod leak {
+    use super::{AtomicU64, Ordering, Process, ktask};
+    use crate::services::IrqMutex;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Snapshot {
+        heap: usize,
+        files: usize,
+        pins: usize,
+        root_refs: u32,
+        slots: usize,
+        threads: u32,
+    }
+
+    /// The fork whose entry state is the baseline: two warm-up rounds precede it.
+    const BASELINE_FORK: u64 = 3;
+    static FORKS: AtomicU64 = AtomicU64::new(0);
+    static BASELINE: IrqMutex<Option<Snapshot>> = IrqMutex::new(None);
+
+    fn sample(process: &Process) -> Snapshot {
+        Snapshot {
+            // The pid table grows with the highest pid number (until the cursor wraps).
+            heap: crate::kalloc::requested_bytes() - process.tasks.pid_table_bytes(),
+            files: process.vfs.files.open_count(),
+            pins: process.vfs.pin_count(),
+            root_refs: process.vfs.fs.inode_refs(process.vfs.fs.root()),
+            slots: ktask::tasks_in_use(),
+            threads: process.tasks.nr_threads(),
+        }
+    }
+
+    /// A fork is starting (`PROCESS` held by the caller).
+    pub(super) fn at_fork(process: &Process) {
+        if FORKS.fetch_add(1, Ordering::Relaxed) + 1 == BASELINE_FORK {
+            *BASELINE.lock() = Some(sample(process));
+        }
+    }
+
+    /// Init is dying: print how the objects moved since the baseline.
+    pub(super) fn report(process: &Process) {
+        let (Some(was), now) = (*BASELINE.lock(), sample(process)) else {
+            return;
+        };
+        crate::log!(
+            "CHECK fork-objects forks={} heap={}/{} files={}/{} pins={}/{} root_refs={}/{} slots={}/{} threads={}/{}\n",
+            FORKS.load(Ordering::Relaxed),
+            was.heap,
+            now.heap,
+            was.files,
+            now.files,
+            was.pins,
+            now.pins,
+            was.root_refs,
+            now.root_refs,
+            was.slots,
+            now.slots,
+            was.threads,
+            now.threads,
+        );
+    }
+}
+
+impl Syscall<'_> {
+    /// `kernel_clone` / `copy_process` / `wake_up_new_task` for a plain
+    /// process copy, in the order of `copy_process` (the argument checks and
+    /// the pending-signal restart are the syscall layer's).
+    ///
+    /// Everything the child needs is built first, each step undone by the
+    /// ones after it on failure; the child becomes visible to the rest of the
+    /// system (the task list) only when nothing else can fail, and runnable
+    /// last. The address space is copied eagerly (shortcut S2 of the process
+    /// lane: copy-on-write is the upgrade).
+    ///
+    /// Context: task, IF=0, on the parent's kernel stack; takes `PROCESS`
+    /// (-> heap, -> `FRAMES` through the page-table copy).
+    fn fork(&mut self, request: &ForkRequest) -> Result<i32, Errno> {
+        let parent = self.own.me;
+        let params = ForkParams::of(&self.own.attrs, request);
+        #[cfg(feature = "qemu-self-test")]
+        leak::at_fork(self.shared.get());
+        // copy_process: the limits first (EAGAIN beats ENOMEM).
+        self.shared.get().tasks.fork_allowed(parent, params)?;
+        // dup_task_struct: the child's state block, so that no later step
+        // loses what it holds to an allocation failure.
+        let block = Box::<TaskLocal>::try_new_uninit().map_err(|_| Errno::ENOMEM)?;
+        // copy_mm: the VMA model, then the pages.
+        let space = self.own.space.dup(&self.own.env)?;
+        let tables = self.space.fork_tables().map_err(|error| {
+            if matches!(error, paging::Error::Memory(_)) {
+                Errno::ENOMEM
+            } else {
+                crate::log!("FAIL fork page tables error={:?}\n", error);
+                crate::fail()
+            }
+        });
+        let tables = match tables {
+            Ok(tables) => tables,
+            Err(errno) => {
+                drop(space);
+                return Err(errno);
+            }
+        };
+        // sched_fork + copy_thread: slot, kernel stack, the child's registers
+        // (`ax` = 0, the requested stack), FP and segment state, its CR3.
+        let mut regs = *self.regs;
+        regs.ax = 0;
+        if request.child_sp != 0 {
+            regs.sp = request.child_sp;
+        }
+        let Ok(sched) = ktask::prepare_fork(regs, tables.root_address()) else {
+            destroy_tables(tables);
+            return Err(Errno::EAGAIN);
+        };
+        let child_owner = u32::try_from(sched.index()).unwrap_or(u32::MAX);
+        // copy_files / copy_fs / the mapping and executable references.
+        let process = self.shared.get();
+        let fdt = match process.vfs.dup_fd(&self.own.fdt) {
+            Ok(fdt) => fdt,
+            Err(errno) => {
+                ktask::cancel_new_task(sched);
+                destroy_tables(tables);
+                return Err(errno);
+            }
+        };
+        if let Err(errno) = process.vfs.pin_clone(self.own.owner(), child_owner) {
+            let mut fdt = fdt;
+            process.vfs.close_files(&mut fdt);
+            ktask::cancel_new_task(sched);
+            destroy_tables(tables);
+            return Err(errno);
+        }
+        let fs = process.vfs.dup_fs(&self.own.attrs.fs);
+        process.vfs.files.dup(self.own.exe_file);
+        // The point of no failure but the task list's: publish the child.
+        let child = match process.tasks.fork(parent, params) {
+            Ok(child) => child,
+            Err(errno) => {
+                let mut fdt = fdt;
+                process.vfs.close_files(&mut fdt);
+                process.vfs.put_fs(&fs);
+                process.vfs.unpin_all(child_owner);
+                process.vfs.fput(self.own.exe_file);
+                ktask::cancel_new_task(sched);
+                destroy_tables(tables);
+                return Err(errno);
+            }
+        };
+        let pid = process.tasks.task_pid_vnr(child);
+        process.tasks.set_sched(child, sched);
+        let mut attrs = self.own.attrs;
+        attrs.fs = fs;
+        // copy_process: `clear_child_tid` per CLONE_CHILD_CLEARTID, no robust list.
+        attrs.clear_child_tid = request.clear_child_tid;
+        attrs.robust_list = 0;
+        let tid = pid.cast_unsigned();
+        let local = Box::write(
+            block,
+            TaskLocal {
+                tables,
+                own: Owned {
+                    me: child,
+                    sched,
+                    tgid: tid,
+                    tid,
+                    attrs,
+                    restart: RestartBlock::NONE,
+                    space,
+                    env: self.own.env,
+                    exe_file: self.own.exe_file,
+                    exec: self.own.exec,
+                    fdt,
+                },
+            },
+        );
+        install_local(sched.index(), local);
+        // wake_up_new_task: the child is on the run queue; it first runs when
+        // the parent next gives up the CPU.
+        ktask::wake_up_new_task(sched);
+        Ok(pid)
+    }
+}
+
+/// Free a page-table tree that no task owns (a failed fork): the frame
+/// allocator is a leaf below everything the caller holds.
+fn destroy_tables(tables: Tables) {
+    tables.destroy_user(&mut services::FRAMES.lock());
 }
 
 impl Context for Syscall<'_> {
@@ -756,28 +1118,22 @@ impl Context for Syscall<'_> {
         &mut self.tty
     }
     fn tgid(&self) -> u32 {
-        self.process
-            .tasks
-            .task_tgid_vnr(self.process.current)
-            .cast_unsigned()
+        self.own.tgid
     }
     fn tid(&self) -> u32 {
-        self.process
-            .tasks
-            .task_pid_vnr(self.process.current)
-            .cast_unsigned()
+        self.own.tid
     }
     fn tasks(&mut self) -> Tasks<'_> {
-        let process = &mut *self.process;
+        let process = self.shared.get();
         Tasks {
             list: &mut process.tasks,
-            current: process.current,
+            current: self.own.me,
             wake: &mut process.wake,
         }
     }
     fn replace_exe_file(&mut self, file: FileId) -> Option<FileId> {
-        self.process.exec = u64::from(file.index());
-        Some(core::mem::replace(&mut self.process.exe_file, file))
+        self.own.exec = u64::from(file.index());
+        Some(core::mem::replace(&mut self.own.exe_file, file))
     }
     fn exec_aux(&mut self) -> ExecAux {
         ExecAux {
@@ -804,7 +1160,7 @@ impl Context for Syscall<'_> {
         };
     }
     fn attrs(&mut self) -> &mut Attributes {
-        &mut self.process.attrs
+        &mut self.own.attrs
     }
     fn fs_base(&self) -> u64 {
         cpu::user_fs_base()
@@ -824,30 +1180,38 @@ impl Context for Syscall<'_> {
     fn machine(&self) -> Machine {
         // `ktime_get_boottime_ns` is the boot clock `do_sysinfo` reads.
         let uptime_ns = crate::timer::ktime_get_boottime_ns();
-        // Lock order: `FRAMES` is the leaf below `PROCESS` -> `TABLES` -> heap.
-        // The load averages take no lock: they are replayed from `Process::load`.
+        // Lock order: `FRAMES` and `LOAD` are leaves. The load averages are
+        // replayed from the start state to the boot clock.
         let frames = services::FRAMES.lock();
+        let loads = LOAD.lock().loads_at(
+            jiffies_of(uptime_ns),
+            i64::try_from(ktask::nr_active()).unwrap_or(i64::MAX),
+        );
         Machine {
             uptime_ns,
             total_pages: frames.total() as u64,
             free_pages: frames.available() as u64,
-            loads: self.process.load.loads_at(jiffies_of(uptime_ns), NR_ACTIVE),
+            loads,
         }
     }
     fn address_space(&mut self) -> AddressSpace<'_> {
         AddressSpace {
-            mm: &mut self.process.space,
-            env: &self.process.env,
+            mm: &mut self.own.space,
+            env: &self.own.env,
             pages: &mut self.space,
         }
     }
     fn files(&mut self) -> Files<'_> {
-        let process = &mut *self.process;
+        let owner = self.own.owner();
         Files {
-            vfs: &mut process.vfs,
-            fdt: &mut process.fdt,
-            fs: &mut process.attrs.fs,
+            vfs: &mut self.shared.get().vfs,
+            fdt: &mut self.own.fdt,
+            fs: &mut self.own.attrs.fs,
+            owner,
         }
+    }
+    fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, Errno> {
+        self.fork(request)
     }
 }
 
@@ -860,16 +1224,16 @@ impl Clocks for Syscall<'_> {
         timer::set_realtime(offset, real_ns);
     }
     fn set_restart_block(&mut self, block: RestartBlock) {
-        self.process.restart = block;
+        self.own.restart = block;
     }
     fn restart_block(&self) -> RestartBlock {
-        self.process.restart
+        self.own.restart
     }
     fn cpu_sample(&self) -> CpuSample {
-        CPUTIME.sample(timer::ktime_get_ns())
+        ktask::cpu_account(self.own.sched).sample(timer::ktime_get_ns())
     }
     fn cpu_adjusted(&mut self) -> (u64, u64) {
-        CPUTIME.adjusted(timer::ktime_get_ns())
+        ktask::cpu_account(self.own.sched).adjusted(timer::ktime_get_ns())
     }
     fn sleep_until(&mut self, deadline_ns: u64) -> Option<u64> {
         // `do_nanosleep`: asleep until the deadline or a pending signal.
@@ -894,18 +1258,15 @@ impl<'a> signal::Task for Syscall<'a> {
     where
         Self: 'b;
     fn state(&mut self) -> State<'_> {
-        signal_state(&mut *self.process)
+        current_signals(&mut self.shared.get().tasks, self.own.me)
     }
     fn parts(&mut self) -> (State<'_>, FaultPages<'_, 'a>) {
-        FaultPages::of(self.process, &mut self.space)
+        FaultPages::of(self.shared.get(), &mut *self.own, &mut self.space)
     }
     fn now_ns(&self) -> u64 {
         timer::ktime_get_ns()
     }
     fn wait(&mut self, key: WaitKey, deadline_ns: Option<u64>) {
-        // The task leaves the CPU for the wait (`schedule()`): the time until it
-        // is chosen again is not the task's.
-        CPUTIME.sleep_begin(timer::ktime_get_ns());
         // The interval timer is a wake-up source of every sleep: it rides on the
         // task's timed wake-up (the queue holds one entry per task), and the
         // woken loop's `sync_timers` turns the expiry into `SIGALRM`.
@@ -913,14 +1274,18 @@ impl<'a> signal::Task for Syscall<'a> {
             .into_iter()
             .flatten()
             .min();
+        // No lock is held while the task is off the CPU: another task runs
+        // system calls meanwhile. The time until it is chosen again is not
+        // the task's (the switch marks it off the CPU).
+        self.shared.release();
         ktask::sleep_current(key, wake_at);
-        CPUTIME.sleep_end(timer::ktime_get_ns());
     }
     fn user_sp(&self) -> u64 {
         self.regs.sp
     }
     fn rt_sigreturn(&mut self) -> Sigreturn {
-        let (mut state, mut pages) = FaultPages::of(self.process, &mut self.space);
+        let (mut state, mut pages) =
+            FaultPages::of(self.shared.get(), &mut *self.own, &mut self.space);
         let result = signal::frame::rt_sigreturn(
             &mut state,
             self.regs,
@@ -930,17 +1295,19 @@ impl<'a> signal::Task for Syscall<'a> {
         // `restore_sigcontext`'s first statement: a pending restarted system
         // call now returns -EINTR; a frame refused before it resets nothing.
         if result.reached_sigcontext {
-            self.process.restart = RestartBlock::NONE;
+            self.own.restart = RestartBlock::NONE;
         }
         if result.bad_frame {
             // `signal_fault`: printed before the SIGSEGV is forced; `regs` are
             // whatever the failed `restore_sigcontext` left, as in Linux.
-            if printk_ratelimit(self.process, "signal_fault") {
+            let process = self.shared.get();
+            if printk_ratelimit(process, self.own, "signal_fault") {
                 let line = BadFrame {
+                    pid: self.own.tid.cast_signed(),
                     ip: self.regs.ip,
                     sp: self.regs.sp,
                     orig_ax: self.regs.orig_ax,
-                    region: region_of(self.process, self.regs.ip),
+                    region: region_of(process, self.own, self.regs.ip),
                 };
                 crate::log!("{}\n", line);
             }
@@ -957,30 +1324,79 @@ impl Console for Tty {
     }
 }
 
+/// The pieces of a task's state; the box itself is freed on return (this
+/// function returns, `do_exit` does not: a box left to its scope would leak).
+fn into_parts(boxed: Box<TaskLocal>) -> (Tables, Owned) {
+    let TaskLocal { tables, own } = *boxed;
+    (tables, own)
+}
+
 /// `do_exit` of the calling task: `exit` (`group` false) or `do_group_exit`
 /// (`exit_group`, a fatal signal). The last thread of global init panics
-/// (`init_died`). No other task exists yet to take the rest of the path
-/// (`exit_mm`, `exit_files`, `exit_notify`, `do_task_dead`), so a task that
-/// is not init stops the kernel loudly.
+/// (`init_died`); any other task releases its address space, descriptors and
+/// working directory, tells its parent, hands its children to init and leaves
+/// the CPU for good (`do_task_dead`).
+///
+/// Context: task, IF=0, no lock held, on the task's own kernel stack.
 fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
-    let mut process = PROCESS.lock();
-    let current = process.current;
+    let slot = ktask::current().index();
+    let me = current_local().own.me;
+    let mut shared = PROCESS.lock();
     let code = if group {
-        process.tasks.do_group_exit(current, code)
+        shared.tasks.do_group_exit(me, code)
     } else {
         code
     };
-    match process.tasks.exit_prepare(current, code, signaled) {
+    match shared.tasks.exit_prepare(me, code, signaled) {
         ExitPrep::InitDied { exitcode } => {
-            drop(process);
+            #[cfg(feature = "qemu-self-test")]
+            leak::report(&shared);
+            drop(shared);
             init_died(exitcode)
         }
-        ExitPrep::Proceed { .. } => {
-            drop(process);
-            crate::log!("FAIL exit of a task other than init: no scheduler to leave\n");
-            crate::fail()
-        }
+        ExitPrep::Proceed { .. } => {}
     }
+    drop(shared);
+    // The task state leaves its slot: nothing can reach it after this.
+    let Some(boxed) = take_local(slot) else {
+        crate::log!("FAIL exiting task has no state slot={}\n", slot);
+        crate::fail();
+    };
+    let (tables, own) = into_parts(boxed);
+    // exit_mm: CR3 moves to the kernel tree before the user tree is freed.
+    let kernel = KERNEL_ROOT.load(Ordering::Acquire);
+    // SAFETY: `kernel` is the root of the kernel-only tree kept in
+    // `services::TABLES` from `start` on (never freed); IF=0 on the BSP; the
+    // kernel half it maps is the published one, so this code, the stack and
+    // the heap stay mapped; no PCID or global translations exist.
+    unsafe { cpu::activate_tables(kernel) };
+    ktask::set_current_cr3(kernel);
+    destroy_tables(tables);
+    let mut own = own;
+    let mut shared = PROCESS.lock();
+    let owner = own.owner();
+    // exit_mm / exit_files / exit_fs: the mappings' and the executable's
+    // references, every descriptor, the root and working directory.
+    shared.vfs.unpin_all(owner);
+    shared.vfs.fput(own.exe_file);
+    shared.vfs.close_files(&mut own.fdt);
+    shared.vfs.put_fs(&own.attrs.fs);
+    // The task's CPU time is what its parent's wait reports (cputime_adjust).
+    let (utime, stime) = ktask::cpu_account(own.sched).adjusted(timer::ktime_get_ns());
+    if let Some(task) = shared.tasks.task_mut(own.me) {
+        task.utime_ns = utime;
+        task.stime_ns = stime;
+    }
+    // exit_notify: reparent the children, SIGCHLD to the parent, auto-reap.
+    let Process { tasks, wake, .. } = &mut *shared;
+    if tasks.exit_notify(own.me, wake).is_err() {
+        crate::log!("FAIL exit_notify refused a task that was exiting\n");
+        crate::fail();
+    }
+    drop(shared);
+    drop(own);
+    // do_task_dead: the next task releases this one's slot and stack.
+    ktask::exit_current()
 }
 
 /// `kernel/exit.c`: init exiting for any reason panics. In a `qemu-self-test`
@@ -1021,17 +1437,17 @@ fn init_died(code: u32) -> ! {
 
 /// Called by `syscall_entry` with the saved registers; writes the result into
 /// `regs.ax`, then runs the exit-to-user work (pending signals). Interrupts are
-/// off and the CPU is on the `BOOT_STACK` top.
+/// off and the CPU is on the running task's kernel stack.
 pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
     let args = [regs.di, regs.si, regs.dx, regs.r10, regs.r8, regs.r9];
     let number = regs.orig_ax;
     let outcome = {
-        let mut process = PROCESS.lock();
-        let mm = process.mm;
-        let mut tables = mm.lock();
+        let mut local = current_local();
+        let TaskLocal { tables, own } = &mut *local;
         let mut context = Syscall {
             space: tables.user_space(),
-            process: &mut process,
+            own,
+            shared: Shared::default(),
             regs: &mut *regs,
             tty: Tty,
         };
@@ -1045,8 +1461,14 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
             crate::fail();
         }
         Outcome::Blocked(number) => {
-            // Linux would sleep and nothing can wake the only task.
-            crate::log!("FAIL syscall would block forever nr={}\n", number);
+            // Linux would sleep on the pipe or the console. The wake-ups between
+            // tasks (a pipe end written or closed by another task, console input)
+            // are not ported, so the kernel stops loudly instead of returning
+            // early or sleeping forever.
+            crate::log!(
+                "FAIL syscall would block nr={}: cross-task wake-ups not implemented\n",
+                number
+            );
             crate::fail();
         }
     }
@@ -1064,41 +1486,43 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
 /// `cpu::iret_site` and `cpu::fixup_bad_iret` turns that into a user exception
 /// (Linux's `.Lerror_bad_iret`), which comes back through this function.
 ///
-/// Context: interrupts masked, task context of the one process; takes
-/// `PROCESS` then `TABLES` (the shared lock order). A fatal signal never
-/// returns: init's death panics, as Linux's `do_exit` does for pid 1.
+/// Context: interrupts masked, task context of a user task; takes `PROCESS`
+/// (the shared lock order). A fatal signal never returns: it ends the task
+/// ([`do_exit`]), and init's death panics, as Linux's `do_exit` does for pid 1.
 pub fn exit_to_user(regs: &mut cpu::PtRegs) {
     loop {
         // `exit_to_user_mode_loop`: `TIF_NEED_RESCHED` first; this task continues,
         // with everything re-examined below, when it is chosen again.
         ktask::preempt_user(regs.orig_ax == u64::MAX);
+        let mut local = current_local();
+        let TaskLocal { tables, own } = &mut *local;
         let mut process = PROCESS.lock();
         // Nothing to expire or dequeue: skip the clock read (`now_ns` is only
         // used when a pending SIGALRM leaves the queue).
         let pending = {
-            let mut state = signal_state(&mut process);
+            let mut state = current_signals(&mut process.tasks, own.me);
             if state.sig.itimer.next_event().is_some() || state.signal_pending() {
                 state.sync_timers(timer::ktime_get_ns());
             }
             state.signal_pending()
         };
         if pending {
-            let mm = process.mm;
-            let mut tables = mm.lock();
-            let mut space = tables.user_space();
-            let (mut state, mut pages) = FaultPages::of(&mut process, &mut space);
-            let outcome = deliver::handle_pending_signals(
-                &mut state,
-                regs,
-                &mut pages,
-                &mut cpu::UserCpu::new(),
-            );
-            drop(tables);
+            let outcome = {
+                let mut space = tables.user_space();
+                let (mut state, mut pages) = FaultPages::of(&mut process, own, &mut space);
+                deliver::handle_pending_signals(
+                    &mut state,
+                    regs,
+                    &mut pages,
+                    &mut cpu::UserCpu::new(),
+                )
+            };
             match outcome {
                 // `handle_pending_signals` loops while a forced SIGSEGV is pending.
                 SignalOutcome::Resume | SignalOutcome::Handled | SignalOutcome::FrameFailed => {}
                 SignalOutcome::Exit { exit_code, .. } => {
                     drop(process);
+                    drop(local);
                     // get_signal: PF_SIGNALED, then do_group_exit(signr).
                     do_exit(exit_code, true, true);
                 }
@@ -1109,7 +1533,10 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
             }
         }
         // Wake the CPU for the next interval-timer expiry while ring 3 runs.
-        let expiry = signal_state(&mut process).sig.itimer.next_event();
+        let expiry = current_signals(&mut process.tasks, own.me)
+            .sig
+            .itimer
+            .next_event();
         timer::set_itimer_ns(expiry);
         // `rearm` drops an expiry that fell between the `sync_timers` above and
         // its own clock read (or while a frame was built): nothing would wake
@@ -1123,10 +1550,10 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
 
 /// `printk_ratelimit()` called from `func`: ten lines per five seconds, and the
 /// "callbacks suppressed" line (named after the caller) when it re-opens.
-fn printk_ratelimit(process: &mut Process, func: &str) -> bool {
+fn printk_ratelimit(process: &mut Process, task: &Owned, func: &str) -> bool {
     // The lines this limiter guards name the program `init` (`report`); after
     // an `execve` of another program they would be wrong, so stop instead.
-    if process.attrs.comm[..5] != *b"init\0" {
+    if task.attrs.comm[..5] != *b"init\0" {
         crate::log!(
             "FAIL fault report names only init (comm of the faulting program differs) func={}\n",
             func
@@ -1142,14 +1569,16 @@ fn printk_ratelimit(process: &mut Process, func: &str) -> bool {
 }
 
 /// `show_signal` / `show_signal_msg`: Linux prints the fault line when
-/// `show_unhandled_signals && unhandled_signal(current, sig) && printk_ratelimit()`;
-/// for the global init `unhandled_signal` is always true, handler or not.
+/// `show_unhandled_signals && unhandled_signal(current, sig) && printk_ratelimit()`
+/// (always for the global init, for any other task when `sig` has the default
+/// or ignore disposition and the task is not already dying).
 /// `message` is whether this fault has a line at all (a page fault that ends in
 /// `SIGSEGV`, or a vector with a `show_signal` message). The limiter allows ten
 /// lines per five seconds and reports the suppressed ones when it re-opens.
 /// shortcut: no `Code:` line (`show_opcodes`) after the `segfault at` line.
 fn show_unhandled_signal(
     process: &mut Process,
+    task: &Owned,
     regs: &cpu::PtRegs,
     vector: u64,
     error: u64,
@@ -1162,17 +1591,32 @@ fn show_unhandled_signal(
     if vector != 14 && message.is_none() {
         return;
     }
+    // The signal this vector raises (`show_signal`'s `signr`; `SIGSEGV` for
+    // `show_signal_msg`).
+    let signr = if vector == 14 {
+        signal::SIGSEGV
+    } else {
+        u8::try_from(vector)
+            .ok()
+            .and_then(report::user_exception)
+            .map_or(signal::SIGSEGV, |signal| signal.signal)
+    };
+    if !current_signals(&mut process.tasks, task.me).unhandled_signal(signr) {
+        return;
+    }
     let func = if vector == 14 {
         "show_signal_msg"
     } else {
         "show_signal"
     };
-    if !printk_ratelimit(process, func) {
+    if !printk_ratelimit(process, task, func) {
         return;
     }
-    let region = region_of(process, regs.ip);
+    let region = region_of(process, task, regs.ip);
+    let pid = task.tid.cast_signed();
     if vector == 14 {
         let line = Segfault {
+            pid,
             address,
             ip: regs.ip,
             sp: regs.sp,
@@ -1182,6 +1626,7 @@ fn show_unhandled_signal(
         crate::log!("{}\n", line);
     } else if let Some((kind, desc)) = message {
         let line = TrapLine {
+            pid,
             kind,
             desc,
             ip: regs.ip,
@@ -1199,6 +1644,7 @@ fn show_unhandled_signal(
 /// absent siginfo is a spurious `#MF`/`#XM` that raises nothing.
 fn force(
     process: &mut Process,
+    task: &Owned,
     regs: &cpu::PtRegs,
     fault: info::Fault,
     vector: u64,
@@ -1209,14 +1655,20 @@ fn force(
         return false;
     };
     if vector != 14 || signo == i32::from(signal::SIGSEGV) {
-        show_unhandled_signal(process, regs, vector, error, address);
+        show_unhandled_signal(process, task, regs, vector, error, address);
     }
-    signal_state(process).force_fault(&fault);
+    current_signals(&mut process.tasks, task.me).force_fault(&fault);
     true
 }
 
 /// The signal of a non-page-fault exception (`exc_*` in traps.c).
-fn raise_fault(process: &mut Process, regs: &cpu::PtRegs, vector: u64, error: u64) -> bool {
+fn raise_fault(
+    process: &mut Process,
+    task: &Owned,
+    regs: &cpu::PtRegs,
+    vector: u64,
+    error: u64,
+) -> bool {
     let vector8 = u8::try_from(vector).unwrap_or(u8::MAX);
     // #DB reports DR6 (cleared again, as `debug_read_clear_dr6`); #MF/#XM
     // read the saved FPU state (`fpu__exception_code`).
@@ -1230,7 +1682,7 @@ fn raise_fault(process: &mut Process, regs: &cpu::PtRegs, vector: u64, error: u6
         _ => 0,
     };
     let fault = info::exception(vector8, error, regs.ip, dr6, fpe);
-    fault.is_some_and(|fault| force(process, regs, fault, vector, error, 0))
+    fault.is_some_and(|fault| force(process, task, regs, fault, vector, error, 0))
 }
 
 /// Called by the IDT entry for an exception raised in ring 3: a page fault the
@@ -1239,13 +1691,16 @@ fn raise_fault(process: &mut Process, regs: &cpu::PtRegs, vector: u64, error: u6
 /// return to ring 3 then delivers it. A vector that is not a plain user fault
 /// (NMI, #DF, #MC, #NM, ...) is a kernel failure, never a user death.
 pub fn exception(regs: &mut cpu::PtRegs, vector: u64, error: u64, address: u64) {
-    let mut guard = PROCESS.lock();
-    let raised = if vector == 14 {
-        page_fault(&mut guard, regs, error, address)
-    } else {
-        raise_fault(&mut guard, regs, vector, error)
+    let raised = {
+        let mut local = current_local();
+        let TaskLocal { tables, own } = &mut *local;
+        let mut process = PROCESS.lock();
+        if vector == 14 {
+            page_fault(&mut process, tables, own, regs, error, address)
+        } else {
+            raise_fault(&mut process, own, regs, vector, error)
+        }
     };
-    drop(guard);
     if !raised {
         crate::log!(
             "FAIL user exception vector={} error={:#x} rip={:#x}\n",
@@ -1264,17 +1719,12 @@ pub fn exception(regs: &mut cpu::PtRegs, vector: u64, error: u64, address: u64) 
 /// possible `/dev/zero` mapping, see below).
 /// shortcut: resolve the name from the description's dentry when a program
 /// other than `/init` can run.
-fn region_of(process: &Process, ip: u64) -> Option<FileRegion> {
-    let Some(region) = FileRegion::of(&process.space, ip) else {
+fn region_of(process: &Process, task: &Owned, ip: u64) -> Option<FileRegion> {
+    let Some(region) = FileRegion::of(&task.space, ip) else {
         // A private /dev/zero VMA keeps no `vm_file` here but Linux prints
         // ` in zero[...]` for it: once one was made, an anonymous `ip` cannot
         // be told from it.
-        if process.vfs.zero_mapped()
-            && process
-                .space
-                .find_vma(ip)
-                .is_some_and(|vma| vma.start <= ip)
-        {
+        if process.vfs.zero_mapped() && task.space.find_vma(ip).is_some_and(|vma| vma.start <= ip) {
             crate::log!(
                 "FAIL mm user fault in an anonymous mapping after a /dev/zero mapping ip={:#x} (vm_file of mmap_zero not kept)\n",
                 ip
@@ -1283,7 +1733,7 @@ fn region_of(process: &Process, ip: u64) -> Option<FileRegion> {
         }
         return None;
     };
-    if process.space.find_vma(ip).and_then(|vma| vma.file) != Some(process.exec) {
+    if task.space.find_vma(ip).and_then(|vma| vma.file) != Some(task.exec) {
         crate::log!(
             "FAIL mm user fault in a mapped file other than /init ip={:#x} (file name resolution not ported)\n",
             ip
@@ -1294,15 +1744,16 @@ fn region_of(process: &Process, ip: u64) -> Option<FileRegion> {
 }
 
 /// A page fault taken in ring 3 (`exc_page_fault` -> `do_user_addr_fault`).
-/// Context: the faulting task, interrupts off, `PROCESS` held by the caller;
-/// takes `TABLES` (-> heap, `FRAMES` inside). Returns `true`: the fault was
-/// resolved or its signal is forced and delivered on the way out.
+/// Context: the faulting task, interrupts off, `PROCESS` held by the caller
+/// (`TaskLocal` is the task's own); takes `FRAMES` (and the heap) below it.
+/// Returns `true`: the fault was resolved or its signal is forced and
+/// delivered on the way out.
 ///
 /// Outcomes and what Linux does (6.18.57, arch/x86/mm/fault.c):
 /// * `Handled`: return to user, the instruction retries.
 /// * `Segv`: `force_sig_fault(SIGSEGV, SEGV_MAPERR|SEGV_ACCERR, address)`; the
-///   `init[1]: segfault at ...` line (`show_signal_msg`) is printed if the
-///   signal then kills init.
+///   `init[<pid>]: segfault at ...` line (`show_signal_msg`) is printed if the
+///   signal would then kill the task.
 /// * `Bus`: `do_sigbus` -> `force_sig_fault(SIGBUS, BUS_ADRERR, address)` (no
 ///   console line for `SIGBUS` itself).
 /// * `Oom`, `PgtableBad`, `Vsyscall`: Linux runs the OOM killer (which finds
@@ -1311,19 +1762,26 @@ fn region_of(process: &Process, ip: u64) -> Option<FileRegion> {
 ///   signal that did not happen.
 /// * `NeedsFile` (a page of a private file mapping) is resolved by
 ///   [`user_fault`] into `Handled`, `Bus` or `Oom`.
-fn page_fault(process: &mut Process, regs: &cpu::PtRegs, error: u64, address: u64) -> bool {
-    let (ip, mm) = (regs.ip, process.mm);
-    let mut tables = mm.lock();
+fn page_fault(
+    process: &mut Process,
+    tables: &mut Tables,
+    own: &mut Owned,
+    regs: &cpu::PtRegs,
+    error: u64,
+    address: u64,
+) -> bool {
+    let ip = regs.ip;
+    let owner = own.owner();
     let mut space = tables.user_space();
     let outcome = user_fault(
-        &mut process.space,
-        &process.env,
+        &mut own.space,
+        &own.env,
         &mut process.vfs,
+        owner,
         &mut space,
         address,
         error | mm::PF_USER,
     );
-    drop(tables);
     let kind = match outcome {
         FaultOutcome::Handled => {
             #[cfg(all(feature = "qemu-self-test", not(feature = "baremetal-suite")))]
@@ -1363,7 +1821,7 @@ fn page_fault(process: &mut Process, regs: &cpu::PtRegs, error: u64, address: u6
         FaultOutcome::NeedsFile { .. } => unreachable!("resolved by user_fault"),
     };
     let fault = info::page_fault(kind.0, kind.1, error);
-    force(process, regs, fault, 14, error, kind.1)
+    force(process, own, regs, fault, 14, error, kind.1)
 }
 
 /// One system call through the dispatcher in the self-test (stops loudly on an
@@ -1545,7 +2003,7 @@ fn mm_usercopy_faults(context: &mut Syscall<'_>, a: u64, b: u64) {
 /// (`__do_page_fault` of a kernel access to user memory) with Linux's
 /// short-copy results. Context: BSP, IF clear, `PROCESS` installed, no lock held.
 #[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
-fn check_mm_usercopy() {
+fn check_mm_usercopy(local: &mut TaskLocal) {
     use kernel::mm::{
         MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE, Pte, UserPages as _, VmFlags,
     };
@@ -1553,16 +2011,15 @@ fn check_mm_usercopy() {
     use syscalls::Sysno;
 
     const P: u64 = PAGE;
-    let mut guard = PROCESS.lock();
-    let mm = guard.mm;
-    let mut tables = mm.lock();
-    let data_frames = |tables: &Tables| services::FRAMES.lock().allocated() - tables.pages;
-    let (frames0, vm0) = (data_frames(&tables), guard.space.total_vm);
+    let TaskLocal { tables, own } = local;
+    let data_frames = |table_pages: usize| services::FRAMES.lock().allocated() - table_pages;
+    let (frames0, vm0) = (data_frames(tables.pages), own.space.total_vm);
     // The self-test makes its calls from the kernel: no entry registers.
     let mut regs = cpu::PtRegs::default();
     let mut context = Syscall {
         space: tables.user_space(),
-        process: &mut guard,
+        own,
+        shared: Shared::default(),
         regs: &mut regs,
         tty: Tty,
     };
@@ -1604,7 +2061,7 @@ fn check_mm_usercopy() {
     // (`expand_downwards` through the fault path) and maps a private frame:
     // the only accounting change left, one frame and one page.
     let top = context
-        .process
+        .own
         .space
         .vmas()
         .iter()
@@ -1622,19 +2079,19 @@ fn check_mm_usercopy() {
     );
     crate::require(
         context
-            .process
+            .own
             .space
             .find_vma(grown)
             .is_some_and(|vma| vma.start == grown && vma.flags.intersects(VmFlags::GROWSDOWN))
             && context.space.lookup(grown) == (Pte::Anon { writable: true }),
         "mm-usercopy-stack-vma-grown",
     );
+    let vm_now = context.own.space.total_vm;
+    drop(context);
     crate::require(
-        data_frames(&tables) == frames0 + 1 && guard.space.total_vm == vm0 + 1,
+        data_frames(tables.pages) == frames0 + 1 && vm_now == vm0 + 1,
         "mm-usercopy-accounting",
     );
-    drop(tables);
-    drop(guard);
     crate::log!(
         "CHECK mm-usercopy ok fault_in=read,write short_write=4 hole=8 readonly=refused zero_page=shared range=refused protnone=inverted,restored fixed=replaced stack=grown unmap=restored\n"
     );
@@ -1817,30 +2274,62 @@ pub fn load_group(
     {
         let _ = line.push_within_capacity(byte);
     }
-    let mut tables = services::TABLES.lock();
-    load_rootfs(&line, rootfs.vfs, rootfs.compressed, &mut tables)
+    // The group's tree: an empty user half over the kernel tree that
+    // `services::TABLES` keeps (which also owns the shared zero page).
+    // `TABLES` -> `FRAMES`, the documented order.
+    let mut tables = {
+        let mut template = services::TABLES.lock();
+        let mut frames = services::FRAMES.lock();
+        if !template.has_zero_page() {
+            template.init_zero_page(&mut frames)?;
+        }
+        template.fork_template(&mut frames)?
+    };
+    match load_rootfs(&line, rootfs.vfs, rootfs.compressed, &mut tables) {
+        Ok(mut loaded) => {
+            loaded.tables = Some(tables);
+            Ok(loaded)
+        }
+        Err(error) => {
+            // No task owns the tree yet: its pages and tables go back.
+            tables.destroy_user(&mut services::FRAMES.lock());
+            Err(error)
+        }
+    }
 }
 
-/// End of a group's process: unmap and free every user page, then drop the
-/// process (rootfs, open files, address-space model).
+/// End of a group's run: free the address space of every task that is left
+/// (init's and its children's: `exit_mmap`), then drop the shared state
+/// (rootfs, open files, task list). The kernel stacks of the abandoned tasks
+/// are reset by `ktask::reset_group`; what only those stacks held (a heap block
+/// a task was using when its group was cut off) is lost, which a group ended by
+/// a kernel stop or a time bound can do.
 ///
-/// shortcut: the intermediate user page tables stay (they are never freed
-/// before address-space teardown, see `paging`) and are reused by the next
-/// group's identical layout; a real `exit_mmap` replaces this with `execve`/
-/// `exit`. Everything else returns to the allocator.
-///
-/// Context: BSP, IF clear, `PROCESS`, `TABLES` and `FRAMES` free (the suite
-/// checks [`locks_free`] after a kernel stop).
+/// Context: BSP, IF clear on the boot stack (the idle task), `PROCESS`, `TABLES`
+/// and `FRAMES` free (the suite checks [`locks_free`] after a kernel stop).
 #[cfg(feature = "baremetal-suite")]
 pub fn teardown() {
     let process = PROCESS.take();
-    {
-        let mut tables = services::TABLES.lock();
-        let mut frames = services::FRAMES.lock();
-        tables.mm_unmap(&mut frames, 0, usercopy::TASK_SIZE_MAX / PAGE);
+    // No task's tree may be the loaded one when it is freed.
+    let kernel = KERNEL_ROOT.load(Ordering::Acquire);
+    if kernel != 0 {
+        // SAFETY: the kernel-only tree in `services::TABLES` (alive for the life
+        // of the system); IF=0 on the BSP; its kernel half is the published
+        // one, so everything this code runs on stays mapped.
+        unsafe { cpu::activate_tables(kernel) };
+    }
+    for (slot, entry) in LOCALS.0.iter().enumerate() {
+        // An abandoned task's guard never dropped: nothing runs now.
+        entry.busy.store(false, Ordering::Release);
+        if let Some(local) = take_local(slot) {
+            let TaskLocal { tables, own } = *local;
+            tables.destroy_user(&mut services::FRAMES.lock());
+            drop(own);
+        }
     }
     drop(process);
-    // The process's signal state (handlers, queues, `ITIMER_REAL`) died with it;
+    let _ = LOAD.take();
+    // The group's signal state (handlers, queues, `ITIMER_REAL`) died with it;
     // its clockevent wake-ups must not outlive it.
     timer::clear_waits();
 }
@@ -1849,14 +2338,41 @@ pub fn teardown() {
 #[cfg(feature = "baremetal-suite")]
 pub fn locks_free() -> bool {
     PROCESS.is_free()
+        && LOAD.is_free()
         && ktask::locks_free()
         && services::TABLES.is_free()
         && services::FRAMES.is_free()
         && crate::kalloc::lock_free()
 }
 
+/// init's page tables: the group's own tree (the suite), or the published
+/// one, which a kernel-only tree then replaces in `services::TABLES` as the
+/// template every later tree copies its kernel half from and the tree CR3
+/// holds while no task's may be (`exit_mm`).
+fn take_init_tables(init: &mut Loaded) -> Tables {
+    let tables = if let Some(tables) = init.tables.take() {
+        tables
+    } else {
+        let Some(published) = services::TABLES.take() else {
+            crate::log!("FAIL published page tables missing at init start\n");
+            crate::fail();
+        };
+        let template = crate::unwrap(
+            published
+                .fork_template(&mut services::FRAMES.lock())
+                .map_err(|_| "kernel-only tables"),
+            "kernel-tables",
+        );
+        services::TABLES.install(template);
+        published
+    };
+    KERNEL_ROOT.store(services::TABLES.lock().root_address(), Ordering::Release);
+    tables
+}
+
 fn start(mut init: Loaded) {
-    check_user_image(&init, &mut services::TABLES.lock().user_space());
+    let mut tables = take_init_tables(&mut init);
+    check_user_image(&init, &mut tables.user_space());
     crate::log!("Run /init as init process\n");
     // SAFETY: BSP, CPL0, IF clear (nothing since the timer test re-enabled it
     // except the guarded sections, which restore it off), descriptors installed
@@ -1886,20 +2402,15 @@ fn start(mut init: Loaded) {
     let managed_pages = services::FRAMES.lock().total() as u64;
     // `sched_init`: the first load window starts when the scheduler does.
     // shortcut: that is when init starts here, not at kernel entry.
-    let load = LoadAvg::new(jiffies_of(crate::timer::ktime_get_boottime_ns()));
-    // The task starts running: `sum_exec_runtime` counts from here, and the tick
-    // (masked after the boot proofs) runs again so user/system time accrues.
-    CPUTIME.start(timer::ktime_get_ns());
+    LOAD.install(LoadAvg::new(jiffies_of(
+        crate::timer::ktime_get_boottime_ns(),
+    )));
+    // The tick (masked after the boot proofs) runs again so user/system time accrues.
     timer::resume_tick();
     // Timekeeping runs now: replace the placeholders of the unpack-time stamps,
     // then follow the real wall clock.
     init.vfs
         .start_timekeeping(timer::ktime_get_real, timer::ktime_get_real());
-    // The segments' VMAs hold /init (`vm_file`). The loader's reference
-    // (`bprm->file`) stays as `mm->exe_file` for the life of the process, so
-    // `Process::exec` can never name a recycled description.
-    crate::unwrap(init.vfs.reserve_pin(), "exec-pin");
-    init.vfs.pin(u64::from(init.exec.index()));
     let mut fdt = FdTable::default();
     // console_on_rootfs: descriptors 0-2 are one /dev/console open file.
     if init.vfs.console_on_rootfs(&mut fdt).is_err() {
@@ -1908,7 +2419,7 @@ fn start(mut init: Loaded) {
     let mut attrs = Attributes::init(task::max_threads(managed_pages));
     attrs.fs = init.vfs.new_fs_struct(0o022);
     let max_threads = task::max_threads(managed_pages);
-    let (tasks, current) = crate::unwrap(
+    let (tasks, me) = crate::unwrap(
         Tasklist::new(
             u32::try_from(max_threads).unwrap_or(u32::MAX),
             &attrs.cred,
@@ -1919,24 +2430,36 @@ fn start(mut init: Loaded) {
     );
     PROCESS.install(Process {
         tasks,
-        current,
-        wake: SchedWaker::default(),
-        exe_file: init.exec,
-        mm: &services::TABLES,
-        attrs,
-        load,
-        restart: RestartBlock::NONE,
-        space: init.mm,
-        env: init.env,
-        exec: u64::from(init.exec.index()),
+        wake: SchedWaker,
         vfs: init.vfs,
-        fdt,
         printk_ratelimit: RateLimit::printk(kernel::time::HZ),
     });
+    // init's own state. Its scheduling handle is known only when the task is
+    // created (`bound` below), the placeholder is the idle slot.
+    let mut local = crate::unwrap(
+        Box::try_new(TaskLocal {
+            tables,
+            own: Owned {
+                me,
+                sched: SchedId::from_raw(0),
+                tgid: 1,
+                tid: 1,
+                attrs,
+                restart: RestartBlock::NONE,
+                space: init.mm,
+                env: init.env,
+                exe_file: init.exec,
+                exec: u64::from(init.exec.index()),
+                fdt,
+            },
+        })
+        .map_err(|_| "init task state"),
+        "init-state",
+    );
     // Not in the suite: it runs once per group and the `mm` group covers the
     // user-copy faults from ring 3.
     #[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
-    check_mm_usercopy();
+    check_mm_usercopy(&mut local);
     crate::unwrap(ktask::init(), "scheduler");
     #[cfg(feature = "qemu-self-test")]
     match crate::services::boot().test {
@@ -1945,15 +2468,27 @@ fn start(mut init: Loaded) {
         kernel::boot::TestMode::SchedPreempt => ktask::selftest::start_preempt_hog(),
         _ => {}
     }
-    // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
-    // is active and maps `entry` (executable) and `sp` (writable, user); all
-    // state used by the syscall/fault paths is in `PROCESS` and `services`;
-    // `kernel_main`'s frame stays on the boot stack, which is idle's from here on.
+    let cr3 = local.tables.root_address();
+    // SAFETY: descriptors and syscall MSRs are installed above; init's tree
+    // maps `entry` (executable) and `sp` (writable, user) and its kernel half
+    // is the published one; all state used by the syscall/fault paths is in
+    // `PROCESS`, `LOCALS` (installed by `bound` before the first switch) and
+    // `services`; `kernel_main`'s frame stays on the boot stack, which is
+    // idle's from here on.
     unsafe {
-        ktask::start_init(entry, sp, |sched| {
+        ktask::start_init(entry, sp, cr3, |sched| {
+            local.own.sched = sched;
             let mut process = PROCESS.lock();
-            let init = process.current;
-            process.wake.init = Some((init, sched));
+            process.tasks.set_sched(me, sched);
+            // The segments' VMAs hold /init (`vm_file`). The loader's reference
+            // (`bprm->file`) stays as `mm->exe_file` for the life of the task, so
+            // `exec` can never name a recycled description.
+            crate::unwrap(process.vfs.reserve_pin(), "exec-pin");
+            process
+                .vfs
+                .pin(local.own.owner(), u64::from(init.exec.index()));
+            drop(process);
+            install_local(sched.index(), local);
         });
     }
 }
