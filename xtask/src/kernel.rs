@@ -4395,8 +4395,9 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
             protection,
         } => (argc, mode_line, exact_summary, protection),
         User::ForkLeak => (2, Some(FORKLEAK_MODE_LINE), true, (false, false)),
-        User::ForkBomb => (2, None, true, (false, false)),
-        User::Segfault | User::Unimplemented | User::Oracle(_) => (2, None, true, (false, false)),
+        User::ForkBomb | User::Segfault | User::Unimplemented | User::Oracle(_) => {
+            (2, None, true, (false, false))
+        }
     };
     let audit = find.at(
         &|line| line.starts_with("CHECK userspace-audit ok user_pages="),
