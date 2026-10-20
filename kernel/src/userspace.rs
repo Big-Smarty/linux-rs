@@ -666,12 +666,11 @@ fn signal_state(process: &mut Process) -> State<'_> {
 }
 
 fn current_signals(tasks: &mut Tasklist, current: TaskId) -> State<'_> {
-    match tasks.signal_state(current) {
-        Some(state) => state,
-        None => {
-            crate::log!("FAIL current task is not in the task list\n");
-            crate::fail();
-        }
+    if let Some(state) = tasks.signal_state(current) {
+        state
+    } else {
+        crate::log!("FAIL current task is not in the task list\n");
+        crate::fail();
     }
 }
 
