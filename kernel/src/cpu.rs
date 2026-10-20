@@ -8,7 +8,7 @@ use core::{
     arch::{asm, naked_asm},
     marker::PhantomData,
     ptr,
-    sync::atomic::{AtomicU8, AtomicU64, Ordering, compiler_fence},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, compiler_fence},
 };
 use kernel::{
     intc::{ERROR_VECTOR, ISA_IRQ_VECTOR_BASE, LOCAL_TIMER_VECTOR, SPURIOUS_VECTOR},
@@ -25,7 +25,7 @@ use x86_64::{
     },
     registers::{
         control::{Cr0, Cr0Flags, Cr2, Cr3, Cr4, Cr4Flags},
-        debug::{DebugAddressRegister, Dr0, Dr1, Dr2, Dr3, Dr7},
+        debug::{DebugAddressRegister, Dr0, Dr1, Dr2, Dr3, Dr6, Dr7},
         model_specific::{Efer, EferFlags, FsBase, GsBase, KernelGsBase, LStar, Msr, SFMask, Star},
         rflags::RFlags,
     },
@@ -633,33 +633,77 @@ unsafe fn install_idt() {
     }
 }
 
-// Non-error entries use the qualified compiler interrupt ABI. Its error-code
-// entries misalign ordinary calls (retained integrated-007 fatal-PF witness).
-// The error arm therefore supplies only the unavoidable hardware entry boundary:
-// IA-32e aligns RSP16 before five frame words plus an error word, so entry RSP%16
-// is zero. Save nine SysV caller-clobbered GPRs and eight padding bytes: CALL is
-// aligned16, error is at +80 and the five-word frame at +88. Ordinary C-ABI Rust
-// preserves RBX/RBP/R12-R15; all fifteen are exercised across a returning PF.
-// No FP/SIMD, allocation, unwind or privilege transition is allowed. CLD clears
-// live DF; IRETQ restores saved flags/stack after the hardware error is removed.
-// Rust/intrinsics cannot express this entry/IRET boundary. Do not normalize an
-// already misaligned ordinary Rust call or rely on forced inlining instead.
+// Exception and interrupt entry, every vector: the five-word hardware frame
+// becomes a Linux `struct pt_regs` (`PtRegs`) that Rust reads and edits in place.
+//
+// Why asm: the CPU enters with only the hardware frame on the stack and every
+// GPR live; the full register file must be saved before any Rust code runs, and
+// `iretq` is the only way back. No intrinsic or `extern "x86-interrupt"` lowering
+// can do this: that ABI saves only the registers its handler happens to use, and
+// its error-code lowering was independently found to misalign ordinary calls
+// (retained integrated-007 fatal-PF witness). A signal frame, a handler entry or
+// `rt_sigreturn` needs all fifteen GPRs, including RBX/RBP/R12-R15.
+// Prerequisites: IDT gate installed by `install_idt` (interrupt gate, so IF=0 on
+// entry); 64-bit mode always pushes SS:RSP, so the frame has five words whatever
+// the CPL; the CPU aligns RSP to 16 bytes before pushing, so RSP%16 is 8 at
+// entry without a hardware error code and 0 with one. Vectors 8, 10-14, 17, 21,
+// 29 and 30 push an error code (the `error` arm); the others get a pushed -1.
+// Inputs: none (the vector is an assembler constant). Layout: the stub pushes
+// `orig_ax` (-1, or the hardware error code which it then reads into RDX and
+// overwrites with -1, as Linux's `error_entry` does so that `syscall_get_nr`
+// reports "not a syscall"), then DI SI DX CX AX R8-R11 BX BP R12-R15: 16
+// pushes in total, which is exactly `PtRegs` below the hardware frame. One more
+// `sub rsp, 8` makes RSP%16==0 at the CALL (both arms start from RSP%16==0
+// after their first push), so the SysV callee sees RSP%16==8. Outputs/clobbers:
+// RDI = &mut PtRegs, ESI = vector, RDX = error code (0 in the non-error arm);
+// every GPR is restored from `PtRegs` (a handler may have changed any of them,
+// including the return CS/RIP/RFLAGS/RSP/SS) and flags come back from IRETQ.
+// CLD clears a live user DF for the C ABI. Memory: the stack stores/loads
+// above, the handler may touch anything, so no `nomem`. Stack: ring-3 and
+// ring-0 entries run on the current stack (BOOT_STACK for ring 3, IST for the
+// vectors that have one); no red zone is used and the handler never unwinds
+// (panic=abort). Control flow: CALL to `interrupt_handler`, then IRETQ; it
+// returns once the pending-signal work of a ring-3 return is done. FP/SIMD
+// state is not touched (the kernel is soft-float; user FP state stays live).
+// Privilege: reachable from any CPL; user-controllable inputs are only the
+// hardware frame contents, never trusted by the stub.
 macro_rules! entry {
     ($name:ident, $vector:expr) => {
-        extern "x86-interrupt" fn $name(mut frame: InterruptFrame) {
-            interrupt_handler(&mut frame, $vector, 0);
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name() {
+            naked_asm!(
+                "push -1",
+                "push rdi", "push rsi", "push rdx", "push rcx", "push rax",
+                "push r8", "push r9", "push r10", "push r11",
+                "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+                "sub rsp, 8",
+                "cld", "lea rdi, [rsp + 8]", "mov esi, {vector}", "xor edx, edx",
+                "call {handler}",
+                "add rsp, 8",
+                "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
+                "pop r11", "pop r10", "pop r9", "pop r8",
+                "pop rax", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
+                "add rsp, 8", "iretq",
+                vector = const $vector,
+                handler = sym interrupt_handler,
+            );
         }
     };
     ($name:ident, $vector:expr, error) => {
         #[unsafe(naked)]
         unsafe extern "C" fn $name() {
             naked_asm!(
-                "push rax", "push rcx", "push rdx", "push rsi", "push rdi",
-                "push r8", "push r9", "push r10", "push r11", "sub rsp, 8",
-                "cld", "lea rdi, [rsp + 88]", "mov esi, {vector}",
-                "mov rdx, [rsp + 80]", "call {handler}",
-                "add rsp, 8", "pop r11", "pop r10", "pop r9", "pop r8",
-                "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rax",
+                "push rdi", "push rsi", "push rdx", "push rcx", "push rax",
+                "push r8", "push r9", "push r10", "push r11",
+                "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+                "mov rdx, [rsp + 120]", "mov qword ptr [rsp + 120], -1",
+                "sub rsp, 8",
+                "cld", "lea rdi, [rsp + 8]", "mov esi, {vector}",
+                "call {handler}",
+                "add rsp, 8",
+                "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
+                "pop r11", "pop r10", "pop r9", "pop r8",
+                "pop rax", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
                 "add rsp, 8", "iretq",
                 vector = const $vector,
                 handler = sym interrupt_handler,
@@ -710,14 +754,6 @@ entry!(apic_spurious_entry, 0xff);
 const UNKNOWN_EXTERNAL_VECTOR: u64 = 256;
 entry!(unexpected_entry, UNKNOWN_EXTERNAL_VECTOR);
 
-#[repr(C)]
-struct InterruptFrame {
-    rip: u64,
-    cs: u64,
-    flags: u64,
-    rsp: u64,
-    ss: u64,
-}
 static BREAKPOINTS: AtomicU64 = AtomicU64::new(0);
 static BREAKPOINT_ARMED: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -747,24 +783,31 @@ fn external_interrupt(vector: u64, user: bool) -> bool {
     true
 }
 
-extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: u64) {
-    // `user_mode(regs)`: the interrupted code ran in ring 3.
-    if external_interrupt(vector, frame.cs & 3 == 3) {
+/// Rust half of every exception and interrupt entry; `regs` is the live
+/// `pt_regs` on the entry stack (see the `entry!` proof above), and whatever
+/// it holds on return is what `iretq` restores.
+extern "C" fn interrupt_handler(regs: &mut PtRegs, vector: u64, error: u64) {
+    // `user_mode(regs)`: any ring-3 CS (64-bit 0x33 or compatibility 0x23).
+    let user = regs.cs & 3 == 3;
+    if external_interrupt(vector, user) {
+        if user {
+            // A tick can be the wake-up of an expired interval timer, and the
+            // return to ring 3 is where pending signals are delivered.
+            crate::userspace::exit_to_user(regs);
+        }
         return;
     }
-    // Any ring-3 CS (64-bit 0x33 or compatibility 0x23, RPL 3).
-    if frame.cs & 3 == 3 {
-        // Any exception raised by init is fatal to it (no signal handlers exist
-        // yet) except a page fault the address-space model resolves, which
-        // returns here and `iretq`s to the faulting instruction (the error-code
-        // entry preserves all fifteen GPRs across a returning #PF, see `entry!`).
-        // CR2 is read first, before anything that could fault.
+    if user {
+        // An exception raised by init is a signal (`force_sig`); the return
+        // path delivers it, except a page fault the address-space model
+        // resolves, which returns here and `iretq`s to the faulting
+        // instruction. CR2 is read first, before anything that could fault.
         let address = if vector == 14 { Cr2::read_raw() } else { 0 };
-        crate::userspace::exception(vector, error, frame.rip, frame.rsp, address);
+        crate::userspace::exception(regs, vector, error, address);
         return;
     }
-    if frame.cs != u64::from(KERNEL_CS.0) {
-        unexpected(frame, vector, error, 0);
+    if regs.cs != u64::from(KERNEL_CS.0) {
+        unexpected(regs, vector, error, 0);
     }
     match vector {
         3 if BREAKPOINT_ARMED.swap(0, Ordering::Acquire) == 1 => {
@@ -775,7 +818,7 @@ extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: 
             let address = Cr2::read_raw();
             if FAULT_ARMED.swap(0, Ordering::Acquire) == 1
                 && address == FAULT_ADDRESS.load(Ordering::Relaxed)
-                && frame.rip == FAULT_RIP.load(Ordering::Relaxed)
+                && regs.ip == FAULT_RIP.load(Ordering::Relaxed)
                 && error == FAULT_ERROR.load(Ordering::Relaxed)
             {
                 // SAFETY: the entry boundary supplies the immovable live CPU
@@ -784,16 +827,16 @@ extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: 
                 // reviewed recovery RET, preserving the saved CPL/flags/stack.
                 unsafe {
                     ptr::write_volatile(
-                        ptr::addr_of_mut!(frame.rip),
+                        ptr::addr_of_mut!(regs.ip),
                         probe_return as *const () as u64,
                     );
                 }
                 FAULTS.fetch_add(1, Ordering::Relaxed);
             } else {
-                unexpected(frame, vector, error, address);
+                unexpected(regs, vector, error, address);
             }
         }
-        _ => unexpected(frame, vector, error, 0),
+        _ => unexpected(regs, vector, error, 0),
     }
 }
 #[cfg(feature = "qemu-self-test")]
@@ -806,7 +849,7 @@ unsafe extern "C" fn ordinary_call_stack_residue() -> u64 {
     naked_asm!("mov rax, rsp", "and eax, 15", "ret");
 }
 
-fn unexpected(frame: &InterruptFrame, vector: u64, error: u64, address: u64) -> ! {
+fn unexpected(frame: &PtRegs, vector: u64, error: u64, address: u64) -> ! {
     #[cfg(feature = "qemu-self-test")]
     {
         // SAFETY: ordinary scalar C-ABI CALL into the naked entry witness.
@@ -822,8 +865,8 @@ fn unexpected(frame: &InterruptFrame, vector: u64, error: u64, address: u64) -> 
         crate::log!(
             "FAIL trap vector=unknown-external error={:#x} rip={:#x} rsp={:#x}\n",
             error,
-            frame.rip,
-            frame.rsp
+            frame.ip,
+            frame.sp
         );
         crate::fail();
     }
@@ -831,9 +874,9 @@ fn unexpected(frame: &InterruptFrame, vector: u64, error: u64, address: u64) -> 
         "FAIL trap vector={} error={:#x} rip={:#x} cr2={:#x} rsp={:#x}\n",
         vector,
         error,
-        frame.rip,
+        frame.ip,
         address,
-        frame.rsp
+        frame.sp
     );
     crate::fail()
 }
@@ -1155,31 +1198,10 @@ pub fn unexpected_interrupt() -> ! {
 // stacks.
 
 /// Linux `struct pt_regs` (arch/x86/include/asm/ptrace.h, GPL-2.0), lowest
-/// address first: the layout `syscall_entry` builds and `iretq` consumes.
-#[repr(C)]
-pub struct PtRegs {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub bp: u64,
-    pub bx: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub ax: u64,
-    pub cx: u64,
-    pub dx: u64,
-    pub si: u64,
-    pub di: u64,
-    pub orig_ax: u64,
-    pub ip: u64,
-    pub cs: u64,
-    pub flags: u64,
-    pub sp: u64,
-    pub ss: u64,
-}
+/// address first: the layout `syscall_entry` and the exception/interrupt
+/// `entry!` stubs build and `iretq` consumes. It is the signal model's `Regs`
+/// (one type): a handler entry or `rt_sigreturn` edits the live return frame.
+pub use kernel::signal::Regs as PtRegs;
 const _: () = assert!(core::mem::size_of::<PtRegs>() == 21 * 8);
 
 /// Linux `MSR_SYSCALL_MASK` (arch/x86/kernel/cpu/common.c `syscall_init`):
@@ -1568,7 +1590,130 @@ pub unsafe fn init_user_fpu() -> Result<(), Error> {
         // SAFETY: OSFXSR set, EM clear, FXSR checked.
         load_initial_fpu_state();
     }
+    // Linux `fpu__init_system_mxcsr`: the MXCSR bits this CPU accepts come from
+    // an FXSAVE image's MXCSR_MASK field (0 means the architectural 0xffbf).
+    let mut image = FxImage([0; 512]);
+    // SAFETY: the state FXSAVE needs was just established above.
+    unsafe { save_fpu_state(&mut image) };
+    let mask = u32::from_le_bytes([image.0[28], image.0[29], image.0[30], image.0[31]]);
+    MXCSR_MASK.store(if mask == 0 { 0xffbf } else { mask }, Ordering::Relaxed);
+    FPU_READY.store(true, Ordering::Release);
     Ok(())
+}
+
+/// `mxcsr_feature_mask`, valid once [`FPU_READY`].
+static MXCSR_MASK: AtomicU32 = AtomicU32::new(0xffbf);
+/// `init_user_fpu` ran: CR4.OSFXSR=1, CR0.EM=0, CR0.TS=0, FXSR/SSE present, so
+/// FXSAVE/FXRSTOR cannot fault on their feature or CR bits.
+static FPU_READY: AtomicBool = AtomicBool::new(false);
+
+/// `FXSAVE64` of the live x87/XMM state.
+///
+/// # Safety
+/// `FPU_READY` (CPUID FXSR, CR4.OSFXSR=1, CR0.EM=0 and TS=0); CPL0.
+#[target_feature(enable = "fxsr")]
+unsafe fn save_fpu_state(image: &mut FxImage) {
+    // SAFETY: `image` is 512 bytes, 16-byte aligned (`FxImage`) and exclusively
+    // borrowed, so FXSAVE's 512-byte store stays inside it; the caller gives
+    // the CPU state FXSAVE requires. 64-bit form, as Linux (`fxsaveq`).
+    unsafe { core::arch::x86_64::_fxsave64(image.0.as_mut_ptr()) };
+}
+
+/// `FXRSTOR64` of `image`.
+///
+/// # Safety
+/// As [`save_fpu_state`], and `image` holds no reserved MXCSR bit (else #GP).
+#[target_feature(enable = "fxsr")]
+unsafe fn restore_fpu_state(image: &FxImage) {
+    // SAFETY: 512 readable, 16-byte aligned bytes; the MXCSR condition is the
+    // caller's contract.
+    unsafe { core::arch::x86_64::_fxrstor64(image.0.as_ptr()) };
+}
+
+/// The CPU facts the signal model needs ([`kernel::signal::Cpu`]): the user FPU
+/// state (which is live in the registers whenever the kernel runs, because the
+/// kernel is soft-float) and the segment test of `force_valid_ss`.
+pub struct UserCpu(());
+
+impl UserCpu {
+    /// # Panics
+    /// Before `init_user_fpu` (a kernel bug: ring 3 cannot run yet).
+    #[must_use]
+    pub fn new() -> Self {
+        assert!(
+            FPU_READY.load(Ordering::Acquire),
+            "user FPU used before init_user_fpu"
+        );
+        Self(())
+    }
+}
+
+impl kernel::signal::Cpu for UserCpu {
+    fn fxsave(&mut self) -> [u8; 512] {
+        let mut image = FxImage([0; 512]);
+        // SAFETY: `UserCpu::new` checked `FPU_READY`; CPL0 (kernel code).
+        unsafe { save_fpu_state(&mut image) };
+        image.0
+    }
+
+    fn mxcsr_mask(&self) -> u32 {
+        MXCSR_MASK.load(Ordering::Relaxed)
+    }
+
+    fn fxrstor(&mut self, image: &[u8; 512]) {
+        let aligned = FxImage(*image);
+        let mxcsr = u32::from_le_bytes([image[24], image[25], image[26], image[27]]);
+        if mxcsr & !self.mxcsr_mask() != 0 {
+            // The caller validated this; a reserved bit would be a #GP in ring
+            // 0, so fail safe to the init state instead.
+            self.fpu_reset();
+            return;
+        }
+        // SAFETY: `FPU_READY` as above; the reserved-MXCSR condition was just
+        // checked; `aligned` is a 16-byte aligned 512-byte copy.
+        unsafe { restore_fpu_state(&aligned) };
+    }
+
+    fn fpu_reset(&mut self) {
+        // SAFETY: `FPU_READY` as above, CPL0; the image is the immutable Linux
+        // initial state.
+        unsafe { load_initial_fpu_state() };
+    }
+
+    // `force_valid_ss`'s `lar` (arch/x86/kernel/signal_64.c:28-48).
+    //
+    // Why asm: LAR (load access rights) has no Rust intrinsic and the x86_64
+    // crate has no wrapper; reading the GDT descriptor by hand would reimplement
+    // the hardware's selector walk (TI bit, LDT, limits, DPL/RPL rules) and
+    // could disagree with it. Prerequisites: none beyond long mode; LAR with a
+    // register operand takes no fault for any 16-bit value (a null, out of
+    // range, LDT or system selector just clears ZF). Inputs: the selector in a
+    // 16-bit register. Outputs: the access-rights dword in a 32-bit register,
+    // preset to 0 and left untouched when LAR fails, so a failure reads as
+    // rights 0 (Linux zeroes it explicitly). Clobbers: ZF (flags are not
+    // declared preserved); no other register. Memory: none read or written
+    // (`nomem`), no stack (`nostack`), no red zone, no side effect on any
+    // descriptor. Privilege/context: any CPL, IF and preemption irrelevant. No
+    // control flow, no unwind.
+    fn ss_is_valid_user_data(&self, ss: u16) -> bool {
+        // AR_DPL_MASK | AR_S | AR_P | AR_TYPE_MASK (the accessed bit 8 is not in
+        // the mask): DPL 3, S, P and type read-write data or its expand-down form.
+        const MASK: u32 = (3 << 13) | (1 << 12) | (1 << 15) | (7 << 9);
+        const DPL3_S_P: u32 = (3 << 13) | (1 << 12) | (1 << 15);
+        let mut rights: u32 = 0;
+        // SAFETY: the instruction only reads the descriptor table entry the
+        // selector names (architecturally, not through Rust memory) and writes
+        // the register operand and ZF, as described above.
+        unsafe {
+            asm!(
+                "lar {rights:e}, {selector:x}",
+                rights = inout(reg) rights,
+                selector = in(reg) ss,
+                options(nomem, nostack),
+            );
+        }
+        matches!(rights & MASK, v if v == DPL3_S_P | (1 << 9) || v == DPL3_S_P | (3 << 9))
+    }
 }
 
 /// Linux `initialize_debug_regs`: no stale hardware breakpoint from the
@@ -1586,11 +1731,43 @@ pub unsafe fn scrub_debug_registers() {
     // status bits (BS, B0-B3...) left by firmware or the loader. The crate has
     // no DR6 writer, and there is no intrinsic for `mov dr6`: one `asm!` site,
     // CPL0 only, a single register input, no memory, stack or flags effect.
-    // SAFETY: CPL0; writing DR6 changes no execution state and no breakpoint
-    // is armed (DR7 was cleared above).
+    // SAFETY: CPL0; DR7 was cleared above, so no breakpoint is armed.
+    unsafe { reset_dr6() };
+}
+
+/// `set_debugreg(DR6_RESERVED, 6)`: the architectural reset value, no stale
+/// status bit. The crate has no DR6 writer and there is no intrinsic for
+/// `mov dr6`: one `asm!` site, CPL0 only, a single register input, no memory,
+/// stack or flags effect.
+///
+/// # Safety
+/// CPL0.
+unsafe fn reset_dr6() {
+    // SAFETY: CPL0; writing DR6 changes no execution state (hardware only ORs
+    // status bits into it) and the value is the reserved-bit pattern.
     unsafe {
         asm!("mov dr6, {}", in(reg) DR6_RESET, options(nomem, nostack, preserves_flags));
     }
+}
+
+/// `debug_read_clear_dr6`: the conditions of the `#DB` just taken (active-high,
+/// the reserved bits flipped off) and DR6 back to its reset value, so the next
+/// `#DB` reports only itself.
+pub fn take_dr6() -> u64 {
+    let raw = Dr6::read_raw();
+    // SAFETY: the only callers run in the `#DB` handler at CPL0.
+    unsafe { reset_dr6() };
+    raw ^ DR6_RESET
+}
+
+/// `fpu__exception_code` for `#MF` (vector 16) / `#XM` (19): the `si_code` from
+/// the live FPU state, 0 for a spurious exception.
+pub fn fpu_exception_code(vector: u8) -> i32 {
+    use kernel::signal::Cpu;
+    let image = UserCpu::new().fxsave();
+    let word = |at: usize| u16::from_le_bytes([image[at], image[at + 1]]);
+    let mxcsr = u32::from_le_bytes([image[24], image[25], image[26], image[27]]);
+    kernel::signal::info::fpu_exception_code(vector, word(0), word(2), mxcsr)
 }
 
 const DR6_RESET: u64 = 0xffff_0ff0;

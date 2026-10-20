@@ -35,7 +35,7 @@ use crate::{
     services::{self, Service},
     timer,
 };
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
     iter,
@@ -56,6 +56,12 @@ use kernel::{
     image::elf::Elf,
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
+    signal::{
+        self, State, USER_CS,
+        deliver::{self, Outcome as SignalOutcome},
+        frame::Sigreturn,
+        info,
+    },
     syscall::{
         self, AddressSpace, ClockState, Clocks, Console, Context, Files, Machine, Outcome,
         RestartBlock, RestartFn,
@@ -471,6 +477,25 @@ pub struct Process {
     pub vfs: Vfs,
     /// `current->files`.
     pub fdt: FdTable,
+    /// `sighand` + `signal_struct` + the task's signal fields (the pure model
+    /// in `kernel::signal`), boxed because the two pending queues are ~16 KiB.
+    pub signal: Box<State>,
+    /// The synchronous fault whose signal was raised and not yet delivered,
+    /// for `show_unhandled_signals` when it turns out to kill init.
+    fault: Option<UserFault>,
+}
+
+/// What `show_signal` / `show_signal_msg` print about a user fault.
+#[derive(Clone, Copy)]
+struct UserFault {
+    vector: u64,
+    /// The hardware error code.
+    error: u64,
+    ip: u64,
+    sp: u64,
+    address: u64,
+    /// The signal the fault forced.
+    signal: u8,
 }
 
 static PROCESS: Service<Process> = Service::new();
@@ -527,10 +552,12 @@ pub fn account_ticks(user: bool, periods: u64) {
 static USER_FAULTS_HANDLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Syscall context: the process plus its user-memory view (a borrow of the
-/// locked tables, so no map/unmap can run mid-syscall) and the console.
+/// locked tables, so no map/unmap can run mid-syscall), the entry registers
+/// and the console.
 struct Syscall<'a> {
     process: &'a mut Process,
     space: UserSpace<'a>,
+    regs: &'a mut cpu::PtRegs,
     tty: Tty,
 }
 
@@ -698,6 +725,32 @@ impl Clocks for Syscall<'_> {
     }
 }
 
+impl<'a> signal::Task for Syscall<'a> {
+    type Pages = UserSpace<'a>;
+    fn parts(&mut self) -> (&mut State, &mut UserSpace<'a>) {
+        (&mut self.process.signal, &mut self.space)
+    }
+    fn now_ns(&self) -> u64 {
+        timer::ktime_get_ns()
+    }
+    fn wait(&mut self, deadline_ns: Option<u64>) {
+        // The interval timer is a wake-up source of every sleep.
+        timer::set_itimer_ns(self.process.signal.itimer.next_event());
+        timer::wait_event(deadline_ns);
+    }
+    fn user_sp(&self) -> u64 {
+        self.regs.sp
+    }
+    fn rt_sigreturn(&mut self) -> Sigreturn {
+        signal::frame::rt_sigreturn(
+            &mut self.process.signal,
+            self.regs,
+            &mut self.space,
+            &mut cpu::UserCpu::new(),
+        )
+    }
+}
+
 /// init's `/dev/console`: the same sinks as `log!`.
 struct Tty;
 impl Console for Tty {
@@ -731,20 +784,23 @@ fn init_died(code: u32) -> ! {
 }
 
 /// Called by `syscall_entry` with the saved registers; writes the result into
-/// `regs.ax`. Interrupts are off and the CPU is on the `BOOT_STACK` top.
+/// `regs.ax`, then runs the exit-to-user work (pending signals). Interrupts are
+/// off and the CPU is on the `BOOT_STACK` top.
 pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
     let args = [regs.di, regs.si, regs.dx, regs.r10, regs.r8, regs.r9];
-    let mut process = PROCESS.lock();
-    let mm = process.mm;
-    let mut tables = mm.lock();
-    let mut context = Syscall {
-        space: tables.user_space(),
-        process: &mut process,
-        tty: Tty,
+    let number = regs.orig_ax;
+    let outcome = {
+        let mut process = PROCESS.lock();
+        let mm = process.mm;
+        let mut tables = mm.lock();
+        let mut context = Syscall {
+            space: tables.user_space(),
+            process: &mut process,
+            regs: &mut *regs,
+            tty: Tty,
+        };
+        syscall::dispatch(&mut context, number, args)
     };
-    let outcome = syscall::dispatch(&mut context, regs.orig_ax, args);
-    drop(tables);
-    drop(process);
     match outcome {
         Outcome::Return(value) => regs.ax = value.cast_unsigned(),
         Outcome::Exit(code) => init_died(code),
@@ -758,41 +814,186 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
             crate::fail();
         }
     }
+    exit_to_user(regs);
 }
 
-/// Called by the IDT entry for an exception raised in ring 3. A page fault
-/// the address-space model resolves returns (the entry code `iretq`s to the
-/// faulting instruction); everything else is fatal to init: no signal handler
-/// can exist yet, so the signal's default action (terminate) runs, the exit
-/// code is the signal number, and init's death panics.
-pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) {
-    if vector == 14 {
-        page_fault(error, ip, sp, address);
+/// `exit_to_user_mode_loop` + `arch_do_signal_or_restart`: before every return
+/// to ring 3 (syscall, exception or interrupt from CPL3) bring the timers up
+/// to date, deliver pending signals (a handler entry or `rt_sigreturn` has
+/// rewritten `regs`, which `iretq` then installs: no `sysret` path exists), and
+/// make sure the frame can be returned to at all.
+///
+/// Context: interrupts masked, task context of the one process; takes
+/// `PROCESS` then `TABLES` (the shared lock order). A fatal signal never
+/// returns: init's death panics, as Linux's `do_exit` does for pid 1.
+pub fn exit_to_user(regs: &mut cpu::PtRegs) {
+    loop {
+        let mut process = PROCESS.lock();
+        process.signal.sync_timers(timer::ktime_get_ns());
+        if process.signal.signal_pending() {
+            let mm = process.mm;
+            let mut tables = mm.lock();
+            let mut space = tables.user_space();
+            let compat = regs.cs != USER_CS;
+            let outcome = deliver::handle_pending_signals(
+                &mut process.signal,
+                regs,
+                &mut space,
+                &mut cpu::UserCpu::new(),
+            );
+            drop(tables);
+            match outcome {
+                SignalOutcome::Handled | SignalOutcome::FrameFailed if compat => {
+                    // The ia32 frame (`ia32_setup_rt_frame`) is not modelled.
+                    crate::log!("FAIL signal delivery in compatibility mode unimplemented\n");
+                    crate::fail();
+                }
+                // `handle_pending_signals` loops while a forced SIGSEGV is pending.
+                SignalOutcome::Resume | SignalOutcome::Handled | SignalOutcome::FrameFailed => {}
+                SignalOutcome::Exit { exit_code, .. } => {
+                    let fault = process.fault.take();
+                    let fault = fault.filter(|f| report::signal_exit_code(f.signal) == exit_code);
+                    let region = fault.and_then(|f| region_of(&process, f.ip));
+                    drop(process);
+                    if let Some(fault) = fault {
+                        show_unhandled_signal(&fault, region);
+                    }
+                    init_died(exit_code);
+                }
+                SignalOutcome::Stop(sig) => {
+                    crate::log!("FAIL signal stop unimplemented sig={}\n", sig);
+                    crate::fail();
+                }
+            }
+        }
+        process.fault = None;
+        // A return frame the CPU would refuse in ring 0 (a hostile `rt_sigreturn`
+        // frame or handler address): Linux's `.Lbad_iret` turns that into a user
+        // #GP, and so does this.
+        if bad_iret_frame(regs) {
+            raise_fault(&mut process, regs, 13, 0, 0);
+            continue;
+        }
+        // Wake the CPU for the next interval-timer expiry while ring 3 runs.
+        timer::set_itimer_ns(process.signal.itimer.next_event());
         return;
     }
-    let region = region_of(&PROCESS.lock(), ip);
-    let signal = u8::try_from(vector).ok().and_then(report::user_exception);
-    let Some(signal) = signal else {
-        crate::log!(
-            "FAIL user exception vector={} error={:#x} rip={:#x}\n",
-            vector,
-            error,
-            ip
-        );
-        crate::fail();
-    };
-    if let Some((kind, desc)) = signal.message {
+}
+
+/// Would `iretq` to this frame fault in ring 0? 64-bit CS needs a canonical
+/// RIP, any frame a canonical RSP, a user code selector and a usable user SS.
+fn bad_iret_frame(regs: &cpu::PtRegs) -> bool {
+    use kernel::signal::Cpu;
+    const fn canonical(address: u64) -> bool {
+        // 4-level paging: bits 63..47 equal.
+        (address.cast_signed() << 16 >> 16).cast_unsigned() == address
+    }
+    let cs_ok = regs.cs == USER_CS || regs.cs == 0x23;
+    #[allow(clippy::cast_possible_truncation)]
+    let ss_ok = regs.ss & 3 == 3 && cpu::UserCpu::new().ss_is_valid_user_data(regs.ss as u16);
+    !cs_ok || !ss_ok || !canonical(regs.sp) || (regs.cs == USER_CS && !canonical(regs.ip))
+}
+
+/// `show_signal` / `show_signal_msg` for a user fault that killed init (Linux
+/// prints them when the signal is unhandled; for the global init every fault
+/// signal is unhandled, shortcut: the line is printed only when the signal
+/// then kills init, and `printk_ratelimit` is not modelled). `region` is the
+/// file-backed VMA containing `fault.ip` ([`region_of`]).
+fn show_unhandled_signal(fault: &UserFault, region: Option<FileRegion>) {
+    if fault.vector == 14 {
+        let line = Segfault {
+            address: fault.address,
+            ip: fault.ip,
+            sp: fault.sp,
+            error: fault.error,
+            region,
+        };
+        crate::log!("{}\n", line);
+    } else if let Some((kind, desc)) = u8::try_from(fault.vector)
+        .ok()
+        .and_then(report::user_exception)
+        .and_then(|signal| signal.message)
+    {
         let line = TrapLine {
             kind,
             desc,
-            ip,
-            sp,
-            error,
+            ip: fault.ip,
+            sp: fault.sp,
+            error: fault.error,
             region,
         };
         crate::log!("{}\n", line);
     }
-    init_died(report::signal_exit_code(signal.signal));
+}
+
+/// Force the signal of a synchronous user-mode fault (`force_sig_*`): record
+/// what `show_signal` prints and what the signal frame reports. `Fault`'s
+/// absent siginfo is a spurious `#MF`/`#XM` that raises nothing.
+fn force(
+    process: &mut Process,
+    regs: &cpu::PtRegs,
+    fault: info::Fault,
+    vector: u64,
+    error: u64,
+    address: u64,
+) -> bool {
+    let Some(signal) = fault.info.map(|i| i.signo) else {
+        return false;
+    };
+    process.signal.force_fault(&fault);
+    process.fault = Some(UserFault {
+        vector,
+        error,
+        ip: regs.ip,
+        sp: regs.sp,
+        address,
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        signal: signal as u8,
+    });
+    true
+}
+
+/// The signal of a non-page-fault exception (`exc_*` in traps.c).
+fn raise_fault(process: &mut Process, regs: &cpu::PtRegs, vector: u64, error: u64) -> bool {
+    let vector8 = u8::try_from(vector).unwrap_or(u8::MAX);
+    // #DB reports DR6 (cleared again, as `debug_read_clear_dr6`); #MF/#XM
+    // read the saved FPU state (`fpu__exception_code`).
+    let dr6 = if vector8 == info::X86_TRAP_DB {
+        cpu::take_dr6()
+    } else {
+        0
+    };
+    let fpe = match vector8 {
+        info::X86_TRAP_MF | info::X86_TRAP_XF => cpu::fpu_exception_code(vector8),
+        _ => 0,
+    };
+    let fault = info::exception(vector8, error, regs.ip, dr6, fpe);
+    fault.is_some_and(|fault| force(process, regs, fault, vector, error, 0))
+}
+
+/// Called by the IDT entry for an exception raised in ring 3: a page fault the
+/// address-space model resolves retries the instruction, every other one
+/// becomes a forced signal (default action: terminate, handlers run); the
+/// return to ring 3 then delivers it. A vector that is not a plain user fault
+/// (NMI, #DF, #MC, #NM, ...) is a kernel failure, never a user death.
+pub fn exception(regs: &mut cpu::PtRegs, vector: u64, error: u64, address: u64) {
+    let mut guard = PROCESS.lock();
+    let raised = if vector == 14 {
+        page_fault(&mut guard, regs, error, address)
+    } else {
+        raise_fault(&mut guard, regs, vector, error)
+    };
+    drop(guard);
+    if !raised {
+        crate::log!(
+            "FAIL user exception vector={} error={:#x} rip={:#x}\n",
+            vector,
+            error,
+            regs.ip
+        );
+        crate::fail();
+    }
+    exit_to_user(regs);
 }
 
 /// `print_vma_addr`'s file part for `ip`: Linux prints the basename of the
@@ -831,52 +1032,37 @@ fn region_of(process: &Process, ip: u64) -> Option<FileRegion> {
 }
 
 /// A page fault taken in ring 3 (`exc_page_fault` -> `do_user_addr_fault`).
-/// Context: the faulting task, interrupts off, no lock held (the fault came
-/// from ring 3). Locks `PROCESS` -> `TABLES` (-> heap, `FRAMES` inside).
+/// Context: the faulting task, interrupts off, `PROCESS` held by the caller;
+/// takes `TABLES` (-> heap, `FRAMES` inside). Returns `true`: the fault was
+/// resolved or its signal is forced and delivered on the way out.
 ///
-/// Outcomes and what Linux does (6.18.57, arch/x86/mm/fault.c) once signals
-/// exist; until then the default action of the signal is carried out directly:
+/// Outcomes and what Linux does (6.18.57, arch/x86/mm/fault.c):
 /// * `Handled`: return to user, the instruction retries.
-/// * `Segv`: `force_sig_fault(SIGSEGV, SEGV_MAPERR|SEGV_ACCERR, address)` after
-///   `show_signal_msg` (the `init[1]: segfault at ...` line); init has no
-///   handler, so it dies with exit code 11.
-/// * `Bus`: `do_sigbus` -> `SIGBUS` (no console line), exit code 7.
+/// * `Segv`: `force_sig_fault(SIGSEGV, SEGV_MAPERR|SEGV_ACCERR, address)`; the
+///   `init[1]: segfault at ...` line (`show_signal_msg`) is printed if the
+///   signal then kills init.
+/// * `Bus`: `do_sigbus` -> `force_sig_fault(SIGBUS, BUS_ADRERR, address)` (no
+///   console line for `SIGBUS` itself).
 /// * `Oom`, `PgtableBad`, `Vsyscall`: Linux runs the OOM killer (which finds
 ///   init unkillable and panics), oopses and kills the task, or emulates the
 ///   vsyscall page. None is implemented: a loud `FAIL mm ...` stop, never a
 ///   signal that did not happen.
 /// * `NeedsFile` (a page of a private file mapping) is resolved by
 ///   [`user_fault`] into `Handled`, `Bus` or `Oom`.
-fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
-    let mut guard = PROCESS.lock();
-    let process = &mut *guard;
-    let mut tables = process.mm.lock();
+fn page_fault(process: &mut Process, regs: &cpu::PtRegs, error: u64, address: u64) -> bool {
+    let (ip, mm) = (regs.ip, process.mm);
+    let mut tables = mm.lock();
     let mut space = tables.user_space();
     let outcome = user_fault(process, &mut space, address, error | mm::PF_USER);
     drop(tables);
-    match outcome {
+    let kind = match outcome {
         FaultOutcome::Handled => {
             #[cfg(feature = "qemu-self-test")]
             USER_FAULTS_HANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return true;
         }
-        FaultOutcome::Segv { address, .. } => {
-            // Both refusals (MAPERR, ACCERR) print the same line; the code only
-            // reaches siginfo, which no handler can read yet.
-            let line = Segfault {
-                address,
-                ip,
-                sp,
-                error,
-                region: region_of(process, ip),
-            };
-            drop(guard);
-            crate::log!("{}\n", line);
-            init_died(report::signal_exit_code(report::SIGSEGV));
-        }
-        FaultOutcome::Bus { .. } => {
-            drop(guard);
-            init_died(report::signal_exit_code(report::SIGBUS));
-        }
+        FaultOutcome::Segv { code, address } => (info::PageFault::Segv(code as i32), address),
+        FaultOutcome::Bus { address } => (info::PageFault::Bus, address),
         FaultOutcome::Oom => {
             crate::log!(
                 "FAIL mm out of memory in a user fault (Linux: pagefault_out_of_memory finds no killable task and panics) address={:#x} ip={:#x}\n",
@@ -906,7 +1092,9 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
             crate::fail();
         }
         FaultOutcome::NeedsFile { .. } => unreachable!("resolved by user_fault"),
-    }
+    };
+    let fault = info::page_fault(kind.0, kind.1, error);
+    force(process, regs, fault, 14, error, kind.1)
 }
 
 /// One system call through the dispatcher in the self-test (stops loudly on an
@@ -1348,6 +1536,11 @@ fn start(mut init: Loaded) -> ! {
     }
     let mut attrs = Attributes::init(task::max_threads(managed_pages));
     attrs.fs = init.vfs.new_fs_struct(0o022);
+    let signal = crate::unwrap(
+        Box::try_new(State::new_init(task::max_threads(managed_pages) / 2))
+            .map_err(|_| "out of memory"),
+        "signal-state",
+    );
     PROCESS.install(Process {
         pid: 1,
         tgid: 1,
@@ -1365,6 +1558,8 @@ fn start(mut init: Loaded) -> ! {
         exec: u64::from(init.exec.index()),
         vfs: init.vfs,
         fdt,
+        signal,
+        fault: None,
     });
     #[cfg(feature = "qemu-self-test")]
     check_mm_usercopy();
