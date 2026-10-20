@@ -461,6 +461,9 @@ pub struct Process {
     /// shortcut: fixed `INIT_RLIMITS`; `setrlimit`/`prlimit64` must update it
     /// (or derive it from the credentials group's limits) when they land.
     pub env: Env,
+    /// `FileInfo::id` of the open description `/init` was loaded from
+    /// (`mm->exe_file`): the only file whose name the fault report knows.
+    pub exec: u64,
     /// The mounted rootfs, open files and pipes.
     /// shortcut: one process, so the system-wide VFS lives here; with tasks it
     /// becomes its own service (lock class `vfs` between `PROCESS` and `TABLES`).
@@ -766,7 +769,7 @@ pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) {
         page_fault(error, ip, sp, address);
         return;
     }
-    let region = FileRegion::of(&PROCESS.lock().space, ip);
+    let region = region_of(&PROCESS.lock(), ip);
     let signal = u8::try_from(vector).ok().and_then(report::user_exception);
     let Some(signal) = signal else {
         crate::log!(
@@ -789,6 +792,23 @@ pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) {
         crate::log!("{}\n", line);
     }
     init_died(report::signal_exit_code(signal.signal));
+}
+
+/// `print_vma_addr`'s file part for `ip`: Linux prints the basename of the
+/// VMA's file, and [`FileRegion`] knows only `init`. A fault in a VMA of any
+/// other file would print a wrong name, so it stops loudly instead.
+/// shortcut: resolve the name from the description's dentry when a program
+/// other than `/init` can run.
+fn region_of(process: &Process, ip: u64) -> Option<FileRegion> {
+    let region = FileRegion::of(&process.space, ip)?;
+    if process.space.find_vma(ip).and_then(|vma| vma.file) != Some(process.exec) {
+        crate::log!(
+            "FAIL mm user fault in a mapped file other than /init ip={:#x} (file name resolution not ported)\n",
+            ip
+        );
+        crate::fail();
+    }
+    Some(region)
 }
 
 /// A page fault taken in ring 3 (`exc_page_fault` -> `do_user_addr_fault`).
@@ -828,7 +848,7 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
                 ip,
                 sp,
                 error,
-                region: FileRegion::of(&process.space, ip),
+                region: region_of(process, ip),
             };
             drop(guard);
             crate::log!("{}\n", line);
@@ -1323,6 +1343,7 @@ fn start(mut init: Loaded) -> ! {
         },
         space: init.mm,
         env: init.env,
+        exec: u64::from(init.exec.index()),
         vfs: init.vfs,
         fdt,
     });
