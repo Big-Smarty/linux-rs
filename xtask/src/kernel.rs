@@ -186,6 +186,9 @@ enum User {
     Segfault,
     /// Calls `mmap`, which Linux implements and this slice does not: the kernel stops.
     Unimplemented,
+    /// Runs one oracle syscall-test group (`-- <group>`, `user/init/src/tests`) to `init: ok`;
+    /// every `init: test|tests|info` line equals the pinned Linux's ([`validate_oracle`]).
+    Oracle(&'static str),
     /// No `/init` in any archive: Linux's `prepare_namespace` failure text.
     NoRoot,
 }
@@ -285,7 +288,28 @@ const SUCCESS_MARKERS: &[&str] = &[
     "RESULT success",
 ];
 
-const DEBUG_CASES: [DebugCase; 25] = [
+/// One oracle syscall-test group run on this kernel: `-- <group>` on the command line, the normal
+/// success markers, and every `init: test|tests|info` line equal to `xtask/oracle/expected.tsv`
+/// ([`validate_oracle`]). Add one `oracle_case!(<group>)` line to [`DEBUG_CASES`] when the group's
+/// syscalls land; nothing else needs editing.
+macro_rules! oracle_case {
+    ($group:ident) => {
+        DebugCase {
+            name: concat!("oracle-", stringify!($group)),
+            cmdline: Some(concat!("-- ", stringify!($group))),
+            cpu: "qemu64",
+            expected_exit: 33,
+            required: SUCCESS_MARKERS,
+            forbid_success: false,
+            modules: ARCHIVE_ONLY,
+            user: User::Oracle(stringify!($group)),
+            framebuffers: 1,
+            plat: Q35_TCG,
+        }
+    };
+}
+
+const DEBUG_CASES: &[DebugCase] = &[
     DebugCase {
         name: "success",
         cmdline: None,
@@ -648,21 +672,15 @@ const DEBUG_CASES: [DebugCase; 25] = [
             ..Q35_TCG
         },
     },
+    oracle_case!(ids),
 ];
 
 /// Expected stdout lines of the oracle syscall suite (`user/init` modes `mm ids time signal fs
 /// proc`) as observed on the pinned Linux 6.18.57 (`target/linux-reference/init-reference-006`).
 /// Tab-separated `group kind name line`, `#` comments and a header row; see the file header.
-/// The `kernel-test` cases that run these modes on this kernel are added with the syscalls they
-/// need, so nothing outside the unit test reads it yet.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the cases added with each syscall slice"
-    )
-)]
-pub(crate) const ORACLE_EXPECTED: &str = include_str!("../oracle/expected.tsv");
+/// [`oracle_rows`] reads it; the `kernel-test` cases made by `oracle_case!` compare a run of the
+/// mode on this kernel against it.
+const ORACLE_EXPECTED: &str = include_str!("../oracle/expected.tsv");
 
 /// One case catalog for execution and downstream evidence packaging.
 pub(crate) fn debug_case_catalog() -> impl ExactSizeIterator<Item = (&'static str, i32)> {
@@ -4052,7 +4070,7 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
             exact_summary,
             protection,
         } => (argc, mode_line, exact_summary, protection),
-        User::Segfault | User::Unimplemented => (2, None, true, (false, false)),
+        User::Segfault | User::Unimplemented | User::Oracle(_) => (2, None, true, (false, false)),
     };
     let audit = find.at(
         &|line| line.starts_with("CHECK userspace-audit ok user_pages="),
@@ -4092,12 +4110,91 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     if let Some(mode_line) = mode_line {
         positions.push(find.exact(mode_line, "init mode line")?);
     }
+    if let User::Oracle(group) = user {
+        let (first, last) = validate_oracle(lines, group)?;
+        positions.push(first);
+        // A one-line group has first == last; strict ordering must not reject it.
+        if last != first {
+            positions.push(last);
+        }
+    }
     positions.extend(user_tail(&find, user, init)?);
     if positions.windows(2).all(|pair| pair[0] < pair[1]) {
         Ok(())
     } else {
         Err("userspace records are out of order".to_owned())
     }
+}
+
+/// Rows of [`ORACLE_EXPECTED`] for `group` in file order: `(kind, exact stdout line)` where kind is
+/// `check`, `info` or `summary`. The header row and `#` comments are skipped.
+fn oracle_rows(group: &str) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+    ORACLE_EXPECTED
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .skip(1)
+        .filter_map(move |row| {
+            let mut fields = row.split('\t');
+            let (row_group, kind, _name, line) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            (row_group == group).then_some((kind, line))
+        })
+}
+
+/// The line prefixes of an oracle test group's output; everything else the guest prints (kernel
+/// `printk`s, `init:` banner lines) is not part of the comparison.
+const ORACLE_PREFIXES: [&str; 3] = ["init: test ", "init: tests ", "init: info "];
+
+/// `init: info <group>.<name>`: the part of an info line that must match.
+fn oracle_key(line: &str) -> Vec<&str> {
+    line.splitn(4, ' ').take(3).collect()
+}
+
+/// The oracle group's output on this kernel must equal the pinned Linux's: the lines starting with
+/// [`ORACLE_PREFIXES`], in order, none missing and none extra. `check` and `summary` rows compare
+/// exactly (a `FAIL` line, a different count or a reordering is a mismatch); an `info` row is a
+/// recorded observation, so only its `init: info <group>.<name>` key must match. Returns the
+/// serial indices of the first and last such line, so the caller can order them between init's
+/// summary line and `init: ok`.
+fn validate_oracle(lines: &[&str], group: &str) -> Result<(usize, usize), String> {
+    let expected = oracle_rows(group).collect::<Vec<_>>();
+    if expected.is_empty() {
+        return Err(format!("no expected oracle lines for group {group}"));
+    }
+    let observed = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            ORACLE_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .map(|(index, line)| (index, *line))
+        .collect::<Vec<_>>();
+    for (position, ((kind, want), (_, got))) in expected.iter().zip(&observed).enumerate() {
+        let same = if *kind == "info" {
+            oracle_key(want) == oracle_key(got)
+        } else {
+            want == got
+        };
+        if !same {
+            return Err(format!(
+                "oracle {group} line {position}: expected {want:?}, got {got:?}"
+            ));
+        }
+    }
+    if observed.len() != expected.len() {
+        return Err(format!(
+            "oracle {group}: expected {} lines, got {}",
+            expected.len(),
+            observed.len()
+        ));
+    }
+    Ok((observed[0].0, observed[observed.len() - 1].0))
 }
 
 /// `init[1]: segfault at 0 ip <ip> sp <sp> error 4 in init[<off>,<start>+<len>] likely on CPU 0
@@ -4144,7 +4241,7 @@ fn user_tail(
 ) -> Result<Vec<usize>, String> {
     const DEATH: &str = "Kernel panic - not syncing: Attempted to kill init! exitcode=";
     Ok(match user {
-        User::Ok { .. } => vec![
+        User::Ok { .. } | User::Oracle(_) => vec![
             find.exact("init: ok", "init: ok")?,
             find.exact(&format!("{DEATH}0x00000000"), "init death panic")?,
             find.exact("RESULT success", "RESULT success")?,
@@ -4687,7 +4784,7 @@ fn run_kernel_test(output: &Output, timeout: Duration) -> io::Result<TestRun> {
     let tools = prepare_qemu_inputs(&output.root, &output.path, &init_build.elf)?;
     copy_notices(&output.root, &output.path, &tools.sha256sum.path)?;
     let mut cases = Vec::with_capacity(DEBUG_CASES.len());
-    for case in DEBUG_CASES {
+    for case in DEBUG_CASES.iter().copied() {
         cases.push(run_debug_case(
             &output.root,
             &output.path,
@@ -6939,6 +7036,116 @@ mod tests {
             timed_out: true,
         };
         assert!(!validate(DEBUG_CASES[0], &timed_out, &success_serial()).0);
+    }
+
+    fn oracle_lines(group: &str) -> Vec<String> {
+        oracle_rows(group)
+            .map(|(_, line)| line.to_owned())
+            .collect()
+    }
+
+    /// The success serial of a `-- <group>` run: argc 2 and the group's lines before `init: ok`.
+    fn oracle_serial(lines: &[String]) -> String {
+        let one = fixture::init_summary(&expected().init, 1);
+        let two = fixture::init_summary(&expected().init, 2);
+        success_serial().replace(&one, &two).replace(
+            "\ninit: ok\n",
+            &format!("\n{}\ninit: ok\n", lines.join("\n")),
+        )
+    }
+
+    #[test]
+    fn oracle_case_requires_every_expected_line_exactly_in_order() {
+        let process = ProcessResult {
+            exit_code: Some(33),
+            timed_out: false,
+        };
+        let case = case("oracle-ids");
+        assert_eq!(case.cmdline, Some("-- ids"));
+        assert_eq!(case.user, User::Oracle("ids"));
+        let lines = oracle_lines("ids");
+        assert_eq!(lines.len(), 158, "157 checks and the summary");
+        assert_eq!(lines.last().unwrap(), "init: tests ids passed=157 failed=0");
+        let (accepted, why) = validate(case, &process, &oracle_serial(&lines));
+        assert!(accepted, "{why}");
+
+        let mutate = |edit: &dyn Fn(&mut Vec<String>)| {
+            let mut changed = lines.clone();
+            edit(&mut changed);
+            validate(case, &process, &oracle_serial(&changed))
+        };
+        for (what, (accepted, why)) in [
+            ("missing line", mutate(&|l| drop(l.remove(10)))),
+            ("missing summary", mutate(&|l| drop(l.pop()))),
+            (
+                "extra line",
+                mutate(&|l| l.insert(5, "init: test ids.extra ok".to_owned())),
+            ),
+            ("duplicate", mutate(&|l| l.insert(5, l[5].clone()))),
+            (
+                "failing check",
+                mutate(&|l| l[7] = format!("{} FAIL got=1 want=2", l[7].trim_end_matches(" ok"))),
+            ),
+            (
+                "wrong count",
+                mutate(&|l| {
+                    *l.last_mut().unwrap() = "init: tests ids passed=156 failed=1".to_owned();
+                }),
+            ),
+            ("reordered", mutate(&|l| l.swap(3, 4))),
+            (
+                "another group",
+                mutate(&|l| l[0] = oracle_lines("time")[0].clone()),
+            ),
+        ] {
+            assert!(!accepted, "{what} accepted: {why}");
+            assert!(why.contains("oracle ids"), "{what}: {why}");
+        }
+        // Kernel noise and the banner are not part of the comparison ...
+        let mut noisy = lines.clone();
+        noisy.insert(2, "[    0.1] some printk".to_owned());
+        noisy.insert(9, "init: banner line".to_owned());
+        assert!(validate(case, &process, &oracle_serial(&noisy)).0);
+        // ... but the lines must sit between init's summary line and `init: ok`.
+        let serial = oracle_serial(&lines);
+        let first = format!("\n{}", lines[0]);
+        let early = serial.replacen(&first, "", 1).replacen(
+            "init: hello from userspace",
+            &format!("{}\ninit: hello from userspace", lines[0]),
+            1,
+        );
+        assert!(!validate(case, &process, &early).0);
+        // A run that did not reach `init: ok` is still a failure.
+        let truncated = oracle_serial(&lines).replace("\ninit: ok\n", "\n");
+        assert!(!validate(case, &process, &truncated).0);
+    }
+
+    #[test]
+    fn oracle_info_rows_match_by_name_only() {
+        let fs = oracle_rows("fs").collect::<Vec<_>>();
+        let info = fs
+            .iter()
+            .position(|(kind, _)| *kind == "info")
+            .expect("fs has info rows");
+        let mut observed = fs
+            .iter()
+            .map(|(_, line)| (*line).to_owned())
+            .collect::<Vec<_>>();
+        let strings = observed.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            validate_oracle(&strings, "fs").map(|(first, _)| first),
+            Ok(0)
+        );
+        // Another cookie value is an observation, another name is not.
+        let original = observed[info].clone();
+        let name_end = original.match_indices(' ').nth(2).unwrap().0;
+        observed[info] = format!("{} different observation", &original[..name_end]);
+        let strings = observed.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(validate_oracle(&strings, "fs").is_ok());
+        observed[info] = original.replacen("init: info fs.", "init: info fs.x", 1);
+        let strings = observed.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(validate_oracle(&strings, "fs").is_err());
+        assert!(validate_oracle(&[], "nonexistent").is_err());
     }
 
     #[test]

@@ -1926,7 +1926,7 @@ ws-kernel-sched	kernel/sched	docs/subsystems/process.md	P0	not_started
 ws-kernel-seccomp-c	kernel/seccomp.c	docs/subsystems/security.md	P0	not_started
 ws-kernel-signal-c	kernel/signal.c	docs/subsystems/process.md	P0	in_progress
 ws-kernel-stacktrace-c	kernel/stacktrace.c	docs/subsystems/observability.md	P1	not_started
-ws-kernel-sys-c	kernel/sys.c	docs/subsystems/process.md	P0	not_started
+ws-kernel-sys-c	kernel/sys.c	docs/subsystems/process.md	P0	in_progress
 ws-kernel-sys-ni-c	kernel/sys_ni.c	docs/subsystems/process.md	P0	not_started
 ws-kernel-sysctl-c	kernel/sysctl.c	docs/subsystems/process.md	P0	not_started
 ws-kernel-sysctl-test-c	kernel/sysctl-test.c	docs/subsystems/process.md	P0	not_started

@@ -2,7 +2,8 @@
 //! Host fakes for the syscall tests: a task whose user memory is the sparse
 //! `usercopy::fake::Space` and whose console collects bytes.
 
-use super::{Console, Context};
+use super::{Console, Context, Machine};
+use crate::task::Attributes;
 use crate::usercopy::{UserPages, fake::Space};
 extern crate std;
 use std::vec::Vec;
@@ -19,6 +20,11 @@ pub struct Task<P = Space, C = Sink> {
     pub pages: P,
     pub sink: C,
     pub tgid: u32,
+    pub attrs: Attributes,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub machine: Machine,
+    pub cpuid_fault_absent: bool,
 }
 
 impl<P, C> Task<P, C> {
@@ -27,6 +33,16 @@ impl<P, C> Task<P, C> {
             pages,
             sink,
             tgid: 1,
+            attrs: Attributes::init(1000),
+            fs_base: 0,
+            gs_base: 0,
+            machine: Machine {
+                uptime_ns: 0,
+                total_pages: 100,
+                free_pages: 40,
+                loads: [0; 3],
+            },
+            cpuid_fault_absent: false,
         }
     }
 }
@@ -47,5 +63,29 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
     }
     fn tgid(&self) -> u32 {
         self.tgid
+    }
+    fn tid(&self) -> u32 {
+        self.tgid
+    }
+    fn attrs(&mut self) -> &mut Attributes {
+        &mut self.attrs
+    }
+    fn fs_base(&self) -> u64 {
+        self.fs_base
+    }
+    fn set_fs_base(&mut self, base: u64) {
+        self.fs_base = base;
+    }
+    fn gs_base(&self) -> u64 {
+        self.gs_base
+    }
+    fn set_gs_base(&mut self, base: u64) {
+        self.gs_base = base;
+    }
+    fn machine(&self) -> Machine {
+        self.machine
+    }
+    fn cpuid_fault_absent(&self) -> bool {
+        self.cpuid_fault_absent
     }
 }

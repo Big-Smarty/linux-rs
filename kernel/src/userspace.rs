@@ -43,7 +43,9 @@ use kernel::{
         stack::{self, ARG_PAGES, Aux, ENVP, EXPAND_PAGES, STACK_START, STACK_TOP, StackError},
     },
     image::{cpio::FileType, elf::Elf},
-    syscall::{self, Console, Context, Outcome},
+    loadavg::LoadAvg,
+    syscall::{self, Console, Context, Machine, Outcome},
+    task::{self, Attributes},
     usercopy::{self, UserPages},
 };
 use syscalls::Errno;
@@ -361,7 +363,6 @@ fn load_init(
 /// re-enter), so a field needs no lock of its own.
 pub struct Process {
     /// Task id; `pid == tgid` for the single-threaded init.
-    #[allow(dead_code, reason = "read by gettid and the identity group")]
     pub pid: u32,
     /// Thread-group id: what `getpid` reports.
     pub tgid: u32,
@@ -375,9 +376,46 @@ pub struct Process {
     /// `mm->start_brk`, and the initial `mm->brk`.
     #[allow(dead_code, reason = "read by the brk syscall (mm group)")]
     pub brk: u64,
+    /// Credentials, rlimits, filesystem context, comm, personality and the
+    /// user pointers libc registers (`task::Attributes`, the identity group).
+    pub attrs: Attributes,
+    /// Load-average state at init start; `sysinfo` replays it to the boot
+    /// clock ([`LoadAvg::loads_at`]), so there is no tick hook and no lock.
+    pub load: LoadAvg,
 }
 
 static PROCESS: Service<Process> = Service::new();
+
+/// `nr_running + nr_uninterruptible` of the one CPU: init is always runnable
+/// (running or preempted by the tick) because no syscall blocks yet and the
+/// kernel never halts while init exists.
+/// shortcut: a constant; replace with the runqueue's counters when a syscall
+/// can sleep (nanosleep, futex, wait4, blocking I/O) or a second task exists.
+const NR_ACTIVE: i64 = 1;
+
+/// The boot clock in jiffies, the unit of the load-average windows. The
+/// periodic tick is masked before init starts, so `timer::ticks()` does not
+/// advance; the boot clock (`ktime_get_boottime_ns`) does.
+fn jiffies_of(boot_ns: u64) -> u64 {
+    boot_ns / kernel::time::TICK_NSEC
+}
+
+/// `!X86_FEATURE_CPUID_FAULT`, decided only where CPUID can prove it. AMD sets
+/// the feature from `X86_FEATURE_GP_ON_USER_CPUID`, CPUID `0x80000021` EAX bit
+/// 17 (arch/x86/kernel/cpu/amd.c:536, common.c:1046). Intel reads
+/// `MSR_PLATFORM_INFO` with `rdmsrq_safe` (intel.c:488); there is no fault
+/// fixup here to make that read safe, so Intel and every other vendor are
+/// "not determinable" (false) and `ARCH_SET_CPUID` stops loudly instead.
+/// shortcut: AMD-only proof; upgrade with an MSR-read fixup mechanism.
+fn cpuid_fault_absent() -> bool {
+    let amd = raw_cpuid::CpuId::new()
+        .get_vendor_info()
+        .is_some_and(|vendor| vendor.as_str() == "AuthenticAMD");
+    // `__cpuid` is unconditionally available on x86_64 (CPUID is baseline).
+    let gp_on_user_cpuid =
+        __cpuid(0x8000_0000).eax >= 0x8000_0021 && __cpuid(0x8000_0021).eax & (1 << 17) != 0;
+    amd && !gp_on_user_cpuid
+}
 
 /// Syscall context: the process plus its user-memory view (a borrow of the
 /// locked tables, so no map/unmap can run mid-syscall) and the console.
@@ -399,6 +437,40 @@ impl Context for Syscall<'_> {
     }
     fn tgid(&self) -> u32 {
         self.process.tgid
+    }
+    fn tid(&self) -> u32 {
+        self.process.pid
+    }
+    fn attrs(&mut self) -> &mut Attributes {
+        &mut self.process.attrs
+    }
+    fn fs_base(&self) -> u64 {
+        cpu::user_fs_base()
+    }
+    fn set_fs_base(&mut self, base: u64) {
+        cpu::set_user_fs_base(base);
+    }
+    fn gs_base(&self) -> u64 {
+        cpu::user_gs_base()
+    }
+    fn set_gs_base(&mut self, base: u64) {
+        cpu::set_user_gs_base(base);
+    }
+    fn cpuid_fault_absent(&self) -> bool {
+        cpuid_fault_absent()
+    }
+    fn machine(&self) -> Machine {
+        // `ktime_get_boottime_ns` is the boot clock `do_sysinfo` reads.
+        let uptime_ns = crate::timer::ktime_get_boottime_ns();
+        // Lock order: `FRAMES` is the leaf below `PROCESS` -> `TABLES` -> heap.
+        // The load averages take no lock: they are replayed from `Process::load`.
+        let frames = services::FRAMES.lock();
+        Machine {
+            uptime_ns,
+            total_pages: frames.total() as u64,
+            free_pages: frames.available() as u64,
+            loads: self.process.load.loads_at(jiffies_of(uptime_ns), NR_ACTIVE),
+        }
     }
 }
 
@@ -624,12 +696,23 @@ fn start(init: &Loaded) -> ! {
         protection.smap
     );
     let (entry, sp) = (init.entry, init.sp);
+    // `fork_init`: RLIMIT_NPROC and RLIMIT_SIGPENDING derive from memory.
+    // shortcut: Linux uses `memblock_estimated_nr_free_pages()` (memblock memory
+    // minus early reservations); this is every page the frame allocator
+    // manages, so the limits equal Linux's only for the same page count. Upgrade
+    // with a memblock-equivalent estimate.
+    let managed_pages = services::FRAMES.lock().total() as u64;
+    // `sched_init`: the first load window starts when the scheduler does.
+    // shortcut: that is when init starts here, not at kernel entry.
+    let load = LoadAvg::new(jiffies_of(crate::timer::ktime_get_boottime_ns()));
     PROCESS.install(Process {
         pid: 1,
         tgid: 1,
         mm: &services::TABLES,
         vmas: init.vmas,
         brk: init.brk,
+        attrs: Attributes::init(task::max_threads(managed_pages)),
+        load,
     });
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all

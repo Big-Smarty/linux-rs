@@ -1396,6 +1396,42 @@ pub fn fsgsbase_enabled() -> bool {
     Cr4::read().contains(Cr4Flags::FSGSBASE)
 }
 
+/// Linux `x86_fsbase_read_cpu` without FSGSBASE: `rdmsr(MSR_FS_BASE)`. The
+/// user's `%fs` base stays in the MSR while the kernel runs (nothing in the
+/// kernel uses `%fs`), so no save/restore exists.
+#[must_use]
+pub fn user_fs_base() -> u64 {
+    FsBase::read().as_u64()
+}
+
+/// `x86_gsbase_read_cpu_inactive`. Linux keeps the user's `%gs` base in
+/// `MSR_KERNEL_GS_BASE` while it runs because it executes `SWAPGS` on entry;
+/// this kernel never does (see `enter_user`), so the user's base is still the
+/// live `MSR_GS_BASE`.
+#[must_use]
+pub fn user_gs_base() -> u64 {
+    GsBase::read().as_u64()
+}
+
+/// `ARCH_SET_FS`: `loadseg(FS, 0)` then `x86_fsbase_write_cpu`. `base` is below
+/// `TASK_SIZE_MAX` (checked by `arch_prctl`), hence canonical.
+pub fn set_user_fs_base(base: u64) {
+    let null = SegmentSelector::new(0, PrivilegeLevel::Ring0);
+    // SAFETY: CPL0; the null selector is legal for FS in 64-bit mode and
+    // `%fs` is not used by kernel code.
+    unsafe { FS::set_reg(null) };
+    FsBase::write(VirtAddr::new_truncate(base));
+}
+
+/// `ARCH_SET_GS`: `loadseg(GS, 0)` then the base write (see [`user_gs_base`]).
+pub fn set_user_gs_base(base: u64) {
+    let null = SegmentSelector::new(0, PrivilegeLevel::Ring0);
+    // SAFETY: CPL0; the null selector is legal for GS in 64-bit mode and kernel
+    // code never uses `%gs` (no per-CPU area is addressed through it).
+    unsafe { GS::set_reg(null) };
+    GsBase::write(VirtAddr::new_truncate(base));
+}
+
 /// Linux `start_thread` for a new 64-bit task, then IRETQ to ring 3.
 ///
 /// # Safety
