@@ -22,11 +22,11 @@ use syscalls::Errno;
 use super::{
     env::{Env, FileInfo, RLIM_INFINITY},
     flags::{
-        LEGACY_MAP_MASK, MAP_ANONYMOUS, MAP_DROPPABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_HUGETLB, MAP_LOCKED,
-        MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE,
-        MAP_TYPE, PAGE_SHIFT, PAGE_SIZE, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ,
-        PROT_SEM, PROT_WRITE, VmFlags, calc_vm_flag_bits, calc_vm_prot_bits, offset_in_page,
-        page_prot,
+        LEGACY_MAP_MASK, MAP_ANONYMOUS, MAP_DROPPABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_HUGETLB,
+        MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
+        MAP_SHARED_VALIDATE, MAP_TYPE, PAGE_SHIFT, PAGE_SIZE, PROT_EXEC, PROT_GROWSDOWN,
+        PROT_GROWSUP, PROT_READ, PROT_SEM, PROT_WRITE, VmFlags, calc_vm_flag_bits,
+        calc_vm_prot_bits, offset_in_page, page_prot,
     },
     layout::round_hint_to_min,
     pt::UserPages,
