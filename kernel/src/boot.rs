@@ -245,6 +245,10 @@ pub enum TestMode {
     /// QEMU self-test only: treat the machine as a hypervisor with x2APIC so
     /// the x2APIC register backend runs under TCG (no KVM signature there).
     ForceX2apic,
+    /// QEMU self-test only: run the scheduler self-test (`ktask::selftest`).
+    SchedSwitch,
+    /// QEMU self-test only: overflow a kernel thread's stack on purpose.
+    KstackOverflow,
 }
 
 #[repr(C)]
@@ -525,6 +529,8 @@ impl BootInfo {
                     b"test=bad-map" => TestMode::BadMap,
                     b"test=firmware-x2apic" => TestMode::FirmwareX2apic,
                     b"test=force-x2apic" => TestMode::ForceX2apic,
+                    b"test=sched-switch" => TestMode::SchedSwitch,
+                    b"test=kstack-overflow" => TestMode::KstackOverflow,
                     _ => TestMode::Normal,
                 };
             }

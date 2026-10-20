@@ -24,7 +24,7 @@ pub struct Declared {
     pub enosys: &'static [u32],
 }
 
-pub const DECLARED: [Declared; 10] = [
+pub const DECLARED: [Declared; 11] = [
     Declared {
         symbol: "boot: console=ttyS0",
         value: "the console tty is the 8250 serial line at its default 9600n8: TCGETS reports tty_std_termios with c_cflag B9600|CS8|CREAD|HUPCL|CLOCAL (a vt console would differ: vt.c sets IUTF8 in UTF-8 mode)",
@@ -83,6 +83,12 @@ pub const DECLARED: [Declared; 10] = [
         symbol: "CONFIG_IA32_EMULATION=y with boot ia32_emulation=0",
         value: "y (sigframe_ia32 sizing: AT_MINSIGSTKSZ 0x5a0 equals the oracle) but ia32_enabled() is false: no int $0x80 gate (#GP), no SYSENTER/compat SYSCALL entry (CSTAR -> -ENOSYS stub, SYSENTER MSRs zero)",
         source: "arch/x86/kernel/signal.c:181-185, arch/x86/kernel/idt.c:124-126 and 233-239, arch/x86/kernel/cpu/common.c:2230-2252, arch/x86/include/asm/ia32.h:84",
+        enosys: &[],
+    },
+    Declared {
+        symbol: "CONFIG_PREEMPT_VOLUNTARY",
+        value: "y (as the reference config): code in ring 0 is never preempted; a task in the kernel gives up the CPU only in schedule() (sleeps, yields), and a running task is rescheduled at the tick only on its way back to ring 3",
+        source: "kernel/Kconfig.preempt:36-52, kernel/sched/core.c:5597 (sched_tick sets need_resched) and 7025 (schedule), kernel/entry/common.c:19 (exit_to_user_mode_loop)",
         enosys: &[],
     },
 ];

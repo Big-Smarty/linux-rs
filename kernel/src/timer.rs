@@ -148,12 +148,18 @@ static DEADLINE_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// disarmed. Only the wake-up is programmed here; the expiry is acted on by
 /// `State::sync_timers` at the next kernel exit or wake-up.
 static ITIMER_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The head of the scheduler's timer queue (`ktask::TIMERQ`): the earliest
+/// sleeping task's wake-up, `u64::MAX` when none. Published by `ktask` whenever
+/// the head changes; the expiry itself is acted on by [`lapic_timer_interrupt`]
+/// and the idle loop, which drain the queue.
+static WAKE_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// The earliest wanted wake-up other than the tick.
 fn event_deadline() -> u64 {
     DEADLINE_NS
         .load(Ordering::Relaxed)
         .min(ITIMER_NS.load(Ordering::Relaxed))
+        .min(WAKE_NS.load(Ordering::Relaxed))
 }
 
 // A sequence-counted clock: readers (any context, including the tick IRQ)
@@ -356,6 +362,7 @@ fn tick_bookkeeping(now_ns: u64, user: bool) {
         TICKS.fetch_add(periods, Ordering::Relaxed);
         NEXT_TICK_NS.store(next + periods * TICK_NSEC, Ordering::Relaxed);
         crate::userspace::account_ticks(user, periods);
+        crate::ktask::scheduler_tick();
     }
 }
 
@@ -364,6 +371,9 @@ pub fn lapic_timer_interrupt(user: bool) {
     apic::eoi();
     let now = ktime_get_ns();
     tick_bookkeeping(now, user);
+    // Wake the sleepers whose time has come and publish the new queue head,
+    // before `rearm` programs the clockevent from it.
+    crate::ktask::timer_interrupt(now);
     cpu::irq_lock_probe();
     rearm(now);
     // After the EOI and the re-arm: a timed-out group abandons this frame.
@@ -384,6 +394,8 @@ pub fn isa_irq0_interrupt(user: bool) {
     if EVENT.load(Ordering::Relaxed) == EVENT_PIT && TICK_ON.load(Ordering::Relaxed) {
         TICKS.fetch_add(1, Ordering::Relaxed);
         crate::userspace::account_ticks(user, 1);
+        crate::ktask::scheduler_tick();
+        crate::ktask::timer_interrupt(ktime_get_ns());
         cpu::irq_lock_probe();
     }
     #[cfg(feature = "baremetal-suite")]
@@ -422,7 +434,7 @@ pub fn mask_timer() {
 /// has been shown to deliver (`TICK_VERIFIED`): a halted CPU whose timer is dead
 /// never wakes. Before that proof (and if bring-up failed) it spins for 100 us
 /// with IF=1 instead, so no wait can hang on a source that never worked.
-fn idle() {
+pub(crate) fn idle() {
     if TICK_VERIFIED.load(Ordering::Relaxed) {
         cpu::wait_for_interrupt();
     } else {
@@ -462,9 +474,10 @@ pub fn wait_until_ns(deadline_ns: u64) {
 }
 
 /// Program (or clear) the wake-up for the process's `ITIMER_REAL` expiry.
-/// Called before the CPU can take an interrupt that matters: before halting in
-/// [`wait_event`] and before the return to ring 3. Context: task or interrupt
-/// return path, interrupts masked, BSP.
+/// Called before the CPU can take an interrupt that matters: before the return
+/// to ring 3 (a sleeping task's `ITIMER_REAL` expiry rides on its timer-queue
+/// wake-up instead, `ktask::sleep_current`). Context: task or interrupt return
+/// path, interrupts masked, BSP.
 pub fn set_itimer_ns(expiry: Option<u64>) {
     let expiry = expiry.unwrap_or(u64::MAX);
     // Every syscall exit republishes; reprogramming the clockevent (an MSR or
@@ -481,43 +494,42 @@ pub fn set_itimer_ns(expiry: Option<u64>) {
 }
 
 /// Forget every wake-up the finished process programmed (a sleep deadline that
-/// a timed-out group abandoned, its `ITIMER_REAL` expiry), so the next group
+/// a timed-out group abandoned, its `ITIMER_REAL` expiry, the scheduler's
+/// queue head), so the next group
 /// starts with no stale clockevent. Context: BSP, interrupts masked, no task.
 #[cfg(feature = "baremetal-suite")]
 pub fn clear_waits() {
     cpu::timer_transaction(|| {
         DEADLINE_NS.store(u64::MAX, Ordering::Relaxed);
         ITIMER_NS.store(u64::MAX, Ordering::Relaxed);
+        WAKE_NS.store(u64::MAX, Ordering::Relaxed);
         if EVENT.load(Ordering::Relaxed) != EVENT_NONE {
             rearm(ktime_get_ns());
         }
     });
 }
 
-/// One interruptible sleep: halt until the next interrupt (a signal source or
-/// the clockevent armed for `deadline_ns` or the interval timer) and return, so
-/// the caller can re-check its condition; a deadline already reached returns at
-/// once. Context: task, interrupts masked on entry and exit, BSP. The caller
-/// checks its wake condition with interrupts masked just before, and the halt is
-/// `sti; hlt`, so a wake-up between the check and the halt is not lost.
-pub fn wait_event(deadline_ns: Option<u64>) {
-    let deadline = deadline_ns.unwrap_or(u64::MAX);
-    if EVENT.load(Ordering::Relaxed) != EVENT_NONE {
-        cpu::timer_transaction(|| {
-            DEADLINE_NS.store(deadline, Ordering::Relaxed);
+/// Publish the scheduler's earliest wake-up (`None`: no sleeper with a
+/// deadline) so the clockevent fires for it. Task context, IF masked, BSP. A
+/// deadline already due is not armed (`rearm` skips it): the caller's idle loop
+/// drains the queue before it halts, which is what catches it.
+pub fn set_wake_deadline_ns(next: Option<u64>) {
+    let next = next.unwrap_or(u64::MAX);
+    if WAKE_NS.load(Ordering::Relaxed) == next {
+        return;
+    }
+    cpu::timer_transaction(|| {
+        WAKE_NS.store(next, Ordering::Relaxed);
+        if EVENT.load(Ordering::Relaxed) != EVENT_NONE {
             rearm(ktime_get_ns());
-        });
-    }
-    // `rearm` ignores a wake-up that is already due: do not halt for it.
-    if ktime_get_ns() < event_deadline() {
-        idle();
-    }
-    if EVENT.load(Ordering::Relaxed) != EVENT_NONE {
-        cpu::timer_transaction(|| {
-            DEADLINE_NS.store(u64::MAX, Ordering::Relaxed);
-            rearm(ktime_get_ns());
-        });
-    }
+        }
+    });
+}
+
+/// Interrupt-context form of [`set_wake_deadline_ns`]: only the store, because
+/// the tick handler's own `rearm` follows and reads it.
+pub(crate) fn publish_wake_deadline_ns(next: Option<u64>) {
+    WAKE_NS.store(next.unwrap_or(u64::MAX), Ordering::Relaxed);
 }
 
 /// Block `ns` nanoseconds (the `nanosleep` primitive).

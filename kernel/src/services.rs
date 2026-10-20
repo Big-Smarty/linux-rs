@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Persistent kernel services: state that must outlive `kernel_main`'s frame
-//! (the boot stack is reused as init's kernel stack) and be reachable from the
-//! syscall and fault paths, in statics with explicit synchronization.
+//! (the boot stack becomes the idle task's, init runs on a pool stack) and be
+//! reachable from the syscall and fault paths, in statics with explicit
+//! synchronization.
 //!
 //! # Objects
 //! | static | owner of | writers | readers |
@@ -9,11 +10,20 @@
 //! | [`BOOT`] | the immutable loader handoff | `kernel_main`, once | any context, lock-free |
 //! | [`FRAMES`] | the physical frame allocator (`'static`: it borrows [`BOOT`]) | task context | task context |
 //! | [`TABLES`] | the published page tables (the one address space) | task context | task context |
+//! | `ktask::RQ` | the run queue: task states, wait keys, FIFO order (`kernel::sched::Rq`) | task context, tick/timer hardirq | task context, hardirq |
+//! | `ktask::TIMERQ` | absolute wake-up times of sleeping tasks (`kernel::sched::timerq`) | task context, timer hardirq | task context, hardirq |
 //!
 //! # Lock order (the shared DAG; acquire left to right, never the reverse)
 //! `userspace::PROCESS` -> [`TABLES`] -> `heap` -> [`FRAMES`], and `PROCESS` ->
-//! `TIMER_HW` (a leaf: the clockevent programming of `timer::set_itimer_ns` /
-//! `wait_event`, called with `PROCESS` held). [`FRAMES`] is a
+//! `TIMER_HW` (a leaf: the clockevent programming of `timer::set_itimer_ns`,
+//! called with `PROCESS` held). The scheduler adds two classes (`ktask`):
+//! `RQ` is a **leaf that may be taken under any lock and from hardirq** (it only
+//! mutates the queue and returns; wakers call out of nothing), and `TIMERQ` ->
+//! `TIMER_HW` (arming the clockevent for the queue head under the queue lock).
+//! `TIMERQ` and `RQ` are never held together: the expiry drains due entries
+//! under `TIMERQ`, releases it, then wakes under `RQ`. So the edges are
+//! `PROCESS`/`TABLES`/`heap` -> `RQ`, `PROCESS` -> `TIMERQ` -> `TIMER_HW`, and
+//! no edge leaves `RQ`. [`FRAMES`] is a
 //! leaf: it calls nothing that locks. A table operation takes the frame
 //! allocator as an argument, so callers lock [`TABLES`] first and pass the
 //! [`FRAMES`] guard. `PROCESS` and [`TABLES`] ARE held across a user-memory
@@ -48,15 +58,19 @@
 //! asks for wake-ups: an implementation may take `RQ` and nothing else.
 //!
 //! One exception, the blocking system calls (`pause`, `rt_sigsuspend`,
-//! `rt_sigtimedwait`, `nanosleep`, later blocking `read`): `Task::wait` halts
-//! (`sti; hlt`) with `PROCESS` and `TABLES` held, so interrupts are enabled
-//! while two `IrqMutex` guards are alive. That is sound only because **no
-//! interrupt or exception handler that can run in ring 0 takes `PROCESS`,
-//! `TABLES`, the heap or `FRAMES`**: the timer, spurious and error vectors
-//! touch only atomics and the clockevent (`TIMER_HW`), and `exit_to_user` is
-//! reached only from CPL3 entries, where no kernel lock is held. A handler
-//! that needs process state (an IRQ that wakes a reader, a VFS completion)
-//! must queue the work and let the waking task take the lock.
+//! `rt_sigtimedwait`, `nanosleep`, later blocking `read`): `Task::wait` calls
+//! `ktask::sleep_current`, which `schedule()`s with `PROCESS` and `TABLES`
+//! held. The task's guards live on its own kernel stack and the next task is
+//! the idle loop (`sti; hlt`) or a kernel thread, so interrupts are enabled
+//! while two `IrqMutex` guards are alive. That is sound only because **no other
+//! task and no interrupt or exception handler that can run in ring 0 takes
+//! `PROCESS`, `TABLES`, the heap or `FRAMES`**: the timer, spurious and error
+//! vectors touch only atomics, the clockevent (`TIMER_HW`) and the scheduler
+//! queues, and `exit_to_user` is reached only from CPL3 entries, where no kernel
+//! lock is held. A handler that needs process state (an IRQ that wakes a
+//! reader, a VFS completion) must queue the work and let the waking task take
+//! the lock. The task-model lane removes this exception: no guard may be alive
+//! across `schedule()` once a second user task exists.
 //!
 //! The bare-metal suite (`baremetal-suite` only) adds `baremetal::ARCHIVES`
 //! in front of the chain: it is held across `userspace::load_group`, so the

@@ -31,7 +31,7 @@
 #[cfg_attr(feature = "baremetal-suite", allow(unused_imports))]
 use crate::{
     boot::{BootError, BootInfo},
-    console, cpu,
+    console, cpu, ktask,
     memory::{Error as MemoryError, PAGE, PAGE_BYTES, Physical},
     paging::{self, Tables, UserSpace},
     services::{self, Service},
@@ -59,6 +59,7 @@ use kernel::{
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     ratelimit::RateLimit,
+    sched::WaitKey,
     signal::{
         self, State,
         deliver::{self, Outcome as SignalOutcome},
@@ -877,13 +878,18 @@ impl<'a> signal::Task for Syscall<'a> {
     fn now_ns(&self) -> u64 {
         timer::ktime_get_ns()
     }
-    fn wait(&mut self, deadline_ns: Option<u64>) {
-        // The task leaves the CPU for the wait (`schedule()`): the halted CPU is
-        // idle time, not the task's.
+    fn wait(&mut self, key: WaitKey, deadline_ns: Option<u64>) {
+        // The task leaves the CPU for the wait (`schedule()`): the time until it
+        // is chosen again is not the task's.
         CPUTIME.sleep_begin(timer::ktime_get_ns());
-        // The interval timer is a wake-up source of every sleep.
-        timer::set_itimer_ns(self.state().sig.itimer.next_event());
-        timer::wait_event(deadline_ns);
+        // The interval timer is a wake-up source of every sleep: it rides on the
+        // task's timed wake-up (the queue holds one entry per task), and the
+        // woken loop's `sync_timers` turns the expiry into `SIGALRM`.
+        let wake_at = [deadline_ns, self.state().sig.itimer.next_event()]
+            .into_iter()
+            .flatten()
+            .min();
+        ktask::sleep_current(key, wake_at);
         CPUTIME.sleep_end(timer::ktime_get_ns());
     }
     fn user_sp(&self) -> u64 {
@@ -1038,6 +1044,13 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
 /// returns: init's death panics, as Linux's `do_exit` does for pid 1.
 pub fn exit_to_user(regs: &mut cpu::PtRegs) {
     loop {
+        // `exit_to_user_mode_loop`: `TIF_NEED_RESCHED` first. The tick asked for
+        // a reschedule because another task is runnable (`CONFIG_PREEMPT_VOLUNTARY`
+        // preempts only here, never in ring 0); this task continues, with
+        // everything re-examined, when it is chosen again.
+        if ktask::resched_pending() {
+            ktask::schedule();
+        }
         let mut process = PROCESS.lock();
         // Nothing to expire or dequeue: skip the clock read (`now_ns` is only
         // used when a pending SIGALRM leaves the queue).
@@ -1897,9 +1910,16 @@ fn start(mut init: Loaded) -> ! {
     // user-copy faults from ring 3.
     #[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
     check_mm_usercopy();
+    crate::unwrap(ktask::init(), "scheduler");
+    #[cfg(feature = "qemu-self-test")]
+    match crate::services::boot().test {
+        kernel::boot::TestMode::SchedSwitch => ktask::selftest::sched_switch(),
+        kernel::boot::TestMode::KstackOverflow => ktask::selftest::kstack_overflow(),
+        _ => {}
+    }
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all
-    // state used by the syscall/fault paths is in `PROCESS` and `services`; `kernel_main`'s
-    // frame is abandoned, its stack top is TSS.RSP0.
-    unsafe { cpu::enter_user(entry, sp) }
+    // state used by the syscall/fault paths is in `PROCESS` and `services`;
+    // `kernel_main`'s frame stays on the boot stack, which is idle's from here on.
+    unsafe { ktask::start_init(entry, sp) }
 }

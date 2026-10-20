@@ -27,6 +27,7 @@ mod baremetal;
 mod console;
 mod cpu;
 mod kalloc;
+mod ktask;
 mod mmio;
 mod paging;
 #[cfg(feature = "baremetal-suite")]

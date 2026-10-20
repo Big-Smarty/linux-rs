@@ -62,6 +62,49 @@ static mut MACHINE_STACK: Stack = Stack::ZERO;
 // SYSCALL entry window on the user's RSP, so it gets its own stack.
 static mut DEBUG_STACK: Stack = Stack::ZERO;
 
+/// Number of task kernel stacks (`THREAD_SIZE` stacks of `task_struct`), one
+/// per scheduler slot. The idle task runs on [`BOOT_STACK`], as Linux's
+/// `swapper` runs on its boot stack.
+pub const KSTACK_SLOTS: usize = 128;
+/// The kernel stacks of tasks. Same type as `BOOT_STACK`: a 4 KiB guard page
+/// that `Tables::build` leaves unmapped, then 64 KiB of usable stack. An
+/// overflow therefore faults on the guard, and with no stack left for the
+/// exception frame escalates to #DF on its IST stack (`unexpected` names it).
+/// shortcut: a fixed pool in the image (about 8.5 MiB of bss) instead of
+/// Linux's vmalloc'ed `THREAD_SIZE` stacks; upgrade with a stack window when
+/// the task limit must follow `max_threads`.
+static mut KSTACKS: [Stack; KSTACK_SLOTS] = [Stack::ZERO; KSTACK_SLOTS];
+
+fn kstack_base(slot: usize) -> u64 {
+    ptr::addr_of!(KSTACKS) as u64 + (slot * core::mem::size_of::<Stack>()) as u64
+}
+/// Address of the unmapped guard page of pool stack `slot`.
+pub fn kstack_guard(slot: usize) -> u64 {
+    kstack_base(slot)
+}
+/// Lowest usable address of pool stack `slot` (just above its guard page).
+pub fn kstack_lowest(slot: usize) -> u64 {
+    kstack_base(slot) + 4096
+}
+/// Initial stack pointer of pool stack `slot` (16-byte aligned).
+pub fn kstack_top(slot: usize) -> u64 {
+    kstack_base(slot) + core::mem::size_of::<Stack>() as u64
+}
+/// The initial stack pointer of the boot stack, where the idle task runs.
+pub fn boot_stack_top() -> u64 {
+    ptr::addr_of!(BOOT_STACK) as u64 + core::mem::size_of::<Stack>() as u64
+}
+/// The unmapped guard pages of every pool stack.
+pub fn kstack_guards() -> impl Iterator<Item = u64> {
+    (0..KSTACK_SLOTS).map(kstack_guard)
+}
+/// The pool slot whose stack (guard page included) contains `address`.
+pub fn kstack_slot_of(address: u64) -> Option<usize> {
+    let offset = address.checked_sub(kstack_base(0))?;
+    let slot = usize::try_from(offset / core::mem::size_of::<Stack>() as u64).ok()?;
+    (slot < KSTACK_SLOTS).then_some(slot)
+}
+
 pub fn guards() -> [u64; 5] {
     [
         ptr::addr_of!(BOOT_STACK) as u64,
@@ -496,6 +539,9 @@ unsafe fn install_gdt() {
             VirtAddr::zero(),
         ];
     }
+    // Until the first task is switched in, ring-3 entries (none can occur yet)
+    // would use the boot stack, like RSP0 above.
+    KERNEL_STACK_TOP.store(top(ptr::addr_of!(BOOT_STACK)).as_u64(), Ordering::Relaxed);
     // SAFETY: the caller guarantees exclusive access to descriptor memory.
     let gdt = unsafe { &mut *ptr::addr_of_mut!(GDT) };
     for (descriptor, selector) in [
@@ -812,8 +858,17 @@ fn external_interrupt(vector: u64, user: bool) -> bool {
     true
 }
 
-/// Consecutive refused returns to ring 3 without an entry from ring 3 between.
+/// Consecutive refused returns to ring 3 without an entry from ring 3 between,
+/// for the running task: a context switch swaps it with the next task's
+/// ([`swap_bad_iret_depth`]), so one task's nested refusals neither count
+/// against nor are reset by another's.
 static BAD_IRET_DEPTH: AtomicU64 = AtomicU64::new(0);
+
+/// Install `depth` as the running task's `BAD_IRET_DEPTH`; returns the
+/// previous task's value for its save slot. Context: a switch, IF=0.
+pub(crate) fn swap_bad_iret_depth(depth: u64) -> u64 {
+    BAD_IRET_DEPTH.swap(depth, Ordering::Relaxed)
+}
 /// shortcut: Linux's `fixup_bad_iret` copies the user frame back to the top of
 /// the entry stack, so a handler that keeps returning to a refused frame
 /// (`SA_NODEFER` on a non-canonical handler address) loops forever there; this
@@ -838,17 +893,23 @@ fn fixup_bad_iret(regs: &mut PtRegs, vector: u64) -> bool {
     {
         return false;
     }
-    let low = ptr::addr_of!(BOOT_STACK) as u64 + 4096;
+    // Every ring-3 entry runs on its task's pool stack (the boot stack belongs
+    // to the idle task and never returns to ring 3), so the frame must lie in
+    // the usable part of one pool slot.
     let frame = regs.sp;
-    if !frame.is_multiple_of(8) || frame < low || frame > low + STACK_BYTES as u64 - 5 * 8 {
+    let Some(slot) = kstack_slot_of(frame) else {
+        return false;
+    };
+    if !frame.is_multiple_of(8) || frame < kstack_lowest(slot) || frame > kstack_top(slot) - 5 * 8 {
         return false;
     }
     // SAFETY: the fault happened at `iret_site`, which only runs with RSP at the
-    // five-word frame that a stub or `syscall_entry` pushed on `BOOT_STACK`
-    // (checked above to lie wholly inside its usable part, 8-aligned), and the
-    // exception left RSP unchanged; the CPU has pushed its own frame below it,
-    // so the words are intact and initialized. Nothing else writes that stack
-    // while this handler runs (interrupts are masked, single CPU).
+    // five-word frame that a stub, `syscall_entry` or `restore_regs_and_iret`
+    // left on a task's kernel stack (checked above to lie wholly inside the
+    // usable part of one pool stack, 8-aligned), and the exception left RSP
+    // unchanged; the CPU has pushed its own frame below it, so the words are
+    // intact and initialized. Nothing else writes that stack while this handler
+    // runs (interrupts are masked, single CPU, and the task is the one running).
     let [ip, cs, flags, sp, ss] = unsafe { ptr::read_volatile(frame as *const [u64; 5]) };
     if cs & 3 != 3 {
         return false; // a ring-0 return that failed is a kernel bug
@@ -925,6 +986,9 @@ extern "C" fn interrupt_handler(regs: &mut PtRegs, vector: u64, error: u64) {
                 unexpected(regs, vector, error, address);
             }
         }
+        // A #DF taken on its IST stack: CR2 still holds the first fault's
+        // address, which names a stack overflow (`unexpected`).
+        8 => unexpected(regs, vector, error, Cr2::read_raw()),
         _ => unexpected(regs, vector, error, 0),
     }
 }
@@ -949,6 +1013,25 @@ fn unexpected(frame: &PtRegs, vector: u64, error: u64, address: u64) -> ! {
             crate::log!("FAIL trap-call-abi\n");
             crate::fail();
         }
+    }
+    // A fault (or the double fault it became, when the exception frame had no
+    // room either) on a task stack's guard page is a kernel stack overflow,
+    // Linux's `handle_stack_overflow` ("kernel stack overflow (double-fault)").
+    // The boot stack's guard is read on purpose by the `unexpected-page-fault`
+    // case, so it keeps the plain trap line.
+    if let Some(slot) =
+        kstack_slot_of(address).filter(|&slot| address >> 12 == kstack_guard(slot) >> 12)
+    {
+        crate::log!(
+            "FAIL kernel stack overflow slot={} vector={} error={:#x} rip={:#x} cr2={:#x} rsp={:#x}\n",
+            slot,
+            vector,
+            error,
+            frame.ip,
+            address,
+            frame.sp
+        );
+        crate::fail();
     }
     if vector == UNKNOWN_EXTERNAL_VECTOR {
         crate::log!(
@@ -1279,12 +1362,11 @@ pub fn unexpected_interrupt() -> ! {
 // Ring 3 for the first-userspace slice (decision A18).
 //
 // Kernel stack: ring-3 -> ring-0 transitions of every kind (exception, IRQ and
-// SYSCALL) run on the top of BOOT_STACK, which is also TSS.RSP0. kernel_main's
-// frame is abandoned by `enter_user` (it never returns) and everything the
-// syscall/fault paths use lives in statics, so reusing that stack is sound; it
-// keeps its 4 KiB unmapped guard page, and the deepest path (a 2 KiB tty chunk
-// plus formatting) is far below its 64 KiB. NMI, #DF and #MC keep their IST
-// stacks.
+// SYSCALL) run on the top of the running task's own kernel stack, a slot of the
+// `KSTACKS` pool (4 KiB unmapped guard page, 64 KiB usable; the deepest path, a
+// 2 KiB tty chunk plus formatting, is far below that), whose top `ktask` makes
+// both `TSS.RSP0` and `KERNEL_STACK_TOP` on every switch. The boot stack is the
+// idle task's. NMI, #DF, #MC and #DB keep their IST stacks.
 
 /// Linux `struct pt_regs` (arch/x86/include/asm/ptrace.h, GPL-2.0), lowest
 /// address first: the layout `syscall_entry` and the exception/interrupt
@@ -1318,6 +1400,36 @@ const MSR_SYSENTER_CS: u32 = 0x174;
 const MSR_SYSENTER_ESP: u32 = 0x175;
 const MSR_SYSENTER_EIP: u32 = 0x176;
 
+/// Where `syscall_entry` switches to: the top of the running task's kernel
+/// stack, the same value as `TSS.RSP0` (what the CPU loads on an exception or
+/// interrupt from ring 3). Written only by [`set_kernel_stack`].
+static KERNEL_STACK_TOP: AtomicU64 = AtomicU64::new(0);
+
+/// Make `top` the kernel stack of the next ring-3 entry: `TSS.RSP0` for
+/// exceptions and interrupts and `KERNEL_STACK_TOP` for `SYSCALL`
+/// (`switch_to` -> `update_task_stack`, `arch/x86/include/asm/switch_to.h`).
+///
+/// Context: BSP, IF clear (a scheduler switch or boot), so no ring-3 entry can
+/// observe the two halves of RSP0 torn; NMI/#DB/#DF/#MC use IST stacks, never
+/// RSP0. `top` must be the 16-byte aligned top of a mapped kernel stack that
+/// stays reserved while the task can enter ring 3.
+pub fn set_kernel_stack(top: u64) {
+    debug_assert!(top.is_multiple_of(16) && !interrupts_enabled());
+    KERNEL_STACK_TOP.store(top, Ordering::Relaxed);
+    // `privilege_stack_table[0]` is a u64 at offset 4 of the packed(4) TSS:
+    // write its two halves as volatile aligned u32s (the CPU reads it).
+    let tss = ptr::addr_of_mut!(TSS);
+    // SAFETY: `TSS` is a permanent static, initialized by `install_gdt`; the
+    // field is 4-aligned (packed(4)) and 24 bytes, so word 0 and 1 are in
+    // bounds and aligned for u32; no reference to it exists (raw pointers only),
+    // and the only other accessor is the CPU's RSP0 load, excluded by IF=0 above.
+    unsafe {
+        let rsp0 = ptr::addr_of_mut!((*tss).privilege_stack_table).cast::<u32>();
+        ptr::write_volatile(rsp0, u32::try_from(top & 0xffff_ffff).unwrap_or(0));
+        ptr::write_volatile(rsp0.add(1), u32::try_from(top >> 32).unwrap_or(0));
+    }
+}
+
 /// Single-CPU scratch for the user RSP between SYSCALL and the stack switch.
 /// shortcut: Linux keeps this per CPU behind SWAPGS; upgrade with SMP.
 static mut USER_RSP: u64 = 0;
@@ -1332,9 +1444,11 @@ static mut USER_RSP: u64 = 0;
 // number, RDI/RSI/RDX/R10/R8/R9 = arguments, RIP-relative static addressing,
 // IF/DF/TF/AC/NT cleared by SFMASK so no maskable interrupt can intervene and
 // DF=0 holds for the C ABI (NMI, #MC, #DF and #DB run on IST stacks and never
-// touch the user RSP, so the window before the stack switch is safe). Registers: RSP is replaced by the BOOT_STACK top
-// (16-aligned); 21 pushes build a Linux `pt_regs` (168 bytes), then `sub 8`
-// makes RSP%16==0 at the CALL. RDI = &mut pt_regs (the number is
+// touch the user RSP, so the window before the stack switch is safe). Registers: RSP is replaced by the
+// running task's kernel stack top, `KERNEL_STACK_TOP` (16-aligned, a pool stack
+// or the boot stack; written only by `set_kernel_stack` with IF=0, so no
+// `schedule()` can run between SYSCALL and the load); 21 pushes build a Linux
+// `pt_regs` (168 bytes), then `sub 8` makes RSP%16==0 at the CALL. RDI = &mut pt_regs (the number is
 // `pt_regs.orig_ax`, truncated to `int` by the dispatcher); the C-ABI handler preserves RBX/RBP/R12-R15 and may write
 // `pt_regs.ax`. Clobbers: all caller-saved registers (restored from pt_regs),
 // flags (restored by IRETQ). Memory: writes the scratch slot and the kernel
@@ -1349,7 +1463,7 @@ static mut USER_RSP: u64 = 0;
 unsafe extern "C" fn syscall_entry() {
     naked_asm!(
         "mov [rip + {user_rsp}], rsp",
-        "lea rsp, [rip + {stack} + {size}]",
+        "mov rsp, [rip + {stack_top}]",
         "push {ss}",
         "push qword ptr [rip + {user_rsp}]",
         "push r11",
@@ -1364,19 +1478,122 @@ unsafe extern "C" fn syscall_entry() {
         "sub rsp, 8",
         "call {handler}",
         "add rsp, 8",
+        "jmp {restore}",
+        user_rsp = sym USER_RSP,
+        stack_top = sym KERNEL_STACK_TOP,
+        ss = const USER_DS_RAW,
+        cs = const USER_CS_RAW,
+        enosys = const ENOSYS,
+        handler = sym crate::userspace::syscall,
+        restore = sym restore_regs_and_iret,
+    );
+}
+
+// The shared tail of every return to ring 3 that is not an exception or
+// interrupt stub: `syscall_entry` and the first run of a new task
+// (`ret_from_fork_asm`). Linux's `swapgs_restore_regs_and_return_to_usermode`
+// (arch/x86/entry/entry_64.S).
+//
+// Why asm: it must pop the whole `pt_regs` and end in `IRETQ`; no intrinsic
+// restores 15 GPRs and then jumps. Why shared: one copy per entry path is one
+// more place a register could be forgotten. Prerequisites: reached by `jmp`,
+// never `call`ed, from CPL0 with IF=0, RSP = the base of a complete `pt_regs`
+// (r15 lowest, `orig_ax` above the GPRs, then the five-word IRET frame) on the
+// running task's kernel stack. Inputs/outputs: every GPR is loaded from
+// `pt_regs`; no register is read. Clobbers: all, which is the point (flags come
+// from the IRET frame). Memory: reads the frame, writes nothing; no red zone,
+// no unwind (panic=abort). Control flow: `jmp` to the one `iret_site`, which
+// `fixup_bad_iret` recognises by address; this function adds no second
+// `iretq`. Privilege: CPL0 only.
+#[unsafe(naked)]
+unsafe extern "C" fn restore_regs_and_iret() -> ! {
+    naked_asm!(
         "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
         "pop r11", "pop r10", "pop r9", "pop r8",
         "pop rax", "pop rcx", "pop rdx", "pop rsi", "pop rdi",
         "add rsp, 8",
         "jmp {iret}",
-        user_rsp = sym USER_RSP,
-        stack = sym BOOT_STACK,
-        size = const core::mem::size_of::<Stack>(),
-        ss = const USER_DS_RAW,
-        cs = const USER_CS_RAW,
-        enosys = const ENOSYS,
-        handler = sym crate::userspace::syscall,
         iret = sym iret_site,
+    );
+}
+
+// Linux `__switch_to_asm` (arch/x86/entry/entry_64.S:177-209): the register half
+// of a context switch.
+//
+// Why asm: it exchanges RSP between two kernel stacks and resumes a frame
+// that Rust did not call. Safe Rust cannot name RSP, and a normal `asm!` block
+// may not change the stack pointer net, so no `asm!`/intrinsic form exists.
+// Prerequisites: CPL0, IF=0, DF=0 (interrupt gates and SFMASK guarantee both),
+// SysV C ABI call from `ktask::context_switch` with `prev_sp` a valid writable
+// word (the previous task's `Thread::sp`) and `next_sp` a stack pointer that
+// either an earlier `switch_to_asm` stored or `ktask::spawn` built as a
+// `ForkFrame`, i.e. six callee-saved slots followed by a return address.
+// Inputs: RDI = `prev_sp`, RSI = `next_sp`. Outputs: none; it returns when
+// some later switch resumes this stack. Clobbers: the SysV caller-saved
+// registers and flags are dead across the call by the C ABI; the callee-saved
+// set RBP, RBX, R12-R15 is pushed here and popped from the next stack, so each
+// task sees its own values come back. Memory: writes `*prev_sp` and the
+// previous stack, reads the next stack; the call is opaque to the compiler
+// (extern "C"), so all other memory is assumed changed. Stack: 6 pushes before
+// the switch and 6 pops after, 8 bytes each, plus the `ret`; no red zone (the
+// target disables it), no unwind (panic=abort). Control flow: `ret` goes to
+// whatever return address the next stack holds. Privilege: CPL0 only. Not
+// done, with the reason: Linux fills the return stack buffer here on CPUs
+// affected by RSB underflow (`X86_FEATURE_RSB_CTXSW`) and the stack protector
+// canary is not switched (the kernel is built without one);
+// shortcut: no RSB fill, upgrade with the speculation-mitigation work.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn switch_to_asm(_prev_sp: *mut u64, _next_sp: u64) {
+    naked_asm!(
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov [rdi], rsp",
+        "mov rsp, rsi",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+    );
+}
+
+// Linux `ret_from_fork_asm` (arch/x86/entry/entry_64.S:228-260): the first
+// instruction of every task. `switch_to_asm` `ret`s here on the first run of
+// a task whose stack `ktask::spawn` filled with a `ForkFrame`.
+//
+// Why asm: a new task has no Rust caller frame to return into, so its first
+// instruction must be reached by `ret` from a hand-built frame, and it must
+// move the callee-saved register values that frame carried (RBX = thread
+// function, R12 = its argument) into argument registers. Prerequisites: CPL0,
+// IF=0, entered only by that `ret` with RSP = the base of the `pt_regs` the
+// `ForkFrame` holds directly above the return slot, which is 8 mod 16 (the top
+// of a pool stack is 16-aligned and `PtRegs` is 168 bytes) so that the `sub 8`
+// below makes RSP 16-aligned at the CALL, the SysV rule. Inputs: RBX, R12
+// (from the frame). Outputs: RDI = `&mut PtRegs`, RSI = thread function or 0,
+// RDX = its argument; `ret_from_fork` is an `extern "C" fn` and never
+// unwinds. Clobbers: all caller-saved registers (dead: nothing lives across the
+// first instruction). Memory: only the stack (the CALL's return slot). Control
+// flow: CALL `ret_from_fork` (a kernel thread never returns from it; a user
+// task returns after its exit-to-user work), then `jmp` to the shared
+// `restore_regs_and_iret`. No red zone, no unwind. Privilege: CPL0 only.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn ret_from_fork_asm() {
+    naked_asm!(
+        "mov rdi, rsp",
+        "mov rsi, rbx",
+        "mov rdx, r12",
+        "sub rsp, 8",
+        "call {ret_from_fork}",
+        "add rsp, 8",
+        "jmp {restore}",
+        ret_from_fork = sym crate::ktask::ret_from_fork,
+        restore = sym restore_regs_and_iret,
     );
 }
 
@@ -1551,18 +1768,21 @@ pub fn set_user_gs_base(base: u64) {
     GsBase::write(VirtAddr::new_truncate(base));
 }
 
-/// Linux `start_thread` for a new 64-bit task, then IRETQ to ring 3.
+/// The CPU's segment state at boot for a first user task (Linux's
+/// `start_thread`): DS/ES/FS/GS null and FS/GS bases (and `KERNEL_GS_BASE`)
+/// zero. No `SWAPGS` is ever executed by the kernel, so the user's GS base
+/// lives in `MSR_GS_BASE` and `KERNEL_GS_BASE` stays zero. A task's own values
+/// are applied at its switch-in ([`Segments::load`]); this sets the state the
+/// boot context hands over, so the first switch-in finds nothing to reload.
 ///
 /// # Safety
-/// BSP at CPL0; `install_descriptors` and `enable_syscalls` done; the active
-/// tree maps `rip` executable and `sp` writable for the user; no Rust object
-/// in the current stack frame is used afterwards (the frame is abandoned);
-/// everything the syscall/fault paths need is in statics.
-pub unsafe fn enter_user(rip: u64, sp: u64) -> ! {
+/// BSP at CPL0, before the first ring-3 task runs; no kernel code uses the
+/// segment registers afterwards (64-bit mode ignores DS/ES, and the kernel uses
+/// no `%fs`/`%gs`).
+pub unsafe fn prepare_user_segments() {
     let null = SegmentSelector::new(0, PrivilegeLevel::Ring0);
     // SAFETY: CPL0. Null selectors are legal for DS/ES/FS/GS in 64-bit mode;
-    // zero bases make user FS/GS start at 0 as in Linux (no SWAPGS is ever
-    // executed by the kernel, so KERNEL_GS_BASE is just zeroed as well).
+    // the caller guarantees no kernel code relies on their old values.
     unsafe {
         DS::set_reg(null);
         ES::set_reg(null);
@@ -1572,37 +1792,62 @@ pub unsafe fn enter_user(rip: u64, sp: u64) -> ! {
     FsBase::write(VirtAddr::zero());
     GsBase::write(VirtAddr::zero());
     KernelGsBase::write(VirtAddr::zero());
-    // SAFETY: forwarded contract.
-    unsafe { iret_to_user(rip, sp) }
 }
 
-// Why asm: IRETQ is the only way to enter CPL3 with an exact RIP/RSP/CS/SS/
-// RFLAGS and all GPRs known. Inputs: RDI = user RIP, RSI = user RSP (both
-// validated by the caller as mapped user addresses). Prerequisites: CPL0,
-// TSS.RSP0 valid for the next ring-3 event, GDT with USER_CS/USER_DS.
-// Effects: CLI first (IF is restored from the pushed RFLAGS = 0x202: IF set,
-// IOPL 0, TF/NT/RF/AC/VM clear, bit 1 fixed); pushes the five-word frame on
-// the current stack (consumed by IRETQ, never unwound; the stack is abandoned
-// afterwards); zeroes every GPR like Linux's `elf_common_init`; clobbers all
-// registers and flags; does not return. Memory: only the stack pushes; no
-// `nomem` claim needed because the function never returns to Rust.
-#[unsafe(naked)]
-unsafe extern "C" fn iret_to_user(rip: u64, sp: u64) -> ! {
-    naked_asm!(
-        "cli",
-        "push {ss}",
-        "push rsi",
-        "push 0x202",
-        "push {cs}",
-        "push rdi",
-        "xor eax, eax", "xor ebx, ebx", "xor ecx, ecx", "xor edx, edx",
-        "xor esi, esi", "xor edi, edi", "xor ebp, ebp",
-        "xor r8d, r8d", "xor r9d, r9d", "xor r10d, r10d", "xor r11d, r11d",
-        "xor r12d, r12d", "xor r13d, r13d", "xor r14d, r14d", "xor r15d, r15d",
-        "iretq",
-        ss = const USER_DS_RAW,
-        cs = const USER_CS_RAW,
-    );
+/// The per-task segment state a ring-3 task owns (`thread_struct`'s `ds`,
+/// `es`, `fsindex`, `gsindex`, `fsbase`, `gsbase`; `arch/x86/kernel/process_64.c`
+/// `save_fsgs` / `load_seg_legacy`). A switch-out [`save`](Segments::save)s the
+/// running values and the next ring-3 task [`load`](Segments::load)s its own.
+/// shortcut: both bases are always rewritten (`wrmsr`) instead of only when
+/// they differ, which Linux does; upgrade with the FSGSBASE / cache work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Segments {
+    pub(crate) ds: u16,
+    pub(crate) es: u16,
+    pub(crate) fs: u16,
+    pub(crate) gs: u16,
+    pub(crate) fs_base: u64,
+    pub(crate) gs_base: u64,
+}
+
+impl Segments {
+    /// Read the running task's values. Context: CPL0.
+    pub(crate) fn save() -> Self {
+        Self {
+            ds: DS::get_reg().0,
+            es: ES::get_reg().0,
+            fs: FS::get_reg().0,
+            gs: GS::get_reg().0,
+            fs_base: FsBase::read().as_u64(),
+            gs_base: GsBase::read().as_u64(),
+        }
+    }
+
+    /// Make these the running values. Loading a selector replaces the segment's
+    /// hidden base, so a selector is reloaded only when it differs and the bases
+    /// are written afterwards. Context: CPL0, IF=0.
+    pub(crate) fn load(&self) {
+        // SAFETY: CPL0. Each selector either is null or was read back from the
+        // CPU by `save` (so it named a valid descriptor of the immutable GDT
+        // when the CPU accepted it in ring 3) or is the initial null; loading
+        // it again cannot fault. Kernel code uses none of these registers.
+        unsafe {
+            if DS::get_reg().0 != self.ds {
+                DS::set_reg(SegmentSelector(self.ds));
+            }
+            if ES::get_reg().0 != self.es {
+                ES::set_reg(SegmentSelector(self.es));
+            }
+            if FS::get_reg().0 != self.fs {
+                FS::set_reg(SegmentSelector(self.fs));
+            }
+            if GS::get_reg().0 != self.gs {
+                GS::set_reg(SegmentSelector(self.gs));
+            }
+        }
+        FsBase::write(VirtAddr::new_truncate(self.fs_base));
+        GsBase::write(VirtAddr::new_truncate(self.gs_base));
+    }
 }
 
 /// Linux's initial FPU image for a new task (`fpstate_init_fxstate`, arch/x86/
@@ -1610,7 +1855,46 @@ unsafe extern "C" fn iret_to_user(rip: u64, sp: u64) -> ! {
 /// everything else zero (x87 empty, XMM0-15 zero). FXSAVE layout: FCW at 0,
 /// MXCSR at 24.
 #[repr(C, align(16))]
-struct FxImage([u8; 512]);
+#[derive(Clone)]
+pub(crate) struct FxImage(pub(crate) [u8; 512]);
+
+impl FxImage {
+    pub(crate) const ZERO: Self = Self([0; 512]);
+
+    /// The image of a new task.
+    pub(crate) fn initial() -> Self {
+        INIT_FXSTATE.clone()
+    }
+}
+
+/// `switch_fpu_prepare`: save the running ring-3 task's x87/SSE state (live in
+/// the registers, since the kernel is soft-float).
+///
+/// # Panics
+/// Before `init_user_fpu`.
+pub(crate) fn fpu_save(image: &mut FxImage) {
+    assert!(
+        FPU_READY.load(Ordering::Acquire),
+        "FPU used before init_user_fpu"
+    );
+    // SAFETY: `FPU_READY` (CR4.OSFXSR=1, CR0.EM=TS=0, FXSR present); CPL0;
+    // `image` is exclusively borrowed and 16-byte aligned.
+    unsafe { save_fpu_state(image) };
+}
+
+/// `switch_fpu_finish`: make `image` the live state.
+///
+/// # Panics
+/// Before `init_user_fpu`.
+pub(crate) fn fpu_restore(image: &FxImage) {
+    assert!(
+        FPU_READY.load(Ordering::Acquire),
+        "FPU used before init_user_fpu"
+    );
+    // SAFETY: as `fpu_save`; `image` holds a state `fpu_save` produced or the
+    // initial state, so it has no reserved MXCSR bit.
+    unsafe { restore_fpu_state(image) };
+}
 static INIT_FXSTATE: FxImage = {
     let mut bytes = [0u8; 512];
     bytes[0] = 0x7f;
