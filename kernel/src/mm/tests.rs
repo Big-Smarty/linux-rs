@@ -1388,5 +1388,5 @@ fn inserted_vma_is_accounted_and_unmaps_cleanly() {
     assert_eq!((w.mm.total_vm, w.mm.stack_vm), (STACK_PAGES, STACK_PAGES));
     assert_eq!(w.munmap(STACK_START, STACK_PAGES * P), Ok(()));
     assert_eq!((w.mm.total_vm, w.mm.stack_vm), (0, 0));
-    assert!(w.mm.vmas().is_empty());
+    assert_eq!(w.mm.map_count(), 0);
 }

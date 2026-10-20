@@ -280,7 +280,7 @@ impl Mm {
         // errno before any other check (only `MAP_FIXED` can reach this, as the
         // arch function hands the caller's address back unexamined).
         if addr >= u64::MAX - 4094 {
-            return Err(Errno::new(addr.wrapping_neg() as i32));
+            return Err(Errno::new(i32::try_from(addr.wrapping_neg()).unwrap_or(0)));
         }
         if addr > TASK_SIZE - len {
             return Err(Errno::ENOMEM);
