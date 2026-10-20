@@ -171,6 +171,7 @@ fn list(path: &[u8], names: &mut [u8; 512]) -> Result<usize, Errno> {
     Ok(used)
 }
 
+/// The `fs` group.
 pub fn run() -> bool {
     let mut t = T::new("fs");
     console(&mut t);
@@ -255,6 +256,23 @@ fn console(t: &mut T) {
         "console-tcgets-fault",
         sys(Sysno::ioctl, &[1, 0x5401, BAD]),
         Err(Errno::EFAULT),
+    );
+    // `tty_std_termios` with the ttyS0 console's `c_cflag` (`uart_set_options`: B9600 | CS8 |
+    // CREAD | HUPCL | CLOCAL): c_iflag ICRNL|IXON, c_oflag OPOST|ONLCR, c_lflag ISIG|ICANON|ECHO|
+    // ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN, c_line N_TTY, then INIT_C_CC.
+    let mut want = [0u8; 36];
+    for (i, word) in [0o2400u32, 0o5, 0o6275, 0o105_073].into_iter().enumerate() {
+        want[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    want[17..34].copy_from_slice(&[3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0]);
+    let mut termios = [0u8; 36];
+    t.eq(
+        "console-tcgets-termios",
+        (
+            sys(Sysno::ioctl, &[1, 0x5401, addr_mut(&mut termios)]),
+            termios,
+        ),
+        (Ok(0), want),
     );
     t.eq(
         "console-ioctl-unknown",

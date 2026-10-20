@@ -991,7 +991,7 @@ impl Tables {
 }
 
 /// Where the model's frame operations get their allocator: the `FRAMES`
-/// service after publication, the loader's own allocator before it.
+/// service, locked per operation.
 trait Backing {
     fn tables(&self) -> &Tables;
     fn parts<R>(&mut self, f: impl FnOnce(&mut Tables, &mut Allocator<'_>) -> R) -> R;
@@ -1007,22 +1007,6 @@ impl Backing for UserSpace<'_> {
         // storage before calling; `FRAMES` is a leaf.
         let mut frames = crate::services::FRAMES.lock();
         f(self.tables, &mut frames)
-    }
-}
-
-/// The loader's view of the tables before publication: the same operations on
-/// the boot allocator. Used by `userspace::load`.
-pub struct LoadSpace<'a, 'b> {
-    pub tables: &'a mut Tables,
-    pub allocator: &'a mut Allocator<'b>,
-}
-
-impl Backing for LoadSpace<'_, '_> {
-    fn tables(&self) -> &Tables {
-        self.tables
-    }
-    fn parts<R>(&mut self, f: impl FnOnce(&mut Tables, &mut Allocator<'_>) -> R) -> R {
-        f(self.tables, self.allocator)
     }
 }
 
@@ -1070,9 +1054,8 @@ macro_rules! mm_pages {
     };
 }
 mm_pages!(['a] UserSpace<'a>);
-mm_pages!(['a, 'b] LoadSpace<'a, 'b>);
 
-impl kernel::exec::load::Pager for LoadSpace<'_, '_> {
+impl kernel::exec::load::Pager for UserSpace<'_> {
     fn install(
         &mut self,
         page: u64,

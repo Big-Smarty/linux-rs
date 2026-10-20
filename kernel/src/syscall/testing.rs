@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Host fakes for the syscall tests: a task whose user memory is the sparse
-//! `usercopy::fake::Space` and whose console collects bytes.
+//! `usercopy::fake::Space`, whose console collects bytes, and whose files are a
+//! real tmpfs rootfs (`/dev/console`, `/root`, optional extra entries) with
+//! descriptors 0-2 on the console, as `console_on_rootfs` leaves init.
 
 use super::{
-    AddressSpace, Console, Context, Machine,
+    AddressSpace, Console, Context, Files, Machine,
     time::{ClockState, Clocks, RestartBlock},
 };
 use crate::{
     cputime::CpuSample,
-    mm::{Env, Mm, tests::Fake},
+    mm::{Env, Mm, VmFlags, tests::Fake},
     task::Attributes,
     usercopy::{UserPages, fake::Space},
+    vfs::{FdTable, Timespec, Vfs},
 };
 extern crate std;
-use std::vec::Vec;
+use std::{boxed::Box, collections::BTreeMap, vec::Vec};
 
 #[derive(Default)]
 pub struct Sink(pub Vec<u8>);
@@ -79,16 +82,31 @@ pub struct Task<P = Space, C = Sink> {
     pub mm: Mm,
     pub env: Env,
     pub tables: Fake,
+    pub vfs: Vfs,
+    pub fdt: FdTable,
+    /// Private copies of file pages a kernel access faulted in (the binary's
+    /// `user_fault` for `NeedsFile`: `Vfs::fault_page`, then a private frame).
+    pub file_pages: BTreeMap<u64, Box<[u8; 4096]>>,
+}
+
+fn clock() -> Timespec {
+    Timespec { sec: 0, nsec: 0 }
 }
 
 impl<P, C> Task<P, C> {
     pub fn new(pages: P, sink: C) -> Self {
         let env = Env::init(1 << 17, 0);
+        let mut vfs = Vfs::new(1 << 20, 1 << 20, clock).expect("rootfs");
+        vfs.default_rootfs().expect("default rootfs");
+        let mut fdt = FdTable::default();
+        vfs.console_on_rootfs(&mut fdt).expect("console");
+        let mut attrs = Attributes::init(1000);
+        attrs.fs = vfs.new_fs_struct(0o022);
         Self {
             pages,
             sink,
             tgid: 1,
-            attrs: Attributes::init(1000),
+            attrs,
             fs_base: 0,
             gs_base: 0,
             machine: Machine {
@@ -102,6 +120,9 @@ impl<P, C> Task<P, C> {
             mm: Mm::new(&env),
             env,
             tables: Fake::default(),
+            vfs,
+            fdt,
+            file_pages: BTreeMap::new(),
         }
     }
 }
@@ -112,7 +133,25 @@ pub fn task() -> Task {
 
 impl<P: UserPages, C> UserPages for Task<P, C> {
     fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; 4096]> {
-        self.pages.page(page, write)
+        if self.pages.page(page, write).is_some() {
+            return self.pages.page(page, write);
+        }
+        // A page of a private file mapping is supplied on first access.
+        let vma = *self.mm.find_vma_intersection(page, page + 4096)?;
+        let file = vma.file?;
+        if !vma
+            .flags
+            .contains(if write { VmFlags::WRITE } else { VmFlags::READ })
+        {
+            return None;
+        }
+        if !self.file_pages.contains_key(&page) {
+            let mut bytes = Box::new([0u8; 4096]);
+            let pgoff = vma.pgoff + ((page - vma.start) >> 12);
+            self.vfs.fault_page(file, pgoff, &mut bytes).ok()?;
+            self.file_pages.insert(page, bytes);
+        }
+        self.file_pages.get_mut(&page).map(|bytes| &mut **bytes)
     }
 }
 
@@ -152,6 +191,13 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
             mm: &mut self.mm,
             env: &self.env,
             pages: &mut self.tables,
+        }
+    }
+    fn files(&mut self) -> Files<'_> {
+        Files {
+            vfs: &mut self.vfs,
+            fdt: &mut self.fdt,
+            fs: &mut self.attrs.fs,
         }
     }
 }

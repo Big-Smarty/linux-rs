@@ -9,14 +9,14 @@
 // kernel/futex/syscalls.c (`set_robust_list`), kernel/sched/syscalls.c
 // (`sched_getscheduler`, `sched_{get,set}affinity`, `sched_get_priority_*`),
 // arch/x86/kernel/process.c and process_64.c (`arch_prctl`,
-// `do_arch_prctl_64`), fs/d_path.c (`getcwd`), include/uapi/linux/prctl.h,
+// `do_arch_prctl_64`), include/uapi/linux/prctl.h,
 // include/uapi/linux/personality.h, include/linux/uts.h. All GPL-2.0-only.
 // Transformation: one task, one CPU, one user namespace and no LSM: lookups by
 // pid succeed only for the caller, credentials never change, and `prctl`
 // options Linux implements but this slice does not stop the kernel instead of
 // answering.
 //! Identity and process-attribute syscalls: ids, process-tree ids, `uname`,
-//! `arch_prctl`, resource limits, `umask`, `getcwd`, CPU affinity, `sysinfo`,
+//! `arch_prctl`, resource limits, `umask`, CPU affinity, `sysinfo`,
 //! `personality`, the `prctl` options init uses and the pointers libc registers
 //! at startup (`set_tid_address`, `set_robust_list`).
 //!
@@ -105,7 +105,6 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
             let old = core::mem::replace(&mut fs.umask, uint(a0) & 0o777);
             Ok(i64::from(old))
         }
-        Sysno::getcwd => getcwd(ctx, a0, a1),
         Sysno::uname => uname(ctx, a0),
         Sysno::sysinfo => sysinfo(ctx, a0),
         Sysno::arch_prctl => arch_prctl(ctx, int(a0), a1),
@@ -326,30 +325,6 @@ fn prlimit64<C: Context>(ctx: &mut C, pid: i32, resource: u32, new: u64, old: u6
         return Err(Errno::EFAULT.into());
     }
     Ok(0)
-}
-
-/// `PATH_MAX`.
-const PATH_MAX: usize = 4096;
-
-/// `getcwd` on the root directory the working directory text names
-/// (`task::FsContext`): the path, a NUL, and the length including the NUL.
-fn getcwd<C: Context>(ctx: &mut C, buffer: u64, size: u64) -> Res {
-    let cwd = ctx.attrs().fs.cwd;
-    let len = cwd.len() + 1;
-    if len > PATH_MAX {
-        return Err(Errno::ENAMETOOLONG.into());
-    }
-    if len as u64 > size {
-        return Err(Errno::ERANGE.into());
-    }
-    // The path, then its NUL: the bytes before an inaccessible page are
-    // written either way, exactly as one `copy_to_user` of both would.
-    if copy_to_user(ctx, buffer, cwd) != 0
-        || copy_to_user(ctx, buffer + cwd.len() as u64, &[0]) != 0
-    {
-        return Err(Errno::EFAULT.into());
-    }
-    Ok(i64::try_from(len).unwrap_or(i64::MAX))
 }
 
 /// `UTS_RELEASE`: the pinned release string. `uname -r` of a kernel built from

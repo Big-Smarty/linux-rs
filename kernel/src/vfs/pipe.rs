@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Selected semantics from Linux 6.18.57, commit
+// 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: fs/pipe.c (GPL-2.0:
+// `anon_pipe_read`, `anon_pipe_write`, `create_pipe_files`, `alloc_pipe_info`,
+// `pipe_release`, `pipe_ioctl` FIONREAD, `pipe_fcntl`), include/linux/pipe_fs_i.h
+// (`PIPE_DEF_BUFFERS`, `pipe_buffer`). Copyright of the original: Linus
+// Torvalds and contributors.
+// Transformation: the ring of `pipe_buffer`s is a vector of at most
+// `max_usage` page buffers; waiting is the caller's decision (a single task
+// that would sleep has nobody to wake it); no wait queues, fasync, watch queue,
+// packet mode or splice.
+#![forbid(unsafe_code)]
+//! Anonymous pipes. The syscall layer moves bytes between user memory and the
+//! buffers one page at a time, exactly as `anon_pipe_read`/`anon_pipe_write`
+//! copy page by page, so a fault leaves the same bytes consumed or written.
+
+use alloc::vec::Vec;
+use syscalls::Errno;
+
+use super::{KResult, PAGE_SIZE, Timespec, try_push};
+
+/// `PIPE_DEF_BUFFERS`: a new pipe holds sixteen pages (`F_GETPIPE_SZ` 65536).
+pub const PIPE_DEF_BUFFERS: usize = 16;
+
+struct PipeBuf {
+    page: Vec<u8>,
+    offset: usize,
+    len: usize,
+}
+
+pub struct Pipe {
+    bufs: Vec<PipeBuf>,
+    /// `pipe->readers` / `pipe->writers`: open file ends.
+    pub readers: u32,
+    pub writers: u32,
+    pub max_usage: usize,
+    /// pipefs inode facts for `fstat`.
+    pub ino: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub time: Timespec,
+}
+
+impl Pipe {
+    #[must_use]
+    pub fn new(ino: u64, uid: u32, gid: u32, time: Timespec) -> Self {
+        Self {
+            bufs: Vec::new(),
+            readers: 1,
+            writers: 1,
+            max_usage: PIPE_DEF_BUFFERS,
+            ino,
+            uid,
+            gid,
+            time,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bufs.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.bufs.len() >= self.max_usage
+    }
+
+    /// Bytes buffered (`FIONREAD`).
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.bufs.iter().map(|buf| buf.len).sum()
+    }
+
+    /// `max_usage * PAGE_SIZE` (`F_GETPIPE_SZ`).
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.max_usage * PAGE_SIZE
+    }
+
+    /// The data of the oldest buffer.
+    #[must_use]
+    pub fn front(&self) -> Option<&[u8]> {
+        self.bufs
+            .first()
+            .map(|buf| &buf.page[buf.offset..buf.offset + buf.len])
+    }
+
+    /// Consume `count` bytes of the oldest buffer; an emptied buffer is released.
+    pub fn consume(&mut self, count: usize) {
+        if let Some(buf) = self.bufs.first_mut() {
+            buf.offset += count;
+            buf.len -= count;
+            if buf.len == 0 {
+                self.bufs.remove(0);
+            }
+        }
+    }
+
+    /// Room left in the newest buffer for a merging write.
+    #[must_use]
+    pub fn merge_room(&self) -> usize {
+        self.bufs
+            .last()
+            .map_or(0, |buf| PAGE_SIZE - (buf.offset + buf.len))
+    }
+
+    /// Append to the newest buffer (the `PIPE_BUF_FLAG_CAN_MERGE` path).
+    ///
+    /// # Errors
+    /// `EINVAL` if the data does not fit ([`Pipe::merge_room`] is the check).
+    pub fn merge(&mut self, data: &[u8]) -> KResult<()> {
+        let room = self.merge_room();
+        let buf = self.bufs.last_mut().ok_or(Errno::EINVAL)?;
+        if data.len() > room {
+            return Err(Errno::EINVAL);
+        }
+        let end = buf.offset + buf.len;
+        buf.page[end..end + data.len()].copy_from_slice(data);
+        buf.len += data.len();
+        Ok(())
+    }
+
+    /// Add a fresh page buffer holding `data` (at most a page).
+    ///
+    /// # Errors
+    /// `ENOMEM`; `EINVAL` when the pipe is full or `data` exceeds a page.
+    pub fn push_page(&mut self, data: &[u8]) -> KResult<()> {
+        if self.is_full() || data.len() > PAGE_SIZE {
+            return Err(Errno::EINVAL);
+        }
+        let mut page = Vec::new();
+        page.try_reserve_exact(PAGE_SIZE)
+            .map_err(|_| Errno::ENOMEM)?;
+        for &byte in data {
+            page.push_within_capacity(byte).map_err(|_| Errno::ENOMEM)?;
+        }
+        for _ in data.len()..PAGE_SIZE {
+            page.push_within_capacity(0).map_err(|_| Errno::ENOMEM)?;
+        }
+        try_push(
+            &mut self.bufs,
+            PipeBuf {
+                page,
+                offset: 0,
+                len: data.len(),
+            },
+        )
+    }
+}

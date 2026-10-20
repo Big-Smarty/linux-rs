@@ -19,15 +19,23 @@
 //! when `execve` of a second process exists.
 //! shortcut: the file's owner and setuid/setgid bits are ignored; init always
 //! runs with uid/gid 0 and no secure-exec (a root-owned initramfs).
+//! shortcut: `/init` is read whole into a temporary vector and copied into
+//! frames (Linux maps page-cache pages); upgrade with file-backed `mmap`.
+//!
+//! The rootfs (`vfs`) is built and unpacked here, before the owned tables are
+//! activated (the module payloads are only readable then), so its timestamps
+//! carry `vfs::tmpfs::UNSET_TIME` until `start` fixes them with the running
+//! clock.
 
 use crate::{
     boot::{BootError, BootInfo},
     console, cpu,
-    memory::{Allocator, Error as MemoryError, PAGE, PAGE_BYTES, Physical},
-    paging::{self, LoadSpace, Tables, UserSpace},
+    memory::{Error as MemoryError, PAGE, PAGE_BYTES, Physical},
+    paging::{self, Tables, UserSpace},
     services::{self, Service},
     timer,
 };
+use alloc::vec::Vec;
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
     iter,
@@ -36,8 +44,7 @@ use kernel::{
     cputime::{CpuAccount, CpuSample},
     exec::{
         args::{ArgsError, InitArgv, Word},
-        find::{FindError, InitEntry, Search},
-        load::{exec_file, insert_stack, map_segments},
+        load::{Pager, exec_file, insert_stack, map_segments},
         plan::{LoadError, LoadPlan, Unsupported},
         report::{
             self, ExecFailed, FileRegion, InitDeath, NO_INIT, NO_ROOT, NO_ROOT_PANIC, Segfault,
@@ -46,15 +53,19 @@ use kernel::{
         script,
         stack::{self, ARG_PAGES, Aux, ENVP, STACK_START, STACK_TOP, StackError},
     },
-    image::{cpio::FileType, elf::Elf},
+    image::elf::Elf,
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     syscall::{
-        self, AddressSpace, ClockState, Clocks, Console, Context, Machine, Outcome, RestartBlock,
-        RestartFn,
+        self, AddressSpace, ClockState, Clocks, Console, Context, Files, Machine, Outcome,
+        RestartBlock, RestartFn,
     },
     task::{self, Attributes},
     usercopy::{self, UserPages},
+    vfs::{
+        self, FdTable, FileId, MAY_EXEC, O_LARGEFILE, O_RDONLY, Timespec, Vfs, initramfs::Unpacker,
+        mapping::FileFault, ops::OpenFlags, path::LOOKUP_FOLLOW,
+    },
 };
 use syscalls::Errno;
 
@@ -63,11 +74,15 @@ pub const FILENAME: &[u8] = b"/init";
 const _: () = assert!(ARG_PAGES == 4);
 
 pub enum Error {
-    /// No archive provides `/init`: Linux ends in `NO_INIT`.
+    /// The rootfs has no `/init`: Linux ends in `NO_INIT`.
     NoInit,
-    HardLink(FindError),
-    /// `/init` is a symlink; resolving it is outside this slice.
-    Symlink,
+    /// No `/init`, and boot module `module` is compressed: Linux (gzip and the
+    /// other `RD_*` decompressors are configured) would have unpacked it and
+    /// possibly found an `/init`, but no decompressor is ported. Not Linux's
+    /// `NO_INIT`: the boot stops loudly instead of imitating a Linux failure.
+    CompressedModule(usize),
+    /// The rootfs itself could not be built (`default_rootfs` failed or no memory).
+    Vfs(Errno),
     /// Linux `execve` failure; the errno is what `Failed to execute` prints.
     Exec(Errno),
     /// `/init` failed to execute and one of Linux's fallback inits exists in
@@ -88,8 +103,10 @@ impl core::fmt::Debug for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NoInit => f.write_str("NoInit"),
-            Self::HardLink(error) => f.debug_tuple("HardLink").field(error).finish(),
-            Self::Symlink => f.write_str("Symlink"),
+            Self::CompressedModule(module) => {
+                f.debug_tuple("CompressedModule").field(module).finish()
+            }
+            Self::Vfs(errno) => f.debug_tuple("Vfs").field(errno).finish(),
             Self::Exec(errno) => f.debug_tuple("Exec").field(errno).finish(),
             Self::Fallback { errno, path } => f
                 .debug_struct("Fallback")
@@ -139,6 +156,12 @@ impl From<ArgsError> for Error {
 /// Everything later stages need once `/init` is mapped. Plain data; the mapped
 /// pages live in the tables, which belong in `services::TABLES` before ring 3.
 pub struct Loaded {
+    /// The unpacked rootfs; moves into [`Process`] when init starts.
+    pub vfs: Vfs,
+    /// The open file `/init` was read from (`bprm->file`); the VMAs of its
+    /// segments pin it when init starts; the reference itself then stays as
+    /// the process's `mm->exe_file` ([`Process::exec`]).
+    pub exec: FileId,
     pub entry: u64,
     pub sp: u64,
     pub loads: usize,
@@ -181,105 +204,146 @@ fn random_bytes() -> [u8; 16] {
 /// # Errors
 /// [`Error::NoInit`] when absent (the caller reproduces Linux's panic), the
 /// Linux `execve` errno or an explicit unsupported case otherwise.
-pub fn load(
-    boot: &BootInfo,
-    allocator: &mut Allocator<'_>,
-    tables: &mut Tables,
-) -> Result<Loaded, Error> {
-    let fallback = first_fallback(boot);
-    match load_init(boot, allocator, tables) {
+pub fn load(boot: &BootInfo, tables: &mut Tables) -> Result<Loaded, Error> {
+    let (vfs, compressed) = build_rootfs(boot)?;
+    let fallback = first_fallback(&vfs);
+    match load_init(boot, vfs, tables) {
+        Ok(loaded) => Ok(loaded),
+        Err(Error::NoInit) if compressed.is_some() => {
+            Err(Error::CompressedModule(compressed.unwrap_or_default()))
+        }
         Err(Error::Exec(errno) | Error::Load(LoadError::Errno(errno))) if fallback.is_some() => {
             Err(Error::Fallback {
                 errno: errno.into_raw(),
                 path: fallback.unwrap_or_default(),
             })
         }
-        other => other,
+        Err(error) => Err(error),
     }
 }
 
 /// `kernel_init`'s fallbacks after a failed `/init` (init/main.c:1499-1502).
 const FALLBACKS: [&[u8]; 4] = [b"/sbin/init", b"/etc/init", b"/bin/init", b"/bin/sh"];
 
-/// The latest archive entry for `path`, across all boot modules.
-fn locate(boot: &BootInfo, path: &[u8]) -> Result<Option<InitEntry>, Error> {
-    let mut search = Search::new(path);
+/// The clock of the rootfs until timekeeping runs: every timestamp it hands out
+/// is [`vfs::tmpfs::UNSET_TIME`] and `start` replaces those with real time.
+fn early_clock() -> Timespec {
+    vfs::tmpfs::UNSET_TIME
+}
+
+/// The rootfs as `rootfs_initcall` leaves it: tmpfs (`init_rootfs`: no
+/// `root=`), the builtin initramfs (`/dev`, `/dev/console`, `/root`), then every
+/// boot module unpacked in order (`populate_rootfs`). A module the unpacker
+/// stops on keeps the entries before the stop, as in Linux; compressed modules
+/// are skipped (decompression is not ported; the boot log already warned).
+fn build_rootfs(boot: &BootInfo) -> Result<(Vfs, Option<usize>), Error> {
+    // shmem_default_max_blocks / _max_inodes: both half the RAM's pages
+    // (`min3(nr_pages - totalhigh, nr_pages / 2, ...)` for the inodes).
+    let pages = services::FRAMES.lock().total() as u64;
+    let mut vfs = Vfs::new(pages / 2, pages / 2, early_clock).map_err(Error::Vfs)?;
+    let mut compressed = None;
+    vfs.default_rootfs().map_err(Error::Vfs)?;
+    let mut unpacker = Unpacker::new();
     for index in 0..boot.module_count() {
         let span = boot.module_span(index)?;
         // SAFETY: trusted initialized immutable file storage, BSP only, no
-        // DMA/AP/firmware writer or reclaim, loader CR3 still active (callers
-        // run before the owned tables are activated). The borrow ends within
-        // this iteration.
+        // DMA/AP/firmware writer or reclaim, loader CR3 still active (`load`
+        // runs before the owned tables are activated). The borrow ends within
+        // this iteration; the unpacker copies what it keeps.
         let bytes = unsafe { boot.module_bytes(span) }?;
-        search.scan(index, bytes).map_err(Error::HardLink)?;
+        if let Some(message) = unpacker.unpack(&mut vfs, bytes) {
+            // CONFIG_BLK_DEV_RAM=n (`do_populate_rootfs`): the unpacker's own
+            // message; the entries before the failure stay in the tree.
+            if message == vfs::initramfs::NOT_PORTED {
+                compressed.get_or_insert(index);
+                crate::log!("WARN module={}: {}\n", index, message);
+            } else {
+                crate::log!("Initramfs unpacking failed: {}\n", message);
+            }
+        }
     }
-    Ok(search.entry())
+    Ok((vfs, compressed))
 }
 
-/// The first fallback init present in the archives; an untrackable entry
-/// counts as present (it is reported, never silently skipped).
-fn first_fallback(boot: &BootInfo) -> Option<&'static [u8]> {
+/// The kernel thread's view of the rootfs for `init_*` and `kernel_execve`.
+fn exec_open() -> OpenFlags {
+    // open_exec_flags: O_LARGEFILE | O_RDONLY, MAY_EXEC, LOOKUP_FOLLOW.
+    OpenFlags {
+        flags: O_LARGEFILE | O_RDONLY,
+        mode: 0,
+        acc_mode: MAY_EXEC,
+        follow: true,
+        directory: false,
+        cloexec: false,
+    }
+}
+
+/// `do_open_execat` + `kernel_read` of the whole file; the open file stays
+/// open (`bprm->file`) for the caller to hand to the VMAs or `fput`.
+fn open_exec_file(vfs: &mut Vfs, path: &[u8]) -> Result<(Vec<u8>, FileId), Errno> {
+    let env = vfs.kernel_env();
+    let file = vfs.open(&env, path, &exec_open())?;
+    let inode = vfs.files.get(file).inode;
+    let bytes = match inode {
+        // do_open_execat: only regular files execute.
+        Some(inode) if vfs.fs.inode(inode).is_reg() => vfs.fs.read_all(inode),
+        _ => Err(Errno::EACCES),
+    };
+    match bytes {
+        Ok(bytes) => Ok((bytes, file)),
+        Err(errno) => {
+            vfs.fput(file);
+            Err(errno)
+        }
+    }
+}
+
+/// [`open_exec_file`] for a caller that only needs the bytes.
+fn open_exec(vfs: &mut Vfs, path: &[u8]) -> Result<Vec<u8>, Errno> {
+    let (bytes, file) = open_exec_file(vfs, path)?;
+    vfs.fput(file);
+    Ok(bytes)
+}
+
+/// The first fallback init present in the rootfs.
+fn first_fallback(vfs: &Vfs) -> Option<&'static [u8]> {
+    let env = vfs.kernel_env();
     FALLBACKS
         .into_iter()
-        .find(|path| !matches!(locate(boot, path), Ok(None)))
-}
-
-/// Why `exec` of a regular-file candidate fails before the ELF is read.
-fn check_executable(entry: &InitEntry) -> Result<(), Error> {
-    match entry.kind {
-        FileType::Regular => {}
-        FileType::Symlink => return Err(Error::Symlink),
-        // do_open_execat: only regular files execute.
-        _ => return Err(Error::Exec(Errno::EACCES)),
-    }
-    // root passes DAC for exec only when some execute bit is set.
-    if entry.mode & 0o111 == 0 {
-        return Err(Error::Exec(Errno::EACCES));
-    }
-    Ok(())
+        .find(|path| vfs.lookup(&env, path, LOOKUP_FOLLOW).is_ok())
 }
 
 /// `load_script`: `-ENOENT` when the interpreter is not in the rootfs (what
 /// `open_exec` returns), otherwise an explicit unsupported failure.
-fn script_failure(boot: &BootInfo, interpreter: &[u8]) -> Error {
-    interpreter_failure(boot, interpreter, Unsupported::Script)
+fn script_failure(vfs: &mut Vfs, interpreter: &[u8]) -> Error {
+    interpreter_failure(vfs, interpreter, Unsupported::Script)
 }
 
 /// The shared tail of `load_script` and `load_elf_binary`'s `PT_INTERP` scan:
-/// `open_exec(interpreter)` fails `-ENOENT` (or the access error) exactly as
-/// Linux does; an interpreter that exists is `unsupported`.
-fn interpreter_failure(boot: &BootInfo, interpreter: &[u8], unsupported: Unsupported) -> Error {
+/// `open_exec(interpreter)` fails with its `errno` exactly as Linux does; an
+/// interpreter that opens is `unsupported`.
+fn interpreter_failure(vfs: &mut Vfs, interpreter: &[u8], unsupported: Unsupported) -> Error {
     if interpreter.is_empty() {
         return Error::Exec(Errno::ENOENT);
     }
-    match locate(boot, interpreter) {
-        Ok(None) => Error::Exec(Errno::ENOENT),
-        Ok(Some(entry)) => match check_executable(&entry) {
-            Err(error) => error,
-            Ok(()) => Error::Load(LoadError::Unsupported(unsupported)),
-        },
-        Err(error) => error,
+    match open_exec(vfs, interpreter) {
+        Err(errno) => Error::Exec(errno),
+        Ok(_) => Error::Load(LoadError::Unsupported(unsupported)),
     }
 }
 
-fn load_init(
-    boot: &BootInfo,
-    allocator: &mut Allocator<'_>,
-    tables: &mut Tables,
-) -> Result<Loaded, Error> {
-    let init = locate(boot, FILENAME)?.ok_or(Error::NoInit)?;
-    check_executable(&init)?;
-
-    let span = boot.module_span(init.module)?;
-    // SAFETY: as in `locate`; the slice and `file` end before this function returns.
-    let module = unsafe { boot.module_bytes(span) }?;
-    let file = module
-        .get(init.offset..)
-        .and_then(|rest| rest.get(..init.length))
-        .ok_or(BootError::Address)?;
+fn load_init(boot: &BootInfo, mut vfs: Vfs, tables: &mut Tables) -> Result<Loaded, Error> {
+    // kernel_init_freeable: `init_eaccess(ramdisk_execute_command)` failing sends
+    // Linux to `prepare_namespace`; any lookup failure counts.
+    let env = vfs.kernel_env();
+    if vfs.lookup(&env, FILENAME, LOOKUP_FOLLOW).is_err() {
+        return Err(Error::NoInit);
+    }
+    let (file_bytes, exec) = open_exec_file(&mut vfs, FILENAME).map_err(Error::Exec)?;
+    let file = file_bytes.as_slice();
     match script::interpreter(file) {
         Err(errno) => return Err(Error::Exec(errno)),
-        Ok(Some(interpreter)) => return Err(script_failure(boot, interpreter)),
+        Ok(Some(interpreter)) => return Err(script_failure(&mut vfs, interpreter)),
         Ok(None) => {}
     }
     let plan = match LoadPlan::new(file) {
@@ -290,25 +354,38 @@ fn load_init(
                 .ok()
                 .and_then(|elf| elf.interpreter().ok().flatten())
                 .unwrap_or_default();
-            return Err(interpreter_failure(boot, path, Unsupported::Interpreter));
+            return Err(interpreter_failure(
+                &mut vfs,
+                path,
+                Unsupported::Interpreter,
+            ));
         }
         other => other?,
     };
 
     // The address space is built by the one mapping-rule mechanism (`mm`):
     // the shared zero page, the stack VMA, then every `PT_LOAD` (the loader
-    // installs the file pages it owns as it goes). The model's vectors come
-    // from the boot arena (`kalloc`): `FRAMES` does not exist yet.
-    tables.init_zero_page(allocator)?;
-    let env = Env::init(allocator.total() as u64, 0);
+    // installs the file pages it owns as it goes). The model's vectors are
+    // reserved from the heap before each `FRAMES` guard, which the table view
+    // takes per operation (`services`).
+    let total_pages = services::FRAMES.lock().total() as u64;
+    tables.init_zero_page(&mut services::FRAMES.lock())?;
+    let env = Env::init(total_pages, 0);
     let mut mm = Mm::new(&env);
     insert_stack(&mut mm, &env, plan.exec_stack)?;
-    let mut space = LoadSpace {
-        tables: &mut *tables,
-        allocator: &mut *allocator,
-    };
-    map_segments(&plan, file, &exec_file(1), &mut mm, &env, &mut space)?;
+    map_segments(
+        &plan,
+        file,
+        &exec_file(u64::from(exec.index())),
+        &mut mm,
+        &env,
+        &mut tables.user_space(),
+    )?;
 
+    // No heap allocation while `FRAMES` is held (`services`): everything that
+    // grows a vector happened above.
+    let mut allocator = services::FRAMES.lock();
+    let allocator = &mut *allocator;
     // The argument block lives in the top ARG_PAGES pages: one contiguous
     // frame so `stack::build` can write it as a single window.
     let mut top = allocator.allocate_order(2)?;
@@ -341,6 +418,8 @@ fn load_init(
     // `setup_arg_pages` expands the VMA, it does not fault the pages in).
 
     Ok(Loaded {
+        vfs,
+        exec,
         entry: plan.entry,
         sp: built.sp,
         loads: plan.segments().len(),
@@ -383,6 +462,15 @@ pub struct Process {
     /// shortcut: fixed `INIT_RLIMITS`; `setrlimit`/`prlimit64` must update it
     /// (or derive it from the credentials group's limits) when they land.
     pub env: Env,
+    /// `FileInfo::id` of the open description `/init` was loaded from
+    /// (`mm->exe_file`): the only file whose name the fault report knows.
+    pub exec: u64,
+    /// The mounted rootfs, open files and pipes.
+    /// shortcut: one process, so the system-wide VFS lives here; with tasks it
+    /// becomes its own service (lock class `vfs` between `PROCESS` and `TABLES`).
+    pub vfs: Vfs,
+    /// `current->files`.
+    pub fdt: FdTable,
 }
 
 static PROCESS: Service<Process> = Service::new();
@@ -446,13 +534,56 @@ struct Syscall<'a> {
     tty: Tty,
 }
 
+/// `handle_mm_fault` for one user address: the model's decision, and for a
+/// page of a private file mapping (`NeedsFile`) `shmem_fault` + `do_cow_fault`:
+/// a private frame holding the file page ([`Vfs::fault_page`]; `SIGBUS` past
+/// `i_size`), mapped with the VMA's protection.
+fn user_fault(
+    process: &mut Process,
+    space: &mut UserSpace<'_>,
+    address: u64,
+    error: u64,
+) -> FaultOutcome {
+    let outcome = process
+        .space
+        .handle_user_fault(&process.env, space, address, error);
+    let FaultOutcome::NeedsFile { address, .. } = outcome else {
+        return outcome;
+    };
+    let page = address & !(PAGE - 1);
+    // The model only reports `NeedsFile` for an address inside a file VMA.
+    let Some(vma) = process.space.find_vma(page).copied() else {
+        crate::log!(
+            "FAIL mm file fault outside any VMA address={:#x}\n",
+            address
+        );
+        crate::fail();
+    };
+    let Some(file) = vma.file else {
+        crate::log!(
+            "FAIL mm file fault in an anonymous VMA address={:#x}\n",
+            address
+        );
+        crate::fail();
+    };
+    let mut bytes = [0u8; PAGE_BYTES];
+    let pgoff = vma.pgoff + ((page - vma.start) >> 12);
+    match process.vfs.fault_page(file, pgoff, &mut bytes) {
+        Err(FileFault::Bus) => FaultOutcome::Bus { address },
+        Ok(()) => match space.install(page, mm::page_prot(vma.flags), &bytes) {
+            Ok(()) => FaultOutcome::Handled,
+            Err(mm::OutOfMemory) => FaultOutcome::Oom,
+        },
+    }
+}
+
 /// A kernel access to a user page that is not resident takes the fault Linux
 /// would: `exc_page_fault` -> `do_user_addr_fault` with the kernel-mode error
 /// code (no `X86_PF_USER`) on a user address. A fault the model resolves is
 /// retried (once: it must now succeed); any refusal is the exception-table
 /// fixup, i.e. a short copy and `-EFAULT`, with no signal (`__bad_area_nosemaphore`
 /// only signals in user mode; OOM, SIGBUS and the vsyscall page behave the
-/// same for a kernel-mode access). A file page we cannot supply stops loudly.
+/// same for a kernel-mode access).
 /// No lock is held across the fault that is not already held by the syscall
 /// (`PROCESS`, `TABLES`): the handler takes neither again and only `FRAMES`
 /// (a leaf) below them.
@@ -462,20 +593,8 @@ impl UserPages for Syscall<'_> {
             // Present-but-read-only (write) is `X86_PF_PROT`, an absent page is
             // not; the model's decision does not depend on it for a write.
             let error = if write { PF_WRITE } else { 0 };
-            let process = &mut *self.process;
-            match process
-                .space
-                .handle_user_fault(&process.env, &mut self.space, page, error)
-            {
+            match user_fault(&mut *self.process, &mut self.space, page, error) {
                 FaultOutcome::Handled => {}
-                FaultOutcome::NeedsFile { address, write } => {
-                    crate::log!(
-                        "FAIL mm unimplemented file-backed fault address={:#x} write={} (kernel access)\n",
-                        address,
-                        write
-                    );
-                    crate::fail();
-                }
                 _ => return None,
             }
         }
@@ -529,6 +648,14 @@ impl Context for Syscall<'_> {
             mm: &mut self.process.space,
             env: &self.process.env,
             pages: &mut self.space,
+        }
+    }
+    fn files(&mut self) -> Files<'_> {
+        let process = &mut *self.process;
+        Files {
+            vfs: &mut process.vfs,
+            fdt: &mut process.fdt,
+            fs: &mut process.attrs.fs,
         }
     }
 }
@@ -625,6 +752,11 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
             crate::log!("FAIL syscall unimplemented nr={}\n", number);
             crate::fail();
         }
+        Outcome::Blocked(number) => {
+            // Linux would sleep and nothing can wake the only task.
+            crate::log!("FAIL syscall would block forever nr={}\n", number);
+            crate::fail();
+        }
     }
 }
 
@@ -638,7 +770,7 @@ pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) {
         page_fault(error, ip, sp, address);
         return;
     }
-    let region = FileRegion::of(&PROCESS.lock().space, ip);
+    let region = region_of(&PROCESS.lock(), ip);
     let signal = u8::try_from(vector).ok().and_then(report::user_exception);
     let Some(signal) = signal else {
         crate::log!(
@@ -663,6 +795,41 @@ pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) {
     init_died(report::signal_exit_code(signal.signal));
 }
 
+/// `print_vma_addr`'s file part for `ip`: Linux prints the basename of the
+/// VMA's file, and [`FileRegion`] knows only `init`. A fault in a VMA of any
+/// other file would print a wrong name, so it stops loudly instead (also for a
+/// possible `/dev/zero` mapping, see below).
+/// shortcut: resolve the name from the description's dentry when a program
+/// other than `/init` can run.
+fn region_of(process: &Process, ip: u64) -> Option<FileRegion> {
+    let Some(region) = FileRegion::of(&process.space, ip) else {
+        // A private /dev/zero VMA keeps no `vm_file` here but Linux prints
+        // ` in zero[...]` for it: once one was made, an anonymous `ip` cannot
+        // be told from it.
+        if process.vfs.zero_mapped()
+            && process
+                .space
+                .find_vma(ip)
+                .is_some_and(|vma| vma.start <= ip)
+        {
+            crate::log!(
+                "FAIL mm user fault in an anonymous mapping after a /dev/zero mapping ip={:#x} (vm_file of mmap_zero not kept)\n",
+                ip
+            );
+            crate::fail();
+        }
+        return None;
+    };
+    if process.space.find_vma(ip).and_then(|vma| vma.file) != Some(process.exec) {
+        crate::log!(
+            "FAIL mm user fault in a mapped file other than /init ip={:#x} (file name resolution not ported)\n",
+            ip
+        );
+        crate::fail();
+    }
+    Some(region)
+}
+
 /// A page fault taken in ring 3 (`exc_page_fault` -> `do_user_addr_fault`).
 /// Context: the faulting task, interrupts off, no lock held (the fault came
 /// from ring 3). Locks `PROCESS` -> `TABLES` (-> heap, `FRAMES` inside).
@@ -674,19 +841,18 @@ pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) {
 ///   `show_signal_msg` (the `init[1]: segfault at ...` line); init has no
 ///   handler, so it dies with exit code 11.
 /// * `Bus`: `do_sigbus` -> `SIGBUS` (no console line), exit code 7.
-/// * `Oom`, `PgtableBad`, `Vsyscall`, `NeedsFile`: Linux runs the OOM killer
-///   (which finds init unkillable and panics), oopses and kills the task,
-///   emulates the vsyscall page, or reads the page cache. None is implemented:
-///   a loud `FAIL mm ...` stop, never a signal that did not happen.
+/// * `Oom`, `PgtableBad`, `Vsyscall`: Linux runs the OOM killer (which finds
+///   init unkillable and panics), oopses and kills the task, or emulates the
+///   vsyscall page. None is implemented: a loud `FAIL mm ...` stop, never a
+///   signal that did not happen.
+/// * `NeedsFile` (a page of a private file mapping) is resolved by
+///   [`user_fault`] into `Handled`, `Bus` or `Oom`.
 fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
     let mut guard = PROCESS.lock();
     let process = &mut *guard;
     let mut tables = process.mm.lock();
     let mut space = tables.user_space();
-    let outcome =
-        process
-            .space
-            .handle_user_fault(&process.env, &mut space, address, error | mm::PF_USER);
+    let outcome = user_fault(process, &mut space, address, error | mm::PF_USER);
     drop(tables);
     match outcome {
         FaultOutcome::Handled => {
@@ -701,7 +867,7 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
                 ip,
                 sp,
                 error,
-                region: FileRegion::of(&process.space, ip),
+                region: region_of(process, ip),
             };
             drop(guard);
             crate::log!("{}\n", line);
@@ -739,15 +905,7 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
             );
             crate::fail();
         }
-        FaultOutcome::NeedsFile { address, write } => {
-            crate::log!(
-                "FAIL mm unimplemented file-backed fault address={:#x} write={} ip={:#x}\n",
-                address,
-                write,
-                ip
-            );
-            crate::fail();
-        }
+        FaultOutcome::NeedsFile { .. } => unreachable!("resolved by user_fault"),
     }
 }
 
@@ -1101,6 +1259,13 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
             crate::log!("{}\n", NO_ROOT_PANIC);
             stop("no-root");
         }
+        Err(Error::CompressedModule(module)) => {
+            crate::log!(
+                "FAIL initramfs module={} is compressed and no /init was unpacked: decompressor not ported\n",
+                module
+            );
+            crate::fail();
+        }
         Err(Error::Exec(errno) | Error::Load(LoadError::Errno(errno))) => {
             // `kernel_init`: `Failed to execute`, then every fallback fails
             // with ENOENT (silently) because none exists in the archives.
@@ -1131,7 +1296,7 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
     }
 }
 
-fn start(init: Loaded) -> ! {
+fn start(mut init: Loaded) -> ! {
     check_user_image(&init, &mut services::TABLES.lock().user_space());
     crate::log!("Run /init as init process\n");
     // SAFETY: BSP, CPL0, IF clear (nothing since the timer test re-enabled it
@@ -1167,11 +1332,27 @@ fn start(init: Loaded) -> ! {
     // (masked after the boot proofs) runs again so user/system time accrues.
     CPUTIME.start(timer::ktime_get_ns());
     timer::resume_tick();
+    // Timekeeping runs now: replace the placeholders of the unpack-time stamps,
+    // then follow the real wall clock.
+    init.vfs
+        .start_timekeeping(timer::ktime_get_real, timer::ktime_get_real());
+    // The segments' VMAs hold /init (`vm_file`). The loader's reference
+    // (`bprm->file`) stays as `mm->exe_file` for the life of the process, so
+    // `Process::exec` can never name a recycled description.
+    crate::unwrap(init.vfs.reserve_pin(), "exec-pin");
+    init.vfs.pin(u64::from(init.exec.index()));
+    let mut fdt = FdTable::default();
+    // console_on_rootfs: descriptors 0-2 are one /dev/console open file.
+    if init.vfs.console_on_rootfs(&mut fdt).is_err() {
+        crate::log!("Warning: unable to open an initial console.\n");
+    }
+    let mut attrs = Attributes::init(task::max_threads(managed_pages));
+    attrs.fs = init.vfs.new_fs_struct(0o022);
     PROCESS.install(Process {
         pid: 1,
         tgid: 1,
         mm: &services::TABLES,
-        attrs: Attributes::init(task::max_threads(managed_pages)),
+        attrs,
         load,
         restart: RestartBlock {
             func: RestartFn::None,
@@ -1181,6 +1362,9 @@ fn start(init: Loaded) -> ! {
         },
         space: init.mm,
         env: init.env,
+        exec: u64::from(init.exec.index()),
+        vfs: init.vfs,
+        fdt,
     });
     #[cfg(feature = "qemu-self-test")]
     check_mm_usercopy();

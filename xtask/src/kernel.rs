@@ -699,8 +699,10 @@ const DEBUG_CASES: &[DebugCase] = &[
             ..Q35_TCG
         },
     },
+    oracle_case!(mm),
     oracle_case!(ids),
     oracle_case!(time),
+    oracle_case!(fs),
 ];
 
 /// Expected stdout lines of the oracle syscall suite (`user/init` modes `mm ids time signal fs

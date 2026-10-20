@@ -44,9 +44,10 @@ use kernel::{
 /// Size of the boot arena: the heap's minimum chunk (`kernel::heap::MIN_CHUNK`).
 const ARENA_BYTES: usize = 64 * 1024;
 
-/// Memory for the allocations made *before* `services::FRAMES` exists (the
-/// loader's `Mm` vector is built before the tables are published). Natural
-/// alignment of its length, as `ChunkSource` asks.
+/// Memory for allocations made *before* `services::FRAMES` exists. The boot
+/// installs `FRAMES` before the rootfs and the loader's `Mm` are built, so
+/// nothing allocates here today; it stays as the fallback for any earlier
+/// allocation. Natural alignment of its length, as `ChunkSource` asks.
 #[repr(C, align(65536))]
 struct BootArena(UnsafeCell<[u8; ARENA_BYTES]>);
 // SAFETY: the bytes are reached only through the one `(start, length)` handed
@@ -73,7 +74,7 @@ unsafe impl ChunkSource for FrameChunks {
             // Boot arena: exactly one chunk, never returned. A request that
             // does not fit, or a second one, fails like exhaustion (callers
             // use fallible APIs). shortcut: 64 KiB until frames exist; the
-            // boot sequence allocates only the loader's VMA vector here.
+            // boot sequence allocates nothing before `FRAMES` is installed.
             if min_bytes > ARENA_BYTES || ARENA_TAKEN.swap(true, Ordering::AcqRel) {
                 return None;
             }

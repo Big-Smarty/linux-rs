@@ -28,6 +28,8 @@ pub const RLIM_NLIMITS: usize = 16;
 pub const RLIM_INFINITY: u64 = u64::MAX;
 /// `RLIMIT_CPU`.
 pub const RLIMIT_CPU: usize = 0;
+/// `RLIMIT_FSIZE`.
+pub const RLIMIT_FSIZE: usize = 1;
 /// `RLIMIT_NOFILE`.
 pub const RLIMIT_NOFILE: usize = 7;
 /// `sysctl_nr_open` (fs/file.c:96), the ceiling `RLIMIT_NOFILE`'s hard limit may reach.
@@ -94,6 +96,15 @@ impl Rlimits {
             limit(0, 0),                             // RTPRIO
             limit(INF, INF),                         // RTTIME
         ])
+    }
+
+    /// `task_rlimit(current, resource)`.
+    ///
+    /// # Panics
+    /// When `resource >= RLIM_NLIMITS` (callers pass a constant).
+    #[must_use]
+    pub fn get(&self, resource: usize) -> Rlimit {
+        self.0[resource]
     }
 
     /// `do_prlimit` (kernel/sys.c:1500-1556) minus the `RLIMIT_CPU` timer
@@ -170,30 +181,10 @@ impl Cred {
     }
 }
 
-/// `struct fs_struct` as far as the identity group sees it: the file-creation
-/// mask and the working directory.
-///
-/// shortcut: no VFS exists, so the working directory is the initramfs root
-/// held as the one path it prints (`/`) and `getcwd` formats that text. Upgrade
-/// by replacing `cwd` with the real dentry/mount pair the VFS spine provides
-/// and `getcwd` with `d_path`'s `prepend_path` walk (fs/d_path.c:412-448).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FsContext {
-    /// `init_fs.umask` is `0022`; `umask(2)` keeps only `S_IRWXUGO`.
-    pub umask: u32,
-    /// NUL-free absolute path of the working directory.
-    pub cwd: &'static [u8],
-}
-
-impl FsContext {
-    #[must_use]
-    pub const fn root() -> Self {
-        Self {
-            umask: 0o022,
-            cwd: b"/",
-        }
-    }
-}
+/// `current->fs`: the root, the working directory and the file-creation mask.
+/// The VFS spine owns the type ([`crate::vfs::FsStruct`]); `umask(2)` edits
+/// `umask`, `chdir`/`fchdir`/`getcwd` use the directory handles.
+pub use crate::vfs::FsStruct;
 
 /// `TASK_COMM_LEN`.
 pub const COMM_LEN: usize = 16;
@@ -203,7 +194,7 @@ pub const COMM_LEN: usize = 16;
 pub struct Attributes {
     pub cred: Cred,
     pub rlimits: Rlimits,
-    pub fs: FsContext,
+    pub fs: FsStruct,
     /// `task_struct::comm`, NUL-padded. A task started by `execve("/init")`
     /// is named after the file: `init`.
     pub comm: [u8; COMM_LEN],
@@ -234,7 +225,7 @@ impl Attributes {
         Self {
             cred: Cred::root(),
             rlimits: Rlimits::init(max_threads),
-            fs: FsContext::root(),
+            fs: FsStruct::INIT,
             comm,
             personality: 0,
             clear_child_tid: 0,
