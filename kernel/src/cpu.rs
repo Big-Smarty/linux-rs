@@ -8,7 +8,7 @@ use core::{
     arch::{asm, naked_asm},
     marker::PhantomData,
     ptr,
-    sync::atomic::{AtomicU64, Ordering, compiler_fence},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering, compiler_fence},
 };
 use kernel::{
     intc::{ERROR_VECTOR, ISA_IRQ_VECTOR_BASE, LOCAL_TIMER_VECTOR, SPURIOUS_VECTOR},
@@ -19,6 +19,7 @@ use x86_64::{
     PhysAddr, PrivilegeLevel, VirtAddr,
     instructions::{
         interrupts,
+        port::Port,
         segmentation::{CS, DS, ES, FS, GS, SS, Segment},
         tables::{DescriptorTablePointer, lidt, load_tss},
     },
@@ -121,6 +122,13 @@ pub fn validate() -> Result<(), Error> {
     if pat & 0xff != 6 || (pat >> 40) & 0xff != 1 {
         return Err(Error::Pat);
     }
+    // Device pages (LAPIC/IOAPIC/HPET) are mapped through a UC entry; require one
+    // and remember its index (PAT<<2 | PCD<<1 | PWT). Reset value: entry 3.
+    let uc = (0..8u8).find(|&index| pat.to_le_bytes()[usize::from(index)] == 0x00);
+    let Some(uc) = uc else {
+        return Err(Error::Pat);
+    };
+    MMIO_PAT_INDEX.store(uc, Ordering::Relaxed);
     let cr0 = Cr0::read();
     let cr4 = Cr4::read();
     // The address of a live local lies in the current stack frame; this replaces
@@ -176,6 +184,14 @@ const INTERRUPT_FLAG: u64 = 1 << 9;
 // releasing any AP. NMI/fault paths do not participate in this ownership domain.
 // Pack depth<<1 and the first owner's IF in one word: the last removal captures
 // the restoration flag atomically, without a separate reset/publication race.
+/// PAT index of an uncached entry, set by `validate`.
+static MMIO_PAT_INDEX: AtomicU8 = AtomicU8::new(3);
+
+/// PAT index (`PAT<<2 | PCD<<1 | PWT`) of the uncached entry `validate` found.
+pub fn mmio_pat_index() -> u8 {
+    MMIO_PAT_INDEX.load(Ordering::Relaxed)
+}
+
 static IRQ_NESTING: AtomicU64 = AtomicU64::new(0);
 
 fn interrupts_enabled() -> bool {
@@ -306,11 +322,9 @@ pub fn exit(success: bool) -> ! {
     interrupts_off();
     // Only compiled into explicitly opted-in QEMU self-test artifacts. The
     // external runner must attach isa-debug-exit at f4, width4. Not physical I/O.
-    // SAFETY: controlled virtual device, CPL0, scalar EAX/DX, no stack/flags
-    // effects; omit nomem for device ordering. OUT has no supported intrinsic.
-    unsafe {
-        asm!("out dx, eax", in("dx") 0xf4u16, in("eax") if success { 0x10u32 } else { 0x11u32 }, options(nostack, preserves_flags));
-    }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: controlled virtual device, CPL0, one 32-bit OUT.
+    unsafe { Port::<u32>::new(0xf4).write(if success { 0x10 } else { 0x11 }) };
     halt()
 }
 
@@ -337,56 +351,58 @@ pub fn active_tables() -> u64 {
     Cr3::read_raw().0.start_address().as_u64()
 }
 
+// Port I/O and IF control use the vendored `x86_64` crate (`Port`, `interrupts`),
+// whose asm is `nomem`. This kernel's device sequences (configuration, EOI,
+// mask) must stay ordered against ordinary memory work, so each access is
+// bracketed by compiler fences; the processor keeps the I/O instructions
+// themselves in order. No flags or stack are used.
 pub(crate) fn out_byte(port: u16, value: u8) {
+    compiler_fence(Ordering::SeqCst);
     // SAFETY: all callers name owned early PC devices (8259, 8254, CMOS index,
     // speaker gate 0x61, delay port 0x80) or the feature-gated emulated UART; the
     // ports are those of Linux's i8259.c/tsc.c/rtc.c for the same devices. No
-    // general port API is exported. OUT only uses AL/DX, preserves flags/stack; memory barrier
-    // prevents compiler reordering across device configuration and acknowledgment.
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") value, options(nostack, preserves_flags));
-    }
+    // general port API is exported; CPL0 (IOPL irrelevant).
+    unsafe { Port::<u8>::new(port).write(value) };
+    compiler_fence(Ordering::SeqCst);
 }
 pub(crate) fn in_byte(port: u16) -> u8 {
-    let value: u8;
-    // SAFETY: same device ownership as out_byte; IN returns initialized scalar.
-    unsafe {
-        asm!("in al, dx", in("dx") port, out("al") value, options(nostack, preserves_flags));
-    }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: same device ownership as `out_byte`; IN returns an initialized scalar.
+    let value = unsafe { Port::<u8>::new(port).read() };
+    compiler_fence(Ordering::SeqCst);
     value
 }
 pub(crate) fn io_wait() {
     out_byte(0x80, 0);
 }
+/// 32-bit port read for the ACPI PM timer.
 pub(crate) fn in_dword(port: u16) -> u32 {
-    let value: u32;
+    compiler_fence(Ordering::SeqCst);
     // SAFETY: the only caller reads the ACPI PM timer I/O port named by the
-    // checked FADT; IN returns an initialized scalar, uses only EAX/DX, no
-    // stack, flags preserved.
-    unsafe {
-        asm!("in eax, dx", in("dx") port, out("eax") value, options(nostack, preserves_flags));
-    }
+    // checked FADT (a 4-byte, read-only counter block); IN has no side effect there.
+    let value = unsafe { Port::<u32>::new(port).read() };
+    compiler_fence(Ordering::SeqCst);
     value
 }
-/// Enable maskable interrupts (`sti`). Callers poll a bounded condition and
-/// restore IF=0 with [`interrupts_off`] before returning.
+/// Enable maskable interrupts. Callers poll a bounded condition and restore
+/// IF=0 with [`interrupts_off`] before returning.
 pub(crate) fn interrupts_on() {
-    // SAFETY: CPL0 BSP; the IDT, controller and every handler used while IF=1 are
-    // installed by the caller; STI affects only IF, no memory or stack effect
-    // is claimed beyond the compiler boundary (no `nomem`).
-    unsafe {
-        asm!("sti", options(nostack));
-    }
+    compiler_fence(Ordering::SeqCst);
+    // The IDT, controller and every handler reachable with IF=1 are installed by
+    // the caller; BSP, CPL0.
+    interrupts::enable();
+    compiler_fence(Ordering::SeqCst);
 }
-/// Halt until an interrupt, then mask again. STI's one-instruction shadow
-/// makes `sti; hlt` race-free against an already pending interrupt. Needs an
-/// installed IDT and an armed interrupt source; no unwind.
+/// Halt until an interrupt, then mask again. The crate's `enable_and_hlt` is the
+/// adjacent `sti; hlt` pair: STI's one-instruction shadow makes it race-free
+/// against an already pending interrupt. Needs an installed IDT and an armed
+/// interrupt source that is known to work (a dead source halts forever; see
+/// `timer::wait_until_ns`). IF is 0 on return.
 pub(crate) fn wait_for_interrupt() {
-    // SAFETY: as `interrupts_on`; HLT/IF control cannot be expressed with
-    // normal Rust/intrinsics; CLI restores the early-context IF=0.
-    unsafe {
-        asm!("sti", "hlt", "cli");
-    }
+    compiler_fence(Ordering::SeqCst);
+    interrupts::enable_and_hlt();
+    interrupts::disable();
+    compiler_fence(Ordering::SeqCst);
 }
 
 #[cfg(feature = "qemu-self-test")]
@@ -709,16 +725,29 @@ static FAULT_RIP: AtomicU64 = AtomicU64::new(0);
 static FAULT_ERROR: AtomicU64 = AtomicU64::new(0);
 static FAULT_ARMED: AtomicU64 = AtomicU64::new(0);
 
-extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: u64) {
-    // APIC housekeeping vectors are legal in any context, including ring 3
-    // (`/init` runs with IF=1): the spurious vector must not be acknowledged and
-    // an APIC error only latches its status. Neither is a task exception.
-    if vector == u64::from(SPURIOUS_VECTOR) {
-        crate::apic::spurious_interrupt();
-        return;
+/// Hardware interrupt vectors this kernel owns. Like Linux's `common_interrupt`
+/// they are served identically at any CPL (`/init` runs with IF=1, so a timer or
+/// spurious vector that was latched across the shutdown can arrive in ring 3):
+/// they are not task exceptions. Returns false for everything else, including a
+/// *real* 8259 IRQ7/15, which stays an unexpected vector.
+fn external_interrupt(vector: u64) -> bool {
+    let base = u64::from(ISA_IRQ_VECTOR_BASE);
+    match vector {
+        v if v == u64::from(SPURIOUS_VECTOR) => crate::apic::spurious_interrupt(),
+        v if v == u64::from(ERROR_VECTOR) => crate::apic::error_interrupt(),
+        v if v == base => crate::timer::isa_irq0_interrupt(),
+        v if v == u64::from(LOCAL_TIMER_VECTOR) => crate::timer::lapic_timer_interrupt(),
+        // 8259 lines 7 and 15 raise a spurious vector when a request vanishes
+        // between INTR and acknowledge (Linux spurious_8259A_irq): ignore only
+        // when the in-service bit is clear.
+        v if v == base + 7 || v == base + 15 => return crate::apic::pic_spurious(v != base + 7),
+        _ => return false,
     }
-    if vector == u64::from(ERROR_VECTOR) {
-        crate::apic::error_interrupt();
+    true
+}
+
+extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: u64) {
+    if external_interrupt(vector) {
         return;
     }
     // Any ring-3 CS (64-bit 0x33 or compatibility 0x23, RPL 3).
@@ -756,18 +785,6 @@ extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: 
                 FAULTS.fetch_add(1, Ordering::Relaxed);
             } else {
                 unexpected(frame, vector, error, address);
-            }
-        }
-        v if v == u64::from(ISA_IRQ_VECTOR_BASE) => crate::timer::isa_irq0_interrupt(),
-        v if v == u64::from(LOCAL_TIMER_VECTOR) => crate::timer::lapic_timer_interrupt(),
-        // 8259 lines 7 and 15 raise a spurious vector when a request vanishes
-        // between INTR and acknowledge (Linux spurious_8259A_irq): ignore only
-        // when the in-service bit is clear.
-        v if v == u64::from(ISA_IRQ_VECTOR_BASE) + 7
-            || v == u64::from(ISA_IRQ_VECTOR_BASE) + 15 =>
-        {
-            if !crate::apic::pic_spurious(v != u64::from(ISA_IRQ_VECTOR_BASE) + 7) {
-                unexpected(frame, vector, error, 0);
             }
         }
         _ => unexpected(frame, vector, error, 0),

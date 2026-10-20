@@ -2,8 +2,11 @@
 //! BSP-owned four-level page tables.
 //!
 //! # Update rules (single CPU; replaces "all writes precede CR3 publication")
-//! * Kernel half (PML4 index >= 256): written only by [`Tables::build`] before
-//!   [`Tables::activate`]; immutable afterwards, so it never needs invalidation.
+//! * Kernel half (PML4 index >= 256): written only by [`Tables::build`] and
+//!   [`Tables::map_mmio`], both before [`Tables::activate`] (`map_mmio` refuses
+//!   to run on an active tree); immutable afterwards, so it never needs
+//!   invalidation. A later ioremap/hotplug mapping needs an explicit extension
+//!   of this rule (and a TLB-visible protocol), not a quiet extra caller.
 //! * User half (below `TASK_SIZE_MAX`): [`Tables::map_user`], [`Tables::unmap_user`]
 //!   and [`Tables::protect_user`] may run after activation. They need
 //!   `&mut Tables`, i.e. the `services::TABLES` lock, so no other agent edits
@@ -57,6 +60,8 @@ pub enum Error {
     /// The isolation audit found a user bit in the kernel half or a user
     /// mapping at or above `TASK_SIZE_MAX`.
     Audit,
+    /// A kernel-half edit was requested after CR3 publication.
+    Active,
 }
 impl core::fmt::Debug for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -67,6 +72,7 @@ impl core::fmt::Debug for Error {
             Self::Conflict => f.write_str("Conflict"),
             Self::Overflow => f.write_str("Overflow"),
             Self::Audit => f.write_str("Audit"),
+            Self::Active => f.write_str("Active"),
         }
     }
 }
@@ -339,19 +345,23 @@ impl Tables {
     /// Map the 4 KiB device page at physical `address` (an ACPI-described LAPIC,
     /// IOAPIC or HPET block) uncached, writable, never executable, supervisor
     /// only, at its direct-map address `direct_map + address`. Like every table
-    /// write, this happens before CR3 publication. Flags: PCD|PWT select PAT
-    /// entry 3 = UC, which `cpu::validate` leaves at its reset value.
+    /// write, this happens before CR3 publication. The PWT/PCD/PAT bits select
+    /// the UC entry of `IA32_PAT` that `cpu::validate` located (reset value:
+    /// entry 3), so uncached does not rest on an assumed table.
     ///
     /// # Errors
-    /// Rejects an unaligned or unrepresentable address, a page that is already
-    /// mapped (RAM or a loader mapping: device pages must not alias memory) and
-    /// allocation failure.
+    /// Rejects a call on the active tree (`Error::Active`), an unaligned or
+    /// unrepresentable address, a page that is already mapped (RAM or a loader
+    /// mapping: device pages must not alias memory) and allocation failure.
     pub fn map_mmio(
         &mut self,
         boot: &BootInfo,
         allocator: &mut Allocator<'_>,
         address: u64,
     ) -> Result<(), Error> {
+        if self.is_active() {
+            return Err(Error::Active);
+        }
         let virtual_address = self
             .direct_map
             .checked_add(address)
@@ -359,11 +369,15 @@ impl Tables {
         if virtual_address < 0xffff_8000_0000_0000 || virtual_address >= boot.image_virtual {
             return Err(Error::Address);
         }
+        let uc = cpu::mmio_pat_index();
+        let cache = (if uc & 1 != 0 { PWT } else { 0 })
+            | (if uc & 2 != 0 { PCD } else { 0 })
+            | (if uc & 4 != 0 { HUGE } else { 0 }); // bit 7 is PAT in a 4 KiB PTE
         self.map(
             allocator,
             Virtual(virtual_address),
             Physical(address),
-            PRESENT | WRITE | NX | PCD | PWT,
+            PRESENT | WRITE | NX | cache,
             false,
         )
     }

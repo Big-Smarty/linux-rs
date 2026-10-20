@@ -26,7 +26,10 @@ use kernel::{
     firmware::{Acpi, Fadt, MAX_IOAPICS, Madt},
     intc::{self, ApicMode, ISA_IRQ_VECTOR_BASE, TimerMode},
     memory::Allocator,
-    time::{self, Clock, Cyc2Ns, HZ, NSEC_PER_MSEC, RtcRegisters, TICK_NSEC, Timespec, TscSource},
+    time::{
+        self, Clock, Cyc2Ns, HZ, NSEC_PER_MSEC, ReferenceError, RtcRegisters, TICK_NSEC, Timespec,
+        TscSource,
+    },
 };
 use raw_cpuid::{CpuId, native_cpuid::cpuid_count};
 use x86_64::registers::model_specific::Msr;
@@ -98,6 +101,8 @@ const EVENT_LAPIC_DEADLINE: u8 = 3;
 static EVENT: AtomicU8 = AtomicU8::new(EVENT_NONE);
 static TICK_ON: AtomicBool = AtomicBool::new(false);
 static PIT_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Set once `init` saw the clockevent deliver ticks; halting waits depend on it.
+static TICK_VERIFIED: AtomicBool = AtomicBool::new(false);
 static LAPIC_MULT: AtomicU64 = AtomicU64::new(0);
 /// Monotonic time of the next emulated periodic tick.
 static NEXT_TICK_NS: AtomicU64 = AtomicU64::new(0);
@@ -202,16 +207,20 @@ fn lapic_arm(target_ns: u64) {
     }
 }
 fn lapic_shutdown() {
-    apic::lapic_write(
-        intc::REG_LVT_TIMER,
-        intc::lvt_timer(TimerMode::OneShot, true),
-    );
+    // Disarm while the LVT still names the mode that owns the counter, then mask:
+    // the MSR/count write after a mode change would be the order the SDM leaves
+    // unspecified (Vol.3 10.5.4.1: writing 0 to IA32_TSC_DEADLINE disarms;
+    // changing the timer mode clears it), so this order needs no such argument.
     if EVENT.load(Ordering::Relaxed) == EVENT_LAPIC_DEADLINE {
         // SAFETY: as in `lapic_arm`; zero disarms the deadline.
         unsafe { Msr::new(intc::MSR_TSC_DEADLINE).write(0) };
     } else {
         apic::lapic_write(intc::REG_TIMER_INITIAL, 0);
     }
+    apic::lapic_write(
+        intc::REG_LVT_TIMER,
+        intc::lvt_timer(TimerMode::OneShot, true),
+    );
 }
 
 /// Program the LAPIC for the earlier of the next tick (if ticking) and any
@@ -300,9 +309,18 @@ pub fn mask_timer() {
     });
 }
 
-/// Halt until a timer interrupt (or any other) arrives; IF is 0 on return.
-pub fn wait_tick() {
-    cpu::wait_for_interrupt();
+/// Halt until the next interrupt; IF is 0 on return. Only for a clockevent that
+/// has been shown to deliver (`TICK_VERIFIED`): a halted CPU whose timer is dead
+/// never wakes. Before that proof (and if bring-up failed) it spins for 100 us
+/// with IF=1 instead, so no wait can hang on a source that never worked.
+fn idle() {
+    if TICK_VERIFIED.load(Ordering::Relaxed) {
+        cpu::wait_for_interrupt();
+    } else {
+        cpu::interrupts_on();
+        udelay(100);
+        cpu::interrupts_off();
+    }
 }
 
 /// Sleep on the monotonic clock until `deadline_ns` (absolute `CLOCK_MONOTONIC`),
@@ -310,15 +328,17 @@ pub fn wait_tick() {
 /// Context: task, interrupts off on entry and exit, BSP only; one waiter at a
 /// time. Returns immediately for a deadline in the past.
 ///
-/// # Panics
-/// Never; a dead timer is visible as the caller's own bounded outer timeout.
+/// Contract: halting is used only after `init` verified tick delivery; a
+/// clockevent that dies *afterwards* hangs the halted CPU (as it would Linux's
+/// idle loop). Callers that must survive that use the bounded spin forms
+/// (`wait_for_ticks`, `poll_periods`), which is what the boot proofs do.
 pub fn wait_until_ns(deadline_ns: u64) {
     while ktime_get_ns() < deadline_ns {
         cpu::timer_transaction(|| {
             DEADLINE_NS.store(deadline_ns, Ordering::Relaxed);
             rearm(ktime_get_ns());
         });
-        wait_tick();
+        idle();
     }
     cpu::timer_transaction(|| {
         DEADLINE_NS.store(u64::MAX, Ordering::Relaxed);
@@ -372,6 +392,9 @@ fn pit_expect_msb(value: u8) -> (bool, u64, u64) {
     }
     (count > 5, tsc, rdtsc().wrapping_sub(previous))
 }
+/// Quick-PIT attempts before falling back to the reference clocks (Linux makes one
+/// and then runs the slower `pit_calibrate_tsc` loops).
+const PIT_ATTEMPTS: u32 = 3;
 const MAX_QUICK_PIT_ITERATIONS: u64 = 50 * time::PIT_TICK_RATE / 1000 / 256;
 
 /// `quick_pit_calibrate`: kHz or None (not accurate to 500 ppm / PIT unusable).
@@ -481,36 +504,48 @@ fn read_refs(reference: &Reference) -> Option<(u64, u32)> {
     }
     None
 }
-/// TSC kHz from `reference` over ~50 ms (`CAL2_MS`): spin on the reference
-/// itself, so the TSC rate need not be known.
-fn calibrate_against(reference: &Reference) -> Option<u64> {
-    let (target, width_bits) = match *reference {
-        Reference::Hpet(h) => (50_000_000u64 * 1_000_000 / u64::from(h.period_fs), 32),
-        Reference::PmTimer { width_bits, .. } => (time::PMTMR_TICKS_PER_SEC / 20, width_bits),
-    };
-    let (tsc1, ref1) = read_refs(reference)?;
-    let mut spins = 0u64;
-    loop {
-        let (tsc2, ref2) = read_refs(reference)?;
-        let mask = if width_bits >= 32 {
-            u64::from(u32::MAX)
-        } else {
-            (1 << width_bits) - 1
-        };
-        if u64::from(ref2.wrapping_sub(ref1)) & mask >= target {
-            let delta = tsc2.wrapping_sub(tsc1);
-            return match *reference {
-                Reference::Hpet(h) => time::calc_hpet_ref(delta, ref1, ref2, h.period_fs),
-                Reference::PmTimer { width_bits, .. } => {
-                    time::calc_pmtimer_ref(delta, ref1, ref2, width_bits)
-                }
-            };
+/// TSC kHz from `reference` over ~50 ms (`CAL2_MS`): wait on the reference
+/// itself, so the TSC rate need not be known. The wait is bounded in elapsed
+/// TSC time ([`time::REFERENCE_LIMIT_CYCLES`]), so a stopped HPET or a PM-timer
+/// port that reads a constant is reported (`WARN`) after a fraction of a second
+/// instead of freezing boot behind an uncached read loop.
+fn calibrate_against(reference: &Reference) -> Result<u64, ReferenceError> {
+    let (name, target, width_bits) = match *reference {
+        Reference::Hpet(h) => (
+            "hpet",
+            50_000_000u64 * 1_000_000 / u64::from(h.period_fs),
+            32,
+        ),
+        Reference::PmTimer { width_bits, .. } => {
+            ("pmtimer", time::PMTMR_TICKS_PER_SEC / 20, width_bits)
         }
-        spins += 1;
-        if spins > 200_000_000 {
-            return None; // the reference is not counting
+    };
+    let mask = if width_bits >= 32 {
+        u64::from(u32::MAX)
+    } else {
+        (1 << width_bits) - 1
+    };
+    let result = time::wait_reference(
+        || read_refs(reference),
+        target,
+        mask,
+        time::REFERENCE_LIMIT_CYCLES,
+    );
+    let ((tsc1, ref1), (tsc2, ref2)) = result.inspect_err(|error| {
+        crate::log!(
+            "WARN tsc reference={} calibration failed: {:?}\n",
+            name,
+            error
+        );
+    })?;
+    let delta = tsc2.wrapping_sub(tsc1);
+    match *reference {
+        Reference::Hpet(h) => time::calc_hpet_ref(delta, ref1, ref2, h.period_fs),
+        Reference::PmTimer { width_bits, .. } => {
+            time::calc_pmtimer_ref(delta, ref1, ref2, width_bits)
         }
     }
+    .ok_or(ReferenceError::Stuck)
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +606,15 @@ pub struct Mmio {
     pub failed: usize,
 }
 
+/// CPUID 0x80000008 `MAXPHYADDR`; 36 (the PAE minimum) when the leaf is absent.
+fn physical_address_bits() -> u32 {
+    if cpuid_count(0x8000_0000, 0).eax >= 0x8000_0008 {
+        (cpuid_count(0x8000_0008, 0).eax & 0xff).clamp(32, 52)
+    } else {
+        36
+    }
+}
+
 /// Map the ACPI-described device pages uncached before CR3 publication.
 pub fn map_mmio(
     boot: &BootInfo,
@@ -588,8 +632,15 @@ pub fn map_mmio(
     };
     let mut done = [0u64; MAX_IOAPICS + 2];
     let mut mapped = 0;
+    // A device page above the CPU's physical-address width would produce a PTE
+    // with reserved bits set and fault on first use: report it as absent.
+    let width = physical_address_bits();
     let mut map = |physical: u64, mmio_failed: &mut usize| -> Option<u64> {
         let page = physical & !0xfff;
+        if !intc::physical_address_valid(page | 0xfff, width) {
+            *mmio_failed += 1;
+            return None;
+        }
         if !done[..mapped].contains(&page) {
             if tables.map_mmio(boot, allocator, page).is_err() {
                 *mmio_failed += 1;
@@ -637,6 +688,8 @@ struct TscResult {
     source: TscSource,
     refined: bool,
     reference_khz: u64,
+    /// Quick-PIT attempts made (0 when another source decided first).
+    pit_tries: u32,
 }
 
 fn vendor_is_intel() -> bool {
@@ -658,6 +711,7 @@ fn calibrate_tsc(has_pit: bool, reference: Option<Reference>) -> Option<TscResul
     } else {
         None
     };
+    let mut pit_tries = 0u32;
     let (mut khz, source) = if let Some(c) = early {
         if c.known_freq {
             return Some(TscResult {
@@ -665,14 +719,18 @@ fn calibrate_tsc(has_pit: bool, reference: Option<Reference>) -> Option<TscResul
                 source: TscSource::Cpuid15,
                 refined: false,
                 reference_khz: 0,
+                pit_tries: 0,
             });
         }
         (c.tsc_khz, TscSource::Cpuid15)
     } else if let Some(k) = base_mhz.and_then(|m| time::cpu_khz_from_cpuid16(intel, m)) {
         (k, TscSource::Cpuid16)
-    } else if let Some(k) = has_pit
-        .then(|| (0..3).find_map(|_| quick_pit_calibrate()))
-        .flatten()
+    } else if let Some(k) = (0..PIT_ATTEMPTS)
+        .take_while(|_| has_pit)
+        .find_map(|attempt| {
+            pit_tries = attempt + 1;
+            quick_pit_calibrate()
+        })
     {
         (k, TscSource::PitQuick)
     } else {
@@ -682,12 +740,22 @@ fn calibrate_tsc(has_pit: bool, reference: Option<Reference>) -> Option<TscResul
             Reference::Hpet(_) => TscSource::Hpet,
             Reference::PmTimer { .. } => TscSource::PmTimer,
         };
-        let khz = (0..3).filter_map(|_| calibrate_against(&reference)).min()?;
+        // Up to three runs, keeping the lowest (Linux's choice); a disturbed run is
+        // retried, a stuck reference ends the attempt at once.
+        let mut best: Option<u64> = None;
+        for _ in 0..3 {
+            match calibrate_against(&reference) {
+                Ok(k) => best = Some(best.map_or(k, |b| b.min(k))),
+                Err(ReferenceError::Disturbed) => {}
+                Err(ReferenceError::Stuck) => break,
+            }
+        }
         return Some(TscResult {
-            khz,
+            khz: best?,
             source,
             refined: true,
-            reference_khz: khz,
+            reference_khz: best?,
+            pit_tries,
         });
     };
     // tsc_refine_calibration_work: accept the reference only within 1%.
@@ -695,7 +763,7 @@ fn calibrate_tsc(has_pit: bool, reference: Option<Reference>) -> Option<TscResul
     let mut refined = false;
     let mut reference_khz = 0;
     if let Some(reference) = reference
-        && let Some(r) = calibrate_against(&reference)
+        && let Ok(r) = calibrate_against(&reference)
     {
         reference_khz = r;
         if time::refine_is_acceptable(khz, r) {
@@ -708,6 +776,7 @@ fn calibrate_tsc(has_pit: bool, reference: Option<Reference>) -> Option<TscResul
         source,
         refined,
         reference_khz,
+        pit_tries,
     })
 }
 
@@ -837,7 +906,11 @@ unsafe fn init_clock(mmio: &Mmio, fadt: Fadt, has_pic: bool) -> Result<(), Error
         })
     });
     let cpuid_tsc = cpuid_count(0x8000_0007, 0).edx & (1 << 8) != 0;
-    let tsc = calibrate_tsc(has_pic, reference).ok_or(Error::Calibration)?;
+    // Our own sanity floor (Linux has none): no real TSC runs below 100 MHz, so a
+    // smaller value means a broken reference, reported instead of published.
+    let tsc = calibrate_tsc(has_pic, reference)
+        .filter(|t| t.khz >= 100_000)
+        .ok_or(Error::Calibration)?;
     TSC_KHZ.store(tsc.khz, Ordering::Relaxed);
     let tsc_start = rdtsc();
     let (wall, rtc_ok) = rtc_read(fadt.century);
@@ -846,9 +919,10 @@ unsafe fn init_clock(mmio: &Mmio, fadt: Fadt, has_pic: bool) -> Result<(), Error
     let khz = u32::try_from(tsc.khz).map_err(|_| Error::Calibration)?;
     clock_publish(&Clock::new(khz, tsc_start, wall));
     crate::log!(
-        "CHECK tsc ok khz={} source={} refined={} reference_khz={} invariant={} hpet_hz={} pm_timer={:#x} rtc={} wall={}\n",
+        "CHECK tsc ok khz={} source={} pit_tries={} refined={} reference_khz={} invariant={} hpet_hz={} pm_timer={:#x} rtc={} wall={}\n",
         tsc.khz,
         tsc.source.name(),
+        tsc.pit_tries,
         tsc.refined,
         tsc.reference_khz,
         cpuid_tsc,
@@ -933,6 +1007,7 @@ pub unsafe fn init(
         HZ,
         LAPIC_MULT.load(Ordering::Relaxed),
     );
+    TICK_VERIFIED.store(delivered, Ordering::Relaxed);
     if !delivered {
         return Err(Error::TickStalled);
     }
@@ -965,7 +1040,7 @@ fn start_tick(kind: u8) {
 
 /// Enable interrupts and spin on the TSC until `count` ticks arrived or
 /// `limit_ms` passed; IF is 0 on return.
-fn wait_for_ticks(count: u64, limit_ms: u64) -> bool {
+pub fn wait_for_ticks(count: u64, limit_ms: u64) -> bool {
     let start_ticks = ticks();
     let window = tsc_khz() * limit_ms;
     let start = rdtsc();
@@ -1048,21 +1123,6 @@ pub fn observe_periods(periods: u64) -> Result<u64, Error> {
     let result = poll_periods(periods);
     cpu::interrupts_off();
     result
-}
-
-/// Bounded wait for `count` more ticks with `wait_tick`, giving up after
-/// `limit_ms` on the TSC. Returns whether they arrived.
-pub fn wait_ticks(count: u64, limit_ms: u64) -> bool {
-    let target = ticks() + count;
-    let window = tsc_khz() * limit_ms;
-    let start = rdtsc();
-    while ticks() < target {
-        if rdtsc().wrapping_sub(start) >= window {
-            return false;
-        }
-        wait_tick();
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------

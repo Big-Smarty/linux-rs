@@ -309,7 +309,7 @@ fn clock_and_irq_checks(
         require(cpu::irq_register_test(), "irq-all-gpr-preservation");
         let tick_start = timer::ticks();
         let wall_start = timer::ktime_get_ns();
-        require(timer::wait_ticks(16, 500), "timer-delivery");
+        require(timer::wait_for_ticks(16, 500), "timer-delivery");
         let tick_ns = timer::ktime_get_ns() - wall_start;
         // The mutation case deliberately leaves the tick unmasked: the same
         // assertion must fail after real tick progression, not return an

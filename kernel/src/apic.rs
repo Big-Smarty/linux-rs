@@ -57,41 +57,54 @@ pub fn mode() -> ApicMode {
     }
 }
 
-fn rdmsr(msr: u32) -> u64 {
-    // SAFETY: callers name MSRs whose presence the same function checked via
-    // CPUID (APIC_BASE: CPUID.1:EDX.APIC; x2APIC registers: after EXTD was read
-    // back set; ARCH_CAPABILITIES/XAPIC_DISABLE_STATUS: CPUID.7 and the bit
-    // below). CPL0, no memory effects.
+/// # Safety
+/// `msr` exists on this CPU (the caller checked the CPUID bit named at its call
+/// site) and reading it has no side effect; CPL0.
+unsafe fn rdmsr(msr: u32) -> u64 {
+    // SAFETY: forwarded.
     unsafe { Msr::new(msr).read() }
 }
-fn wrmsr(msr: u32, value: u64) {
-    // SAFETY: as `rdmsr`; the values written are built by `kernel::intc` from
-    // the current register contents (reserved bits preserved) or are documented
-    // register values.
+/// # Safety
+/// As [`rdmsr`], and `value` is a valid architectural value for that MSR
+/// (built from its current contents with only documented bits changed).
+unsafe fn wrmsr(msr: u32, value: u64) {
+    // SAFETY: forwarded.
     unsafe { Msr::new(msr).write(value) }
 }
 
 /// Register read in the active mode. Reading before [`init_lapic`] returns 0.
+/// `reg` is a [`intc::LapicReg`], which cannot name anything outside the
+/// 16-byte aligned register page / the `0x800..0x840` x2APIC MSR window.
 #[must_use]
-pub fn lapic_read(reg: u32) -> u32 {
+pub fn lapic_read(reg: intc::LapicReg) -> u32 {
     match mode() {
         // SAFETY: MODE=Xapic is published only after LAPIC_VA names a mapped UC
-        // page (init_lapic), `reg` is an architectural 16-byte aligned offset.
+        // page (init_lapic); `reg.offset()` < 0x400 is inside that page, 4-byte aligned.
         ApicMode::Xapic => unsafe {
-            mmio::read32(LAPIC_VA.load(Ordering::Relaxed) + u64::from(reg))
+            mmio::read32(LAPIC_VA.load(Ordering::Relaxed) + u64::from(reg.offset()))
         },
+        // SAFETY: MODE=X2apic is published only after EXTD was read back set, so
+        // the x2APIC MSR window exists; the MSR number is `reg`'s, in 0x800..0x840.
         // Registers are 32 bits wide; the MSR's high half is reserved zero.
-        ApicMode::X2apic => u32::try_from(rdmsr(intc::x2apic_msr(reg)) & 0xffff_ffff).unwrap_or(0),
+        ApicMode::X2apic => {
+            u32::try_from(unsafe { rdmsr(reg.x2apic_msr()) } & 0xffff_ffff).unwrap_or(0)
+        }
         ApicMode::Disabled => 0,
     }
 }
-pub fn lapic_write(reg: u32, value: u32) {
+/// Register write in the active mode; the caller supplies a valid encoding for
+/// `reg` (all encodings come from `kernel::intc` or documented values).
+pub fn lapic_write(reg: intc::LapicReg, value: u32) {
     match mode() {
         // SAFETY: as `lapic_read`; `value` is a valid register encoding.
         ApicMode::Xapic => unsafe {
-            mmio::write32(LAPIC_VA.load(Ordering::Relaxed) + u64::from(reg), value);
+            mmio::write32(
+                LAPIC_VA.load(Ordering::Relaxed) + u64::from(reg.offset()),
+                value,
+            );
         },
-        ApicMode::X2apic => wrmsr(intc::x2apic_msr(reg), u64::from(value)),
+        // SAFETY: as `lapic_read`; a 32-bit register value zero-extended.
+        ApicMode::X2apic => unsafe { wrmsr(reg.x2apic_msr(), u64::from(value)) },
         ApicMode::Disabled => {}
     }
 }
@@ -105,9 +118,12 @@ pub fn eoi() {
 fn x2apic_hw_locked() -> bool {
     // CPUID.(EAX=7,ECX=0):EDX[29] enumerates IA32_ARCH_CAPABILITIES.
     if cpuid_count(0, 0).eax >= 7 && cpuid_count(7, 0).edx & (1 << 29) != 0 {
-        let capabilities = rdmsr(MSR_ARCH_CAPABILITIES);
+        // SAFETY: CPUID.(7,0):EDX[29] enumerates IA32_ARCH_CAPABILITIES; the
+        // XAPIC_DISABLE_STATUS MSR exists when its bit 21 is set (SDM Vol.4).
+        let capabilities = unsafe { rdmsr(MSR_ARCH_CAPABILITIES) };
         if capabilities & ARCH_CAP_XAPIC_DISABLE != 0 {
-            return rdmsr(MSR_XAPIC_DISABLE_STATUS) & 1 != 0;
+            // SAFETY: as above.
+            return unsafe { rdmsr(MSR_XAPIC_DISABLE_STATUS) } & 1 != 0;
         }
     }
     false
@@ -150,10 +166,13 @@ pub fn prepare(madt: Option<&Madt>, nolapic: bool, nox2apic: bool, test: TestMod
         .is_some_and(raw_cpuid::FeatureInfo::has_x2apic);
     #[cfg(feature = "qemu-self-test")]
     if test == TestMode::FirmwareX2apic && cpu_has_apic && cpu_has_x2apic {
-        let base = rdmsr(MSR_APIC_BASE);
-        let base = base | intc::BASE_EN;
-        wrmsr(MSR_APIC_BASE, base);
-        wrmsr(MSR_APIC_BASE, base | intc::BASE_EXTD);
+        // SAFETY: CPUID.1:EDX.APIC and ECX.x2APIC checked just above; EN is set
+        // before EXTD (SDM Vol.3 12.12.5); qemu-self-test builds only.
+        let base = unsafe { rdmsr(MSR_APIC_BASE) } | intc::BASE_EN;
+        unsafe {
+            wrmsr(MSR_APIC_BASE, base);
+            wrmsr(MSR_APIC_BASE, base | intc::BASE_EXTD);
+        }
     }
     let kvm = features
         .as_ref()
@@ -162,7 +181,8 @@ pub fn prepare(madt: Option<&Madt>, nolapic: bool, nox2apic: bool, test: TestMod
             .get_hypervisor_info()
             .is_some_and(|h| h.identify() == Hypervisor::KVM);
     let base = if cpu_has_apic {
-        rdmsr(MSR_APIC_BASE)
+        // SAFETY: IA32_APIC_BASE exists because CPUID.1:EDX.APIC was set.
+        unsafe { rdmsr(MSR_APIC_BASE) }
     } else {
         0
     };
@@ -220,12 +240,19 @@ pub unsafe fn init_lapic(
     ioapic_routes_irqs: bool,
 ) -> Result<Option<LapicInfo>, Error> {
     for write in prep.plan.writes.into_iter().flatten() {
-        wrmsr(MSR_APIC_BASE, write);
+        // SAFETY: the plan exists only for a CPU with CPUID.1:EDX.APIC (writes
+        // are empty otherwise); values come from `intc::plan_apic_mode`, which
+        // keeps every reserved bit of the current value and orders EN/EXTD per
+        // SDM Vol.3 12.12.5. No exception fixup exists yet (WP-M1.2 extable): a
+        // #GP here, e.g. a locked mode change on unusual firmware, is a fatal
+        // trap rather than a WARN.
+        unsafe { wrmsr(MSR_APIC_BASE, write) };
     }
     if prep.plan.mode == ApicMode::Disabled {
         return Ok(None);
     }
-    let base = rdmsr(MSR_APIC_BASE);
+    // SAFETY: as above.
+    let base = unsafe { rdmsr(MSR_APIC_BASE) };
     let wants_x2 = prep.plan.mode == ApicMode::X2apic;
     if base & intc::BASE_EN == 0 || (base & intc::BASE_EXTD != 0) != wants_x2 {
         return Err(Error::Mode);
@@ -279,7 +306,9 @@ pub unsafe fn init_lapic(
     // shortcut: bounded at 256 EOIs, the architectural ISR capacity; Linux also
     // drains IRR (apic_pending_intr_clear); upgrade with kexec/kdump support.
     for _ in 0..256 {
-        let in_service = (0..8).any(|i| lapic_read(intc::REG_ISR + 0x10 * i) != 0);
+        let in_service = (0..8)
+            .filter_map(intc::LapicReg::isr)
+            .any(|r| lapic_read(r) != 0);
         if !in_service {
             break;
         }
@@ -325,9 +354,19 @@ pub fn error_interrupt() {
     ERRORS.fetch_add(1, Ordering::Relaxed);
     eoi();
 }
-/// Spurious vector body: never acknowledged (SDM 12.9).
+/// Spurious vector body (`handle_spurious_interrupt`, apic.c:2124): a genuine
+/// spurious delivery must not be acknowledged (SDM 12.9), but if the vector's
+/// in-service bit is set the interrupt was real (a misprogrammed IOAPIC pin or
+/// MSI aimed at it) and is acknowledged, else it would block every
+/// lower-priority vector forever.
 pub fn spurious_interrupt() {
     SPURIOUS.fetch_add(1, Ordering::Relaxed);
+    let vector = u32::from(SPURIOUS_VECTOR);
+    if let Some(isr) = intc::LapicReg::isr(vector / 32)
+        && lapic_read(isr) & (1 << (vector % 32)) != 0
+    {
+        eoi();
+    }
 }
 /// (APIC errors, last ESR, spurious interrupts) seen so far.
 #[must_use]
