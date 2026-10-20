@@ -191,12 +191,18 @@ pub fn self_test() -> Result<(), &'static str> {
     if stats().requested != base.requested || stats().allocated != base.allocated {
         return Err("accounting-small");
     }
-    // Growth: more than the heap can have free forces buddy-frame chunks.
+    // Growth: more than the heap can have free forces buddy-frame chunks. How much
+    // is free depends on how the boot (the size of the initramfs unpacked into
+    // it) left the last chunk, so take 128 KiB buffers until a chunk has been
+    // added; the chunk cap is 4 MiB, so 64 of them (8 MiB) always get there.
     let grown = stats();
-    let mut buffers: [Vec<u8>; 8] = core::array::from_fn(|_| Vec::new());
+    let mut buffers: [Vec<u8>; 64] = core::array::from_fn(|_| Vec::new());
     for buffer in &mut buffers {
         buffer.try_reserve_exact(128 << 10).map_err(|_| "grow")?;
         buffer.push_within_capacity(1).map_err(|_| "grow-push")?;
+        if stats().chunks > grown.chunks {
+            break;
+        }
     }
     let after = stats();
     if after.chunks <= grown.chunks

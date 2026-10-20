@@ -23,8 +23,8 @@
 pub const ORACLE_EXPECTED: &[u8] = include_bytes!("../../xtask/oracle/expected.tsv");
 
 /// Oracle groups the kernel can run today, in run order.
-pub const GROUPS: [&str; 8] = [
-    "ids", "time", "mm", "fs", "signal", "fork", "proc", "jobctl",
+pub const GROUPS: [&str; 9] = [
+    "ids", "time", "mm", "fs", "signal", "fork", "proc", "jobctl", "pipe",
 ];
 
 /// Oracle groups that exist in `user/init` but are not run, with the reason

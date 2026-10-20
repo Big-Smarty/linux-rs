@@ -746,7 +746,6 @@ fn exec_and_setpgid(t: &mut T) {
     });
     close(ready_w);
     close(in_r);
-    close(sink_r);
     close(sink_w);
     let _ = read_all(ready_r, &mut ready);
     close(ready_r);
@@ -759,6 +758,7 @@ fn exec_and_setpgid(t: &mut T) {
     t.eq("getpgid-unchanged", sys(Sysno::getpgid, &[c]), Ok(0));
     close(in_w);
     t.eq("exec-image-exits", wait4(c as isize, 0), (Ok(c), 17 << 8));
+    close(sink_r);
 }
 
 /// The image `/init jobwait` of [`exec_and_setpgid`]: say hello on descriptor 40, wait for the

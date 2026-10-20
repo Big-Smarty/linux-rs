@@ -85,7 +85,7 @@ const DEFAULT_PAUSE_MS: usize = 6000;
 /// slow framebuffer should not come near this.
 const DEFAULT_TIMEOUT_S: u64 = 120;
 /// Groups that sleep on the monotonic clock and so cannot run without it.
-const NEEDS_CLOCK: [&str; 5] = ["time", "signal", "fork", "proc", "jobctl"];
+const NEEDS_CLOCK: [&str; 6] = ["time", "signal", "fork", "proc", "jobctl", "pipe"];
 const CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_PROOFS: usize = 40;
 /// Inventory facts the summary repeats: cpu, memory, platform, time, display, pci, adapters.

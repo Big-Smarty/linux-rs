@@ -1,6 +1,6 @@
-# Expected output lines of the oracle syscall suite (user/init modes mm ids time signal fs proc fork jobctl) on the pinned
+# Expected output lines of the oracle syscall suite (user/init modes mm ids time signal fs proc fork jobctl pipe) on the pinned
 # Linux 6.18.57 reference kernel: QEMU q35, -cpu qemu64 (TCG), -smp 1 -m 512M, "console=ttyS0 panic=-1 vdso=0 norandmaps -- <mode>",
-# the harness-built /init and generated initramfs (target/linux-reference/init-reference-006 for mm ids time signal fs proc, -009/-010 for fork, -011 for jobctl; docs/implementation.md#oracle-syscall-test-suite).
+# the harness-built /init and generated initramfs (target/linux-reference/init-reference-006 for mm ids time signal fs proc, -009/-010 for fork, -011 for jobctl and pipe; docs/implementation.md#oracle-syscall-test-suite).
 # Columns: group, kind (check|info|summary), name, line (the exact stdout line without the newline).
 # A consumer matches "check" and "summary" rows exactly; "info" rows are recorded observations (tmpfs d_off cookies), not requirements.
 # Kernel printk lines may interleave with console output and must be filtered by the consumer (keep lines that start with
@@ -1265,3 +1265,38 @@ jobctl	check	setpgid-after-execve	init: test jobctl.setpgid-after-execve ok
 jobctl	check	getpgid-unchanged	init: test jobctl.getpgid-unchanged ok
 jobctl	check	exec-image-exits	init: test jobctl.exec-image-exits ok
 jobctl	summary	-	init: tests jobctl passed=70 failed=0
+pipe	check	poll-counts-the-ready-descriptors	init: test pipe.poll-counts-the-ready-descriptors ok
+pipe	check	poll-reports-only-the-events-asked-for	init: test pipe.poll-reports-only-the-events-asked-for ok
+pipe	check	poll-write-end-without-readers	init: test pipe.poll-write-end-without-readers ok
+pipe	check	poll-read-end-without-writers	init: test pipe.poll-read-end-without-writers ok
+pipe	check	poll-files-without-poll-are-always-ready	init: test pipe.poll-files-without-poll-are-always-ready ok
+pipe	check	poll-invalid-descriptors	init: test pipe.poll-invalid-descriptors ok
+pipe	check	poll-bad-array	init: test pipe.poll-bad-array ok
+pipe	check	poll-more-descriptors-than-the-limit	init: test pipe.poll-more-descriptors-than-the-limit ok
+pipe	check	poll-without-descriptors-sleeps	init: test pipe.poll-without-descriptors-sleeps ok
+pipe	check	poll-times-out-after-the-whole-time	init: test pipe.poll-times-out-after-the-whole-time ok
+pipe	check	poll-zero-timeout-does-not-wait	init: test pipe.poll-zero-timeout-does-not-wait ok
+pipe	check	read-wakes-when-another-task-writes	init: test pipe.read-wakes-when-another-task-writes ok
+pipe	check	read-waits-for-the-last-writer-and-then-sees-eof	init: test pipe.read-waits-for-the-last-writer-and-then-sees-eof ok
+pipe	check	pipe-with-a-duplicate-writer-is-not-at-eof	init: test pipe.pipe-with-a-duplicate-writer-is-not-at-eof ok
+pipe	check	pipe-without-writers-is-at-eof	init: test pipe.pipe-without-writers-is-at-eof ok
+pipe	check	blocked-write-completes-when-the-reader-drains	init: test pipe.blocked-write-completes-when-the-reader-drains ok
+pipe	check	blocked-write-returns-the-partial-count-when-the-reader-leaves	init: test pipe.blocked-write-returns-the-partial-count-when-the-reader-leaves ok
+pipe	check	blocked-write-sees-epipe-when-the-reader-leaves	init: test pipe.blocked-write-sees-epipe-when-the-reader-leaves ok
+pipe	check	blocked-write-dies-of-sigpipe-when-the-reader-leaves	init: test pipe.blocked-write-dies-of-sigpipe-when-the-reader-leaves ok
+pipe	check	small-writes-stay-whole-under-contention	init: test pipe.small-writes-stay-whole-under-contention ok
+pipe	check	both-writers-finished	init: test pipe.both-writers-finished ok
+pipe	check	interrupted-read-returns-eintr	init: test pipe.interrupted-read-returns-eintr ok
+pipe	check	restarted-read-returns-the-data	init: test pipe.restarted-read-returns-the-data ok
+pipe	check	read-goes-on-across-a-stop-and-a-continue	init: test pipe.read-goes-on-across-a-stop-and-a-continue ok
+pipe	check	interrupted-write-returns-the-partial-count	init: test pipe.interrupted-write-returns-the-partial-count ok
+pipe	check	interrupted-write-with-nothing-copied-is-eintr	init: test pipe.interrupted-write-with-nothing-copied-is-eintr ok
+pipe	check	poll-wakes-when-another-task-writes	init: test pipe.poll-wakes-when-another-task-writes ok
+pipe	check	poll-wakes-when-the-last-writer-leaves	init: test pipe.poll-wakes-when-the-last-writer-leaves ok
+pipe	check	poll-wakes-when-a-reader-makes-room	init: test pipe.poll-wakes-when-a-reader-makes-room ok
+pipe	check	poll-wakes-when-the-last-reader-leaves	init: test pipe.poll-wakes-when-the-last-reader-leaves ok
+pipe	check	poll-reports-the-pipe-that-got-the-data	init: test pipe.poll-reports-the-pipe-that-got-the-data ok
+pipe	check	poll-resumes-until-its-original-end	init: test pipe.poll-resumes-until-its-original-end ok
+pipe	check	poll-interrupted-by-a-handler-is-eintr	init: test pipe.poll-interrupted-by-a-handler-is-eintr ok
+pipe	check	poll-without-timeout-resumes-and-finds-the-data	init: test pipe.poll-without-timeout-resumes-and-finds-the-data ok
+pipe	summary	-	init: tests pipe passed=34 failed=0

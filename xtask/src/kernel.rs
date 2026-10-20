@@ -847,6 +847,11 @@ const DEBUG_CASES: &[DebugCase] = &[
     // `setpgid`/`getsid` across sessions and after `execve` (`user/init` group `jobctl`,
     // recorded on the pinned Linux 6.18.57).
     oracle_case!(jobctl),
+    // Pipes and `poll` between tasks: blocking reads and writes with partial progress, `SIGPIPE`
+    // and `EPIPE` for a sleeping writer, interrupted and restarted calls, `poll` events, timeouts,
+    // wake-ups and its restart after a stop (`user/init` group `pipe`, recorded on the pinned
+    // Linux 6.18.57).
+    oracle_case!(pipe),
     // 200 fork/exit/wait rounds: nothing is left behind (`user/init` mode `forkleak`).
     // Pool exhaustion and every unwinding path of `copy_process` (this kernel only: Linux's limit
     // is `max_threads`, not a stack pool).
@@ -7957,7 +7962,7 @@ mod tests {
             }
         }
         let groups = [
-            "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl",
+            "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe",
         ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),

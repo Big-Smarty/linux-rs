@@ -33,6 +33,7 @@ pub(super) const ALL_PASS: &[(&str, bool)] = &[
     ("fork", true),
     ("proc", true),
     ("jobctl", true),
+    ("pipe", true),
 ];
 /// A run that selects six probes ending abnormally (a SIGSEGV, an unimplemented
 /// syscall, a loop that outruns the one-second group bound, that loop in a child while init
@@ -345,7 +346,7 @@ WHAT THIS IS
   with Limine 12.9.3 (the BOOTX64.EFI of your /usr/share/limine). The kernel
   runs its boot self-tests, prints a hardware inventory (CPU, memory map, ACPI,
   APIC/timers, framebuffers, PCI ids), runs the oracle syscall groups ids,
-  time, mm, fs, signal, fork, proc and jobctl each as a fresh /init on a fresh
+  time, mm, fs, signal, fork, proc, jobctl and pipe each as a fresh /init on a fresh
   rootfs, compares each group's output line by line with what the pinned
   Linux 6.18.57 printed, and ends on a summary screen.
 

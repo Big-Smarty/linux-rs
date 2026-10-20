@@ -41,6 +41,7 @@ pub mod fs;
 pub mod ids;
 pub mod jobctl;
 pub mod mm;
+pub mod pipe;
 pub mod proc;
 pub mod signal;
 pub mod smoke;
@@ -358,6 +359,7 @@ pub fn run_mode(mode: &[u8]) -> bool {
         b"fs" => fs::run(),
         b"proc" => proc::run(),
         b"jobctl" => jobctl::run(),
+        b"pipe" => pipe::run(),
         _ => return false,
     };
     conclude(ok);
