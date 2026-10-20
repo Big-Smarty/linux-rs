@@ -175,11 +175,6 @@ pub(crate) enum Stop {
     Blocked,
     /// A Linux behaviour that is not ported yet ([`Outcome::Unimplemented`]).
     Unimplemented,
-    /// `send_sig(SIGPIPE)` with `-EPIPE`: signal delivery is not wired yet.
-    SigPipe,
-    /// `send_sig(SIGXFSZ)` with `-EFBIG` (`RLIMIT_FSIZE` exceeded): signal
-    /// delivery is not wired yet.
-    SigXfsz,
 }
 
 impl From<Errno> for Stop {
@@ -197,7 +192,7 @@ pub(crate) fn outcome(number: u32, result: Sys) -> Outcome {
         Ok(value) => Outcome::Return(value),
         Err(Stop::Errno(errno)) => Outcome::Return(error(errno)),
         Err(Stop::Blocked) => Outcome::Blocked(number),
-        Err(Stop::Unimplemented | Stop::SigPipe | Stop::SigXfsz) => Outcome::Unimplemented(number),
+        Err(Stop::Unimplemented) => Outcome::Unimplemented(number),
     }
 }
 

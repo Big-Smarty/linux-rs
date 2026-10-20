@@ -19,6 +19,7 @@ use super::{
     Outcome, dispatch, error,
     testing::{Task, task},
 };
+use crate::signal::{SIG_IGN, SIGALRM, SIGPIPE, SIGXFSZ};
 use crate::vfs::{
     AT_EMPTY_PATH, AT_FDCWD, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK,
     O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, S_IFCHR, S_IFDIR, S_IFREG, mkdev, new_encode_dev,
@@ -317,14 +318,59 @@ fn pipes_transfer_bytes_and_stop_loudly_where_linux_would_sleep() {
     // Closing the writer gives EOF.
     assert_eq!(call(&mut t, Sysno::close, &[w]), ok(0));
     assert_eq!(call(&mut t, Sysno::read, &[r, OUT + 32, 10]), ok(0));
-    // Writing without a reader would raise SIGPIPE: explicit stop until signals are wired.
+    // Writing without a reader: -EPIPE and SIGPIPE (`send_sig`), pending because
+    // it is neither ignored nor blocked.
     let mut t2 = self::t();
     assert_eq!(call(&mut t2, Sysno::pipe2, &[OUT, 0]), ok(0));
     assert_eq!(call(&mut t2, Sysno::close, &[3]), ok(0));
+    assert_eq!(call(&mut t2, Sysno::write, &[4, BUF, 1]), err(Errno::EPIPE));
+    assert!(t2.state.pending_set().contains(SIGPIPE));
+    // An ignored SIGPIPE is not queued; the write still fails with EPIPE.
+    t2.state.flush_signals(!0);
+    t2.state.actions[usize::from(SIGPIPE) - 1].handler = SIG_IGN;
+    assert_eq!(call(&mut t2, Sysno::write, &[4, BUF, 1]), err(Errno::EPIPE));
+    assert!(!t2.state.pending_set().contains(SIGPIPE));
+}
+
+#[test]
+fn blocking_pipe_and_console_waits_are_interrupted_by_a_signal() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    // A timer is the only thing that can wake the task: with none armed the
+    // wait would never end and the kernel stops loudly.
+    assert_eq!(call(&mut t, Sysno::read, &[3, BUF, 1]), Outcome::Blocked(0));
+    assert_eq!(call(&mut t, Sysno::alarm, &[1]), ok(0));
+    // `anon_pipe_read`: nothing read, `-ERESTARTSYS` with SIGALRM pending.
+    assert_eq!(call(&mut t, Sysno::read, &[3, BUF, 1]), ok(-512));
+    assert!(t.state.pending_set().contains(SIGALRM));
+    assert_eq!(t.now, 1_000_000_000);
+    // A signal that is already pending interrupts at once, without waiting.
+    let waits = t.waits;
+    assert_eq!(call(&mut t, Sysno::read, &[3, BUF, 1]), ok(-512));
     assert_eq!(
-        call(&mut t2, Sysno::write, &[4, BUF, 1]),
-        Outcome::Unimplemented(1)
+        call(&mut t, Sysno::read, &[0, BUF, 1]),
+        ok(-512),
+        "n_tty_read"
     );
+    assert_eq!(t.waits, waits);
+    // `anon_pipe_write` on a full pipe: nothing written restarts, a partial
+    // write is returned.
+    let mut full = self::t();
+    assert_eq!(call(&mut full, Sysno::pipe2, &[OUT, 0]), ok(0));
+    put(&mut full, BUF, &[b'x'; 4096]);
+    for _ in 0..16 {
+        assert_eq!(call(&mut full, Sysno::write, &[4, BUF, 4096]), ok(4096));
+    }
+    assert_eq!(
+        call(&mut full, Sysno::write, &[4, BUF, 1]),
+        Outcome::Blocked(1)
+    );
+    assert_eq!(call(&mut full, Sysno::alarm, &[1]), ok(0));
+    assert_eq!(call(&mut full, Sysno::write, &[4, BUF, 1]), ok(-512));
+    // Room for exactly one page: the write that then fills it returns the
+    // partial count instead of restarting.
+    assert_eq!(call(&mut full, Sysno::read, &[3, OUT, 4096]), ok(4096));
+    assert_eq!(call(&mut full, Sysno::write, &[4, BUF, 4096 + 1]), ok(4096));
 }
 
 #[test]
@@ -848,7 +894,7 @@ fn limit_fsize(t: &mut Task, cur: u64) {
 }
 
 #[test]
-fn rlimit_fsize_clamps_writes_and_stops_where_sigxfsz_would_be_sent() {
+fn rlimit_fsize_clamps_writes_and_sends_sigxfsz_with_efbig() {
     let mut t = t();
     let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
     let app = fd(open(&mut t, "/f", O_WRONLY | O_APPEND, 0));
@@ -856,27 +902,32 @@ fn rlimit_fsize_clamps_writes_and_stops_where_sigxfsz_would_be_sent() {
     put(&mut t, BUF, b"0123456789");
     // generic_write_check_limits: a write that starts below the limit is cut.
     assert_eq!(call(&mut t, Sysno::write, &[f, BUF, 10]), ok(4));
-    // At the limit: -EFBIG with SIGXFSZ, which is a loud stop until signals land.
-    assert_eq!(
-        call(&mut t, Sysno::write, &[f, BUF, 10]),
-        Outcome::Unimplemented(1)
-    );
+    // At the limit: -EFBIG with SIGXFSZ (`send_sig`), each time.
+    let sigxfsz = |t: &mut Task| {
+        let pending = t.state.pending_set().contains(SIGXFSZ);
+        t.state.flush_signals(!0);
+        pending
+    };
+    assert!(!sigxfsz(&mut t));
+    assert_eq!(call(&mut t, Sysno::write, &[f, BUF, 10]), err(Errno::EFBIG));
+    assert!(sigxfsz(&mut t));
     assert_eq!(
         call(&mut t, Sysno::write, &[app, BUF, 1]),
-        Outcome::Unimplemented(1),
+        err(Errno::EFBIG),
         "O_APPEND starts at the size"
     );
+    assert!(sigxfsz(&mut t));
     assert_eq!(call(&mut t, Sysno::pwrite64, &[f, BUF, 10, 2]), ok(2));
+    assert!(!sigxfsz(&mut t), "a clamped write sends nothing");
     assert_eq!(
         call(&mut t, Sysno::pwrite64, &[f, BUF, 1, 5]),
-        Outcome::Unimplemented(18)
+        err(Errno::EFBIG)
     );
+    assert!(sigxfsz(&mut t));
     // inode_newsize_ok only guards growth.
     assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 4]), ok(0));
-    assert_eq!(
-        call(&mut t, Sysno::ftruncate, &[f, 5]),
-        Outcome::Unimplemented(77)
-    );
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 5]), err(Errno::EFBIG));
+    assert!(sigxfsz(&mut t));
     assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 1]), ok(0));
     assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 4]), ok(0));
     // Unlimited again.
