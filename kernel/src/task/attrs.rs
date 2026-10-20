@@ -15,6 +15,8 @@
 //! Per-task attributes of the identity and process-attribute syscalls
 //! (`syscall::ids`): credentials, resource limits, the filesystem context,
 //! personality and the user pointers `set_tid_address`/`set_robust_list` store.
+//! The process tree (parent, process group, session) is not here: it is the
+//! [`super::tasklist::Tasklist`]'s.
 //!
 //! Context: task context of the one user task; the owner (`userspace::Process`)
 //! is only reachable under the `PROCESS` lock, so no field needs a lock of its
@@ -30,6 +32,8 @@ pub const RLIM_INFINITY: u64 = u64::MAX;
 pub const RLIMIT_CPU: usize = 0;
 /// `RLIMIT_FSIZE`.
 pub const RLIMIT_FSIZE: usize = 1;
+/// `RLIMIT_STACK`.
+pub const RLIMIT_STACK: usize = 3;
 /// `RLIMIT_NOFILE`.
 pub const RLIMIT_NOFILE: usize = 7;
 /// `sysctl_nr_open` (fs/file.c:96), the ceiling `RLIMIT_NOFILE`'s hard limit may reach.
@@ -205,14 +209,6 @@ pub struct Attributes {
     pub clear_child_tid: u64,
     /// `task_struct::robust_list` (`set_robust_list`), walked at exit only.
     pub robust_list: u64,
-    /// `real_parent`'s tgid in the task's namespace: init's parent is the
-    /// idle task, which has no pid there.
-    pub ppid: u32,
-    /// `task_pgrp(current)` as `pid_vnr` sees it: init uses `init_struct_pid`,
-    /// which has no number in the namespace.
-    pub pgid: u32,
-    /// `task_session(current)` likewise.
-    pub sid: u32,
 }
 
 impl Attributes {
@@ -230,9 +226,6 @@ impl Attributes {
             personality: 0,
             clear_child_tid: 0,
             robust_list: 0,
-            ppid: 0,
-            pgid: 0,
-            sid: 0,
         }
     }
 }

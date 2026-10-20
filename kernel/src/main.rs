@@ -2,10 +2,13 @@
 #![no_std]
 #![no_main]
 // Fallible allocation API (`Box::try_new`, `Vec::push_within_capacity`); the
-// infallible one does not exist in target builds, see `kalloc`. The process's
-// signal state uses `Box::try_new`; only the self-test uses the `Vec` form.
-#![feature(allocator_ext)]
-#![cfg_attr(feature = "boot-proofs", feature(vec_push_within_capacity))]
+// infallible one does not exist in target builds, see `kalloc`. The task
+// list (library) does the per-task allocation; only the boot proofs use these
+// two forms in the binary.
+#![cfg_attr(
+    feature = "boot-proofs",
+    feature(allocator_ext, vec_push_within_capacity)
+)]
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 compile_error!(

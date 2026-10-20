@@ -5,7 +5,7 @@
 //! descriptors 0-2 on the console, as `console_on_rootfs` leaves init.
 
 use super::{
-    AddressSpace, Console, Context, Files, Machine,
+    AddressSpace, Console, Context, ExecAux, Files, Machine, Tasks,
     time::{ClockState, Clocks, RestartBlock},
 };
 use crate::{
@@ -14,9 +14,9 @@ use crate::{
     signal::{
         self, SIGALRM, SIGUSR1, SIGUSR2, State, frame::Sigreturn, info::SigInfo, state::Target,
     },
-    task::Attributes,
+    task::{Attributes, TaskId, Tasklist, exit::NoWake},
     usercopy::{UserPages, fake::Space},
-    vfs::{FdTable, Timespec, Vfs},
+    vfs::{FdTable, FileId, Timespec, Vfs},
 };
 extern crate std;
 use std::{boxed::Box, collections::BTreeMap, vec::Vec};
@@ -94,9 +94,25 @@ pub struct Task<P = Space, C = Sink> {
     /// Private copies of file pages a kernel access faulted in (the binary's
     /// `user_fault` for `NeedsFile`: `Vfs::fault_page`, then a private frame).
     pub file_pages: BTreeMap<u64, Box<[u8; 4096]>>,
+    /// The task list; `current` is its init (pid 1).
+    pub tasks: Tasklist,
+    pub current: TaskId,
+    pub wake: NoWake,
+    /// `mm->exe_file` as `replace_exe_file` last set it.
+    pub exe: Option<FileId>,
+    /// `(ip, sp)` of the last `start_thread`.
+    pub started: Option<(u64, u64)>,
+    /// shortcut: this is a second signal object for the task `current`, whose
+    /// own is in `tasks` (the binary has only the latter, via
+    /// `Tasklist::signal_state`). Exec, wait and exit tests that touch both
+    /// exercise a different arrangement than the boot. The signal tests need
+    /// a non-init process (`global_init` and `SIGNAL_UNKILLABLE` are derived
+    /// from the task list's init), so unify them when the fake gets a forked
+    /// non-init current task (the fork lane).
+    ///
     /// The signal state: a non-init process whose `SIGUSR1`, `SIGUSR2` and
     /// `SIGALRM` have handlers, so sending them queues rather than kills.
-    pub state: State,
+    pub state: State<'static>,
     /// `CLOCK_MONOTONIC` of the fake wait.
     pub now: u64,
     /// Number of `Task::wait` calls.
@@ -120,9 +136,10 @@ impl<P, C> Task<P, C> {
         vfs.console_on_rootfs(&mut fdt).expect("console");
         let mut attrs = Attributes::init(1000);
         attrs.fs = vfs.new_fs_struct(0o022);
-        let mut state = State::new(1, 0, 1000);
+        let (tasks, current) = Tasklist::new(1000, &attrs.cred, 1000).expect("task list");
+        let state = State::standalone(1, 0, 1000);
         for sig in [SIGUSR1, SIGUSR2, SIGALRM] {
-            state.actions[usize::from(sig) - 1].handler = 0x4000;
+            state.hand.actions[usize::from(sig) - 1].handler = 0x4000;
         }
         Self {
             pages,
@@ -145,6 +162,11 @@ impl<P, C> Task<P, C> {
             vfs,
             fdt,
             file_pages: BTreeMap::new(),
+            tasks,
+            current,
+            wake: NoWake,
+            exe: None,
+            started: None,
             state,
             now: 0,
             waits: 0,
@@ -217,6 +239,27 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
     fn cpuid_fault_absent(&self) -> bool {
         self.cpuid_fault_absent
     }
+    fn tasks(&mut self) -> Tasks<'_> {
+        Tasks {
+            list: &mut self.tasks,
+            current: self.current,
+            wake: &mut self.wake,
+        }
+    }
+    fn replace_exe_file(&mut self, file: FileId) -> Option<FileId> {
+        self.exe.replace(file)
+    }
+    fn exec_aux(&mut self) -> ExecAux {
+        ExecAux {
+            hwcap: 0x0183_fbff,
+            random: *b"0123456789abcdef",
+        }
+    }
+    fn start_thread(&mut self, ip: u64, sp: u64) {
+        self.started = Some((ip, sp));
+        self.fs_base = 0;
+        self.gs_base = 0;
+    }
     fn address_space(&mut self) -> AddressSpace<'_> {
         AddressSpace {
             mm: &mut self.mm,
@@ -281,11 +324,11 @@ impl<P: UserPages, C> signal::Task for Task<P, C> {
         = &'a mut P
     where
         Self: 'a;
-    fn state(&mut self) -> &mut State {
-        &mut self.state
+    fn state(&mut self) -> State<'_> {
+        self.state.reborrow()
     }
-    fn parts(&mut self) -> (&mut State, &mut P) {
-        (&mut self.state, &mut self.pages)
+    fn parts(&mut self) -> (State<'_>, &mut P) {
+        (self.state.reborrow(), &mut self.pages)
     }
     fn now_ns(&self) -> u64 {
         self.now
@@ -296,7 +339,7 @@ impl<P: UserPages, C> signal::Task for Task<P, C> {
         self.waits += 1;
         let next = deadline_ns
             .into_iter()
-            .chain(self.state.itimer.next_event())
+            .chain(self.state.sig.itimer.next_event())
             .chain(self.script.iter().map(|&(at, _)| at))
             .min()
             .expect("a wait with no wake-up source would hang the kernel");

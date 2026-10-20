@@ -327,7 +327,7 @@ fn pipes_transfer_bytes_and_stop_loudly_where_linux_would_sleep() {
     assert!(t2.state.pending_set().contains(SIGPIPE));
     // An ignored SIGPIPE is not queued; the write still fails with EPIPE.
     t2.state.flush_signals(!0);
-    t2.state.actions[usize::from(SIGPIPE) - 1].handler = SIG_IGN;
+    t2.state.hand.actions[usize::from(SIGPIPE) - 1].handler = SIG_IGN;
     assert_eq!(call(&mut t2, Sysno::write, &[4, BUF, 1]), err(Errno::EPIPE));
     assert!(!t2.state.pending_set().contains(SIGPIPE));
 }
@@ -381,9 +381,9 @@ fn a_wait_whose_only_wakeup_expired_into_nothing_stops_loudly() {
         let mut t = t();
         assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
         if blocked {
-            t.state.blocked = SigSet(SigSet::bit(SIGALRM));
+            t.state.me.blocked = SigSet(SigSet::bit(SIGALRM));
         } else {
-            t.state.actions[usize::from(SIGALRM) - 1].handler = SIG_IGN;
+            t.state.hand.actions[usize::from(SIGALRM) - 1].handler = SIG_IGN;
         }
         assert_eq!(call(&mut t, Sysno::alarm, &[1]), ok(0));
         assert_eq!(call(&mut t, Sysno::read, &[3, BUF, 1]), Outcome::Blocked(0));

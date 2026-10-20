@@ -461,7 +461,7 @@ fn interruptible_wait<C: Context>(ctx: &mut C) -> Result<(), Stop> {
     let mut dead = false;
     let _ = crate::signal::wait::wait_event_interruptible(ctx, |c| {
         let state = c.state();
-        dead = !state.signal_pending() && state.itimer.next_event().is_none();
+        dead = !state.signal_pending() && state.sig.itimer.next_event().is_none();
         dead
     });
     if dead { Err(Stop::Blocked) } else { Ok(()) }

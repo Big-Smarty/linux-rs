@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Selected semantics from Linux 6.18.57, commit
 // 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: kernel/sys.c (`getpriority`,
-// `getresuid`, `getresgid`, `gettid`, `getppid`, `getuid`..`getegid`,
-// `getpgid`, `getpgrp`, `getsid`, `newuname` with `override_release` and
+// `getresuid`, `getresgid`, `gettid`, `getuid`..`getegid`, `newuname` with `override_release` and
 // `override_architecture`, `do_prlimit`, `getrlimit`, `prlimit64`,
 // `setrlimit`, `umask`, `prctl`, `do_sysinfo`), kernel/groups.c (`getgroups`),
 // kernel/exec_domain.c (`personality`), kernel/fork.c (`set_tid_address`),
@@ -15,7 +14,7 @@
 // pid succeed only for the caller, credentials never change, and `prctl`
 // options Linux implements but this slice does not stop the kernel instead of
 // answering.
-//! Identity and process-attribute syscalls: ids, process-tree ids, `uname`,
+//! Identity and process-attribute syscalls: ids, `uname`,
 //! `arch_prctl`, resource limits, `umask`, CPU affinity, `sysinfo`,
 //! `personality`, the `prctl` options init uses and the pointers libc registers
 //! at startup (`set_tid_address`, `set_robust_list`).
@@ -24,6 +23,7 @@
 //! `usercopy`. State lives in [`crate::task::Attributes`] (`ctx.attrs()`).
 
 use super::{Context, Outcome};
+use crate::task::pid::PidType;
 use crate::task::{Attributes, COMM_LEN, LimitError, RLIM_INFINITY, RLIMIT_CPU, Rlimit};
 use crate::usercopy::{TASK_SIZE_MAX, copy_from_user, copy_to_user, put_user, strncpy_from_user};
 use syscalls::{Errno, Sysno};
@@ -67,15 +67,11 @@ fn uint(arg: u64) -> u32 {
 pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) -> Option<Outcome> {
     let [a0, a1, a2, a3, a4, _] = args;
     let result: Res = match sysno {
-        Sysno::getppid => Ok(i64::from(ctx.attrs().ppid)),
         Sysno::getuid => Ok(i64::from(ctx.attrs().cred.uid)),
         Sysno::geteuid => Ok(i64::from(ctx.attrs().cred.euid)),
         Sysno::getgid => Ok(i64::from(ctx.attrs().cred.gid)),
         Sysno::getegid => Ok(i64::from(ctx.attrs().cred.egid)),
         Sysno::gettid => Ok(i64::from(ctx.tid())),
-        Sysno::getpgrp => Ok(i64::from(ctx.attrs().pgid)),
-        Sysno::getpgid => find_task(ctx, int(a0)).map(|()| i64::from(ctx.attrs().pgid)),
-        Sysno::getsid => find_task(ctx, int(a0)).map(|()| i64::from(ctx.attrs().sid)),
         Sysno::getresuid => {
             let cred = ctx.attrs().cred;
             put_ids(ctx, [a0, a1, a2], [cred.uid, cred.euid, cred.suid])
@@ -118,13 +114,19 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
     }
 }
 
-/// `find_task_by_vpid`: with one task only the caller exists (`pid` is a
-/// `pid_t`; `0` callers handle themselves).
-fn find_task<C: Context>(ctx: &C, pid: i32) -> Result<(), Stop> {
-    if pid == 0 || u32::try_from(pid) == Ok(ctx.tid()) {
-        Ok(())
-    } else {
-        Err(Errno::ESRCH.into())
+/// `find_task_by_vpid`: `pid` is a `pid_t`, `0` callers handle themselves. The
+/// per-task attributes of any other task belong to that task, so a target
+/// other than the caller stops the kernel loudly instead of answering with the
+/// caller's.
+fn find_task<C: Context>(ctx: &mut C, pid: i32) -> Result<(), Stop> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let tasks = ctx.tasks();
+    match tasks.list.find_task_by_vpid(pid) {
+        None => Err(Errno::ESRCH.into()),
+        Some(task) if task == tasks.current => Ok(()),
+        Some(_) => Err(Stop::Unimplemented),
     }
 }
 
@@ -175,13 +177,29 @@ fn getpriority<C: Context>(ctx: &mut C, which: i32, who: i32) -> Res {
     match which {
         // PRIO_PROCESS
         0 => find_task(ctx, who).map(|()| NICE_TO_RLIMIT_DEFAULT),
-        // PRIO_PGRP: init's group is `init_struct_pid`, which has no number, so
-        // only "my group" (0) names it; any other number has no tasks.
-        1 if who == 0 => Err(Stop::Unimplemented),
+        // PRIO_PGRP: `find_vpid(who)`, or the caller's group for 0.
+        // `init_struct_pid` (no number, so only "my group" names it) also
+        // holds the kernel threads, which this kernel lacks; any numbered
+        // group holds only ordinary tasks, all at nice 0.
+        1 => {
+            let t = ctx.tasks();
+            let pgrp = if who == 0 {
+                t.list.task_pid_type(t.current, PidType::Pgid)
+            } else {
+                t.list.find_vpid(who)
+            };
+            match pgrp {
+                Some(p) if p == t.list.init_struct_pid() => Err(Stop::Unimplemented),
+                Some(p) if t.list.pid(p).is_some_and(|p| p.has_task(PidType::Pgid)) => {
+                    Ok(NICE_TO_RLIMIT_DEFAULT)
+                }
+                _ => Err(Errno::ESRCH.into()),
+            }
+        }
         // PRIO_USER: `who == 0` means the caller's uid; a uid other than the
         // caller's (the only uid with tasks) has no `user_struct`.
         2 if who == 0 || u32::try_from(who) == Ok(ctx.attrs().cred.uid) => Err(Stop::Unimplemented),
-        1 | 2 => Err(Errno::ESRCH.into()),
+        2 => Err(Errno::ESRCH.into()),
         _ => Err(Errno::EINVAL.into()),
     }
 }
@@ -719,6 +737,11 @@ mod tests {
             Outcome::Unimplemented(140)
         );
         assert_eq!(call(&mut t, Sysno::getpriority, &[1, 1]), err(Errno::ESRCH));
+        // A numbered group holds ordinary tasks only: init's own group 1.
+        assert_eq!(call(&mut t, Sysno::setpgid, &[0, 0]), ok(0));
+        assert_eq!(call(&mut t, Sysno::getpriority, &[1, 0]), ok(20));
+        assert_eq!(call(&mut t, Sysno::getpriority, &[1, 1]), ok(20));
+        assert_eq!(call(&mut t, Sysno::getpriority, &[1, 2]), err(Errno::ESRCH));
         assert_eq!(
             call(&mut t, Sysno::getpriority, &[2, 0]),
             Outcome::Unimplemented(140)

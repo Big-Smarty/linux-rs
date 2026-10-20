@@ -107,7 +107,7 @@ pub fn do_sigaction(
     if new.is_some() && sig_kernel_only(sig) {
         return Err(Errno::EINVAL);
     }
-    let slot = &mut state.actions[usize::from(sig) - 1];
+    let slot = &mut state.hand.actions[usize::from(sig) - 1];
     if slot.flags & super::SA_IMMUTABLE != 0 {
         return Err(Errno::EINVAL);
     }
@@ -142,7 +142,7 @@ pub fn sys_rt_sigprocmask<P: UserPages>(
     if sigsetsize != 8 {
         return err(Errno::EINVAL);
     }
-    let old = state.blocked;
+    let old = state.me.blocked;
     if nset != 0 {
         let Some(bytes) = get_user::<_, 8>(pages, nset) else {
             return err(Errno::EFAULT);
@@ -174,7 +174,7 @@ pub fn sys_rt_sigpending<P: UserPages>(
     if sigsetsize > 8 {
         return err(Errno::EINVAL);
     }
-    let set = state.blocked.0 & state.pending_set().0;
+    let set = state.me.blocked.0 & state.pending_set().0;
     #[allow(clippy::cast_possible_truncation)]
     let len = sigsetsize as usize;
     if put_user(pages, uset, &set.to_le_bytes()[..len]) {
@@ -245,7 +245,7 @@ pub fn do_sigaltstack(
     sp: u64,
     min_ss_size: u64,
 ) -> (StackT, Result<(), Errno>) {
-    let st = state.altstack;
+    let st = state.me.altstack;
     let old = StackT {
         sp: st.sp,
         flags: st.ss_flags(sp) | (st.flags & SS_FLAG_BITS),
@@ -278,7 +278,7 @@ pub fn do_sigaltstack(
         }
         (ss_sp, size)
     };
-    state.altstack = AltStack {
+    state.me.altstack = AltStack {
         sp: ss_sp,
         size,
         flags,
@@ -529,8 +529,8 @@ mod tests {
         s.map(0x2000, false); // read-only
         s
     }
-    fn init() -> State {
-        State::new_init(1000)
+    fn init() -> State<'static> {
+        State::standalone_init(1000)
     }
     fn put(s: &mut Space, at: u64, b: &[u8]) {
         assert_eq!(copy_to_user(s, at, b), 0);
@@ -579,7 +579,7 @@ mod tests {
             sys_rt_sigaction(&mut st, &mut sp, 1 << 40 | 10, 0x1000, 0, 8),
             0
         );
-        assert_eq!(st.actions[9].handler, 0x4000);
+        assert_eq!(st.hand.actions[9].handler, 0x4000);
     }
 
     #[test]
@@ -599,7 +599,7 @@ mod tests {
             get(&mut sp, 0x1100, 32)[..],
             SigAction::default().to_bytes()
         );
-        let k = st.actions[9];
+        let k = st.hand.actions[9];
         assert_eq!(k.flags, SA_SIGINFO | SA_RESTORER | SA_ONSTACK); // UAPI_SA_FLAGS only
         assert_eq!(k.mask, SigSet(!(SigSet::bit(9) | SigSet::bit(19))));
         // Reading back returns what was stored.
@@ -615,14 +615,14 @@ mod tests {
             sys_rt_sigaction(&mut st, &mut sp, 10, 0x1000, 0x2000, 8),
             EFAULT
         );
-        assert_eq!(st.actions[9].handler, 0x6000);
+        assert_eq!(st.hand.actions[9].handler, 0x6000);
     }
 
     #[test]
     fn rt_sigaction_ignore_discards_pending() {
-        let mut st = State::new(5, 0, 100);
-        st.blocked.add(SIGUSR1);
-        st.blocked.add(SIGHUP);
+        let mut st = State::standalone(5, 0, 100);
+        st.me.blocked.add(SIGUSR1);
+        st.me.blocked.add(SIGHUP);
         st.send_signal(
             SIGUSR1,
             SigInfo::from_kill(10, false, 1, 0),
@@ -641,8 +641,8 @@ mod tests {
         assert!(!st.pending_set().contains(SIGUSR1));
         assert!(st.pending_set().contains(SIGHUP));
         // SIG_DFL on a default-ignored signal also discards it.
-        st.blocked.add(crate::signal::SIGCHLD);
-        st.actions[16].handler = 0x1234;
+        st.me.blocked.add(crate::signal::SIGCHLD);
+        st.hand.actions[16].handler = 0x1234;
         st.send_signal(17, SigInfo::from_kill(17, false, 1, 0), Target::Process)
             .unwrap();
         assert!(st.pending_set().contains(17));
@@ -651,14 +651,14 @@ mod tests {
         assert!(!st.pending_set().contains(17));
     }
 
-    fn handled(sig: u8) -> State {
-        let mut st = State::new(7, 0, 100_000);
-        st.actions[usize::from(sig) - 1].handler = 0x1000;
-        st.blocked.add(sig);
+    fn handled(sig: u8) -> State<'static> {
+        let st = State::standalone(7, 0, 100_000);
+        st.hand.actions[usize::from(sig) - 1].handler = 0x1000;
+        st.me.blocked.add(sig);
         st
     }
     fn drain(st: &mut State) -> usize {
-        st.blocked = SigSet::EMPTY;
+        st.me.blocked = SigSet::EMPTY;
         let mut n = 0;
         while st.dequeue_signal().is_some() {
             n += 1;
@@ -739,7 +739,7 @@ mod tests {
             sys_rt_sigprocmask(&mut st, &mut sp, 0, 0x1000, 0x1100, 8),
             0
         );
-        assert_eq!(st.blocked, SigSet(0b1110_0000_0000));
+        assert_eq!(st.me.blocked, SigSet(0b1110_0000_0000));
         assert_eq!(get(&mut sp, 0x1100, 8)[..], 0u64.to_le_bytes());
         // SIG_UNBLOCK.
         set(&mut sp, 0b0110_0000_0000);
@@ -747,7 +747,7 @@ mod tests {
             sys_rt_sigprocmask(&mut st, &mut sp, 1, 0x1000, 0x1100, 8),
             0
         );
-        assert_eq!(st.blocked, SigSet(0b1000_0000_0000));
+        assert_eq!(st.me.blocked, SigSet(0b1000_0000_0000));
         assert_eq!(
             get(&mut sp, 0x1100, 8)[..],
             0b1110_0000_0000u64.to_le_bytes()
@@ -755,9 +755,9 @@ mod tests {
         // SIG_SETMASK.
         set(&mut sp, u64::MAX);
         assert_eq!(sys_rt_sigprocmask(&mut st, &mut sp, 2, 0x1000, 0, 8), 0);
-        assert_eq!(st.blocked, SigSet(u64::MAX).without_unblockable());
+        assert_eq!(st.me.blocked, SigSet(u64::MAX).without_unblockable());
         // Bad `how`: EINVAL, nothing changed, nset still read first (EFAULT wins).
-        let before = st.blocked;
+        let before = st.me.blocked;
         assert_eq!(
             sys_rt_sigprocmask(&mut st, &mut sp, 3, 0x1000, 0, 8),
             EINVAL
@@ -766,7 +766,7 @@ mod tests {
             sys_rt_sigprocmask(&mut st, &mut sp, 3, 0x9000, 0, 8),
             EFAULT
         );
-        assert_eq!(st.blocked, before);
+        assert_eq!(st.me.blocked, before);
         // `how` is an int.
         assert_eq!(
             sys_rt_sigprocmask(&mut st, &mut sp, 1 << 32 | 2, 0x1000, 0, 8),
@@ -778,23 +778,23 @@ mod tests {
             sys_rt_sigprocmask(&mut st, &mut sp, 2, 0x1000, 0x2000, 8),
             EFAULT
         );
-        assert_eq!(st.blocked, SigSet::EMPTY);
+        assert_eq!(st.me.blocked, SigSet::EMPTY);
         assert_eq!(sys_rt_sigprocmask(&mut st, &mut sp, 99, 0, 0x1100, 8), 0);
     }
 
     #[test]
     fn rt_sigpending_truncates_and_checks_size() {
-        let mut st = State::new(5, 0, 100);
-        st.blocked = SigSet(0xffff_ffff_ffff);
+        let mut st = State::standalone(5, 0, 100);
+        st.me.blocked = SigSet(0xffff_ffff_ffff);
         let mk = |sig| SigInfo::from_kill(sig, false, 1, 0);
         st.send_signal(10, mk(10), Target::Process).unwrap();
         st.send_signal(40, mk(40), Target::Thread).unwrap();
-        st.blocked = SigSet(1 << 9); // only 10 blocked
+        st.me.blocked = SigSet(1 << 9); // only 10 blocked
         let mut sp = space();
         assert_eq!(sys_rt_sigpending(&st, &mut sp, 0x1000, 9), EINVAL);
         assert_eq!(sys_rt_sigpending(&st, &mut sp, 0x1000, 8), 0);
         assert_eq!(get(&mut sp, 0x1000, 8)[..], (1u64 << 9).to_le_bytes());
-        st.blocked = SigSet(u64::MAX);
+        st.me.blocked = SigSet(u64::MAX);
         put(&mut sp, 0x1010, &[0xaa; 8]);
         assert_eq!(sys_rt_sigpending(&st, &mut sp, 0x1010, 2), 0);
         let b = get(&mut sp, 0x1010, 8);
@@ -826,7 +826,7 @@ mod tests {
         put_ss(&mut sp, ss(0x10_0000, 0, 2048));
         assert_eq!(sys_sigaltstack(&mut st, &mut sp, 0x1000, 0, 0x7000), 0);
         assert_eq!(
-            st.altstack,
+            st.me.altstack,
             AltStack {
                 sp: 0x10_0000,
                 size: 2048,
@@ -851,15 +851,15 @@ mod tests {
             ss(0x10_0000, SS_ONSTACK, 2048).to_bytes()
         );
         // sp == top is on the stack, sp == base is not (`sp > sas_ss_sp`).
-        assert_eq!(st.altstack.ss_flags(0x10_0000 + 2048), SS_ONSTACK);
-        assert_eq!(st.altstack.ss_flags(0x10_0000), 0);
+        assert_eq!(st.me.altstack.ss_flags(0x10_0000 + 2048), SS_ONSTACK);
+        assert_eq!(st.me.altstack.ss_flags(0x10_0000), 0);
         // Unchanged request returns before size checks; DISABLE zeroes the rest.
         put_ss(&mut sp, ss(0x10_0000, 0, 2048));
         assert_eq!(sys_sigaltstack(&mut st, &mut sp, 0x1000, 0, 0x7000), 0);
         put_ss(&mut sp, ss(0xabc, SS_DISABLE, 77));
         assert_eq!(sys_sigaltstack(&mut st, &mut sp, 0x1000, 0, 0x7000), 0);
         assert_eq!(
-            st.altstack,
+            st.me.altstack,
             AltStack {
                 sp: 0,
                 size: 0,
@@ -869,8 +869,8 @@ mod tests {
         // AUTODISARM: stored, reported, and "never on the stack".
         put_ss(&mut sp, ss(0x20_0000, SS_AUTODISARM, 4096));
         assert_eq!(sys_sigaltstack(&mut st, &mut sp, 0x1000, 0, 0x7000), 0);
-        assert_eq!(st.altstack.flags, SS_AUTODISARM);
-        assert!(!st.altstack.on_stack(0x20_0000 + 10));
+        assert_eq!(st.me.altstack.flags, SS_AUTODISARM);
+        assert!(!st.me.altstack.on_stack(0x20_0000 + 10));
         assert_eq!(
             sys_sigaltstack(&mut st, &mut sp, 0x1000, 0x1100, 0x20_0000 + 10),
             0
@@ -912,8 +912,8 @@ mod tests {
         assert_eq!(sys_kill(&mut init, 1 << 32 | 77, 0), Some(ESRCH));
 
         // A handled signal sent by kill carries SI_USER, pid=tgid, uid.
-        let mut p = State::new(7, 1000, 100);
-        p.actions[14].handler = 0x1000; // SIGTERM
+        let mut p = State::standalone(7, 1000, 100);
+        p.hand.actions[14].handler = 0x1000; // SIGTERM
         assert_eq!(sys_kill(&mut p, 7, 15), Some(0));
         let (sig, info) = p.dequeue_signal().unwrap();
         assert_eq!(sig, SIGTERM);
@@ -941,8 +941,8 @@ mod tests {
 
     #[test]
     fn sigqueueinfo_order_and_payload() {
-        let mut p = State::new(7, 1000, 100);
-        p.actions[9].handler = 0x1000; // SIGUSR1
+        let mut p = State::standalone(7, 1000, 100);
+        p.hand.actions[9].handler = 0x1000; // SIGUSR1
         let mut sp = space();
         let mut info = [0u8; 128];
         info[0..4].copy_from_slice(&0x77i32.to_le_bytes());
@@ -1007,8 +1007,8 @@ mod tests {
 
     #[test]
     fn tkill_of_rt_signal_can_eagain_kill_cannot() {
-        let mut p = State::new(7, 0, 1);
-        p.blocked.add(40);
+        let mut p = State::standalone(7, 0, 1);
+        p.me.blocked.add(40);
         assert_eq!(sys_tkill(&mut p, 7, 40), 0);
         assert_eq!(sys_tkill(&mut p, 7, 40), EAGAIN);
         assert_eq!(sys_kill(&mut p, 7, 40), Some(0));
@@ -1017,11 +1017,11 @@ mod tests {
 
     #[test]
     fn fatal_default_kills_non_init() {
-        let mut p = State::new(7, 0, 100);
+        let mut p = State::standalone(7, 0, 100);
         assert_eq!(sys_kill(&mut p, 7, 15), Some(0));
-        assert_eq!(p.group_exit, Some(15));
-        let mut p = State::new(7, 0, 100);
+        assert_eq!(p.sig.group_exit, Some(15));
+        let mut p = State::standalone(7, 0, 100);
         assert_eq!(sys_kill(&mut p, 7, SIGKILL.into()), Some(0));
-        assert_eq!(p.group_exit, Some(9));
+        assert_eq!(p.sig.group_exit, Some(9));
     }
 }

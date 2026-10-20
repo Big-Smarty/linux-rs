@@ -12,6 +12,36 @@ Every numbered mechanism is independently incomplete until all ordered steps, UA
 
 **First-userspace slice (A18).** Sections 3–5 now have a bounded kernel-side start: `/init` discovery, a `load_elf_binary`-ordered load plan for static `ET_EXEC`, the `create_elf_tables` stack and auxv, a four-syscall dispatch (`write`, `getpid`, `exit`, `exit_group`) and the init-death/segfault/trap text, as host-tested pure logic in `kernel/src/exec/` and `kernel/src/syscall/mod.rs`. There is no task object, scheduler, `execve` syscall, signal delivery or ring-3 entry yet; see [the slice record](../implementation.md#first-userspace-slice-kernel-side) for design answers, shortcuts and evidence. The `Implementation status` above stays `not_started` for the complete mechanisms.
 
+**Task-model slice (lane `task-model`, [record](../implementation.md#task-model-and-process-syscalls)).** A pure, host-tested [`Tasklist`](../../kernel/src/task/tasklist.rs) (pids, parentage, process groups and sessions, exit/reparent/`SIGCHLD`, `wait4`/`waitid`, the `kill` family, orphaned groups, credential snapshots) now backs `getppid`/`getpgid`/`getpgrp`/`getsid`/`setsid`/`setpgid`, `wait4`/`waitid` (their argument and `ECHILD` paths on the machine) and the `execve`/`execveat` commit path; the status of section 1 and 2 above stays `not_started` for `fork`/`clone`, stacks and the scheduler, which are other lanes.
+
+### Lock order and non-parity table for the task lane
+
+Acquire left to right, never the reverse (the shared DAG; `kernel/src/services.rs` repeats it next to the locks that exist):
+
+```text
+TASKLIST -> VFS -> TABLES -> heap -> FRAMES
+TASKLIST -> TIMERQ -> TIMER_HW
+any lock -> RQ
+```
+
+* `TASKLIST` collapses `tasklist_lock`, `siglock` and `pidmap_lock` (a named coarsening; Linux orders them in that sequence and one CPU makes them one section). It must be IRQ-saving, because the interval-timer expiry will take it from hardirq.
+* `TABLES` (the published page tables, `kernel/src/services.rs`) is taken by `execve`'s commit and by user-memory faults while the `PROCESS` borrow is held; it sits between `VFS` and the heap, as in the `PROCESS -> TABLES -> heap -> FRAMES` order of that file.
+* `VFS -> TASKLIST` is forbidden: `SIGPIPE` is sent after the VFS borrow ends. `TIMERQ -> TASKLIST` is forbidden: expiry drains due entries under `TIMERQ`, releases it, and only then wakes (`RQ`) or signals (`TASKLIST`). `RQ` is a leaf that every other lock may take; its holders call nothing.
+* No guard may be alive across `schedule()`. The task model never sleeps: blocking is the caller's re-check loop (`wait_event_interruptible`), and the model reaches sleepers only through `task::exit::Waker`.
+* Today the task list lives inside `PROCESS` (no `TASKLIST` lock exists yet); `PROCESS` stands for `TASKLIST` plus `VFS` until the VFS is promoted, which only splits the lock.
+
+| # | Where this slice differs from Linux 6.18.57 | Why it is safe or loud | Upgrade |
+| --- | --- | --- | --- |
+| T1 | One thread per group: `signal_struct`/`sighand_struct` are inline in the task (`TaskSignals`), `CLONE_THREAD`/`SIGHAND`/`VM`/`FILES` do not exist | `State` is a view, so callers do not change | counted shared slots |
+| T2 | No ptrace, subreaper, `pdeath_signal`, `EXIT_TRACE`, `__WNOTHREAD` effect, pidfd, `PIDTYPE` beyond the four of one namespace | the code paths are absent, not stubbed; `pidfd_open` stops the kernel and every `P_PIDFD` descriptor is `EBADF` | ptrace/pidfd lanes |
+| T3 | `init_task` (the idle task, pid 0) is not a task: init has no parent (`real_parent` is `None`) and `getppid` is 0 | observable result identical where the idle task is consulted as a parent: its group and session are `init_struct_pid` and it is not `is_global_init`, which `will_become_orphaned_pgrp`/`kill_orphaned_pgrp` apply to init's `None` parent | none needed |
+| T4 | Capability sets are not modelled: `CredSnapshot` derives `CAP_KILL`/`CAP_SYS_RESOURCE` from `euid == 0` | no syscall can change a credential (all stop the kernel; a test pins that) | real `cap_effective` bits with the first such syscall |
+| T5 | `kill(-1)` and `kill(0)` through the existing `sys_kill` still stop loudly: Linux also signals kernel threads, which do not exist | the model implements `kill_something_info` (host-tested) but the syscall is not rewired until the fork lane | wire with `fork` and kernel threads |
+| T6 | Pid numbers start at 1 for init and 2 for the first child, not at the values of a real boot; `pid_max` is the single-CPU default 32768 | no oracle row observes beyond `child > 1`; wrap behaviour is `alloc_pid`'s | none |
+| T7 | `execve`: the whole argument block must fit four stack pages (16 KiB) where Linux allows `max(min(6 MiB, RLIMIT_STACK/4), 128 KiB)`; setuid bits, `ETXTBSY` and the page cache are not modelled; the user page-table pages of the replaced image are kept; `AT_EMPTY_PATH` with an empty name stops loudly | larger blocks are `E2BIG` here and succeed there (documented in `exec::bprm`) | window sized by the block; per-task page-table roots |
+| T8 | Scheduler task state is not consulted: `task_is_stopped` is the `JOBCTL_STOPPED` bit that `do_signal_stop` will set | nothing sets it yet; the wait code is tested with it set by hand | the scheduler lane's `__TASK_STOPPED` |
+| T9 | `Tasklist::fork`'s `RLIMIT_NPROC` check counts the global `nr_threads`, waived by `euid == 0` (`cap_sys_resource`); Linux checks the per-user `ucounts`, waived for `INIT_USER`, `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN` | equal while only uid 0 exists (T4); `fork` is model-only | per-user counts with the first non-root credential |
+
 ## 1. Task identity, lifecycle foundations, clone, and fork — M2–M3
 
 **Baseline.** [`copy_process`](https://raw.githubusercontent.com/gregkh/linux/v6.18.57/kernel/fork.c) validates clone relationships, establishes resources and cgroup/scheduler placement before publication, and has extensive rollback. CLONE_THREAD requires shared signal handlers; CLONE_SIGHAND requires shared VM; namespace and shared-FS combinations have restrictions. [`pid.c`](https://raw.githubusercontent.com/gregkh/linux/v6.18.57/kernel/pid.c) distinguishes stable PID objects from recyclable numeric IDs and supports pidfd flags beyond a process-only handle.

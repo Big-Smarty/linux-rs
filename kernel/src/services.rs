@@ -24,6 +24,29 @@
 //! dereferences a user address, so no hardware fault occurs under a lock). No
 //! lock is held across a callback.
 //!
+//! # Lock-order DAG for the task lane (designed before the code that needs it)
+//! The task list ([`kernel::task::Tasklist`]: tasks, pids, process groups,
+//! sessions, credential snapshots, the signal objects of every task) is
+//! today **inside** `PROCESS` and has no lock of its own, so it takes part in
+//! the order above as part of `PROCESS`. The order the design in
+//! `docs/subsystems/process.md#lock-order-and-non-parity-table-for-the-task-lane`
+//! commits to, which every later task/scheduler/VFS change extends, is:
+//!
+//! ```text
+//! TASKLIST -> VFS -> TABLES -> heap -> FRAMES  (TASKLIST = tasklist_lock + siglock + pidmap_lock)
+//! TASKLIST -> TIMERQ -> TIMER_HW
+//! any lock -> RQ                           (RQ: scheduler run queue, a leaf, callable from hardirq)
+//! ```
+//!
+//! `VFS -> TASKLIST` is forbidden (a pipe write sends `SIGPIPE` after the VFS
+//! borrow ends), `TIMERQ -> TASKLIST` is forbidden (expiry drains under
+//! `TIMERQ`, acts after releasing it), and no guard may be alive across
+//! `schedule()`. Until the VFS is promoted out of `Process` (its comment in
+//! `userspace`), `PROCESS` stands for `TASKLIST` and `VFS` together; nothing
+//! in the task model calls out under it, so the promotion only splits the
+//! lock. [`kernel::task::exit::Waker`] is the seam through which the model
+//! asks for wake-ups: an implementation may take `RQ` and nothing else.
+//!
 //! One exception, the blocking system calls (`pause`, `rt_sigsuspend`,
 //! `rt_sigtimedwait`, `nanosleep`, later blocking `read`): `Task::wait` halts
 //! (`sti; hlt`) with `PROCESS` and `TABLES` held, so interrupts are enabled

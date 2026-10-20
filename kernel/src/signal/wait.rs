@@ -37,9 +37,9 @@ fn err(errno: Errno) -> i64 {
 }
 
 /// Bring the timers up to date and borrow the state.
-fn synced<T: Task>(task: &mut T) -> &mut State {
+fn synced<T: Task>(task: &mut T) -> State<'_> {
     let now = task.now_ns();
-    let state = task.state();
+    let mut state = task.state();
     state.sync_timers(now);
     state
 }
@@ -115,8 +115,8 @@ pub fn sys_rt_sigsuspend<T: Task>(task: &mut T, unewset: u64, sigsetsize: u64) -
         };
         bytes
     };
-    let state = task.state();
-    state.saved_sigmask = Some(state.blocked);
+    let mut state = task.state();
+    state.me.saved_sigmask = Some(state.me.blocked);
     state.set_blocked(SigSet(u64::from_le_bytes(bytes)));
     while !synced(task).signal_pending() {
         task.wait(None);
@@ -180,7 +180,7 @@ pub fn sys_rt_sigtimedwait<T: Task>(
         };
         (these, timeout)
     };
-    let state = task.state();
+    let mut state = task.state();
     // `mask` is the set to skip: everything not awaited, plus KILL and STOP.
     let awaited =
         SigSet(u64::from_le_bytes(these) & !(SigSet::bit(SIGKILL) | SigSet::bit(SIGSTOP)));
@@ -192,9 +192,9 @@ pub fn sys_rt_sigtimedwait<T: Task>(
     if found.is_none() && timeout != Some(0) {
         // Temporarily unblock the awaited signals so they wake the sleep;
         // `real_blocked` keeps them "blocked" for `sig_ignored`.
-        let real_blocked = state.blocked;
-        state.real_blocked = real_blocked;
-        state.blocked = SigSet(real_blocked.0 & mask.0);
+        let real_blocked = state.me.blocked;
+        state.me.real_blocked = real_blocked;
+        state.me.blocked = SigSet(real_blocked.0 & mask.0);
         let deadline = timeout.map(|ns| now.saturating_add(ns));
         loop {
             if synced(task).signal_pending() {
@@ -206,10 +206,10 @@ pub fn sys_rt_sigtimedwait<T: Task>(
             }
             task.wait(deadline);
         }
-        let state = task.state();
+        let mut state = task.state();
         // __set_task_blocked(real_blocked), then collect.
-        state.blocked = real_blocked;
-        state.real_blocked = SigSet::EMPTY;
+        state.me.blocked = real_blocked;
+        state.me.real_blocked = SigSet::EMPTY;
         found = state.dequeue_signal_masked(mask);
     }
     match found {

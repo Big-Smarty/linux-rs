@@ -6,6 +6,7 @@
 //! freestanding binary owns frames, page tables and privileged transitions.
 
 pub mod args;
+pub mod bprm;
 pub mod load;
 pub mod plan;
 pub mod report;

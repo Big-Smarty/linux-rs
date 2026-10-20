@@ -133,7 +133,7 @@ fn get_sigframe<P: UserPages, C: Cpu>(
     pages: &mut P,
     cpu: &mut C,
 ) -> Option<(u64, u64)> {
-    let alt = state.altstack;
+    let alt = state.me.altstack;
     let nested_altstack = alt.on_stack(regs.sp);
     let mut entering_altstack = false;
     let mut sp = regs.sp.wrapping_sub(REDZONE);
@@ -201,7 +201,7 @@ pub fn setup_rt_frame<P: UserPages, C: Cpu>(
             Err(FrameFault)
         }
     };
-    let alt = state.altstack;
+    let alt = state.me.altstack;
     put(pages, UC_FLAGS, &uc_flags.to_le_bytes())?;
     put(pages, UC_LINK, &0u64.to_le_bytes())?;
     // unsafe_save_altstack: the *stored* flags, padding untouched.
@@ -209,7 +209,7 @@ pub fn setup_rt_frame<P: UserPages, C: Cpu>(
     put(pages, UC_STACK + 8, &alt.flags.to_le_bytes())?;
     put(pages, UC_STACK + 16, &alt.size.to_le_bytes())?;
     put(pages, 0, &ksig.action.restorer.to_le_bytes())?;
-    let mask = state.saved_sigmask.unwrap_or(state.blocked).0;
+    let mask = state.me.saved_sigmask.unwrap_or(state.me.blocked).0;
     let sc = UC_MCONTEXT;
     // __unsafe_setup_sigcontext, field by field in Linux's order.
     let words: [(u64, u64); 16] = [
@@ -233,8 +233,8 @@ pub fn setup_rt_frame<P: UserPages, C: Cpu>(
     for (offset, value) in words {
         put(pages, sc + offset, &value.to_le_bytes())?;
     }
-    put(pages, sc + 160, &state.arch.trap_nr.to_le_bytes())?; // trapno
-    put(pages, sc + 152, &state.arch.error_code.to_le_bytes())?; // err
+    put(pages, sc + 160, &state.me.arch.trap_nr.to_le_bytes())?; // trapno
+    put(pages, sc + 152, &state.me.arch.error_code.to_le_bytes())?; // err
     put(pages, sc + 128, &regs.ip.to_le_bytes())?;
     put(pages, sc + 136, &regs.flags.to_le_bytes())?;
     #[allow(clippy::cast_possible_truncation)]
@@ -246,7 +246,7 @@ pub fn setup_rt_frame<P: UserPages, C: Cpu>(
     }
     put(pages, sc + 184, &fpstate.to_le_bytes())?;
     put(pages, sc + 168, &mask.to_le_bytes())?; // oldmask = sig[0]
-    put(pages, sc + 176, &state.arch.cr2.to_le_bytes())?;
+    put(pages, sc + 176, &state.me.arch.cr2.to_le_bytes())?;
     put(pages, UC_SIGMASK, &mask.to_le_bytes())?;
     if flags & SA_SIGINFO != 0 {
         put(pages, INFO, &ksig.info.to_bytes())?;

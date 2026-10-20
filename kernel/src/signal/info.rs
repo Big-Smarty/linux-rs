@@ -183,6 +183,19 @@ impl SigInfo {
         Self::kill(signo, SI_KERNEL, 0, 0)
     }
 
+    /// `_sigchld`: `do_notify_parent` / `do_notify_parent_cldstop`. `utime`
+    /// and `stime` are in `clock_t` ticks (`USER_HZ`).
+    #[must_use]
+    pub fn chld(code: i32, pid: i32, uid: u32, status: i32, utime: i64, stime: i64) -> Self {
+        Self::with(super::SIGCHLD, code, |b| {
+            b[0..4].copy_from_slice(&pid.to_le_bytes());
+            b[4..8].copy_from_slice(&uid.to_le_bytes());
+            b[8..12].copy_from_slice(&status.to_le_bytes());
+            b[16..24].copy_from_slice(&utime.to_le_bytes());
+            b[24..32].copy_from_slice(&stime.to_le_bytes());
+        })
+    }
+
     /// `_rt`: pid, uid and `sigval` (`rt_sigqueueinfo`, `SI_QUEUE`).
     #[must_use]
     pub fn rt(signo: u8, code: i32, pid: i32, uid: u32, value: u64) -> Self {

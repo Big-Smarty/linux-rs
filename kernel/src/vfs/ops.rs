@@ -968,3 +968,19 @@ pub fn stat_lookup_flags(flags: u32) -> u32 {
         0
     }
 }
+
+impl Vfs {
+    /// `do_close_on_exec`: close every descriptor carrying `FD_CLOEXEC`, in
+    /// ascending order (`begin_new_exec`, after the point of no return).
+    pub fn do_close_on_exec(&mut self, fdt: &mut super::FdTable) {
+        let fds = u32::try_from(fdt.max_fds()).unwrap_or(u32::MAX);
+        for fd in 0..fds {
+            if fdt.get(fd).is_some()
+                && fdt.cloexec(fd)
+                && let Some(file) = fdt.close(fd)
+            {
+                self.fput(file);
+            }
+        }
+    }
+}

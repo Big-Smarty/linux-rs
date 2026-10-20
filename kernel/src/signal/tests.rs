@@ -201,17 +201,17 @@ fn regs() -> Regs {
     }
 }
 
-fn handler_state() -> State {
-    let mut st = State::new(5, 0, 1000);
-    st.actions[usize::from(SIGUSR1) - 1] = SigAction {
+fn handler_state() -> State<'static> {
+    let st = State::standalone(5, 0, 1000);
+    st.hand.actions[usize::from(SIGUSR1) - 1] = SigAction {
         handler: 0x40_1000,
         flags: SA_SIGINFO | SA_RESTORER,
         restorer: 0x40_2000,
         mask: SigSet(1 << 11), // SIGUSR2
     };
-    st.arch.trap_nr = 14;
-    st.arch.error_code = 6;
-    st.arch.cr2 = 0xdead_b000;
+    st.me.arch.trap_nr = 14;
+    st.me.arch.error_code = 6;
+    st.me.arch.cr2 = 0xdead_b000;
     st
 }
 
@@ -241,15 +241,15 @@ fn expected_frame(
     let stk = offset_of!(MRtSigframe, uc.uc_stack);
     put(
         stk + offset_of!(MStackT, ss_sp),
-        &st.altstack.sp.to_le_bytes(),
+        &st.me.altstack.sp.to_le_bytes(),
     );
     put(
         stk + offset_of!(MStackT, ss_flags),
-        &st.altstack.flags.to_le_bytes(),
+        &st.me.altstack.flags.to_le_bytes(),
     );
     put(
         stk + offset_of!(MStackT, ss_size),
-        &st.altstack.size.to_le_bytes(),
+        &st.me.altstack.size.to_le_bytes(),
     );
     for (i, v) in [r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15]
         .into_iter()
@@ -268,10 +268,10 @@ fn expected_frame(
         (offset_of!(MSigContext, sp), r.sp),
         (offset_of!(MSigContext, ip), r.ip),
         (offset_of!(MSigContext, flags), r.flags),
-        (offset_of!(MSigContext, err), st.arch.error_code),
-        (offset_of!(MSigContext, trapno), st.arch.trap_nr),
+        (offset_of!(MSigContext, err), st.me.arch.error_code),
+        (offset_of!(MSigContext, trapno), st.me.arch.trap_nr),
         (offset_of!(MSigContext, oldmask), mask),
-        (offset_of!(MSigContext, cr2), st.arch.cr2),
+        (offset_of!(MSigContext, cr2), st.me.arch.cr2),
         (offset_of!(MSigContext, fpstate), fp),
     ] {
         put(sco(o), &v.to_le_bytes());
@@ -316,7 +316,7 @@ fn handler_frame_is_byte_exact_and_sigreturn_restores() {
     assert_eq!((r.ip, r.cs, r.ss), (0x40_1000, USER_CS, USER_DS));
     assert_eq!(r.flags, 0x246); // DF cleared
     assert_eq!(cpu.resets, 1);
-    assert_eq!(st.blocked, SigSet((1 << 11) | (1 << 9)));
+    assert_eq!(st.me.blocked, SigSet((1 << 11) | (1 << 9)));
 
     let info = SigInfo::from_kill(SIGUSR1, false, 1, 77);
     let want = expected_frame(0xaa, &before, &st_at_signal(), &info, buf_fx, 0);
@@ -360,7 +360,7 @@ fn handler_frame_is_byte_exact_and_sigreturn_restores() {
     // Flags: FIX_EFLAGS bits come from the frame (DF set again), the rest
     // (IF, IOPL, NT, ...) from the current regs.
     assert_eq!(ret.flags, (0x3202 & !0x50DD5) | (0x646 & 0x50DD5));
-    assert_eq!(st.blocked, SigSet::EMPTY);
+    assert_eq!(st.me.blocked, SigSet::EMPTY);
     assert_eq!(cpu.restored, vec![cpu.image_with_sw(&sw)]);
 }
 
@@ -372,14 +372,14 @@ impl FakeCpu {
     }
 }
 
-fn st_at_signal() -> State {
+fn st_at_signal() -> State<'static> {
     handler_state()
 }
 
 #[test]
 fn siginfo_is_only_written_with_sa_siginfo() {
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].flags = SA_RESTORER;
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags = SA_RESTORER;
     let mut space = user_space();
     let mut cpu = FakeCpu::new();
     fill(&mut space, STACK_LO, STACK_TOP + 0x1000, 0xaa);
@@ -398,8 +398,8 @@ fn handler_flags_nodefer_resethand_restart() {
     // SA_NODEFER: signal not added to the mask. SA_RESETHAND: handler reset,
     // flags kept. sa_mask never blocks SIGKILL/SIGSTOP.
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_NODEFER | SA_RESETHAND;
-    st.actions[usize::from(SIGUSR1) - 1].mask = SigSet(u64::MAX);
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags |= SA_NODEFER | SA_RESETHAND;
+    st.hand.actions[usize::from(SIGUSR1) - 1].mask = SigSet(u64::MAX);
     let mut space = user_space();
     let mut cpu = FakeCpu::new();
     let mut r = regs();
@@ -408,8 +408,8 @@ fn handler_flags_nodefer_resethand_restart() {
         do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu),
         Outcome::Handled
     );
-    assert_eq!(st.blocked, SigSet(u64::MAX).without_unblockable());
-    let k = st.actions[usize::from(SIGUSR1) - 1];
+    assert_eq!(st.me.blocked, SigSet(u64::MAX).without_unblockable());
+    let k = st.hand.actions[usize::from(SIGUSR1) - 1];
     assert_eq!(k.handler, 0);
     assert_ne!(k.flags & SA_RESTORER, 0);
     // The frame still reports the pre-delivery mask (empty).
@@ -419,24 +419,24 @@ fn handler_flags_nodefer_resethand_restart() {
 #[test]
 fn saved_sigmask_goes_into_the_frame_and_is_cleared() {
     let mut st = handler_state();
-    st.blocked = SigSet(0b1000);
-    st.saved_sigmask = Some(SigSet(0b100000));
+    st.me.blocked = SigSet(0b1000);
+    st.me.saved_sigmask = Some(SigSet(0b100000));
     let mut space = user_space();
     let mut cpu = FakeCpu::new();
     let mut r = regs();
     send(&mut st, SIGUSR1);
     do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu);
     assert_eq!(read(&mut space, r.sp + 304, 8), 0b100000u64.to_le_bytes());
-    assert_eq!(st.saved_sigmask, None);
+    assert_eq!(st.me.saved_sigmask, None);
     // The handler runs with blocked | sa_mask | sig, not the saved mask.
-    assert_eq!(st.blocked, SigSet(0b1000 | (1 << 11) | (1 << 9)));
+    assert_eq!(st.me.blocked, SigSet(0b1000 | (1 << 11) | (1 << 9)));
 }
 
 #[test]
 fn missing_restorer_or_bad_stack_forces_sigsegv() {
     // x64_setup_rt_frame: no SA_RESTORER -> -EFAULT -> force_sigsegv(sig).
-    let mut st = State::new_init(1000);
-    st.actions[usize::from(SIGUSR1) - 1] = SigAction {
+    let mut st = State::standalone_init(1000);
+    st.hand.actions[usize::from(SIGUSR1) - 1] = SigAction {
         handler: 0x40_1000,
         ..SigAction::default()
     };
@@ -450,7 +450,7 @@ fn missing_restorer_or_bad_stack_forces_sigsegv() {
     );
     assert_eq!(r, regs()); // nothing changed, no FPU reset
     assert_eq!(cpu.resets, 0);
-    assert!(!st.blocked.contains(SIGUSR1));
+    assert!(!st.me.blocked.contains(SIGUSR1));
     // SIGSEGV is now pending (init made killable) and fatal.
     assert_eq!(
         do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu),
@@ -461,8 +461,8 @@ fn missing_restorer_or_bad_stack_forces_sigsegv() {
     );
 
     // Unmapped stack page: partial failure, same result.
-    let mut st = State::new_init(1000);
-    st.actions[usize::from(SIGUSR1) - 1] = SigAction {
+    let mut st = State::standalone_init(1000);
+    st.hand.actions[usize::from(SIGUSR1) - 1] = SigAction {
         handler: 0x40_1000,
         flags: SA_RESTORER | SA_SIGINFO,
         restorer: 0x40_2000,
@@ -479,8 +479,8 @@ fn missing_restorer_or_bad_stack_forces_sigsegv() {
     );
     assert_eq!(r.sp, 0x20_0000);
     // A kernel-range stack fails access_ok with no write at all.
-    let mut st = State::new_init(1000);
-    st.actions[usize::from(SIGUSR1) - 1] = SigAction {
+    let mut st = State::standalone_init(1000);
+    st.hand.actions[usize::from(SIGUSR1) - 1] = SigAction {
         handler: 0x40_1000,
         flags: SA_RESTORER,
         restorer: 0x40_2000,
@@ -501,8 +501,8 @@ fn missing_restorer_or_bad_stack_forces_sigsegv() {
 fn sigsegv_handler_failure_is_fatal_without_recursion() {
     // force_sigsegv(SIGSEGV) = force_fatal_sig: default action even though
     // a SIGSEGV handler exists.
-    let mut st = State::new_init(1000);
-    st.actions[usize::from(SIGSEGV) - 1] = SigAction {
+    let mut st = State::standalone_init(1000);
+    st.hand.actions[usize::from(SIGSEGV) - 1] = SigAction {
         handler: 0x40_1000,
         flags: SA_RESTORER,
         restorer: 0x40_2000,
@@ -537,8 +537,8 @@ fn altstack_selection_and_overflow() {
     let alt_lo = 0x7_0000;
     let alt_size = 0x2000;
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
-    st.altstack = crate::signal::AltStack {
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
+    st.me.altstack = crate::signal::AltStack {
         sp: alt_lo,
         size: alt_size,
         flags: 0,
@@ -564,7 +564,7 @@ fn altstack_selection_and_overflow() {
 
     // Nested signal while on the altstack: keeps going down the same stack,
     // 128-byte red zone included.
-    st.blocked = SigSet::EMPTY;
+    st.me.blocked = SigSet::EMPTY;
     let mut inner = Regs { sp: frame, ..r };
     send(&mut st, SIGUSR1);
     do_signal_or_restart(&mut st, &mut inner, &mut space, &mut cpu);
@@ -573,8 +573,8 @@ fn altstack_selection_and_overflow() {
 
     // Too small a stack: sp falls below the base -> bogus frame -> SIGSEGV.
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
-    st.altstack = crate::signal::AltStack {
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
+    st.me.altstack = crate::signal::AltStack {
         sp: alt_lo,
         size: 0x100,
         flags: 0,
@@ -591,7 +591,7 @@ fn altstack_selection_and_overflow() {
 
     // SA_ONSTACK with the stack disabled uses the normal stack.
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
     let mut r = regs();
     send(&mut st, SIGUSR1);
     do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu);
@@ -601,13 +601,13 @@ fn altstack_selection_and_overflow() {
 #[test]
 fn autodisarm_disarms_for_the_handler_and_rearms_on_return() {
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
     let arm = crate::signal::AltStack {
         sp: 0x7_0000,
         size: 0x2000,
         flags: SS_AUTODISARM,
     };
-    st.altstack = arm;
+    st.me.altstack = arm;
     let mut space = user_space();
     let mut cpu = FakeCpu::new();
     let mut r = Regs {
@@ -617,27 +617,27 @@ fn autodisarm_disarms_for_the_handler_and_rearms_on_return() {
     space.map(0x7_8000, true);
     send(&mut st, SIGUSR1);
     do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu);
-    assert_eq!(st.altstack.flags, SS_DISABLE);
-    assert_eq!(st.altstack.size, 0);
+    assert_eq!(st.me.altstack.flags, SS_DISABLE);
+    assert_eq!(st.me.altstack.size, 0);
     // The frame recorded the armed stack (with SS_AUTODISARM).
     assert_eq!(read(&mut space, r.sp + 32, 4), SS_AUTODISARM.to_le_bytes());
     // sigreturn restores it (do_sigaltstack is not "on stack" while disarmed).
     let mut ret = Regs { sp: r.sp + 8, ..r };
     rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu);
-    assert_eq!(st.altstack, arm);
+    assert_eq!(st.me.altstack, arm);
 }
 
 #[test]
 fn sigreturn_does_not_restore_altstack_while_running_on_it() {
     // restore_altstack squashes EPERM from do_sigaltstack.
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
     let alt = crate::signal::AltStack {
         sp: 0x7_0000,
         size: 0x2000,
         flags: 0,
     };
-    st.altstack = alt;
+    st.me.altstack = alt;
     let mut space = user_space();
     let mut cpu = FakeCpu::new();
     let mut r = Regs {
@@ -650,7 +650,7 @@ fn sigreturn_does_not_restore_altstack_while_running_on_it() {
     // Handler changed nothing; frame holds the same stack; EPERM is ignored.
     let mut ret = Regs { sp: r.sp + 8, ..r };
     assert!(!rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu).bad_frame);
-    assert_eq!(st.altstack, alt);
+    assert_eq!(st.me.altstack, alt);
 }
 
 #[test]
@@ -768,7 +768,7 @@ fn sigreturn_mask_is_applied_even_when_a_later_step_fails() {
             reached_sigcontext: true
         }
     );
-    assert_eq!(st.blocked, SigSet(SigSet::bit(SIGUSR1)));
+    assert_eq!(st.me.blocked, SigSet(SigSet::bit(SIGUSR1)));
     assert!(cpu.restored.is_empty());
     assert!(cpu.resets >= 2, "fpu reset on the failed restore");
     // SIGSEGV is pending, forced from kernel (SI_KERNEL).
@@ -809,7 +809,7 @@ fn sigreturn_fpstate_cases() {
 #[test]
 fn sigreturn_with_unreadable_frame_forces_sigsegv() {
     let mut cpu = FakeCpu::new();
-    let mut st = State::new_init(1000);
+    let mut st = State::standalone_init(1000);
     let mut space = user_space();
     let mut r = Regs {
         sp: 0x30_0000,
@@ -834,7 +834,15 @@ fn sigreturn_with_unreadable_frame_forces_sigsegv() {
     );
     // sp wrapping around (frame range check).
     let mut r = Regs { sp: 4, ..regs() };
-    assert!(rt_sigreturn(&mut State::new(5, 0, 5), &mut r, &mut space, &mut cpu).bad_frame);
+    assert!(
+        rt_sigreturn(
+            &mut State::standalone(5, 0, 5),
+            &mut r,
+            &mut space,
+            &mut cpu
+        )
+        .bad_frame
+    );
 }
 
 fn sys_regs(error: i64) -> Regs {
@@ -904,8 +912,8 @@ fn restart_rules() {
 #[test]
 fn no_signal_restarts_and_restores_saved_mask() {
     let mut st = handler_state();
-    st.saved_sigmask = Some(SigSet(0b10));
-    st.blocked = SigSet(0b1);
+    st.me.saved_sigmask = Some(SigSet(0b10));
+    st.me.blocked = SigSet(0b1);
     let mut space = user_space();
     let mut cpu = FakeCpu::new();
     let mut r = sys_regs(ERESTARTSYS);
@@ -914,7 +922,7 @@ fn no_signal_restarts_and_restores_saved_mask() {
         Outcome::Resume
     );
     assert_eq!((r.ax, r.ip), (7, 0x40_0100));
-    assert_eq!((st.blocked, st.saved_sigmask), (SigSet(0b10), None));
+    assert_eq!((st.me.blocked, st.me.saved_sigmask), (SigSet(0b10), None));
 }
 
 #[test]
@@ -922,7 +930,7 @@ fn handler_entry_applies_restart_before_the_frame() {
     // ERESTARTSYS + SA_RESTART: the frame records the backed-up ip and the
     // restored syscall number in rax; EINTR otherwise.
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_RESTART;
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags |= SA_RESTART;
     let mut space = user_space();
     let mut cpu = FakeCpu::new();
     let mut r = sys_regs(ERESTARTSYS);
@@ -941,8 +949,8 @@ fn handler_entry_applies_restart_before_the_frame() {
 #[test]
 fn failed_frame_keeps_restart_adjustment() {
     // handle_signal adjusts regs before setup_rt_frame; a failure keeps it.
-    let mut st = State::new_init(1000);
-    st.actions[usize::from(SIGUSR1) - 1] = SigAction {
+    let mut st = State::standalone_init(1000);
+    st.hand.actions[usize::from(SIGUSR1) - 1] = SigAction {
         handler: 0x1000,
         ..SigAction::default()
     };
@@ -960,10 +968,10 @@ fn failed_frame_keeps_restart_adjustment() {
 #[test]
 fn get_signal_default_actions() {
     // Non-init: fatal default; ignore; stop; handler; SIG_IGN.
-    let mut st = State::new(5, 0, 100);
-    st.blocked.add(SIGTERM);
+    let mut st = State::standalone(5, 0, 100);
+    st.me.blocked.add(SIGTERM);
     send(&mut st, SIGTERM);
-    st.blocked = SigSet::EMPTY;
+    st.me.blocked = SigSet::EMPTY;
     // Group exit was not started (blocked): get_signal reports the fatal signal.
     assert_eq!(
         get_signal(&mut st),
@@ -972,32 +980,32 @@ fn get_signal_default_actions() {
             core: false
         }
     );
-    assert_eq!(st.group_exit, Some(15));
+    assert_eq!(st.sig.group_exit, Some(15));
 
-    let mut st = State::new(5, 0, 100);
-    st.blocked.add(SIGTSTP);
+    let mut st = State::standalone(5, 0, 100);
+    st.me.blocked.add(SIGTSTP);
     send(&mut st, SIGTSTP);
-    st.blocked = SigSet::EMPTY;
+    st.me.blocked = SigSet::EMPTY;
     assert_eq!(get_signal(&mut st), GetSignal::Stop(SIGTSTP));
 
     // Default-ignore signal that was queued blocked is dropped at delivery.
-    let mut st = State::new(5, 0, 100);
-    st.blocked.add(SIGCHLD);
+    let mut st = State::standalone(5, 0, 100);
+    st.me.blocked.add(SIGCHLD);
     send(&mut st, SIGCHLD);
-    st.blocked = SigSet::EMPTY;
+    st.me.blocked = SigSet::EMPTY;
     assert_eq!(get_signal(&mut st), GetSignal::None);
     assert!(!st.signal_pending());
 
     // SIG_IGN installed while pending... through sa_handler directly.
-    let mut st = State::new(5, 0, 100);
-    st.blocked.add(SIGUSR1);
+    let mut st = State::standalone(5, 0, 100);
+    st.me.blocked.add(SIGUSR1);
     send(&mut st, SIGUSR1);
-    st.blocked = SigSet::EMPTY;
-    st.actions[usize::from(SIGUSR1) - 1].handler = SIG_IGN;
+    st.me.blocked = SigSet::EMPTY;
+    st.hand.actions[usize::from(SIGUSR1) - 1].handler = SIG_IGN;
     assert_eq!(get_signal(&mut st), GetSignal::None);
 
     // Core signals request a dump; the exit code is still the number.
-    let mut st = State::new(5, 0, 100);
+    let mut st = State::standalone(5, 0, 100);
     st.force_fault(&crate::signal::info::page_fault(
         crate::signal::info::PageFault::Segv(SEGV_MAPERR),
         0x10,
@@ -1015,10 +1023,10 @@ fn get_signal_default_actions() {
 #[test]
 fn init_never_acts_on_default_signals_but_dies_of_forced_ones() {
     // get_signal: SIGNAL_UNKILLABLE && !sig_kernel_only -> continue.
-    let mut init = State::new_init(100);
-    init.blocked.add(SIGTERM);
+    let mut init = State::standalone_init(100);
+    init.me.blocked.add(SIGTERM);
     send(&mut init, SIGTERM); // queued because blocked
-    init.blocked = SigSet::EMPTY;
+    init.me.blocked = SigSet::EMPTY;
     assert_eq!(get_signal(&mut init), GetSignal::None);
     // Forced SIGSEGV (a fault): init becomes killable and dies with 11.
     init.force_fault(&crate::signal::info::page_fault(
@@ -1042,15 +1050,15 @@ fn init_never_acts_on_default_signals_but_dies_of_forced_ones() {
 #[test]
 fn faults_are_delivered_before_other_signals() {
     let mut st = handler_state();
-    st.actions[usize::from(SIGSEGV) - 1] = SigAction {
+    st.hand.actions[usize::from(SIGSEGV) - 1] = SigAction {
         handler: 0x40_3000,
         flags: SA_SIGINFO | SA_RESTORER,
         restorer: 0x40_2000,
         mask: SigSet::EMPTY,
     };
-    st.blocked.add(SIGUSR1);
+    st.me.blocked.add(SIGUSR1);
     send(&mut st, SIGUSR1);
-    st.blocked = SigSet::EMPTY;
+    st.me.blocked = SigSet::EMPTY;
     st.force_fault(&crate::signal::info::page_fault(
         crate::signal::info::PageFault::Segv(SEGV_MAPERR),
         0x1234,
@@ -1073,7 +1081,7 @@ fn faults_are_delivered_before_other_signals() {
 
 #[test]
 fn stop_signals_are_never_queued_for_init_by_kill() {
-    let mut init = State::new_init(100);
+    let mut init = State::standalone_init(100);
     send(&mut init, SIGSTOP);
     send(&mut init, SIGKILL);
     assert!(!init.signal_pending());
@@ -1086,20 +1094,20 @@ fn pending_signals_stack_frames_newest_first() {
     // sa_mask blocks the rest run one at a time, lowest first.
     let sigs = [1u8, 10, 12, 34]; // HUP, USR1, USR2, RT2
     for (mask, expect_top, frames) in [(0u64, 34u8, 4usize), (u64::MAX, 1, 1)] {
-        let mut st = State::new(5, 0, 100);
+        let mut st = State::standalone(5, 0, 100);
         for s in sigs {
-            st.actions[usize::from(s) - 1] = SigAction {
+            st.hand.actions[usize::from(s) - 1] = SigAction {
                 handler: 0x40_1000 + u64::from(s),
                 flags: SA_SIGINFO | SA_RESTORER,
                 restorer: 0x40_2000,
                 mask: SigSet(mask),
             };
-            st.blocked.add(s);
+            st.me.blocked.add(s);
         }
         for s in sigs.iter().rev() {
             send(&mut st, *s);
         }
-        st.blocked = SigSet::EMPTY;
+        st.me.blocked = SigSet::EMPTY;
         let mut space = user_space();
         let mut cpu = FakeCpu::new();
         let mut r = regs();
@@ -1156,16 +1164,16 @@ fn replay_linux_frame(frame_hex: &str, fp_hex: &str, frame_addr: u64, sig: u8, a
         )),
         orig_ax: 62, // kill(2), returned 0: no restart
     };
-    let mut st = State::new(1, 0, 15_000);
-    st.actions[usize::from(sig) - 1] = SigAction {
+    let mut st = State::standalone(1, 0, 15_000);
+    st.hand.actions[usize::from(sig) - 1] = SigAction {
         handler: 0x20_10a0,
         flags: SA_SIGINFO | SA_RESTORER | if altstack { SA_ONSTACK } else { 0 },
         restorer: q(0),
         mask: SigSet(if altstack { 0 } else { 1 << 11 }),
     };
-    st.blocked = SigSet(1); // the probe blocked SIGHUP
+    st.me.blocked = SigSet(1); // the probe blocked SIGHUP
     if altstack {
-        st.altstack = crate::signal::AltStack {
+        st.me.altstack = crate::signal::AltStack {
             sp: q(24),
             size: q(40),
             flags: 0,
@@ -1224,7 +1232,7 @@ fn replay_linux_frame(frame_hex: &str, fp_hex: &str, frame_addr: u64, sig: u8, a
             ..before
         }
     );
-    assert_eq!(st.blocked, SigSet(1));
+    assert_eq!(st.me.blocked, SigSet(1));
     assert_eq!(cpu.restored, vec![<[u8; 512]>::try_from(&fp[..]).unwrap()]);
 }
 
@@ -1271,13 +1279,13 @@ fn linux_dump_pins_the_fp_facts() {
 fn default_rt_signal_is_fatal_like_any_default_action() {
     // sig_fatal uses siginmask(), which is false for real-time signals:
     // include/linux/signal.h:451.
-    let mut st = State::new(5, 0, 100);
-    st.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
-    st.blocked.add(SIGUSR1);
+    let mut st = State::standalone(5, 0, 100);
+    st.hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+    st.me.blocked.add(SIGUSR1);
     send(&mut st, SIGUSR1);
-    st.blocked = SigSet::EMPTY;
+    st.me.blocked = SigSet::EMPTY;
     send(&mut st, 40);
-    assert_eq!(st.group_exit, Some(40));
+    assert_eq!(st.sig.group_exit, Some(40));
     // The pending handled signal never runs: the death mark comes first.
     assert_eq!(
         get_signal(&mut st),
@@ -1287,22 +1295,22 @@ fn default_rt_signal_is_fatal_like_any_default_action() {
         }
     );
     // Later signals are dropped.
-    let mut st = State::new(5, 0, 100);
+    let mut st = State::standalone(5, 0, 100);
     send(&mut st, 33);
     send(&mut st, SIGTERM);
-    assert_eq!(st.group_exit, Some(33));
+    assert_eq!(st.sig.group_exit, Some(33));
     // A caught or ignored RT signal is not fatal.
-    let mut st = State::new(5, 0, 100);
-    st.actions[39].handler = SIG_IGN;
+    let mut st = State::standalone(5, 0, 100);
+    st.hand.actions[39].handler = SIG_IGN;
     send(&mut st, 40);
-    assert_eq!((st.group_exit, st.signal_pending()), (None, false));
+    assert_eq!((st.sig.group_exit, st.signal_pending()), (None, false));
     // init ignores a default-action RT signal, unless it is blocked first.
-    let mut init = State::new_init(100);
+    let mut init = State::standalone_init(100);
     send(&mut init, 40);
     assert!(!init.signal_pending());
-    init.blocked.add(40);
+    init.me.blocked.add(40);
     send(&mut init, 40);
-    init.blocked = SigSet::EMPTY;
+    init.me.blocked = SigSet::EMPTY;
     assert_eq!(get_signal(&mut init), GetSignal::None);
 }
 
@@ -1311,7 +1319,7 @@ fn sig_fatal_by_class() {
     // default action, per kernel/signal.c masks: ignore/stop signals are not
     // fatal, everything else (incl. all real-time signals) is.
     for sig in 1..=64u8 {
-        let mut st = State::new(5, 0, 100);
+        let mut st = State::standalone(5, 0, 100);
         st.send_signal(sig, SigInfo::from_kill(sig, false, 1, 0), Target::Process)
             .unwrap();
         let ignored_or_stop = [SIGCHLD, 18, 23, 28, SIGSTOP, SIGTSTP, 21, 22].contains(&sig);
@@ -1326,7 +1334,7 @@ fn sig_fatal_by_class() {
         } else {
             want
         };
-        assert_eq!(st.group_exit, want, "signal {sig}");
+        assert_eq!(st.sig.group_exit, want, "signal {sig}");
         if want.is_none() && !ignored_or_stop {
             // coredump signals are not marked at generation, only at delivery
             assert!(st.signal_pending(), "signal {sig}");
@@ -1351,34 +1359,34 @@ fn sigset_bit_is_total() {
 fn exec_keeps_ignored_blocked_and_pending() {
     // flush_signal_handlers(me, 0) in begin_new_exec; fs/exec.c:1234,1275.
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].handler = SIG_IGN;
-    st.actions[usize::from(SIGUSR1) - 1].flags = SA_RESTART;
-    st.actions[11].handler = 0x1234;
-    st.actions[11].mask = SigSet(5);
-    st.blocked = SigSet(0b1000);
+    st.hand.actions[usize::from(SIGUSR1) - 1].handler = SIG_IGN;
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags = SA_RESTART;
+    st.hand.actions[11].handler = 0x1234;
+    st.hand.actions[11].mask = SigSet(5);
+    st.me.blocked = SigSet(0b1000);
     st.send_signal(
         SIGUSR1 + 1,
         SigInfo::from_kill(SIGUSR1 + 1, false, 1, 0),
         Target::Process,
     )
     .ok();
-    st.altstack = crate::signal::AltStack {
+    st.me.altstack = crate::signal::AltStack {
         sp: 0x1000,
         size: 0x2000,
         flags: SS_AUTODISARM,
     };
     st.flush_on_exec();
     assert_eq!(
-        st.actions[usize::from(SIGUSR1) - 1],
+        st.hand.actions[usize::from(SIGUSR1) - 1],
         SigAction {
             handler: SIG_IGN,
             ..SigAction::default()
         }
     );
-    assert_eq!(st.actions[11], SigAction::default());
-    assert_eq!(st.blocked, SigSet(0b1000));
+    assert_eq!(st.hand.actions[11], SigAction::default());
+    assert_eq!(st.me.blocked, SigSet(0b1000));
     assert_eq!(
-        st.altstack,
+        st.me.altstack,
         crate::signal::AltStack {
             sp: 0,
             size: 0,
@@ -1389,16 +1397,16 @@ fn exec_keeps_ignored_blocked_and_pending() {
 
 #[test]
 fn spurious_math_fault_updates_arch_info_without_a_signal() {
-    let mut st = State::new(5, 0, 100);
+    let mut st = State::standalone(5, 0, 100);
     let f = crate::signal::info::exception(16, 0, 0x40, 0, 0).unwrap();
     st.force_fault(&f);
-    assert_eq!((st.arch.trap_nr, st.arch.error_code), (16, 0));
+    assert_eq!((st.me.arch.trap_nr, st.me.arch.error_code), (16, 0));
     assert!(!st.signal_pending());
 }
 
-fn segv_handler_state() -> State {
-    let mut st = handler_state();
-    st.actions[usize::from(SIGSEGV) - 1] = SigAction {
+fn segv_handler_state() -> State<'static> {
+    let st = handler_state();
+    st.hand.actions[usize::from(SIGSEGV) - 1] = SigAction {
         handler: 0x40_3000,
         flags: SA_SIGINFO | SA_RESTORER,
         restorer: 0x40_2000,
@@ -1413,7 +1421,7 @@ fn a_full_rt_quota_never_loses_a_fault_siginfo() {
     // so a forced fault bypasses the RT cap like `override_rlimit` in
     // `__send_signal_locked` (kernel/signal.c:1126).
     let mut st = segv_handler_state();
-    st.blocked.add(40);
+    st.me.blocked.add(40);
     for v in 0..64 {
         let info = SigInfo::rt(40, SI_QUEUE, 1, 0, v);
         st.send_signal(40, info, Target::Thread).unwrap();
@@ -1467,8 +1475,8 @@ fn sigreturn_restores_every_general_register() {
 fn altstack_overflow(size: u64, sp: u64) {
     let base = STACK_LO + 0x4000;
     let mut st = handler_state();
-    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
-    st.altstack = crate::signal::AltStack {
+    st.hand.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
+    st.me.altstack = crate::signal::AltStack {
         sp: base,
         size,
         flags: 0,
@@ -1540,8 +1548,8 @@ fn sigreturn_with_a_non_64bit_cs_keeps_an_invalid_ss() {
 fn handle_pending_signals_loops_after_a_failed_frame() {
     // A handler without a restorer fails its frame (SIGSEGV forced); the loop
     // must continue and take the fatal SIGSEGV instead of resuming user mode.
-    let mut st = State::new_init(1000);
-    st.actions[usize::from(SIGUSR1) - 1] = SigAction {
+    let mut st = State::standalone_init(1000);
+    st.hand.actions[usize::from(SIGUSR1) - 1] = SigAction {
         handler: 0x40_1000,
         ..SigAction::default()
     };
@@ -1558,10 +1566,10 @@ fn handle_pending_signals_loops_after_a_failed_frame() {
 
 #[test]
 fn a_default_stop_signal_stops_the_task() {
-    let mut st = State::new(5, 0, 100);
-    st.blocked.add(SIGTSTP);
+    let mut st = State::standalone(5, 0, 100);
+    st.me.blocked.add(SIGTSTP);
     send(&mut st, SIGTSTP);
-    st.blocked = SigSet::EMPTY;
+    st.me.blocked = SigSet::EMPTY;
     let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
     assert_eq!(
         do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu),
@@ -1573,12 +1581,13 @@ fn a_default_stop_signal_stops_the_task() {
 fn force_fault_records_trap_error_and_keeps_cr2_for_non_page_faults() {
     // do_general_protection: trap 13, error 0x18; cr2 is not touched (Linux
     // keeps the last page-fault address in `thread.cr2`).
-    let mut st = State::new(5, 0, 100);
-    st.actions[usize::from(SIGSEGV) - 1] = segv_handler_state().actions[usize::from(SIGSEGV) - 1];
-    st.arch.cr2 = 0x1234;
+    let mut st = State::standalone(5, 0, 100);
+    st.hand.actions[usize::from(SIGSEGV) - 1] =
+        segv_handler_state().hand.actions[usize::from(SIGSEGV) - 1];
+    st.me.arch.cr2 = 0x1234;
     st.force_fault(&crate::signal::info::exception(13, 0x18, 5, 0, 0).unwrap());
     assert_eq!(
-        (st.arch.trap_nr, st.arch.error_code, st.arch.cr2),
+        (st.me.arch.trap_nr, st.me.arch.error_code, st.me.arch.cr2),
         (13, 0x18, 0x1234)
     );
     let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
