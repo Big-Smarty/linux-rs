@@ -159,7 +159,8 @@ pub struct Loaded {
     /// The unpacked rootfs; moves into [`Process`] when init starts.
     pub vfs: Vfs,
     /// The open file `/init` was read from (`bprm->file`); the VMAs of its
-    /// segments pin it when init starts, then this reference is dropped.
+    /// segments pin it when init starts; the reference itself then stays as
+    /// the process's `mm->exe_file` ([`Process::exec`]).
     pub exec: FileId,
     pub entry: u64,
     pub sp: u64,
@@ -796,11 +797,29 @@ pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) {
 
 /// `print_vma_addr`'s file part for `ip`: Linux prints the basename of the
 /// VMA's file, and [`FileRegion`] knows only `init`. A fault in a VMA of any
-/// other file would print a wrong name, so it stops loudly instead.
+/// other file would print a wrong name, so it stops loudly instead (also for a
+/// possible `/dev/zero` mapping, see below).
 /// shortcut: resolve the name from the description's dentry when a program
 /// other than `/init` can run.
 fn region_of(process: &Process, ip: u64) -> Option<FileRegion> {
-    let region = FileRegion::of(&process.space, ip)?;
+    let Some(region) = FileRegion::of(&process.space, ip) else {
+        // A private /dev/zero VMA keeps no `vm_file` here but Linux prints
+        // ` in zero[...]` for it: once one was made, an anonymous `ip` cannot
+        // be told from it.
+        if process.vfs.zero_mapped()
+            && process
+                .space
+                .find_vma(ip)
+                .is_some_and(|vma| vma.start <= ip)
+        {
+            crate::log!(
+                "FAIL mm user fault in an anonymous mapping after a /dev/zero mapping ip={:#x} (vm_file of mmap_zero not kept)\n",
+                ip
+            );
+            crate::fail();
+        }
+        return None;
+    };
     if process.space.find_vma(ip).and_then(|vma| vma.file) != Some(process.exec) {
         crate::log!(
             "FAIL mm user fault in a mapped file other than /init ip={:#x} (file name resolution not ported)\n",

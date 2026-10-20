@@ -530,7 +530,12 @@ impl Vfs {
     /// size and both times.
     pub fn do_truncate(&mut self, cred: &Cred, inode: InodeId, length: u64) {
         self.remove_privs(cred, inode);
-        self.note_modified(inode);
+        // shmem_setattr unmaps the mappings (private copies included) only
+        // when the size shrinks (`newsize <= oldsize`); growing changes no page
+        // a mapping can hold.
+        if length < self.fs.inode(inode).size {
+            self.note_modified(inode);
+        }
         self.fs.set_size(inode, length);
     }
 

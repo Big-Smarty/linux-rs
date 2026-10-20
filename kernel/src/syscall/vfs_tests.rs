@@ -1256,3 +1256,187 @@ fn truncating_a_file_with_a_touched_mapping_stops_loudly() {
         Outcome::Unimplemented(Sysno::ftruncate as u32)
     );
 }
+
+const MAP_FIXED: u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_LOCKED: u64 = 0x2000;
+const MAP_POPULATE: u64 = 0x8000;
+
+/// A file of `pages` pages of 0x11, 0x22, ... mapped privately read-write.
+fn mapped_file(t: &mut Task, pages: u64) -> (u64, u64) {
+    let f = fd(open(t, "/f", O_CREAT | O_RDWR, 0o644));
+    for page in 0..pages {
+        put(t, BUF, &[0x11 * (page as u8 + 1); 64]);
+        assert_eq!(call(t, Sysno::pwrite64, &[f, BUF, 64, page * 4096]), ok(64));
+    }
+    assert_eq!(call(t, Sysno::ftruncate, &[f, pages * 4096]), ok(0));
+    let Outcome::Return(addr) = call(
+        t,
+        Sysno::mmap,
+        &[0, pages * 4096, PROT_RW, MAP_PRIVATE, f, 0],
+    ) else {
+        panic!()
+    };
+    (f, addr as u64)
+}
+
+/// The copy of a mapped file page is taken while the write's own source buffer
+/// is read: only a check after the copy sees it (`fd.rs` `write_regular`).
+#[test]
+fn a_write_sourced_from_the_files_own_mapping_stops_loudly() {
+    let mut t = t();
+    let (f, addr) = mapped_file(&mut t, 2);
+    assert_eq!(t.vfs.pin_count(), 1);
+    // Page 1 of the mapping is untouched, so no copy exists yet.
+    assert_eq!(
+        call(&mut t, Sysno::pwrite64, &[f, addr + 4096, 32, 0]),
+        Outcome::Unimplemented(Sysno::pwrite64 as u32)
+    );
+    assert!(t.file_pages.contains_key(&(addr + 4096)));
+}
+
+/// `write(2)` that copies nothing changes nothing, so it cannot diverge: it is
+/// `-EFAULT` even with a copied page (`generic_perform_write` faults first).
+#[test]
+fn a_write_that_faults_is_not_a_coherence_stop() {
+    let mut t = t();
+    let (f, addr) = mapped_file(&mut t, 1);
+    let mut page = [0u8; 4096];
+    let id = t.mm.find_vma(addr).unwrap().file.unwrap();
+    t.vfs.fault_page(id, 0, &mut page).unwrap();
+    assert_eq!(call(&mut t, Sysno::write, &[f, BAD, 8]), err(Errno::EFAULT));
+    assert!(!t.vfs.take_coherence_loss());
+}
+
+/// A growing `ftruncate` unmaps nothing in `shmem_setattr`.
+#[test]
+fn growing_a_file_with_a_copied_page_is_ordinary() {
+    let mut t = t();
+    let (f, addr) = mapped_file(&mut t, 1);
+    let id = t.mm.find_vma(addr).unwrap().file.unwrap();
+    t.vfs.fault_page(id, 0, &mut [0; 4096]).unwrap();
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 8192]), ok(0));
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 8192]), ok(0));
+    assert_eq!(
+        call(&mut t, Sysno::ftruncate, &[f, 100]),
+        Outcome::Unimplemented(Sysno::ftruncate as u32)
+    );
+}
+
+/// `shmem_mmap` ends in `file_accessed` (unless `O_NOATIME`).
+#[test]
+fn mmap_of_a_file_updates_atime_unless_o_noatime() {
+    let mut t = t();
+    t.vfs
+        .start_timekeeping(ticking_clock, crate::vfs::Timespec { sec: 7, nsec: 0 });
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    let atime = |t: &mut Task| {
+        assert_eq!(call(t, Sysno::fstat, &[f, OUT]), ok(0));
+        u64_at(t, OUT + 80)
+    };
+    let before = atime(&mut t);
+    let args = |fd| [0, 4096, PROT_READ, MAP_PRIVATE, fd, 0];
+    assert!(matches!(call(&mut t, Sysno::mmap, &args(f)), Outcome::Return(a) if a > 0));
+    let after = atime(&mut t);
+    assert!(after > before, "{before} {after}");
+    let quiet = fd(open(&mut t, "/f", O_RDONLY | 0o1_000_000, 0));
+    assert!(matches!(call(&mut t, Sysno::mmap, &args(quiet)), Outcome::Return(a) if a > 0));
+    assert_eq!(atime(&mut t), after);
+}
+
+/// `mm_populate` of a file mapping would copy the pages at `mmap` time.
+#[test]
+fn populating_a_file_mapping_stops_loudly_and_maps_nothing() {
+    let mut t = t();
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 4096]), ok(0));
+    let vmas = t.mm.vmas().len();
+    for flag in [MAP_POPULATE, MAP_LOCKED] {
+        assert_eq!(
+            call(
+                &mut t,
+                Sysno::mmap,
+                &[0, 4096, PROT_RW, MAP_PRIVATE | flag, f, 0]
+            ),
+            Outcome::Unimplemented(Sysno::mmap as u32)
+        );
+    }
+    assert_eq!((t.mm.vmas().len(), t.vfs.pin_count()), (vmas, 0));
+}
+
+/// Read-only `MAP_SHARED` of a file is served as a private mapping
+/// (`VM_SHARED` and `VM_MAYWRITE` are cleared by `do_mmap`).
+#[test]
+fn a_read_only_shared_mapping_of_a_file_is_served() {
+    let mut t = t();
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    put(&mut t, BUF, b"hello");
+    assert_eq!(call(&mut t, Sysno::write, &[f, BUF, 5]), ok(5));
+    let ro = fd(open(&mut t, "/f", O_RDONLY, 0));
+    let Outcome::Return(addr) = call(
+        &mut t,
+        Sysno::mmap,
+        &[0, 4096, PROT_READ, MAP_SHARED, ro, 0],
+    ) else {
+        panic!()
+    };
+    assert_eq!(t.vfs.pin_count(), 1);
+    let mut head = [0u8; 5];
+    assert_eq!(
+        crate::usercopy::copy_from_user(&mut t, &mut head, addr as u64),
+        0
+    );
+    assert_eq!(&head, b"hello");
+}
+
+/// Every VMA removal drops the pin, not only `munmap` and file `mmap`.
+#[test]
+fn replacing_a_file_vma_by_map_fixed_releases_the_description() {
+    for zero in [false, true] {
+        let mut t = t();
+        mknod_char(&mut t, "/zero", 1, 5);
+        let (f, addr) = mapped_file(&mut t, 1);
+        assert_eq!(t.vfs.pin_count(), 1);
+        assert_eq!(call(&mut t, Sysno::close, &[f]), ok(0));
+        let replaced = if zero {
+            let z = fd(open(&mut t, "/zero", O_RDWR, 0));
+            call(
+                &mut t,
+                Sysno::mmap,
+                &[addr, 4096, PROT_RW, MAP_PRIVATE | MAP_FIXED, z, 0],
+            )
+        } else {
+            call(
+                &mut t,
+                Sysno::mmap,
+                &[
+                    addr,
+                    4096,
+                    PROT_RW,
+                    MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ],
+            )
+        };
+        assert_eq!(replaced, ok(addr as i64), "zero={zero}");
+        assert_eq!(t.vfs.pin_count(), 0, "zero={zero}");
+        assert!(t.vfs.zero_mapped() == zero);
+    }
+}
+
+/// A partial `munmap` and a second `mmap` of the same description.
+#[test]
+fn partial_unmap_keeps_the_pin_and_a_second_mmap_shares_it() {
+    let mut t = t();
+    let (f, addr) = mapped_file(&mut t, 2);
+    // Mapping the same description again adds no pin.
+    assert!(matches!(
+        call(&mut t, Sysno::mmap, &[0, 4096, PROT_READ, MAP_PRIVATE, f, 0]),
+        Outcome::Return(a) if a > 0
+    ));
+    assert_eq!(t.vfs.pin_count(), 1);
+    // The first page of the first mapping goes; the rest of it keeps the file.
+    assert_eq!(call(&mut t, Sysno::munmap, &[addr, 4096]), ok(0));
+    assert_eq!(t.vfs.pin_count(), 1);
+}

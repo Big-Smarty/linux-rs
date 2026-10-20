@@ -26,8 +26,12 @@
 //!   and a later write to the file shows through until the first private
 //!   write). A write or truncate of a file with a touched mapping therefore
 //!   sets [`Vfs::take_coherence_loss`], which the dispatcher turns into a loud
-//!   stop instead of letting the two diverge silently. `MAP_SHARED` mappings
-//!   of a file are not created at all (the syscall layer stops loudly).
+//!   stop instead of letting the two diverge silently. A `MAP_SHARED` mapping
+//!   is created only through a description that cannot write (`VM_SHARED` is
+//!   then cleared, `VM_MAYWRITE` too, so it behaves as a private one); a
+//!   writable one is not created (the syscall layer stops loudly), nor is any
+//!   file mapping with `MAP_POPULATE`/`MAP_LOCKED` (`mm_populate` would take
+//!   the copies at `mmap` time).
 //!   Upgrade with the page cache (tmpfs pages as frames shared with the page
 //!   tables).
 //! * shortcut: a read fault on a hole or past nothing allocates no tmpfs page
@@ -196,6 +200,31 @@ impl Vfs {
         bytes[produced..].fill(0);
         self.pins[slot].snapshot = true;
         Ok(())
+    }
+
+    /// `file_accessed(file)` of `shmem_mmap`: `touch_atime` unless the
+    /// description was opened `O_NOATIME`.
+    ///
+    /// # Panics
+    /// If `id` is not an open description with an inode (a kernel bug).
+    pub fn file_accessed(&mut self, id: u64) {
+        let file = self.files.get(file_of(id));
+        if file.flags & super::O_NOATIME == 0 {
+            let inode = file.inode.expect("mapped file has an inode");
+            self.fs.touch_atime(inode);
+        }
+    }
+
+    /// A private `/dev/zero` mapping now exists (`mmap_zero`).
+    pub fn note_zero_mapping(&mut self) {
+        self.zero_mapped = true;
+    }
+
+    /// Whether a VMA without a file may be a `/dev/zero` mapping, which Linux
+    /// still attributes to `vm_file` (`print_vma_addr`).
+    #[must_use]
+    pub fn zero_mapped(&self) -> bool {
+        self.zero_mapped
     }
 
     /// A write or truncate is about to change (or has changed) the contents of

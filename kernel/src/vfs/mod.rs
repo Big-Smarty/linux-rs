@@ -365,6 +365,8 @@ pub struct Vfs {
     pins: Vec<mapping::Pin>,
     /// A write or truncate hit a file whose mapped pages are private copies.
     coherence_lost: bool,
+    /// A private `/dev/zero` mapping was made (its VMA keeps no `vm_file`).
+    zero_mapped: bool,
 }
 
 impl Vfs {
@@ -382,6 +384,7 @@ impl Vfs {
             next_pipe_ino: 1,
             pins: Vec::new(),
             coherence_lost: false,
+            zero_mapped: false,
         })
     }
 }

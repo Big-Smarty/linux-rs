@@ -10,13 +10,13 @@ use super::{
 };
 use crate::{
     cputime::CpuSample,
-    mm::{Env, Mm, tests::Fake},
+    mm::{Env, Mm, VmFlags, tests::Fake},
     task::Attributes,
     usercopy::{UserPages, fake::Space},
     vfs::{FdTable, Timespec, Vfs},
 };
 extern crate std;
-use std::vec::Vec;
+use std::{boxed::Box, collections::BTreeMap, vec::Vec};
 
 #[derive(Default)]
 pub struct Sink(pub Vec<u8>);
@@ -84,6 +84,9 @@ pub struct Task<P = Space, C = Sink> {
     pub tables: Fake,
     pub vfs: Vfs,
     pub fdt: FdTable,
+    /// Private copies of file pages a kernel access faulted in (the binary's
+    /// `user_fault` for `NeedsFile`: `Vfs::fault_page`, then a private frame).
+    pub file_pages: BTreeMap<u64, Box<[u8; 4096]>>,
 }
 
 fn clock() -> Timespec {
@@ -119,6 +122,7 @@ impl<P, C> Task<P, C> {
             tables: Fake::default(),
             vfs,
             fdt,
+            file_pages: BTreeMap::new(),
         }
     }
 }
@@ -129,7 +133,25 @@ pub fn task() -> Task {
 
 impl<P: UserPages, C> UserPages for Task<P, C> {
     fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; 4096]> {
-        self.pages.page(page, write)
+        if self.pages.page(page, write).is_some() {
+            return self.pages.page(page, write);
+        }
+        // A page of a private file mapping is supplied on first access.
+        let vma = *self.mm.find_vma_intersection(page, page + 4096)?;
+        let file = vma.file?;
+        if !vma
+            .flags
+            .contains(if write { VmFlags::WRITE } else { VmFlags::READ })
+        {
+            return None;
+        }
+        if !self.file_pages.contains_key(&page) {
+            let mut bytes = Box::new([0u8; 4096]);
+            let pgoff = vma.pgoff + ((page - vma.start) >> 12);
+            self.vfs.fault_page(file, pgoff, &mut bytes).ok()?;
+            self.file_pages.insert(page, bytes);
+        }
+        self.file_pages.get_mut(&page).map(|bytes| &mut **bytes)
     }
 }
 
