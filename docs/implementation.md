@@ -392,7 +392,7 @@ Held on both accelerators: everything above. Handled rather than removed: `uc_fl
 
 ### Evidence and commands
 
-`target/linux-reference/init-reference-005/` (local evidence, not committed): `init`/`initramfs.cpio` = the `oracle-002` `kernel-test` artifacts (`init-build/init.elf` `bdda8e80...`, built from the branch's second commit), `oracle-<mode>-{tcg,tcg-repeat,kvm}.{cmd,log}` per group, `oracle-{base,fault,sse}-tcg.*` showing the existing modes unchanged, `SHA256SUMS`, `README.md`. Command (TCG; the KVM runs use `-accel kvm -cpu host`):
+`target/linux-reference/init-reference-005/` (local evidence, not committed): `init`/`initramfs.cpio` = the `oracle-gate` `kernel-test` artifacts (`init-build/init.elf` `f35bd85c...`, built from the final source of the branch), `oracle-<mode>-{tcg,tcg-repeat,kvm}.{cmd,log}` per group, `oracle-{base,fault,sse}-tcg.*` showing the existing modes unchanged, `SHA256SUMS`, `README.md`. Command (TCG; the KVM runs use `-accel kvm -cpu host`):
 
 ```
 timeout 90 qemu-system-x86_64 -machine q35 -accel tcg -cpu qemu64 -m 512M -smp 1 -kernel target/linux-reference/artifacts/bzImage -initrd initramfs.cpio -append 'console=ttyS0 panic=-1 vdso=0 norandmaps -- mm' -nographic -no-reboot
