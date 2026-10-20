@@ -45,6 +45,25 @@ fn synced<T: Task>(task: &mut T) -> &mut State {
     state
 }
 
+/// `do_nanosleep`'s wait: sleep until `CLOCK_MONOTONIC` reaches `deadline_ns`
+/// or a signal is pending. `None` when the deadline was reached, `Some(left)`
+/// with the nanoseconds remaining when a signal interrupted it (the caller then
+/// reports the remainder and returns `-ERESTART_RESTARTBLOCK`). This is the body
+/// of the binary's `Clocks::sleep_until`.
+pub fn sleep_until<T: Task>(task: &mut T, deadline_ns: u64) -> Option<u64> {
+    loop {
+        let signalled = synced(task).signal_pending();
+        let now = task.now_ns();
+        if now >= deadline_ns {
+            return None;
+        }
+        if signalled {
+            return Some(deadline_ns - now);
+        }
+        task.wait(Some(deadline_ns));
+    }
+}
+
 /// `restart_syscall`: runs the stored continuation; none exists, so
 /// `do_no_restart_syscall`'s `-EINTR`.
 #[must_use]

@@ -235,6 +235,28 @@ mod tests {
     }
 
     #[test]
+    fn sleep_until_reports_the_time_left_when_a_signal_interrupts() {
+        use crate::signal::wait::sleep_until;
+        let mut t = mapped();
+        // Deadline reached: None, even when a signal is pending as well.
+        assert_eq!(sleep_until(&mut t, 5_000), None);
+        assert_eq!(t.now, 5_000);
+        // A signal at 8 us of a 20 us sleep: 12 us left.
+        t.script_signal(8_000, SIGUSR1);
+        assert_eq!(sleep_until(&mut t, 20_000), Some(12_000));
+        assert_eq!(t.now, 8_000);
+        // Still pending: returns at once with what is left.
+        let waits = t.waits;
+        assert_eq!(sleep_until(&mut t, 9_000), Some(1_000));
+        assert_eq!(t.waits, waits);
+        // The interval timer interrupts a sleep too.
+        let mut t = mapped();
+        put(&mut t, PAGE, &itimerval((0, 0), (0, 3)));
+        assert_eq!(call(&mut t, Sysno::setitimer, &[0, PAGE, 0]), Outcome::Return(0));
+        assert_eq!(sleep_until(&mut t, 1_000_000), Some(1_000_000 - 3_000));
+    }
+
+    #[test]
     fn sigtimedwait_poll_timeout_and_wakeup() {
         let mut t = mapped();
         let set = SigSet(SigSet::bit(SIGUSR1));
