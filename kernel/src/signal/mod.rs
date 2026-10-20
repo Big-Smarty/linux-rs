@@ -346,10 +346,17 @@ pub use state::{RestartBlock, State};
 /// process (and the host tests' fake). `parts` hands out the two disjoint
 /// borrows the pure functions need.
 pub trait Task {
-    /// The user-memory view (`crate::usercopy`).
-    type Pages: crate::usercopy::UserPages;
+    /// The user-memory view (`crate::usercopy`) the signal code writes frames
+    /// and results through: for a task whose address space can fault pages in,
+    /// the view that does (a kernel access to a non-resident page takes the
+    /// fault Linux would).
+    type Pages<'a>: crate::usercopy::UserPages
+    where
+        Self: 'a;
+    /// The signal state alone.
+    fn state(&mut self) -> &mut State;
     /// The signal state and user memory, borrowed together.
-    fn parts(&mut self) -> (&mut State, &mut Self::Pages);
+    fn parts(&mut self) -> (&mut State, Self::Pages<'_>);
     /// `CLOCK_MONOTONIC` in nanoseconds (`ktime_get`).
     fn now_ns(&self) -> u64;
     /// `schedule()` for one wake-up: halt until an interrupt arrives or the

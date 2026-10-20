@@ -69,6 +69,12 @@ pub trait UserPages {
     fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]>;
 }
 
+impl<T: UserPages + ?Sized> UserPages for &mut T {
+    fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+        (**self).page(page, write)
+    }
+}
+
 /// Visit the pages of `[address, address + length)` in order. Returns the
 /// number of bytes not visited.
 fn walk<P: UserPages>(

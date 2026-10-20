@@ -33,32 +33,32 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         |value: Option<i64>| Some(value.map_or(Outcome::Unimplemented(number), Outcome::Return));
     let value = match sysno {
         Sysno::rt_sigaction => {
-            let (state, pages) = ctx.parts();
-            sys_rt_sigaction(state, pages, a[0], a[1], a[2], a[3])
+            let (state, mut pages) = ctx.parts();
+            sys_rt_sigaction(state, &mut pages, a[0], a[1], a[2], a[3])
         }
         Sysno::rt_sigprocmask => {
-            let (state, pages) = ctx.parts();
-            sys_rt_sigprocmask(state, pages, a[0], a[1], a[2], a[3])
+            let (state, mut pages) = ctx.parts();
+            sys_rt_sigprocmask(state, &mut pages, a[0], a[1], a[2], a[3])
         }
         Sysno::rt_sigpending => {
-            let (state, pages) = ctx.parts();
-            sys_rt_sigpending(state, pages, a[0], a[1])
+            let (state, mut pages) = ctx.parts();
+            sys_rt_sigpending(state, &mut pages, a[0], a[1])
         }
         Sysno::sigaltstack => {
             let sp = ctx.user_sp();
-            let (state, pages) = ctx.parts();
-            sys_sigaltstack(state, pages, a[0], a[1], sp)
+            let (state, mut pages) = ctx.parts();
+            sys_sigaltstack(state, &mut pages, a[0], a[1], sp)
         }
-        Sysno::kill => return unimplemented(sys_kill(ctx.parts().0, a[0], a[1])),
-        Sysno::tkill => sys_tkill(ctx.parts().0, a[0], a[1]),
-        Sysno::tgkill => sys_tgkill(ctx.parts().0, a[0], a[1], a[2]),
+        Sysno::kill => return unimplemented(sys_kill(ctx.state(), a[0], a[1])),
+        Sysno::tkill => sys_tkill(ctx.state(), a[0], a[1]),
+        Sysno::tgkill => sys_tgkill(ctx.state(), a[0], a[1], a[2]),
         Sysno::rt_sigqueueinfo => {
-            let (state, pages) = ctx.parts();
-            sys_rt_sigqueueinfo(state, pages, a[0], a[1], a[2])
+            let (state, mut pages) = ctx.parts();
+            sys_rt_sigqueueinfo(state, &mut pages, a[0], a[1], a[2])
         }
         Sysno::rt_tgsigqueueinfo => {
-            let (state, pages) = ctx.parts();
-            sys_rt_tgsigqueueinfo(state, pages, a[0], a[1], a[2], a[3])
+            let (state, mut pages) = ctx.parts();
+            sys_rt_tgsigqueueinfo(state, &mut pages, a[0], a[1], a[2], a[3])
         }
         // The syscall's value is the restored `rax` (0 after a bad frame).
         #[allow(clippy::cast_possible_wrap)]
@@ -66,7 +66,7 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         Sysno::rt_sigsuspend => sys_rt_sigsuspend(ctx, a[0], a[1]),
         Sysno::rt_sigtimedwait => sys_rt_sigtimedwait(ctx, a[0], a[1], a[2], a[3]),
         Sysno::pause => sys_pause(ctx),
-        Sysno::restart_syscall => sys_restart_syscall(ctx.parts().0),
+        Sysno::restart_syscall => sys_restart_syscall(ctx.state()),
         Sysno::setitimer => return unimplemented(sys_setitimer(ctx, a[0], a[1], a[2])),
         Sysno::getitimer => return unimplemented(sys_getitimer(ctx, a[0], a[1])),
         Sysno::alarm => sys_alarm(ctx, a[0]),

@@ -726,7 +726,13 @@ impl Clocks for Syscall<'_> {
 }
 
 impl<'a> signal::Task for Syscall<'a> {
-    type Pages = UserSpace<'a>;
+    type Pages<'b>
+        = &'b mut UserSpace<'a>
+    where
+        Self: 'b;
+    fn state(&mut self) -> &mut State {
+        &mut self.process.signal
+    }
     fn parts(&mut self) -> (&mut State, &mut UserSpace<'a>) {
         (&mut self.process.signal, &mut self.space)
     }

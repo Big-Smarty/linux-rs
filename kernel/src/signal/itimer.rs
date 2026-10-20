@@ -187,15 +187,15 @@ const fn int(register: u64) -> i32 {
 /// timers) are not built yet; the caller reports an unimplemented syscall.
 pub fn sys_getitimer<T: Task>(task: &mut T, which: u64, value: u64) -> Option<i64> {
     let now = task.now_ns();
-    let (state, pages) = task.parts();
     match int(which) {
         ITIMER_REAL => {}
         ITIMER_VIRTUAL | ITIMER_PROF => return None,
         _ => return Some(err(Errno::EINVAL)),
     }
+    let (state, mut pages) = task.parts();
     let timer = state.itimer;
     Some(
-        if put_itimerval(pages, value, timer.interval(), timer.remaining(now)) {
+        if put_itimerval(&mut pages, value, timer.interval(), timer.remaining(now)) {
             0
         } else {
             err(Errno::EFAULT)
@@ -209,11 +209,11 @@ pub fn sys_getitimer<T: Task>(task: &mut T, which: u64, value: u64) -> Option<i6
 /// already set). `None` as for [`sys_getitimer`].
 pub fn sys_setitimer<T: Task>(task: &mut T, which: u64, value: u64, ovalue: u64) -> Option<i64> {
     let now = task.now_ns();
-    let (state, pages) = task.parts();
+    let (state, mut pages) = task.parts();
     let (interval, value_ns) = if value == 0 {
         (0, 0)
     } else {
-        match get_itimerval(pages, value) {
+        match get_itimerval(&mut pages, value) {
             Ok(pair) => pair,
             Err(errno) => return Some(err(errno)),
         }
@@ -225,7 +225,7 @@ pub fn sys_setitimer<T: Task>(task: &mut T, which: u64, value: u64, ovalue: u64)
     }
     let (old_value, old_interval) = state.itimer.start(now, value_ns, interval);
     Some(
-        if ovalue != 0 && !put_itimerval(pages, ovalue, old_interval, old_value) {
+        if ovalue != 0 && !put_itimerval(&mut pages, ovalue, old_interval, old_value) {
             err(Errno::EFAULT)
         } else {
             0
@@ -239,7 +239,7 @@ pub fn sys_setitimer<T: Task>(task: &mut T, which: u64, value: u64, ovalue: u64)
 /// more).
 pub fn sys_alarm<T: Task>(task: &mut T, seconds: u64) -> i64 {
     let now = task.now_ns();
-    let (state, _) = task.parts();
+    let state = task.state();
     #[allow(clippy::cast_possible_truncation)]
     let seconds = u64::from(seconds as u32);
     let (old, _) = state.itimer.start(now, seconds * NSEC_PER_SEC, 0);

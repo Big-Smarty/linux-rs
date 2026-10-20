@@ -40,7 +40,7 @@ fn err(errno: Errno) -> i64 {
 /// Bring the timers up to date and borrow the state.
 fn synced<T: Task>(task: &mut T) -> &mut State {
     let now = task.now_ns();
-    let (state, _) = task.parts();
+    let state = task.state();
     state.sync_timers(now);
     state
 }
@@ -88,10 +88,14 @@ pub fn sys_rt_sigsuspend<T: Task>(task: &mut T, unewset: u64, sigsetsize: u64) -
     if sigsetsize != 8 {
         return err(Errno::EINVAL);
     }
-    let (state, pages) = task.parts();
-    let Some(bytes) = get_user::<_, 8>(pages, unewset) else {
-        return err(Errno::EFAULT);
+    let bytes = {
+        let (_, mut pages) = task.parts();
+        let Some(bytes) = get_user::<_, 8>(&mut pages, unewset) else {
+            return err(Errno::EFAULT);
+        };
+        bytes
     };
+    let state = task.state();
     state.saved_sigmask = Some(state.blocked);
     state.set_blocked(SigSet(u64::from_le_bytes(bytes)));
     while !synced(task).signal_pending() {
@@ -136,23 +140,27 @@ pub fn sys_rt_sigtimedwait<T: Task>(
         return err(Errno::EINVAL);
     }
     let now = task.now_ns();
-    let (state, pages) = task.parts();
-    let Some(these) = get_user::<_, 8>(pages, uthese) else {
-        return err(Errno::EFAULT);
-    };
-    let timeout = if uts == 0 {
-        None
-    } else {
-        let Some(raw) = get_user::<_, 16>(pages, uts) else {
+    let (these, timeout) = {
+        let (_, mut pages) = task.parts();
+        let Some(these) = get_user::<_, 8>(&mut pages, uthese) else {
             return err(Errno::EFAULT);
         };
-        let sec = i64::from_le_bytes(super::le(&raw, 0));
-        let nsec = i64::from_le_bytes(super::le(&raw, 8));
-        if !timespec_valid(sec, nsec) {
-            return err(Errno::EINVAL);
-        }
-        Some(ktime(sec, nsec))
+        let timeout = if uts == 0 {
+            None
+        } else {
+            let Some(raw) = get_user::<_, 16>(&mut pages, uts) else {
+                return err(Errno::EFAULT);
+            };
+            let sec = i64::from_le_bytes(super::le(&raw, 0));
+            let nsec = i64::from_le_bytes(super::le(&raw, 8));
+            if !timespec_valid(sec, nsec) {
+                return err(Errno::EINVAL);
+            }
+            Some(ktime(sec, nsec))
+        };
+        (these, timeout)
     };
+    let state = task.state();
     // `mask` is the set to skip: everything not awaited, plus KILL and STOP.
     let awaited =
         SigSet(u64::from_le_bytes(these) & !(SigSet::bit(SIGKILL) | SigSet::bit(SIGSTOP)));
@@ -178,18 +186,18 @@ pub fn sys_rt_sigtimedwait<T: Task>(
             }
             task.wait(deadline);
         }
-        let (state, _) = task.parts();
+        let state = task.state();
         // __set_task_blocked(real_blocked), then collect.
         state.blocked = real_blocked;
         state.real_blocked = SigSet::EMPTY;
         found = state.dequeue_signal_masked(mask);
     }
-    let (_, pages) = task.parts();
     match found {
         None if interrupted => err(Errno::EINTR),
         None => err(Errno::EAGAIN),
         Some((sig, info)) => {
-            if uinfo != 0 && !put_user(pages, uinfo, &SigInfo::to_bytes(&info)) {
+            let (_, mut pages) = task.parts();
+            if uinfo != 0 && !put_user(&mut pages, uinfo, &SigInfo::to_bytes(&info)) {
                 return err(Errno::EFAULT);
             }
             i64::from(sig)

@@ -263,7 +263,13 @@ impl<P, C> Clocks for Task<P, C> {
 }
 
 impl<P: UserPages, C> signal::Task for Task<P, C> {
-    type Pages = P;
+    type Pages<'a>
+        = &'a mut P
+    where
+        Self: 'a;
+    fn state(&mut self) -> &mut State {
+        &mut self.state
+    }
     fn parts(&mut self) -> (&mut State, &mut P) {
         (&mut self.state, &mut self.pages)
     }
