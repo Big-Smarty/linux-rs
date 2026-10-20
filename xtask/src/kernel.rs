@@ -189,6 +189,14 @@ enum User {
     /// Runs one oracle syscall-test group (`-- <group>`, `user/init/src/tests`) to `init: ok`;
     /// every `init: test|tests|info` line equals the pinned Linux's ([`validate_oracle`]).
     Oracle(&'static str),
+    /// An oracle group whose later checks need a syscall that is not wired yet: the run must print
+    /// the group's expected lines up to (not including) the first check whose line contains
+    /// `until`, and then stop loudly on the `mmap` stop (`FAIL syscall unimplemented nr=9`).
+    /// Replace by [`User::Oracle`] when the missing syscall lands.
+    OracleUntil {
+        group: &'static str,
+        until: &'static str,
+    },
     /// No `/init` in any archive: Linux's `prepare_namespace` failure text.
     NoRoot,
 }
@@ -701,6 +709,23 @@ const DEBUG_CASES: &[DebugCase] = &[
     },
     oracle_case!(ids),
     oracle_case!(time),
+    // The fs group runs through everything the VFS lane wires and stops at its first `mmap`
+    // check (the memory-mapping lane); replace by `oracle_case!(fs)` when `mmap` lands.
+    DebugCase {
+        name: "oracle-fs-until-mmap",
+        cmdline: Some("-- fs"),
+        cpu: "qemu64",
+        expected_exit: 35,
+        required: &["FAIL syscall unimplemented nr=9"],
+        forbid_success: true,
+        modules: ARCHIVE_ONLY,
+        user: User::OracleUntil {
+            group: "fs",
+            until: "fs.mmap-",
+        },
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
 ];
 
 /// Expected stdout lines of the oracle syscall suite (`user/init` modes `mm ids time signal fs
@@ -4098,7 +4123,9 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
             exact_summary,
             protection,
         } => (argc, mode_line, exact_summary, protection),
-        User::Segfault | User::Unimplemented | User::Oracle(_) => (2, None, true, (false, false)),
+        User::Segfault | User::Unimplemented | User::Oracle(_) | User::OracleUntil { .. } => {
+            (2, None, true, (false, false))
+        }
     };
     let audit = find.at(
         &|line| line.starts_with("CHECK userspace-audit ok user_pages="),
@@ -4139,8 +4166,13 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     if let Some(mode_line) = mode_line {
         positions.push(find.exact(mode_line, "init mode line")?);
     }
-    if let User::Oracle(group) = user {
-        let (first, last) = validate_oracle(lines, group)?;
+    let oracle = match user {
+        User::Oracle(group) => Some((group, None)),
+        User::OracleUntil { group, until } => Some((group, Some(until))),
+        _ => None,
+    };
+    if let Some((group, until)) = oracle {
+        let (first, last) = validate_oracle(lines, group, until)?;
         positions.push(first);
         // A one-line group has first == last; strict ordering must not reject it.
         if last != first {
@@ -4194,8 +4226,22 @@ fn oracle_key(line: &str) -> Vec<&str> {
 /// recorded observation, so only its `init: info <group>.<name>` key must match. Returns the
 /// serial indices of the first and last such line, so the caller can order them between init's
 /// summary line and `init: ok`.
-fn validate_oracle(lines: &[&str], group: &str) -> Result<(usize, usize), String> {
-    let expected = oracle_rows(group).collect::<Vec<_>>();
+///
+/// With `until`, only the rows before the first check whose line contains it are expected (and
+/// the group's summary row is not): the group runs as far as the syscalls that exist.
+fn validate_oracle(
+    lines: &[&str],
+    group: &str,
+    until: Option<&str>,
+) -> Result<(usize, usize), String> {
+    let mut expected = oracle_rows(group).collect::<Vec<_>>();
+    if let Some(marker) = until {
+        let cut = expected
+            .iter()
+            .position(|(_, line)| line.contains(marker))
+            .ok_or_else(|| format!("oracle {group} has no check containing {marker:?}"))?;
+        expected.truncate(cut);
+    }
     if expected.is_empty() {
         return Err(format!("no expected oracle lines for group {group}"));
     }
@@ -4304,6 +4350,10 @@ fn user_tail(
             find.exact(&format!("{DEATH}0x0000000b"), "init death panic")?,
             find.exact("FAIL init exitcode=0x0000000b", "failure marker")?,
         ],
+        User::OracleUntil { .. } => vec![find.exact(
+            "FAIL syscall unimplemented nr=9",
+            "unimplemented-syscall stop",
+        )?],
         User::Unimplemented => vec![
             find.exact(
                 "init: calling io_uring_setup",
@@ -7207,6 +7257,44 @@ mod tests {
     }
 
     #[test]
+    fn partial_oracle_case_runs_to_the_first_unwired_check_and_stops_loudly() {
+        let process = ProcessResult {
+            exit_code: Some(35),
+            timed_out: false,
+        };
+        let case = case("oracle-fs-until-mmap");
+        assert_eq!(case.cmdline, Some("-- fs"));
+        let all = oracle_lines("fs");
+        let cut = all
+            .iter()
+            .position(|line| line.contains("fs.mmap-"))
+            .unwrap();
+        assert_eq!(cut, 245, "245 lines precede the first mapping check");
+        let serial = |lines: &[String]| {
+            oracle_serial(lines)
+                .replace("\ninit: ok\n", "\n")
+                .split("\nRESULT success")
+                .next()
+                .unwrap()
+                .replace(
+                    "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
+                    "FAIL syscall unimplemented nr=9",
+                )
+        };
+        let good = serial(&all[..cut]);
+        let (accepted, why) = validate(case, &process, &good);
+        assert!(accepted, "{why}");
+        // One line more (the mapping check ran), one fewer, or no loud stop all fail.
+        assert!(!validate(case, &process, &serial(&all[..=cut])).0);
+        assert!(!validate(case, &process, &serial(&all[..cut - 1])).0);
+        assert!(!validate(case, &process, &good.replace("nr=9", "nr=0")).0);
+        assert!(!validate(case, &process, &format!("{good}\nRESULT success")).0);
+        let mut wrong = all[..cut].to_vec();
+        wrong[3] = format!("{} FAIL", wrong[3].trim_end_matches(" ok"));
+        assert!(!validate(case, &process, &serial(&wrong)).0);
+    }
+
+    #[test]
     fn oracle_info_rows_match_by_name_only() {
         let fs = oracle_rows("fs").collect::<Vec<_>>();
         let info = fs
@@ -7219,7 +7307,7 @@ mod tests {
             .collect::<Vec<_>>();
         let strings = observed.iter().map(String::as_str).collect::<Vec<_>>();
         assert_eq!(
-            validate_oracle(&strings, "fs").map(|(first, _)| first),
+            validate_oracle(&strings, "fs", None).map(|(first, _)| first),
             Ok(0)
         );
         // Another cookie value is an observation, another name is not.
@@ -7227,11 +7315,11 @@ mod tests {
         let name_end = original.match_indices(' ').nth(2).unwrap().0;
         observed[info] = format!("{} different observation", &original[..name_end]);
         let strings = observed.iter().map(String::as_str).collect::<Vec<_>>();
-        assert!(validate_oracle(&strings, "fs").is_ok());
+        assert!(validate_oracle(&strings, "fs", None).is_ok());
         observed[info] = original.replacen("init: info fs.", "init: info fs.x", 1);
         let strings = observed.iter().map(String::as_str).collect::<Vec<_>>();
-        assert!(validate_oracle(&strings, "fs").is_err());
-        assert!(validate_oracle(&[], "nonexistent").is_err());
+        assert!(validate_oracle(&strings, "fs", None).is_err());
+        assert!(validate_oracle(&[], "nonexistent", None).is_err());
     }
 
     #[test]
