@@ -602,10 +602,29 @@ fn inventory_firmware(boot: &BootInfo, acpi: &Acpi) {
     key(
         2,
         Text::from_args(format_args!(
-            "acpi {} tables, {} cpus, {} ioapics, hpet {:#x}, pm-timer {:#x}",
-            acpi.tables, cpus, ioapics, hpet, pm_timer
+            "acpi {} tables, {} cpus, {} ioapics, hpet {:#x}, pm-timer {:#x}, apic {}",
+            acpi.tables,
+            cpus,
+            ioapics,
+            hpet,
+            pm_timer,
+            APIC_MODES[usize::from(APIC_MODE.load(Ordering::Relaxed))]
         )),
     );
+}
+
+const APIC_MODES: [&str; 4] = ["unknown", "legacy-pic", "xapic", "x2apic"];
+/// Index into [`APIC_MODES`] of the mode the interrupt-controller bring-up chose.
+static APIC_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// Record the chosen local-APIC mode for the inventory.
+pub fn note_apic_mode(mode: kernel::intc::ApicMode) {
+    let index = match mode {
+        kernel::intc::ApicMode::Disabled => 1,
+        kernel::intc::ApicMode::Xapic => 2,
+        kernel::intc::ApicMode::X2apic => 3,
+    };
+    APIC_MODE.store(index, Ordering::Relaxed);
 }
 
 fn inventory_time() {
@@ -613,15 +632,14 @@ fn inventory_time() {
     key(
         3,
         Text::from_args(format_args!(
-            "rtc {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC, tsc {} kHz, uptime {} s",
+            "rtc {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC, tsc {} kHz",
             now.year,
             now.month,
             now.day,
             now.hour,
             now.minute,
             now.second,
-            timer::tsc_khz(),
-            timer::ktime_get_boottime_ns() / 1_000_000_000
+            timer::tsc_khz()
         )),
     );
 }
@@ -823,6 +841,14 @@ fn late_proofs() {
 // ---------------------------------------------------------------------------
 // Summary
 
+/// Per-group init boilerplate the replay leaves out (the `init: argc=` line is
+/// four rows of auxv); the `SUITE group` records say how each run ended.
+const REPLAY_SKIP: [&[u8]; 3] = [
+    b"init: hello from userspace",
+    b"init: ok",
+    b"Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
+];
+
 fn replay() {
     let pause = PAUSE_MS.load(Ordering::Relaxed);
     console::clear_screen();
@@ -837,14 +863,7 @@ fn replay() {
             .iter()
             .any(|prefix| line.starts_with(prefix));
         let failing = line.windows(4).any(|window| window == b"FAIL");
-        // Per-group init boilerplate (four rows of auxv on a normal run); the
-        // `SUITE group` records say how each run ended.
-        const SAME: [&[u8]; 3] = [
-            b"init: hello from userspace",
-            b"init: ok",
-            b"Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
-        ];
-        let boilerplate = SAME.contains(&line) || line.starts_with(b"init: argc=");
+        let boilerplate = REPLAY_SKIP.contains(&line) || line.starts_with(b"init: argc=");
         if (!compared || failing) && !boilerplate {
             console::write_screen(line);
             console::write_screen(b"\n");

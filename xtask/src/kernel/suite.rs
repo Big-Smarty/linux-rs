@@ -57,8 +57,8 @@ const PROOFS: [&str; 23] = [
 ];
 /// What the user acts on; the kernel prints it as the last screen line.
 const FINAL_LINE: &str = "linux-rs suite complete - photograph this screen, then hard-reset";
-/// First line the kernel captures, and the line that starts the summary.
-const CAPTURE_START: &str = "linux-rs bootstrap x86_64 ";
+/// The first line the kernel prints (and so captures: `console::init`'s), and the line that starts the summary.
+const CAPTURE_START: &str = "console: framebuffers used=";
 const SUMMARY_HEAD: &str = "linux-rs bare-metal suite   build ";
 
 /// FNV-1a 64 (the kernel's `Fnv64`), to recompute the digest from the serial log.
@@ -781,7 +781,7 @@ mod tests {
     fn log_of(groups: &[(&str, bool)]) -> String {
         let mut log = String::from("firmware noise\n");
         let begin = log.len();
-        log.push_str("linux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
+        log.push_str("console: framebuffers used=1 reported=1 grid=160x50 limit=fb0\nlinux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
         for name in PROOFS {
             writeln!(log, "PROOF {name} PASS").unwrap();
         }

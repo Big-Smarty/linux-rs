@@ -328,6 +328,8 @@ fn clock_and_irq_checks(
     let clock = unsafe { timer::init(prepared, acpi, device_pages, options) };
     let tick_ok = match clock {
         Ok(report) => {
+            #[cfg(feature = "baremetal-suite")]
+            baremetal::note_apic_mode(report.apic_mode);
             log!(
                 "CHECK interrupt-controllers ok mode={} event={} ioapic_timer={}\n",
                 match report.apic_mode {

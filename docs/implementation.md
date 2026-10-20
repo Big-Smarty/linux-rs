@@ -1394,3 +1394,43 @@ Per-syscall summary (all numbers are x86-64): `getuid`/`geteuid`/`getgid`/`geteg
 | Harness: one generic exact-line validator, one line per group | `oracle_case!`, `validate_oracle`; unit tests `oracle_case_requires_every_expected_line_exactly_in_order`, `oracle_info_rows_match_by_name_only` | done |
 | Behaviour on real hardware, KVM, other QEMU CPU models, `sysinfo` uptime against a real clock | not run | not done |
 | Independent review | not done | not done |
+
+## Kernel-run bare-metal suite (A21)
+
+Authority: [A21](decisions.md) (the user's 2026-10-20 request for "a bare metal test suite I can just execute while using the new kernel which does all sorts of things (preferably non-destructively) and logs the results"). User-facing procedure, meaning of each check and limits: [bare-metal-suite](bare-metal-suite.md#kernel-run-suite-a21); builder and harness: [kernel-tooling](kernel-tooling.md#kernel-run-bare-metal-suite-a21). **Prepared for the user's trial; nothing here is physical evidence.**
+
+### What exists
+
+* **Profile.** `kernel/Cargo.toml`: `boot-proofs` (the proofs that run on any machine; `qemu-self-test` and `baremetal-suite` both imply it, so every former `qemu-self-test` proof gate became `boot-proofs` with no change for the existing profile) and `baremetal-suite` (`freestanding` + `boot-proofs`, **no** COM1/debug-exit).
+* **`kernel/src/baremetal.rs`** (binary crate, the privileged half): the 256 KiB lock-free capture of every console byte (`capture_byte`, claim-by-`fetch_add`, reentrancy-safe); the live-screen filter (`screen_byte`: a passing `init: test ... ok` line is drawn as one `.`, because every scrolled line redraws the whole framebuffer and the groups print ~700 of them); `record_proof` and the results store (`IrqMutex<Results>`, leaf lock); `suite_pause_ms=` and `suite_groups=` command-line options; the hardware inventory; the group loop (`run`, `start_next`, `group_ended`, `fatal`); the late proofs; the log replay and the summary screen. `kernel/src/pci.rs`: the read-only PCI scan with the side-effect argument in its module documentation.
+* **`kernel/src/suite.rs`** (library, `forbid(unsafe_code)`, 12 host tests): the comparison of a group's output with `xtask/oracle/expected.tsv` (embedded with `include_bytes!`; the rules of the host `validate_oracle`, plus the console's `\r\n`), the FNV-1a digest, calendar conversion, bounded `Text`, PCI name tables.
+* **`kernel/src/userspace.rs`**: `Rootfs`/`new_rootfs`/`load_rootfs` split out of the boot path (the boot path is unchanged), `load_group` (fresh rootfs from the retained archive copies, `-- <group>` as the command line), `teardown` (every user page unmapped and freed through the one `mm_unmap`, then `Process` dropped), `locks_free`; `init_died` and `stop` have a suite variant that ends the group instead of the boot; the `mm-usercopy` start-up proof is not run per group (the `mm` group covers it from ring 3).
+* **Small supporting changes**: `main.rs` (`proof`/`proof_result`: outside the suite exactly `require`/`unwrap`, in the suite record and continue; `fail()` calls `baremetal::fatal` in the suite; exhaustion walk moved after the groups), `console.rs` (capture hook, screen filter, `clear_screen`, replay pager, `write_screen`), `firmware.rs` (ACPI table signatures kept), `boot.rs` (`option_value`), `cputime.rs` (`CpuAccount::start` resets a new task's accounting), `services.rs`/`kalloc.rs` (`Service::take`, `is_free`, `lock_free`), `paging.rs` (`Tables::has_zero_page`).
+* **`user/init`**: two assertions made machine-independent without changing what Linux prints (`ids.sysinfo-ram` loses its 512 MiB ceiling; `time.monotonic-coarse-near-monotonic` reads the coarse clock first, since the other order fails on Linux itself when a tick falls between the reads, which a slow emulated CPU made a ~3% flake).
+* **`xtask`**: `Target::Kernel { qemu_self_test, suite }`, the `baremetal-suite` command and `SUITE_CASES` with `suite::validate` (`xtask/src/kernel/suite.rs`).
+
+### Behaviour that differs from Linux, loudly (test profile only)
+
+1. `/init` ending in any way, or a kernel stop while a group runs, ends that group only (the kernel prints Linux's panic text first). A stop with a kernel lock held ends the suite with its results so far.
+2. One boot runs several groups: a new `/init` on a new rootfs per group, the old process's pages freed, its intermediate page tables **kept** (`shortcut:` in `userspace::teardown`; Linux frees them with `exit_mmap`), and the clock keeps running (the reference recorded one boot per group; groups bound uptime to two minutes).
+3. The screen shows `.` for a passing test line; the capture, replay and digest have every line.
+
+### Safety argument for the added hardware access
+
+Port I/O added: `0xCF8` (address, written) and `0xCFC` (data, read) only, standard-header offsets `0x00/0x08/0x0C` only, enable bit set, saved and restored; mechanism #1 presence is the `pci_check_type1` test without the mechanism-2 probe that writes `0xCFB`. No MMIO added. `SAFETY` comments name the contract (CPL0, BSP, IF clear, no other user of the ports). The capture buffers are atomics (no `unsafe`); the only new `unsafe` is `retain_archives` (the existing `module_bytes` contract) and the `pci` port calls.
+
+### Five design questions
+
+1. **Preexisting crate?** No new crate. `x86_64`'s `Port` and `raw-cpuid` (both admitted) do the I/O and CPUID; a PCI crate (`pci_types` and similar) was not admitted: the need is three register reads, not a PCI core.
+2. **Bundle?** One mechanism per concept: the group runner reuses `userspace::{load_rootfs, start, init_died}` and the one `mm_unmap`; the comparison reproduces `validate_oracle` and the harness re-checks every passing group with the original; the replay and the summary share one capture.
+3. **Simplify?** One profile and one result channel (the screen); no keyboard, serial, storage, network or log file; fixed-capacity results; the group list is a command-line option instead of a menu.
+4. **Secure?** No write to any storage, firmware or device state (see above); bounded capture, bounded PCI scan, bounded line buffers, no user-controlled allocation; the heap copy of the initramfs is fallible; a kernel stop with locks held ends the suite instead of deadlocking. The suite weakens nothing in the normal profiles (`boot-proofs` is a rename of the former `qemu-self-test` gate, and the suite code is compiled only with its own feature).
+5. **Improve?** A serial/USB-storage/network log once those drivers exist (the digest and the capture are ready for it); `exit_mmap`-style teardown that frees the page tables; the `signal` and `proc` groups when they are supported; per-vendor inventory (MSRs, SMBIOS, IOMMU) and PCIe ECAM/capability walking.
+
+### Evidence
+
+Filled in at the end of this section with the gate run and the QEMU results.
+
+### Not done (named, not hidden)
+
+No physical run. No serial, storage or network log. `signal` and `proc` are skipped (their syscalls are absent). One CPU only. Intermediate user page tables of a finished group are leaked. The summary is not machine-read: the QEMU screendumps are read by a person. No independent review of the suite yet.
