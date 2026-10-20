@@ -30,6 +30,7 @@ pub(super) const ALL_PASS: &[(&str, bool)] = &[
     ("mm", true),
     ("fs", true),
     ("signal", true),
+    ("fork", true),
 ];
 /// A run that selects three probes ending abnormally (a SIGSEGV, an unimplemented
 /// syscall, a loop that outruns the one-second group bound), then one real group.
@@ -326,7 +327,7 @@ WHAT THIS IS
   with Limine 12.9.3 (the BOOTX64.EFI of your /usr/share/limine). The kernel
   runs its boot self-tests, prints a hardware inventory (CPU, memory map, ACPI,
   APIC/timers, framebuffers, PCI ids), runs the oracle syscall groups ids,
-  time, mm, fs and signal each as a fresh /init on a fresh rootfs, compares
+  time, mm, fs, signal and fork each as a fresh /init on a fresh rootfs, compares
   each group's output line by line with what the pinned Linux 6.18.57 printed,
   and ends on a summary screen. The group proc is not run (the kernel has no
   procfs yet; the summary says so).

@@ -207,6 +207,14 @@ enum User {
     /// Runs one oracle syscall-test group (`-- <group>`, `user/init/src/tests`) to `init: ok`;
     /// every `init: test|tests|info` line equals the pinned Linux's ([`validate_oracle`]).
     Oracle(&'static str),
+    /// `-- forkleak`: 200 fork/exit/wait rounds; the counts line equals the pinned Linux's and
+    /// the free RAM `sysinfo` reports is exactly the same before and after the rounds (every
+    /// frame and kernel object came back).
+    ForkLeak,
+    /// `-- forkbomb` (this kernel only): fork until `EAGAIN` (the kernel-stack pool is the
+    /// limit), kill and reap everything, twice; every child reaped, a fork works afterwards and
+    /// the free RAM is the same after both floods.
+    ForkBomb,
     /// No `/init` in any archive: Linux's `prepare_namespace` failure text.
     NoRoot,
     /// The kernel-run bare-metal suite (`suite`): the groups it runs, each with whether it must
@@ -280,6 +288,8 @@ const IRQ_GUARD_RECORD: &str = "CHECK irq-guard ok nested=2 out_of_order=true sa
 /// one user-copy mechanism on the real tables, faulting pages in with Linux's short-copy results.
 /// What init's `demand` mode prints after taking its own ring-3 page faults.
 const DEMAND_MODE_LINE: &str = "init: demand ok";
+/// The first line of `-- forkleak` (counts only; identical on the pinned Linux).
+const FORKLEAK_MODE_LINE: &str = "init: forkleak warm=true rounds=200 reaped=200 none_left=true";
 const MM_USERCOPY_RECORD: &str = "CHECK mm-usercopy ok fault_in=read,write short_write=4 hole=8 readonly=refused zero_page=shared range=refused protnone=inverted,restored fixed=replaced stack=grown unmap=restored";
 const PF_GPR_RECORD: &str = "CHECK page-fault-gprs ok gprs=15";
 const MEMORY_RUNTIME_RECORD: &str = "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true";
@@ -824,6 +834,37 @@ const DEBUG_CASES: &[DebugCase] = &[
     oracle_case!(time),
     oracle_case!(fs),
     oracle_case!(signal),
+    // Process creation and exit on the task model: `fork`/`clone`/`clone3` arguments and
+    // inheritance, wait statuses, `SIGCHLD`, orphans, `execve` in a child (`user/init` group
+    // `fork`, recorded on the pinned Linux 6.18.57).
+    oracle_case!(fork),
+    // 200 fork/exit/wait rounds: nothing is left behind (`user/init` mode `forkleak`).
+    // Pool exhaustion and every unwinding path of `copy_process` (this kernel only: Linux's limit
+    // is `max_threads`, not a stack pool).
+    DebugCase {
+        name: "forkbomb",
+        cmdline: Some("-- forkbomb"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::ForkBomb,
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    DebugCase {
+        name: "forkleak",
+        cmdline: Some("-- forkleak"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::ForkLeak,
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
     // The signal smoke run on the other two clockevent paths: the PIT-only periodic timer (an
     // `ITIMER_REAL` wake-up served at tick granularity) and the KVM TSC-deadline timer.
     DebugCase {
@@ -4353,6 +4394,8 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
             exact_summary,
             protection,
         } => (argc, mode_line, exact_summary, protection),
+        User::ForkLeak => (2, Some(FORKLEAK_MODE_LINE), true, (false, false)),
+        User::ForkBomb => (2, None, true, (false, false)),
         User::Segfault | User::Unimplemented | User::Oracle(_) => (2, None, true, (false, false)),
     };
     let audit = find.at(
@@ -4394,6 +4437,12 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     if let Some(mode_line) = mode_line {
         positions.push(find.exact(mode_line, "init mode line")?);
     }
+    if user == User::ForkLeak {
+        positions.push(find.at(&forkleak_ram_unchanged, "unchanged free RAM record")?);
+    }
+    if user == User::ForkBomb {
+        positions.extend(forkbomb_records(&find)?);
+    }
     if let User::Oracle(group) = user {
         let (first, last) = validate_oracle(lines, group)?;
         positions.push(first);
@@ -4432,6 +4481,85 @@ fn oracle_rows(group: &str) -> impl Iterator<Item = (&'static str, &'static str)
             );
             (row_group == group).then_some((kind, line))
         })
+}
+
+/// `init: forkleak free_ram before=N after=N` with `N` equal: the free RAM `sysinfo` reports did
+/// not move across the 200 rounds (after two warm-up rounds).
+fn forkleak_ram_unchanged(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("init: forkleak free_ram before=") else {
+        return false;
+    };
+    let Some((before, after)) = rest.split_once(" after=") else {
+        return false;
+    };
+    matches!(
+        (before.parse::<u64>(), after.parse::<u64>()),
+        (Ok(before), Ok(after)) if before == after && before > 0
+    )
+}
+
+/// `CHECK fork-objects forks=202 heap=a/b files=a/b pins=a/b root_refs=a/b slots=a/b threads=a/b`
+/// (printed by the self-test kernel when init exits): the 202 forks of `-- forkleak` happened and
+/// every live-object count, sampled before the 3rd fork and at init's exit, is the same, which
+/// the free-RAM line cannot show (a leaked file reference, inode pin, task slot or heap byte).
+fn forkleak_objects_unchanged(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("CHECK fork-objects forks=202 ") else {
+        return false;
+    };
+    let mut fields = 0;
+    for (index, field) in rest.split(' ').enumerate() {
+        let Some((name, pair)) = field.split_once('=') else {
+            return false;
+        };
+        let Some((was, now)) = pair.split_once('/') else {
+            return false;
+        };
+        let want = ["heap", "files", "pins", "root_refs", "slots", "threads"];
+        if want.get(index) != Some(&name)
+            || was != now
+            || was.parse::<u64>().is_err()
+            || (name == "heap" && was == "0")
+        {
+            return false;
+        }
+        fields += 1;
+    }
+    fields == 6
+}
+
+/// `-- forkbomb`: the three records, in order. Each flood forks until `EAGAIN` (at least 100
+/// children: the pool holds 127), reaps every child it made, the second makes as many as the
+/// first and a fork works again afterwards, and the free RAM after the floods is equal.
+fn forkbomb_records(find: &Finder<'_>) -> Result<Vec<usize>, String> {
+    let flood = |line: &str, round: &str| -> Option<usize> {
+        let rest = line.strip_prefix(&format!("init: forkbomb {round} children="))?;
+        let (children, rest) = rest.split_once(" eagain=true reaped=")?;
+        let (reaped, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+        let children: usize = children.parse().ok()?;
+        let again_ok = round == "first" || tail == "again=true";
+        (children >= 100 && reaped.parse() == Ok(children) && again_ok).then_some(children)
+    };
+    let first = find.at(&|line| flood(line, "first").is_some(), "first flood record")?;
+    let second = find.at(
+        &|line| flood(line, "second").is_some(),
+        "second flood record",
+    )?;
+    let counts = (
+        flood(find.lines[first], "first"),
+        flood(find.lines[second], "second"),
+    );
+    if counts.0 != counts.1 {
+        return Err("the two floods made a different number of children".to_owned());
+    }
+    let ram = find.at(
+        &|line| {
+            line.strip_prefix("init: forkbomb free_ram after_first=")
+                .and_then(|rest| rest.split_once(" after_second="))
+                .is_some_and(|(a, b)| a == b && a.parse::<u64>().is_ok_and(|n| n > 0))
+        },
+        "unchanged free RAM record",
+    )?;
+    Ok(vec![first, second, ram])
 }
 
 /// The line prefixes of an oracle test group's output; everything else the guest prints (kernel
@@ -4541,15 +4669,25 @@ fn user_tail(
 ) -> Result<Vec<usize>, String> {
     const DEATH: &str = "Kernel panic - not syncing: Attempted to kill init! exitcode=";
     Ok(match user {
-        User::Ok { .. } | User::Oracle(_) => vec![
-            find.exact("init: ok", "init: ok")?,
-            find.at(
-                &|line| user_faults_handled(line, demand),
-                "handled ring-3 page faults record",
-            )?,
-            find.exact(&format!("{DEATH}0x00000000"), "init death panic")?,
-            find.exact("RESULT success", "RESULT success")?,
-        ],
+        User::Ok { .. } | User::Oracle(_) | User::ForkLeak | User::ForkBomb => {
+            let mut tail = vec![find.exact("init: ok", "init: ok")?];
+            if user == User::ForkLeak {
+                // Printed by the kernel when init exits, before the death panic.
+                tail.push(find.at(
+                    &forkleak_objects_unchanged,
+                    "unchanged kernel objects record",
+                )?);
+            }
+            tail.extend([
+                find.at(
+                    &|line| user_faults_handled(line, demand),
+                    "handled ring-3 page faults record",
+                )?,
+                find.exact(&format!("{DEATH}0x00000000"), "init death panic")?,
+                find.exact("RESULT success", "RESULT success")?,
+            ]);
+            tail
+        }
         User::Segfault => vec![
             find.exact("init: faulting on purpose", "fault announcement")?,
             find.at(
@@ -7525,6 +7663,156 @@ mod tests {
     }
 
     #[test]
+    fn forkleak_case_requires_the_counts_and_an_unchanged_free_ram() {
+        let process = ProcessResult {
+            exit_code: Some(33),
+            timed_out: false,
+        };
+        let case = case("forkleak");
+        assert_eq!(case.cmdline, Some("-- forkleak"));
+        assert_eq!(case.user, User::ForkLeak);
+        let serial = |lines: &[&str]| {
+            let lines = lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>();
+            validate(case, &process, &oracle_serial(&lines))
+        };
+        let counts = FORKLEAK_MODE_LINE;
+        let ram = "init: forkleak free_ram before=453361664 after=453361664";
+        let objects = "CHECK fork-objects forks=202 heap=484795/484795 files=2/2 pins=1/1 root_refs=5/5 slots=1/1 threads=1/1";
+        let with_objects = |lines: &[&str], objects: &str| {
+            let serial = oracle_serial(&lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>());
+            // The kernel prints the record when init exits, after `init: ok`.
+            validate(
+                case,
+                &process,
+                &serial.replacen("\ninit: ok\n", &format!("\ninit: ok\n{objects}\n"), 1),
+            )
+            .0
+        };
+        assert!(with_objects(&[counts, ram], objects));
+        for (what, bad) in [
+            (
+                "heap grew",
+                objects.replace("484795/484795", "484795/484796"),
+            ),
+            ("a file kept", objects.replace("files=2/2", "files=2/3")),
+            ("a pin kept", objects.replace("pins=1/1", "pins=1/2")),
+            (
+                "a task slot kept",
+                objects.replace("slots=1/1", "slots=1/2"),
+            ),
+            ("too few forks", objects.replace("forks=202", "forks=3")),
+            ("a field missing", objects.replace(" threads=1/1", "")),
+            ("no record", String::new()),
+        ] {
+            assert!(!with_objects(&[counts, ram], &bad), "{what}");
+        }
+        let (accepted, _) = serial(&[counts, ram]);
+        assert!(!accepted, "the kernel's record is required");
+        // Leaked memory, a missing record, wrong counts, a zero reading and reordered records.
+        for (what, lines) in [
+            (
+                "less free RAM",
+                vec![
+                    counts,
+                    "init: forkleak free_ram before=453361664 after=453357568",
+                ],
+            ),
+            (
+                "more free RAM",
+                vec![counts, "init: forkleak free_ram before=1 after=2"],
+            ),
+            ("no RAM record", vec![counts]),
+            ("no counts", vec![ram]),
+            (
+                "fewer children reaped",
+                vec![
+                    "init: forkleak warm=true rounds=200 reaped=199 none_left=true",
+                    ram,
+                ],
+            ),
+            (
+                "unreadable",
+                vec![counts, "init: forkleak free_ram before=0 after=0"],
+            ),
+            ("reordered", vec![ram, counts]),
+        ] {
+            assert!(!with_objects(&lines, objects), "{what}");
+        }
+    }
+
+    #[test]
+    fn forkbomb_case_requires_clean_floods_and_an_unchanged_free_ram() {
+        let process = ProcessResult {
+            exit_code: Some(33),
+            timed_out: false,
+        };
+        let case = case("forkbomb");
+        assert_eq!(case.cmdline, Some("-- forkbomb"));
+        let first = "init: forkbomb first children=127 eagain=true reaped=127";
+        let second = "init: forkbomb second children=127 eagain=true reaped=127 again=true";
+        let ram = "init: forkbomb free_ram after_first=453357568 after_second=453357568";
+        let check = |lines: &[&str]| {
+            let lines = lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>();
+            validate(case, &process, &oracle_serial(&lines)).0
+        };
+        assert!(check(&[first, second, ram]));
+        for (what, lines) in [
+            (
+                "leaked RAM",
+                vec![
+                    first,
+                    second,
+                    "init: forkbomb free_ram after_first=2 after_second=1",
+                ],
+            ),
+            (
+                "a child not reaped",
+                vec![
+                    "init: forkbomb first children=127 eagain=true reaped=126",
+                    second,
+                    ram,
+                ],
+            ),
+            (
+                "no EAGAIN",
+                vec![
+                    "init: forkbomb first children=127 eagain=false reaped=127",
+                    second,
+                    ram,
+                ],
+            ),
+            (
+                "too few children",
+                vec![
+                    "init: forkbomb first children=5 eagain=true reaped=5",
+                    second,
+                    ram,
+                ],
+            ),
+            (
+                "different floods",
+                vec![
+                    first,
+                    "init: forkbomb second children=120 eagain=true reaped=120 again=true",
+                    ram,
+                ],
+            ),
+            (
+                "no fork afterwards",
+                vec![
+                    first,
+                    "init: forkbomb second children=127 eagain=true reaped=127 again=false",
+                    ram,
+                ],
+            ),
+            ("missing RAM", vec![first, second]),
+            ("reordered", vec![second, first, ram]),
+        ] {
+            assert!(!check(&lines), "{what}");
+        }
+    }
+
+    #[test]
     fn oracle_case_requires_every_expected_line_exactly_in_order() {
         let process = ProcessResult {
             exit_code: Some(33),
@@ -7642,7 +7930,7 @@ mod tests {
                 other => panic!("unknown kind {other}"),
             }
         }
-        let groups = ["mm", "ids", "time", "signal", "fs", "proc"];
+        let groups = ["mm", "ids", "time", "signal", "fs", "proc", "fork"];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),
             groups.len()

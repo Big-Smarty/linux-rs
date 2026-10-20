@@ -36,6 +36,7 @@ use syscalls::{Errno, Sysno};
 
 use crate::exit;
 
+pub mod fork;
 pub mod fs;
 pub mod ids;
 pub mod mm;
@@ -328,6 +329,17 @@ pub fn run_mode(mode: &[u8]) -> bool {
         // The kernel-test smoke case of the signal wiring (not an oracle group): see `smoke`.
         b"signals" => {
             smoke::run();
+            return true;
+        }
+        b"fork" => fork::run(),
+        // The leak check of the fork lane (not an oracle group): see `fork::forkleak`.
+        b"forkleak" => {
+            fork::forkleak();
+            return true;
+        }
+        // Candidate-only exhaustion check of the fork lane: see `fork::forkbomb`.
+        b"forkbomb" => {
+            fork::forkbomb();
             return true;
         }
         b"fs" => fs::run(),

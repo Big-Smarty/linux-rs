@@ -17,31 +17,31 @@ use super::signal::{KSigaction, SA_NOCLDWAIT, SA_RESTORER, SA_SIGINFO, bit, rest
 use super::{R, T, addr, addr_mut, die, fn_addr, getpid, sys};
 use crate::Strings;
 
-const BAD: usize = 0xdead_0000_0000;
-const AT_FDCWD: usize = -100isize as usize;
+pub(super) const BAD: usize = 0xdead_0000_0000;
+pub(super) const AT_FDCWD: usize = -100isize as usize;
 
-const SIGHUP: usize = 1;
-const SIGABRT: usize = 6;
-const SIGKILL: usize = 9;
-const SIGUSR1: usize = 10;
-const SIGUSR2: usize = 12;
-const SIGPIPE: usize = 13;
-const SIGTERM: usize = 15;
-const SIGCHLD: usize = 17;
+pub(super) const SIGHUP: usize = 1;
+pub(super) const SIGABRT: usize = 6;
+pub(super) const SIGKILL: usize = 9;
+pub(super) const SIGUSR1: usize = 10;
+pub(super) const SIGUSR2: usize = 12;
+pub(super) const SIGPIPE: usize = 13;
+pub(super) const SIGTERM: usize = 15;
+pub(super) const SIGCHLD: usize = 17;
 const SIGCONT: usize = 18;
 const SIGSTOP: usize = 19;
 
-const WNOHANG: usize = 1;
+pub(super) const WNOHANG: usize = 1;
 const WUNTRACED: usize = 2;
 const WCONTINUED: usize = 8;
-const WEXITED: usize = 4;
-const WNOWAIT: usize = 0x0100_0000;
+pub(super) const WEXITED: usize = 4;
+pub(super) const WNOWAIT: usize = 0x0100_0000;
 
 const O_NONBLOCK: usize = 0o4000;
 const O_CLOEXEC: usize = 0o2_000_000;
 
-static CHLD_COUNT: AtomicUsize = AtomicUsize::new(0);
-static CHLD_INFO: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+pub(super) static CHLD_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub(super) static CHLD_INFO: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
 /// SIGCHLD handler: counts and records `si_code`, `si_pid`, `si_uid`, `si_status`.
 extern "C" fn on_chld(_sig: i32, info: *const u64, _uc: *mut u64) {
@@ -54,7 +54,7 @@ extern "C" fn on_chld(_sig: i32, info: *const u64, _uc: *mut u64) {
     CHLD_INFO[3].store((words[2] & 0xffff_ffff) as usize, Relaxed); // si_status
 }
 
-fn sigaction(sig: usize, handler: u64, flags: u64) -> R {
+pub(super) fn sigaction(sig: usize, handler: u64, flags: u64) -> R {
     let sa = KSigaction {
         handler,
         flags: flags | SA_RESTORER,
@@ -64,16 +64,16 @@ fn sigaction(sig: usize, handler: u64, flags: u64) -> R {
     sys(Sysno::rt_sigaction, &[sig, addr(&sa), 0, 8])
 }
 
-fn on_chld_ptr() -> u64 {
+pub(super) fn on_chld_ptr() -> u64 {
     fn_addr(on_chld as *const ())
 }
 
-fn block(mask: u64) {
+pub(super) fn block(mask: u64) {
     let _ = sys(Sysno::rt_sigprocmask, &[2, addr(&mask), 0, 8]);
 }
 
 /// Forks; the child runs `f` and leaves with its return value as the exit status.
-fn spawn(f: impl FnOnce() -> usize) -> usize {
+pub(super) fn spawn(f: impl FnOnce() -> usize) -> usize {
     match sys(Sysno::fork, &[]) {
         Ok(0) => die(f()),
         Ok(pid) => pid,
@@ -81,7 +81,7 @@ fn spawn(f: impl FnOnce() -> usize) -> usize {
     }
 }
 
-fn wait4(pid: isize, options: usize) -> (R, i32) {
+pub(super) fn wait4(pid: isize, options: usize) -> (R, i32) {
     let mut status = -1i32;
     (
         sys(
@@ -92,7 +92,7 @@ fn wait4(pid: isize, options: usize) -> (R, i32) {
     )
 }
 
-fn waitid(idtype: usize, id: usize, options: usize) -> (R, [i32; 8]) {
+pub(super) fn waitid(idtype: usize, id: usize, options: usize) -> (R, [i32; 8]) {
     let mut info = [-1i32; 32];
     let r = sys(
         Sysno::waitid,
@@ -107,11 +107,11 @@ fn waitid(idtype: usize, id: usize, options: usize) -> (R, [i32; 8]) {
 }
 
 /// Reaps every remaining child (so one test's leftovers cannot leak into the next).
-fn reap_all() {
+pub(super) fn reap_all() {
     while sys(Sysno::wait4, &[usize::MAX, 0, 0, 0]).is_ok() {}
 }
 
-fn nap(ms: i64) {
+pub(super) fn nap(ms: i64) {
     let _ = sys(Sysno::nanosleep, &[addr(&[0i64, ms * 1_000_000]), 0]);
 }
 
