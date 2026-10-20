@@ -821,8 +821,8 @@ static BAD_IRET_DEPTH: AtomicU64 = AtomicU64::new(0);
 /// loudly at this depth. Upgrade by moving the frame to the stack top.
 const BAD_IRET_LIMIT: u64 = 16;
 
-/// `.Lerror_bad_iret` + `fixup_bad_iret` (arch/x86/entry/entry_64.S, arch/x86/
-/// kernel/traps.c): `iretq` to a frame the CPU refuses (a non-canonical RIP, a
+/// `.Lerror_bad_iret` + `fixup_bad_iret` (`arch/x86/entry/entry_64.S`,
+/// `arch/x86/kernel/traps.c`): `iretq` to a frame the CPU refuses (a non-canonical RIP, a
 /// bad CS or SS selector, a compatibility RIP beyond its segment limit, ...)
 /// raises #GP/#NP/#SS in ring 0 at [`iret_site`], with RSP still at that
 /// frame. Make the exception look as if ring 3 had raised it: the user's own
@@ -840,7 +840,7 @@ fn fixup_bad_iret(regs: &mut PtRegs, vector: u64) -> bool {
     }
     let low = ptr::addr_of!(BOOT_STACK) as u64 + 4096;
     let frame = regs.sp;
-    if frame % 8 != 0 || frame < low || frame > low + STACK_BYTES as u64 - 5 * 8 {
+    if !frame.is_multiple_of(8) || frame < low || frame > low + STACK_BYTES as u64 - 5 * 8 {
         return false;
     }
     // SAFETY: the fault happened at `iret_site`, which only runs with RSP at the
