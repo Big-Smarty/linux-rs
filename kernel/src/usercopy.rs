@@ -125,8 +125,12 @@ pub fn put_user<P: UserPages>(pages: &mut P, to: u64, value: &[u8]) -> bool {
 /// `strncpy_from_user` (`lib/strncpy_from_user.c`): copy the NUL-terminated
 /// string at `from` into `to`, at most `to.len()` bytes, stopping after the NUL.
 /// Returns the length without the NUL (`to.len()` when no NUL was found within
-/// the limit), or `None` for `-EFAULT`: `from` outside `TASK_SIZE_MAX` or an
-/// inaccessible byte before the NUL. Bytes of `to` after the copy are untouched.
+/// the caller's limit), or `None` for `-EFAULT`: `from` outside `TASK_SIZE_MAX`,
+/// an inaccessible byte before the NUL, or the end of the address space reached
+/// with no NUL while the caller would have accepted more bytes. Only the bytes
+/// up to and including the NUL are written; Linux's word-at-a-time path also
+/// stores zeros after the NUL within its last word, so callers must not rely on
+/// the bytes of `to` past the string either way.
 pub fn strncpy_from_user<P: UserPages>(pages: &mut P, to: &mut [u8], from: u64) -> Option<usize> {
     if from >= TASK_SIZE_MAX {
         return if to.is_empty() { Some(0) } else { None };
@@ -145,7 +149,9 @@ pub fn strncpy_from_user<P: UserPages>(pages: &mut P, to: &mut [u8], from: u64) 
             return Some(index);
         }
     }
-    Some(limit)
+    // Hit `max` (`res == max`): fine when that was the caller's own limit,
+    // `-EFAULT` when the address space ended first (lib/strncpy_from_user.c:63-72).
+    (limit == to.len()).then_some(limit)
 }
 
 #[cfg(test)]
@@ -254,6 +260,25 @@ mod tests {
         // Address zero is just an unmapped page, not special-cased.
         assert_eq!(copy_to_user(&mut space, 0, &[1]), 1);
         assert_eq!(copy_to_user(&mut space, 0, &[]), 0);
+    }
+
+    #[test]
+    fn strncpy_at_the_top_of_the_address_space() {
+        let mut space = Space::default();
+        let last = TASK_SIZE_MAX - 0x1000;
+        space.map(last, true);
+        space.0.get_mut(&last).unwrap().0.fill(b'a');
+        let mut to = [0u8; 8];
+        // 4 bytes remain below TASK_SIZE_MAX and the string has no NUL there.
+        let from = TASK_SIZE_MAX - 4;
+        assert_eq!(strncpy_from_user(&mut space, &mut to, from), None);
+        // The caller's limit equals the room: that is as much as it asked for.
+        assert_eq!(strncpy_from_user(&mut space, &mut to[..4], from), Some(4));
+        assert_eq!(&to[..4], b"aaaa");
+        assert_eq!(strncpy_from_user(&mut space, &mut to[..3], from), Some(3));
+        // A NUL inside the room wins regardless of the limit.
+        space.0.get_mut(&last).unwrap().0[0xffe] = 0;
+        assert_eq!(strncpy_from_user(&mut space, &mut to, from), Some(2));
     }
 
     #[test]
