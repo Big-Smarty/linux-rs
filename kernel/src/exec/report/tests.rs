@@ -11,7 +11,8 @@ use super::{
     ExecFailed, InitDeath, NO_INIT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP, Segfault, TrapLine,
     signal_exit_code, user_exception,
 };
-use crate::exec::plan::{LoadPlan, tests::oracle};
+use crate::exec::load::tests::loaded_oracle;
+use crate::exec::report::FileRegion;
 use std::string::ToString;
 
 #[test]
@@ -40,13 +41,13 @@ fn init_death_and_no_init_text_are_linux_exact() {
 
 #[test]
 fn segfault_line_matches_the_oracle_byte_for_byte() {
-    let plan = LoadPlan::new(&oracle()).unwrap();
+    let mm = loaded_oracle();
     let line = Segfault {
         address: 0,
         ip: 0x20_55b4,
         sp: 0x7ffd_2010_a150,
         error: 4,
-        vmas: &plan.vmas,
+        region: FileRegion::of(&mm, 0x20_55b4),
     };
     // From target/linux-reference/init-reference-001/oracle-fault.log.
     assert_eq!(
@@ -57,13 +58,13 @@ fn segfault_line_matches_the_oracle_byte_for_byte() {
 
 #[test]
 fn segfault_outside_a_file_mapping_has_no_vma_part_and_kernel_addresses_look_like_prot() {
-    let plan = LoadPlan::new(&oracle()).unwrap();
+    let mm = loaded_oracle();
     let line = Segfault {
         address: 0xffff_8000_0000_1000,
         ip: 0x7fff_ffff_e000,
         sp: 0x7fff_ffff_ee40,
         error: 6,
-        vmas: &plan.vmas,
+        region: FileRegion::of(&mm, 0x7fff_ffff_e000),
     };
     assert_eq!(
         line.to_string(),
@@ -75,7 +76,7 @@ fn segfault_outside_a_file_mapping_has_no_vma_part_and_kernel_addresses_look_lik
         ip: 0x20_cfff,
         sp: 0,
         error: 0,
-        vmas: &plan.vmas,
+        region: FileRegion::of(&mm, 0x20_cfff),
     };
     assert!(inside.to_string().contains(" in init[9fff,20c000+1000]"));
     let past = Segfault {
@@ -83,7 +84,7 @@ fn segfault_outside_a_file_mapping_has_no_vma_part_and_kernel_addresses_look_lik
         ip: 0x20_d000,
         sp: 0,
         error: 0,
-        vmas: &plan.vmas,
+        region: FileRegion::of(&mm, 0x20_d000),
     };
     assert!(!past.to_string().contains(" in "));
 }
@@ -122,14 +123,14 @@ fn user_exceptions_map_to_linux_signals_and_messages() {
 
 #[test]
 fn trap_line_formats_like_show_signal() {
-    let plan = LoadPlan::new(&oracle()).unwrap();
+    let mm = loaded_oracle();
     let line = TrapLine {
         kind: "",
         desc: "general protection fault",
         ip: 0x20_55b4,
         sp: 0x7ffd_2010_a150,
         error: 0,
-        vmas: &plan.vmas,
+        region: FileRegion::of(&mm, 0x20_55b4),
     };
     assert_eq!(
         line.to_string(),
@@ -141,7 +142,7 @@ fn trap_line_formats_like_show_signal() {
         ip: 1,
         sp: 2,
         error: 0,
-        vmas: &plan.vmas,
+        region: FileRegion::of(&mm, 1),
     };
     assert_eq!(
         divide.to_string(),
