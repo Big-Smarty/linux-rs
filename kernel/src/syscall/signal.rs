@@ -317,7 +317,7 @@ mod tests {
             assert_eq!(i64::from_le_bytes(rem[8..].try_into().unwrap()), left);
             assert_eq!(
                 t.clocks.restarts.last().unwrap().expires_ns,
-                (MONO + 1_050_000) as i64
+                (MONO + 1_050_000).cast_signed()
             );
         }
         // Uninterrupted: the sleep ends at the hard expiry, not before.
