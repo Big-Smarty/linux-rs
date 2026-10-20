@@ -14,9 +14,13 @@
 //! `userspace::PROCESS` -> [`TABLES`] -> `heap` -> [`FRAMES`]. [`FRAMES`] is a
 //! leaf: it calls nothing that locks. A table operation takes the frame
 //! allocator as an argument, so callers lock [`TABLES`] first and pass the
-//! [`FRAMES`] guard. No lock is held across a user-memory copy that could
-//! fault (the kernel never touches user addresses, see `usercopy`), a callback
-//! or a blocking operation; nothing here sleeps.
+//! [`FRAMES`] guard. `PROCESS` and [`TABLES`] ARE held across a user-memory
+//! copy: the copy resolves each page first (`usercopy`), and a non-resident
+//! one is faulted in on the spot (`userspace::Syscall::page` ->
+//! `handle_user_fault`), which reserves heap storage, then takes [`FRAMES`] as
+//! the leaf, i.e. the order above and nothing else (the kernel never
+//! dereferences a user address, so no hardware fault occurs under a lock). No
+//! lock is held across a callback or a blocking operation; nothing here sleeps.
 //!
 //! # The rule that is easy to break
 //! [`FRAMES`] is a leaf, and the heap takes it to grow. So **never allocate
@@ -24,7 +28,7 @@
 //! [`FRAMES`] guard**: the heap lock is held first by the allocation, the
 //! grow path then needs `FRAMES`, which the caller holds, and a spinlock with
 //! interrupts masked would spin forever. Reserve heap memory first, then lock
-//! `FRAMES` (e.g. `try_reserve` the VMA `Vec`, then call `map_user_anon`). The
+//! `FRAMES` (e.g. `try_reserve` the VMA `Vec`, then call `mm_map_anon`). The
 //! grow path does not spin: it uses [`Service::try_lock`] and panics (a
 //! `FAIL panic` line, then the boot stops) when `FRAMES` is held, which on
 //! one CPU can only be this violation.

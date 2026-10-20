@@ -7,8 +7,9 @@
 //!   to run on an active tree); immutable afterwards, so it never needs
 //!   invalidation. A later ioremap/hotplug mapping needs an explicit extension
 //!   of this rule (and a TLB-visible protocol), not a quiet extra caller.
-//! * User half (below `TASK_SIZE_MAX`): [`Tables::map_user`], [`Tables::unmap_user`]
-//!   and [`Tables::protect_user`] may run after activation. They need
+//! * User half (below `TASK_SIZE_MAX`): [`Tables::map_user`] and the `mm_*`
+//!   operations (`mm_map_*`, `mm_unmap`, `mm_protect`, ...) may run after
+//!   activation. They need
 //!   `&mut Tables`, i.e. the `services::TABLES` lock, so no other agent edits
 //!   or walks the tree meanwhile, and no `UserSpace` view (which borrows the
 //!   same `&mut Tables`) can hold a frame reference across the edit.
@@ -21,8 +22,13 @@
 //!   freed.
 //! * `PROT_NONE` representation (`mm_protect`): a user PTE with the present bit
 //!   clear, [`PROTNONE`] (bit 8, Linux's `_PAGE_PROTNONE`) set and the frame
-//!   address kept. Hardware ignores every other bit of a not-present entry, so
-//!   it faults with P=0 and cannot reach the frame, while software still knows
+//!   address kept **inverted** (arch/x86/include/asm/pgtable-invert.h
+//!   `protnone_mask`, `pte_pfn`, `pfn_pte`: a non-zero entry with P clear
+//!   stores the complement of its frame bits, so an L1TF-affected CPU that
+//!   speculatively walks a not-present entry reaches a non-existent address,
+//!   not the page's data; only [`leaf_entry`] and [`frame_bits`] touch the
+//!   address field of a leaf). Hardware ignores every other bit of a
+//!   not-present entry, so it faults with P=0, while software still knows
 //!   which frame the page holds (`pte_present()` in Linux is "P or PROTNONE").
 //!   Every walker that means "mapped" tests [`MAPPED`], every walker that means
 //!   "reachable by the CPU" tests `PRESENT` (so `usercopy` refuses it).
@@ -64,6 +70,28 @@ const MAPPED: u64 = PRESENT | PROTNONE;
 const NX: u64 = 1 << 63;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 const LARGE: u64 = 2 * 1024 * 1024;
+
+/// The frame address a leaf entry designates: a non-zero entry with P clear
+/// (a `PROT_NONE` page) holds it complemented (`__pte_needs_invert`).
+const fn frame_bits(entry: u64) -> u64 {
+    if entry != 0 && entry & PRESENT == 0 {
+        !entry & ADDRESS
+    } else {
+        entry & ADDRESS
+    }
+}
+
+/// A leaf entry for `frame` with `flags` (`pfn_pte`): the frame is complemented
+/// exactly when the entry is not present. Non-present `flags` are never zero
+/// (`PROTNONE`), so the cleared entry stays all-zero and is never inverted.
+const fn leaf_entry(frame: u64, flags: u64) -> u64 {
+    let bits = frame & ADDRESS;
+    (if flags & PRESENT == 0 {
+        bits ^ ADDRESS
+    } else {
+        bits
+    }) | flags
+}
 
 pub enum Error {
     Memory(MemoryError),
@@ -326,7 +354,7 @@ impl Tables {
                 if old & MAPPED != 0 {
                     return Err(Error::Conflict);
                 }
-                let entry = physical.0 | flags | if large { HUGE } else { 0 };
+                let entry = leaf_entry(physical.0, flags | if large { HUGE } else { 0 });
                 // SAFETY: the entry is not present (checked above) and hardware
                 // never writes a non-present entry. Either the tree is
                 // unpublished (one owner, no walker) or `&mut self` is the
@@ -429,10 +457,6 @@ impl Tables {
 
     /// The PTE slot of the user page at `address`, if every table above it is
     /// present (the PTE itself may be absent). Never creates tables.
-    #[allow(
-        dead_code,
-        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
-    )]
     fn user_slot(&self, address: u64) -> Result<Option<*mut u64>, Error> {
         if address & (PAGE - 1) != 0 || address >= TASK_SIZE_MAX {
             return Err(Error::Address);
@@ -452,102 +476,19 @@ impl Tables {
             .map(Some)
     }
 
-    /// Remove the user mapping at `address` and invalidate it on this CPU.
-    /// Returns the frame it mapped (now unreferenced, still reserved) or
-    /// `None` if nothing was mapped.
-    ///
-    /// # Errors
-    /// Rejects an unaligned or out-of-range address, or a non-user entry.
-    #[allow(
-        dead_code,
-        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
-    )]
-    pub fn unmap_user(&mut self, address: u64) -> Result<Option<Physical>, Error> {
-        let Some(slot) = self.user_slot(address)? else {
-            return Ok(None);
-        };
-        // SAFETY: `slot` is an aligned PTE of this tree inside the direct map
-        // (`entry_pointer`); `&mut self` excludes software writers, and
-        // `AtomicU64` makes the swap race-free against the hardware's own
-        // accessed/dirty updates of this entry.
-        let entry = unsafe { AtomicU64::from_ptr(slot) };
-        // Check before clearing: a non-user entry in the user half is an
-        // isolation bug that must not also lose the entry (and its frame).
-        // Hardware only changes A/D bits between this load and the swap.
-        let seen = entry.load(Ordering::Acquire);
-        if seen & PRESENT == 0 {
-            return Ok(None);
-        }
-        if seen & USER == 0 {
-            return Err(Error::Audit);
-        }
-        let old = entry.swap(0, Ordering::AcqRel);
-        // Single CPU: `invlpg` retires every cached translation of the page
-        // (and covering paging-structure entries). SMP needs a shootdown here.
-        tlb::flush(VirtAddr::new(address));
-        Ok(Some(Physical(old & ADDRESS)))
-    }
-
-    /// Change the protection of the mapped user page at `address` and
-    /// invalidate it on this CPU. Returns the previous `(write, exec)` so a
-    /// caller can roll a multi-page change back, or `None` if not mapped.
-    ///
-    /// # Errors
-    /// Rejects an unaligned or out-of-range address, or a non-user entry.
-    #[allow(
-        dead_code,
-        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
-    )]
-    pub fn protect_user(
-        &mut self,
-        address: u64,
-        write: bool,
-        exec: bool,
-    ) -> Result<Option<(bool, bool)>, Error> {
-        let Some(slot) = self.user_slot(address)? else {
-            return Ok(None);
-        };
-        // SAFETY: as in `unmap_user`.
-        let entry = unsafe { AtomicU64::from_ptr(slot) };
-        let mut old = entry.load(Ordering::Acquire);
-        loop {
-            if old & PRESENT == 0 {
-                return Ok(None);
-            }
-            if old & USER == 0 {
-                return Err(Error::Audit);
-            }
-            let new =
-                (old & !(WRITE | NX)) | if write { WRITE } else { 0 } | if exec { 0 } else { NX };
-            // A/D bits set by hardware between load and exchange make the CAS
-            // fail and retry with the fresh value instead of being lost.
-            match entry.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
-                Err(current) => old = current,
-            }
-        }
-        // Loosening needs none, tightening needs it; one `invlpg` is cheap and
-        // also clears any stale entry. SMP needs a shootdown here.
-        tlb::flush(VirtAddr::new(address));
-        Ok(Some((old & WRITE != 0, old & NX == 0)))
-    }
-
-    /// Map `pages` fresh zeroed anonymous pages at `start`. All or nothing:
-    /// on any failure every page mapped so far is unmapped and freed again, so
-    /// allocator accounting returns to its entry value (except for empty
-    /// intermediate tables, which stay).
+    /// Map `pages` fresh zeroed anonymous pages at `start` (self-test helper
+    /// over [`Tables::mm_map_anon`]). All or nothing: on any failure every page
+    /// mapped so far is unmapped and freed again, so allocator accounting
+    /// returns to its entry value (except for empty intermediate tables, which
+    /// stay).
     ///
     /// The caller holds the `FRAMES` guard that `allocator` came from: it must
-    /// not allocate from the heap meanwhile (heap growth needs `FRAMES`; see
-    /// the rule in `services`). Reserve heap memory (VMA `Vec`s) first.
+    /// not allocate from the heap meanwhile (see the rule in `services`).
     ///
     /// # Errors
-    /// As [`Tables::map_user`], plus frame exhaustion.
-    #[allow(
-        dead_code,
-        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
-    )]
-    pub fn map_user_anon(
+    /// As [`Tables::mm_map_anon`], plus `Overflow`.
+    #[cfg(feature = "qemu-self-test")]
+    fn map_anon_range(
         &mut self,
         allocator: &mut Allocator<'_>,
         start: u64,
@@ -556,64 +497,18 @@ impl Tables {
         exec: bool,
     ) -> Result<(), Error> {
         for done in 0..pages {
-            let step = (|| {
-                let address = done
-                    .checked_mul(PAGE)
-                    .and_then(|n| start.checked_add(n))
-                    .ok_or(Error::Overflow)?;
-                let frame = allocator.allocate()?.into_reserved();
-                let result = self.map_user(allocator, address, frame, write, exec);
-                if result.is_err() {
-                    // SAFETY: `frame` is the order-zero reservation made one
-                    // line above and `map_user` failed without mapping it, so
-                    // nothing references it.
-                    unsafe { allocator.reclaim_reserved(frame)? };
-                }
-                result
-            })();
+            let step = done
+                .checked_mul(PAGE)
+                .and_then(|n| start.checked_add(n))
+                .ok_or(Error::Overflow)
+                .and_then(|address| self.mm_map_anon(allocator, address, write, exec));
             if let Err(error) = step {
-                // Pages `0..done` were mapped by this call; undo them. A
-                // failure here cannot be recovered and is reported instead.
-                self.unmap_user_free(allocator, start, done)?;
+                // Pages `0..done` were mapped by this call; undo them.
+                self.mm_unmap(allocator, start, done);
                 return Err(error);
             }
         }
         Ok(())
-    }
-
-    /// Unmap `pages` user pages from `start` (holes are skipped) and return
-    /// their frames to the allocator. Returns how many frames were freed.
-    ///
-    /// # Errors
-    /// Address errors as [`Tables::unmap_user`]; the allocator rejecting a
-    /// frame (a mapped frame that was not an order-zero reservation).
-    #[allow(
-        dead_code,
-        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
-    )]
-    pub fn unmap_user_free(
-        &mut self,
-        allocator: &mut Allocator<'_>,
-        start: u64,
-        pages: u64,
-    ) -> Result<u64, Error> {
-        let mut freed = 0;
-        for index in 0..pages {
-            let address = index
-                .checked_mul(PAGE)
-                .and_then(|n| start.checked_add(n))
-                .ok_or(Error::Overflow)?;
-            if let Some(frame) = self.unmap_user(address)? {
-                // SAFETY: `map_user`'s contract made this mapping the unique
-                // owner of an order-zero reservation. The PTE was cleared and
-                // invalidated above, and no `UserSpace` borrow of `&mut self`
-                // can be live, so no reference or translation remains. (SMP:
-                // other CPUs' shootdown must also precede this.)
-                unsafe { allocator.reclaim_reserved(frame)? };
-                freed += 1;
-            }
-        }
-        Ok(freed)
     }
 
     /// The kernel's only way to reach user memory (see `usercopy`). The view
@@ -625,17 +520,18 @@ impl Tables {
 
     /// Executed post-activation user-half checks: rollback at every allocation
     /// point, copy through a fresh anonymous mapping, `invlpg` after
-    /// tightening and after unmapping (a write fault after `protect_user` and a
+    /// tightening and after unmapping (a write fault after `mm_protect` and a
     /// read fault after unmap, both of which a stale TLB entry would hide),
     /// conflict rollback, frame accounting. Uses unmapped pages inside init's
     /// existing stack page table, so no table is added.
     ///
     /// Negative control (QEMU TCG, recorded in `docs/implementation.md`):
-    /// removing the `invlpg` from `unmap_user` or from `protect_user` makes
-    /// this fail with `FAIL user-mm error=Conflict`. That is evidence for TCG's
-    /// TLB model on this cell, not for real hardware.
+    /// removing the `invlpg` from `mm_unmap` or from `mm_protect` makes this
+    /// fail with `FAIL user-mm error=Conflict`. That is evidence for TCG's TLB
+    /// model on this cell, not for real hardware.
     #[cfg(feature = "qemu-self-test")]
     pub fn user_mm_tests(&mut self, allocator: &mut Allocator<'_>) -> Result<(), Error> {
+        use kernel::mm::{PageProt, Pte};
         use kernel::{
             exec::stack::STACK_START,
             usercopy::{copy_from_user, copy_to_user},
@@ -645,8 +541,8 @@ impl Tables {
         // With init loaded the tables for `base` exist already (so the audit's
         // table count is untouched); without it, create them once up front
         // and measure from there. Intermediate tables are never freed.
-        self.map_user_anon(allocator, base, 1, true, false)?;
-        self.unmap_user_free(allocator, base, 1)?;
+        self.map_anon_range(allocator, base, 1, true, false)?;
+        self.mm_unmap(allocator, base, 1);
         let (frames, tables) = (allocator.allocated(), self.pages);
         let unchanged = |this: &Self, allocator: &Allocator<'_>| {
             allocator.allocated() == frames
@@ -655,7 +551,7 @@ impl Tables {
         };
         for limit in 0..3 {
             allocator.set_allocation_budget(Some(limit));
-            let attempt = self.map_user_anon(allocator, base, 3, true, false);
+            let attempt = self.map_anon_range(allocator, base, 3, true, false);
             allocator.set_allocation_budget(None);
             if !matches!(attempt, Err(Error::Memory(MemoryError::NoMemory)))
                 || !unchanged(self, allocator)
@@ -663,7 +559,7 @@ impl Tables {
                 return Err(fail());
             }
         }
-        self.map_user_anon(allocator, base, 3, true, false)?;
+        self.map_anon_range(allocator, base, 3, true, false)?;
         if allocator.allocated() != frames + 3 || self.pages != tables {
             return Err(fail());
         }
@@ -687,12 +583,18 @@ impl Tables {
         let pointer =
             ptr::with_exposed_provenance_mut::<u8>(usize::try_from(base).map_err(|_| fail())?);
         // SAFETY: `base` is a mapped, writable, user-accessible page of the
-        // active tree (just mapped by `map_user_anon`); one byte, naturally
+        // active tree (just mapped by `map_anon_range`); one byte, naturally
         // aligned, no Rust reference to it exists (the `UserSpace` views above
         // ended). SMAP is not enabled yet (`userspace::start` turns it on after
         // this runs), so ring 0 may touch user pages.
         unsafe { pointer.write_volatile(0x5a) };
-        if self.protect_user(base, false, false)? != Some((true, false))
+        let readable = |write| PageProt {
+            accessible: true,
+            write,
+            exec: false,
+        };
+        self.mm_protect(base, 1, readable(false));
+        if self.mm_lookup(base) != (Pte::Anon { writable: false })
             // SAFETY: IF clear, test recovery installed, readonly user page.
             || !unsafe { cpu::fault_test(base, 1) }
         {
@@ -708,31 +610,33 @@ impl Tables {
                 return Err(fail());
             }
         }
-        if self.protect_user(base, true, false)? != Some((false, false))
+        self.mm_make_writable(base);
+        if self.mm_lookup(base) != (Pte::Anon { writable: true })
             // SAFETY: as above; the page is writable again.
             || unsafe { pointer.read_volatile() } != 0x5a
         {
             return Err(fail());
         }
-        if self.unmap_user_free(allocator, base, 3)? != 3
+        if self.mm_unmap(allocator, base, 3) != 3
             // SAFETY: IF clear, test recovery installed, now-unmapped page.
             || !unsafe { cpu::fault_test(base, 0) }
             || !unchanged(self, allocator)
-            || self.unmap_user_free(allocator, base, 3)? != 0
-            || self.protect_user(base, true, false)?.is_some()
-            || !matches!(self.unmap_user(base + 1), Err(Error::Address))
-            || !matches!(self.unmap_user(TASK_SIZE_MAX), Err(Error::Address))
+            || self.mm_unmap(allocator, base, 3) != 0
         {
             return Err(fail());
         }
+        self.mm_protect(base, 3, readable(true));
+        if !unchanged(self, allocator) {
+            return Err(fail());
+        }
         // A conflict on the middle page rolls the first back, keeps the other.
-        self.map_user_anon(allocator, base + PAGE, 1, false, false)?;
+        self.map_anon_range(allocator, base + PAGE, 1, false, false)?;
         if !matches!(
-            self.map_user_anon(allocator, base, 3, true, false),
+            self.map_anon_range(allocator, base, 3, true, false),
             Err(Error::Conflict)
         ) || !matches!(self.lookup(Virtual(base)), Ok(None))
             || !matches!(self.lookup(Virtual(base + PAGE)), Ok(Some(_)))
-            || self.unmap_user_free(allocator, base, 3)? != 1
+            || self.mm_unmap(allocator, base, 3) != 1
             || !unchanged(self, allocator)
         {
             return Err(fail());
@@ -876,7 +780,7 @@ impl Tables {
         let entry = unsafe { ptr::read_volatile(slot) };
         if entry & MAPPED == 0 {
             Pte::Absent
-        } else if Some(Physical(entry & ADDRESS)) == self.zero {
+        } else if Some(Physical(frame_bits(entry))) == self.zero {
             Pte::ZeroPage
         } else {
             Pte::Anon {
@@ -938,10 +842,10 @@ impl Tables {
             let entry = unsafe { AtomicU64::from_ptr(slot) };
             let old = entry.load(Ordering::Acquire);
             if old & MAPPED != 0 {
-                if Some(Physical(old & ADDRESS)) != self.zero || old & USER == 0 {
+                if Some(Physical(frame_bits(old))) != self.zero || old & USER == 0 {
                     return Err(Error::Conflict);
                 }
-                entry.store(frame.0 | flags, Ordering::Release);
+                entry.store(leaf_entry(frame.0, flags), Ordering::Release);
                 // A not-present -> present change needs no invalidation, but
                 // this replaces a live read-only translation of the zero page.
                 tlb::flush(VirtAddr::new(page));
@@ -1022,15 +926,21 @@ impl Tables {
                 // a shootdown acknowledged before the frame is freed.
                 tlb::flush(VirtAddr::new(address));
             }
-            let frame = Physical(old & ADDRESS);
+            let frame = Physical(frame_bits(old));
             if Some(frame) != zero {
                 // SAFETY: a user leaf is the unique owner of an order-zero
                 // reservation (`mm_map_anon`/`mm_install_page`/`map_user`), the
                 // PTE is cleared and invalidated above, and no `UserSpace`
                 // borrow can be live (we hold `&mut self`).
-                if unsafe { allocator.reclaim_reserved(frame) }.is_ok() {
-                    freed += 1;
-                }
+                let result = unsafe { allocator.reclaim_reserved(frame) };
+                // The PTE is already gone: a refusal means the ownership
+                // invariant above is broken (double free, wrong order, foreign
+                // frame). Stop loudly rather than leak the frame silently.
+                assert!(
+                    result.is_ok(),
+                    "mm_unmap: user frame {frame:?} refused by the allocator: {result:?}"
+                );
+                freed += 1;
             }
         });
         freed
@@ -1049,7 +959,8 @@ impl Tables {
                 if old & MAPPED == 0 || old & USER == 0 {
                     return;
                 }
-                let keep = old & !(PRESENT | PROTNONE | WRITE | NX);
+                let keep = old & !(PRESENT | PROTNONE | WRITE | NX | ADDRESS);
+                let frame = frame_bits(old);
                 let new = if prot.accessible {
                     // WRITE survives only on a page that had it and still may.
                     let write = if old & PRESENT != 0 && old & WRITE != 0 && prot.write {
@@ -1057,9 +968,12 @@ impl Tables {
                     } else {
                         0
                     };
-                    keep | PRESENT | write | if prot.exec { 0 } else { NX }
+                    leaf_entry(
+                        frame,
+                        keep | PRESENT | write | if prot.exec { 0 } else { NX },
+                    )
                 } else {
-                    keep | PROTNONE | NX
+                    leaf_entry(frame, keep | PROTNONE | NX)
                 };
                 match entry.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => break,
@@ -1116,7 +1030,7 @@ fn out_of_memory(error: Error) -> kernel::mm::OutOfMemory {
     // Only exhaustion is a legitimate failure. Anything else means the model
     // asked for a page it had not checked, a kernel bug: stop loudly.
     match error {
-        Error::Memory(_) => kernel::mm::OutOfMemory,
+        Error::Memory(MemoryError::NoMemory) => kernel::mm::OutOfMemory,
         other => panic!("mm page-table backend: {other:?}"),
     }
 }
@@ -1185,6 +1099,30 @@ impl UserSpace<'_> {
     #[must_use]
     pub fn resident(&self, page: u64, write: bool) -> bool {
         self.translate(page, write).is_some()
+    }
+
+    /// The raw leaf entry of the user page at page-aligned `page`, or 0 (self-test
+    /// evidence of the `PROT_NONE` frame inversion).
+    #[cfg(feature = "qemu-self-test")]
+    #[must_use]
+    pub fn raw_entry(&self, page: u64) -> u64 {
+        match self.tables.user_slot(page) {
+            // SAFETY: `user_slot` returned an aligned PTE of this tree inside
+            // the direct map; a volatile read creates no reference.
+            Ok(Some(slot)) => unsafe { ptr::read_volatile(slot) },
+            _ => 0,
+        }
+    }
+
+    /// Whether `after` is `before` (a present leaf) turned `PROT_NONE`: P clear,
+    /// `PROTNONE` set and exactly the frame bits complemented (self-test).
+    #[cfg(feature = "qemu-self-test")]
+    #[must_use]
+    pub fn protnone_guard(before: u64, after: u64) -> bool {
+        before & PRESENT != 0
+            && after & (PRESENT | PROTNONE) == PROTNONE
+            && (before ^ after) & ADDRESS == ADDRESS
+            && frame_bits(after) == before & ADDRESS
     }
 
     /// The frame of the user page at page-aligned `address`; present, user at
@@ -1289,8 +1227,20 @@ impl UserSpace<'_> {
         let shift = 39 - 9 * level;
         for index in 0..512usize {
             let entry = read_entry(self.tables.direct_map, table, index)?;
-            if entry & PRESENT == 0 {
+            // A leaf is mapped when present or `PROT_NONE` (it holds a frame
+            // either way and must satisfy the same isolation rules); a table
+            // entry only counts when present. Both bits at once is no state
+            // this code creates.
+            let mapped = if level == 3 {
+                entry & MAPPED != 0
+            } else {
+                entry & PRESENT != 0
+            };
+            if !mapped {
                 continue;
+            }
+            if level == 3 && entry & MAPPED == MAPPED {
+                return Err(Error::Audit);
             }
             let address = base | ((index as u64) << shift);
             if entry & USER == 0 || address >= TASK_SIZE_MAX || (level < 3 && entry & HUGE != 0) {
@@ -1312,15 +1262,23 @@ impl UserPages for UserSpace<'_> {
         let physical = self.translate(page, write)?;
         let address = usize::try_from(self.tables.direct_map.checked_add(physical.0)?).ok()?;
         let pointer = ptr::with_exposed_provenance_mut::<[u8; PAGE_BYTES]>(address);
-        // SAFETY: `translate` found a present user leaf. Only `map_user` installs
-        // them, from an order-zero allocator reservation mapped nowhere else
-        // that `unmap_user_free` is the only way to free, so the 4 KiB frame
-        // is live, initialized (allocator zeroing, then plain bytes) and 4 KiB
-        // aligned. The direct map covers all usable RAM read-write (checked by
-        // `Allocator::new`). The view holds `&mut Tables`, so nothing can free,
-        // remap or hand out another reference to the frame while the returned
-        // borrow (tied to `&mut self`) lives, and user code does not run (one
-        // CPU) while the kernel holds it. Any byte pattern is a valid `[u8; N]`.
+        // SAFETY: `translate` found a present user leaf. Its frame is one of
+        // two kinds. (1) A private frame: an order-zero allocator reservation
+        // that exactly one leaf owns (`map_user`, `mm_map_anon`,
+        // `mm_install_page`) and only `mm_unmap` frees, after clearing and
+        // invalidating that leaf. (2) The shared zero frame
+        // (`Tables::init_zero_page`): mapped by any number of leaves, never
+        // freed, and hardware-read-only in every leaf, so `translate(write)`
+        // never returns it. The frame is live, initialized (allocator zeroing,
+        // then plain bytes) and 4 KiB aligned. The direct map covers all usable
+        // RAM read-write (checked by `Allocator::new`). The view holds
+        // `&mut Tables`, so nothing can free, remap or hand out another
+        // reference to the frame while the returned borrow (tied to `&mut
+        // self`) lives, and user code does not run (one CPU) while the kernel
+        // holds it. Any byte pattern is a valid `[u8; N]`. The zero frame stays
+        // zero only because every caller obeys the `UserPages::page` contract:
+        // a page requested with `write == false` is only read (the sole caller
+        // is `usercopy::walk`, whose read visitor is `copy_from_user`).
         Some(unsafe { &mut *pointer })
     }
 }
