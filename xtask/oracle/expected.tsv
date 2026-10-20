@@ -394,7 +394,17 @@ time	check	clock_nanosleep-coarse	init: test time.clock_nanosleep-coarse ok
 time	check	clock_nanosleep-thread-cputime	init: test time.clock_nanosleep-thread-cputime ok
 time	check	clock_nanosleep-fault	init: test time.clock_nanosleep-fault ok
 time	check	clock_nanosleep-invalid-flag-bits	init: test time.clock_nanosleep-invalid-flag-bits ok
-time	summary	-	init: tests time passed=108 failed=0
+time	check	settime-realtime	init: test time.settime-realtime ok
+time	check	settime-time-at-once	init: test time.settime-time-at-once ok
+time	check	settime-coarse-at-once	init: test time.settime-coarse-at-once ok
+time	check	settime-realtime-reads-back	init: test time.settime-realtime-reads-back ok
+time	check	settime-restore	init: test time.settime-restore ok
+time	check	cpu-nanosleep-zero	init: test time.cpu-nanosleep-zero ok
+time	check	cpu-nanosleep-abs-zero	init: test time.cpu-nanosleep-abs-zero ok
+time	check	cpu-nanosleep-abs-past	init: test time.cpu-nanosleep-abs-past ok
+time	check	cpu-nanosleep-by-pid-zero	init: test time.cpu-nanosleep-by-pid-zero ok
+time	check	cpu-nanosleep-by-pid-abs-past	init: test time.cpu-nanosleep-by-pid-abs-past ok
+time	summary	-	init: tests time passed=118 failed=0
 signal	check	sigaction-default	init: test signal.sigaction-default ok
 signal	check	sigaction-set-returns-old	init: test signal.sigaction-set-returns-old ok
 signal	check	sigaction-roundtrip	init: test signal.sigaction-roundtrip ok

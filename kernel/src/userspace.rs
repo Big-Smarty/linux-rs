@@ -26,12 +26,14 @@ use crate::{
     memory::{Allocator, Error as MemoryError, PAGE, PAGE_BYTES, Physical},
     paging::{self, Tables, UserSpace},
     services::{self, Service},
+    timer,
 };
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
     iter,
 };
 use kernel::{
+    cputime::{CpuAccount, CpuSample},
     exec::{
         args::{ArgsError, InitArgv, Word},
         find::{FindError, InitEntry, Search},
@@ -44,7 +46,9 @@ use kernel::{
     },
     image::{cpio::FileType, elf::Elf},
     loadavg::LoadAvg,
-    syscall::{self, Console, Context, Machine, Outcome},
+    syscall::{
+        self, ClockState, Clocks, Console, Context, Machine, Outcome, RestartBlock, RestartFn,
+    },
     task::{self, Attributes},
     usercopy::{self, UserPages},
 };
@@ -358,7 +362,8 @@ fn load_init(
 /// groups extend it (file table, credentials, signals, ...); exactly one is
 /// reachable until tasks exist.
 ///
-/// Lock order: `PROCESS` -> `TABLES` -> heap -> `FRAMES` (`services`). The
+/// Lock order: `PROCESS` -> `TABLES` -> heap -> `FRAMES` (`services`), and
+/// `PROCESS` -> `TIMER_HW` (a leaf, taken by `sleep_until`'s timer wait). The
 /// handler holds `PROCESS` for the whole syscall (a single task cannot
 /// re-enter), so a field needs no lock of its own.
 pub struct Process {
@@ -382,6 +387,9 @@ pub struct Process {
     /// Load-average state at init start; `sysinfo` replays it to the boot
     /// clock ([`LoadAvg::loads_at`]), so there is no tick hook and no lock.
     pub load: LoadAvg,
+    /// `current->restart_block.nanosleep`, written by the sleeping syscalls.
+    #[allow(dead_code, reason = "read by restart_syscall (signal lane)")]
+    pub restart: RestartBlock,
 }
 
 static PROCESS: Service<Process> = Service::new();
@@ -389,8 +397,10 @@ static PROCESS: Service<Process> = Service::new();
 /// `nr_running + nr_uninterruptible` of the one CPU: init is always runnable
 /// (running or preempted by the tick) because no syscall blocks yet and the
 /// kernel never halts while init exists.
-/// shortcut: a constant; replace with the runqueue's counters when a syscall
-/// can sleep (nanosleep, futex, wait4, blocking I/O) or a second task exists.
+/// shortcut: a constant, though `nanosleep`/`clock_nanosleep` now sleep (Linux
+/// counts a sleeping task in neither `nr_running` nor `nr_uninterruptible`, so
+/// `sysinfo` loads over-count while init sleeps); replace with the runqueue's
+/// counters when a second task or a blocking syscall (futex, wait4, I/O) exists.
 const NR_ACTIVE: i64 = 1;
 
 /// The boot clock in jiffies, the unit of the load-average windows. The
@@ -415,6 +425,18 @@ fn cpuid_fault_absent() -> bool {
     let gp_on_user_cpuid =
         __cpuid(0x8000_0000).eax >= 0x8000_0021 && __cpuid(0x8000_0021).eax & (1 << 17) != 0;
     amd && !gp_on_user_cpuid
+}
+
+/// CPU-time accounting of the (only) task. Lives outside `PROCESS` because the
+/// tick interrupt writes it while a syscall holds the `PROCESS` lock; it is all
+/// atomics (`cputime`). shortcut: one task; moves into the task struct with the
+/// scheduler.
+static CPUTIME: CpuAccount = CpuAccount::new();
+
+/// The tick found init running (`user`: in ring 3, else in the kernel on its
+/// behalf) for `periods` ticks; called from the timer interrupt.
+pub fn account_ticks(user: bool, periods: u64) {
+    CPUTIME.tick(user, periods);
 }
 
 /// Syscall context: the process plus its user-memory view (a borrow of the
@@ -471,6 +493,44 @@ impl Context for Syscall<'_> {
             free_pages: frames.available() as u64,
             loads: self.process.load.loads_at(jiffies_of(uptime_ns), NR_ACTIVE),
         }
+    }
+}
+
+impl Clocks for Syscall<'_> {
+    fn clock_state(&self) -> ClockState {
+        timer::clock_state()
+    }
+    fn set_realtime(&mut self, offset: i64, real_ns: i64) {
+        // IF is clear for the whole syscall (SYSCALL_MASK), the clock's writer rule.
+        timer::set_realtime(offset, real_ns);
+    }
+    fn set_restart_block(&mut self, block: RestartBlock) {
+        self.process.restart = block;
+    }
+    fn cpu_sample(&self) -> CpuSample {
+        CPUTIME.sample(timer::ktime_get_ns())
+    }
+    fn cpu_adjusted(&mut self) -> (u64, u64) {
+        CPUTIME.adjusted(timer::ktime_get_ns())
+    }
+    fn sleep_until(&mut self, deadline_ns: u64) -> Option<u64> {
+        // The task leaves the CPU for the wait (`schedule()`): the halted CPU is
+        // idle time, not the task's. Nothing can interrupt the wait yet (no signals).
+        CPUTIME.sleep_begin(timer::ktime_get_ns());
+        timer::wait_until_ns(deadline_ns);
+        CPUTIME.sleep_end(timer::ktime_get_ns());
+        None
+    }
+    // shortcut: init is root with every capability; credentials come with the
+    // ids/capability work, which replaces these two with `capable(...)`.
+    fn capable_sys_time(&self) -> bool {
+        true
+    }
+    fn capable_wake_alarm(&self) -> bool {
+        true
+    }
+    fn alarm_rtc(&self) -> bool {
+        timer::rtc_present()
     }
 }
 
@@ -705,6 +765,10 @@ fn start(init: &Loaded) -> ! {
     // `sched_init`: the first load window starts when the scheduler does.
     // shortcut: that is when init starts here, not at kernel entry.
     let load = LoadAvg::new(jiffies_of(crate::timer::ktime_get_boottime_ns()));
+    // The task starts running: `sum_exec_runtime` counts from here, and the tick
+    // (masked after the boot proofs) runs again so user/system time accrues.
+    CPUTIME.start(timer::ktime_get_ns());
+    timer::resume_tick();
     PROCESS.install(Process {
         pid: 1,
         tgid: 1,
@@ -713,6 +777,12 @@ fn start(init: &Loaded) -> ! {
         brk: init.brk,
         attrs: Attributes::init(task::max_threads(managed_pages)),
         load,
+        restart: RestartBlock {
+            func: RestartFn::None,
+            clockid: 0,
+            expires_ns: 0,
+            rmtp: 0,
+        },
     });
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all

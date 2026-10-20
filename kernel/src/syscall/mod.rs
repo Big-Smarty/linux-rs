@@ -31,12 +31,14 @@ mod io;
 mod process;
 #[cfg(test)]
 mod testing;
+mod time;
 
 use crate::{config, task::Attributes, usercopy::UserPages};
 use syscalls::{Errno, Sysno};
 
 pub use io::{MAX_RW_COUNT, TTY_CHUNK};
 pub use process::exit_code;
+pub use time::{ClockState, Clocks, Kclock, RestartBlock, RestartFn, clockid_to_kclock};
 
 /// `Sysno` values the `syscalls` crate lists for `x86_64` that the pinned
 /// 6.18.57 `syscall_64.tbl` leaves without an entry point or maps to
@@ -55,7 +57,7 @@ pub trait Console {
 /// Everything a syscall may touch: the calling task's user memory (the one
 /// user-copy mechanism, `usercopy`) and its identity and devices. The binary
 /// implements it for its `Process`; host tests for a fake.
-pub trait Context: UserPages {
+pub trait Context: UserPages + Clocks {
     /// init's `/dev/console`.
     fn console(&mut self) -> &mut dyn Console;
     /// `task_tgid_vnr(current)`: what `getpid` returns.
@@ -129,6 +131,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
     io::dispatch(ctx, sysno, args)
         .or_else(|| process::dispatch(ctx, sysno, args))
         .or_else(|| ids::dispatch(ctx, sysno, args))
+        .or_else(|| time::dispatch(ctx, sysno, args))
         // shortcut: single-init only. A syscall Linux implements but this slice
         // does not ends the kernel (explicitly, never as success or ENOSYS);
         // with a second task this must become the real syscall or an error

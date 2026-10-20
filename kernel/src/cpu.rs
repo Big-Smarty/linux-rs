@@ -194,7 +194,8 @@ pub fn mmio_pat_index() -> u8 {
 
 static IRQ_NESTING: AtomicU64 = AtomicU64::new(0);
 
-fn interrupts_enabled() -> bool {
+/// `RFLAGS.IF` of the calling CPU (`irqs_disabled()` is its negation).
+pub fn interrupts_enabled() -> bool {
     let flags: u64;
     // SAFETY: CPL0, owned mapped stack with no red zone. PUSHFQ/POP balance the
     // stack and only read flags. Omit nomem to retain the compiler boundary.
@@ -730,13 +731,13 @@ static FAULT_ARMED: AtomicU64 = AtomicU64::new(0);
 /// spurious vector that was latched across the shutdown can arrive in ring 3):
 /// they are not task exceptions. Returns false for everything else, including a
 /// *real* 8259 IRQ7/15, which stays an unexpected vector.
-fn external_interrupt(vector: u64) -> bool {
+fn external_interrupt(vector: u64, user: bool) -> bool {
     let base = u64::from(ISA_IRQ_VECTOR_BASE);
     match vector {
         v if v == u64::from(SPURIOUS_VECTOR) => crate::apic::spurious_interrupt(),
         v if v == u64::from(ERROR_VECTOR) => crate::apic::error_interrupt(),
-        v if v == base => crate::timer::isa_irq0_interrupt(),
-        v if v == u64::from(LOCAL_TIMER_VECTOR) => crate::timer::lapic_timer_interrupt(),
+        v if v == base => crate::timer::isa_irq0_interrupt(user),
+        v if v == u64::from(LOCAL_TIMER_VECTOR) => crate::timer::lapic_timer_interrupt(user),
         // 8259 lines 7 and 15 raise a spurious vector when a request vanishes
         // between INTR and acknowledge (Linux spurious_8259A_irq): ignore only
         // when the in-service bit is clear.
@@ -747,7 +748,8 @@ fn external_interrupt(vector: u64) -> bool {
 }
 
 extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: u64) {
-    if external_interrupt(vector) {
+    // `user_mode(regs)`: the interrupted code ran in ring 3.
+    if external_interrupt(vector, frame.cs & 3 == 3) {
         return;
     }
     // Any ring-3 CS (64-bit 0x33 or compatibility 0x23, RPL 3).

@@ -99,6 +99,7 @@ const EVENT_PIT: u8 = 1;
 const EVENT_LAPIC_ONESHOT: u8 = 2;
 const EVENT_LAPIC_DEADLINE: u8 = 3;
 static EVENT: AtomicU8 = AtomicU8::new(EVENT_NONE);
+static RTC_OK: AtomicBool = AtomicBool::new(false);
 static TICK_ON: AtomicBool = AtomicBool::new(false);
 static PIT_RUNNING: AtomicBool = AtomicBool::new(false);
 /// Set once `init` saw the clockevent deliver ticks; halting waits depend on it.
@@ -116,7 +117,8 @@ static CLOCK_SEQ: AtomicU64 = AtomicU64::new(0);
 static CLOCK_MUL: AtomicU64 = AtomicU64::new(0);
 static CLOCK_SHIFT: AtomicU64 = AtomicU64::new(0);
 static CLOCK_OFFSET: AtomicU64 = AtomicU64::new(0);
-static CLOCK_EPOCH: AtomicI64 = AtomicI64::new(0);
+static CLOCK_REAL_OFFSET: AtomicI64 = AtomicI64::new(0);
+static CLOCK_SETTOD_REAL: AtomicI64 = AtomicI64::new(0);
 
 fn clock_publish(clock: &Clock) {
     let scale = clock.scale();
@@ -124,7 +126,8 @@ fn clock_publish(clock: &Clock) {
     CLOCK_MUL.store(u64::from(scale.mul), Ordering::Relaxed);
     CLOCK_SHIFT.store(u64::from(scale.shift), Ordering::Relaxed);
     CLOCK_OFFSET.store(scale.offset, Ordering::Relaxed);
-    CLOCK_EPOCH.store(clock.epoch_real_sec(), Ordering::Relaxed);
+    CLOCK_REAL_OFFSET.store(clock.real_offset_ns(), Ordering::Relaxed);
+    CLOCK_SETTOD_REAL.store(clock.settod_real_ns(), Ordering::Relaxed);
     CLOCK_SEQ.fetch_add(1, Ordering::Release);
 }
 fn clock_load() -> Clock {
@@ -139,10 +142,11 @@ fn clock_load() -> Clock {
             shift: u32::try_from(CLOCK_SHIFT.load(Ordering::Relaxed)).unwrap_or(0),
             offset: CLOCK_OFFSET.load(Ordering::Relaxed),
         };
-        let epoch = CLOCK_EPOCH.load(Ordering::Relaxed);
+        let real_offset = CLOCK_REAL_OFFSET.load(Ordering::Relaxed);
+        let settod = CLOCK_SETTOD_REAL.load(Ordering::Relaxed);
         fence(Ordering::Acquire);
         if CLOCK_SEQ.load(Ordering::Relaxed) == before {
-            return Clock::from_parts(scale, epoch);
+            return Clock::from_parts(scale, real_offset, settod);
         }
     }
 }
@@ -162,6 +166,37 @@ pub fn ktime_get_boottime_ns() -> u64 {
 #[must_use]
 pub fn ktime_get_real() -> Timespec {
     clock_load().realtime(rdtsc())
+}
+/// Everything the syscall layer needs to read every clock consistently.
+#[must_use]
+pub fn clock_state() -> kernel::syscall::ClockState {
+    let clock = clock_load();
+    kernel::syscall::ClockState {
+        mono_ns: clock.monotonic_ns(rdtsc()),
+        // No suspend: `CLOCK_BOOTTIME` is `CLOCK_MONOTONIC`.
+        boot_offset_ns: 0,
+        real_offset_ns: clock.real_offset_ns(),
+        settod_real_ns: clock.settod_real_ns(),
+    }
+}
+/// `do_settimeofday64`'s store: replace the realtime offset and record the
+/// value that was set (`xtime`, which the coarse readers return until a tick).
+///
+/// Context: task context with IF clear (the syscall entry masks it), BSP. The
+/// sequence-counted clock has one writer; an interrupt arriving mid-write on
+/// this CPU would spin on the odd sequence forever, hence IF must be clear.
+/// Takes no lock itself; it runs under the `PROCESS` lock like the syscall.
+pub fn set_realtime(offset: i64, real_ns: i64) {
+    debug_assert!(!cpu::interrupts_enabled(), "clock writer needs IF clear");
+    let mut clock = clock_load();
+    clock.set_realtime(offset, real_ns);
+    clock_publish(&clock);
+}
+/// Whether the CMOS RTC answered at boot: the wakeup-capable RTC that
+/// `alarmtimer_get_rtcdev` needs on this platform.
+#[must_use]
+pub fn rtc_present() -> bool {
+    RTC_OK.load(Ordering::Relaxed)
 }
 #[must_use]
 pub fn ticks() -> u64 {
@@ -262,7 +297,9 @@ fn pit_rearm(now_ns: u64) {
     }
 }
 
-fn tick_bookkeeping(now_ns: u64) {
+/// `user` is whether the tick interrupted ring 3 (`user_mode(regs)`), which
+/// `account_process_tick` needs to classify the tick's CPU time.
+fn tick_bookkeeping(now_ns: u64, user: bool) {
     if !TICK_ON.load(Ordering::Relaxed) {
         return;
     }
@@ -272,20 +309,21 @@ fn tick_bookkeeping(now_ns: u64) {
         let periods = (now_ns - next) / TICK_NSEC + 1;
         TICKS.fetch_add(periods, Ordering::Relaxed);
         NEXT_TICK_NS.store(next + periods * TICK_NSEC, Ordering::Relaxed);
+        crate::userspace::account_ticks(user, periods);
     }
 }
 
-/// Vector 0xec body.
-pub fn lapic_timer_interrupt() {
+/// Vector 0xec body; `user` as in [`tick_bookkeeping`].
+pub fn lapic_timer_interrupt(user: bool) {
     apic::eoi();
     let now = ktime_get_ns();
-    tick_bookkeeping(now);
+    tick_bookkeeping(now, user);
     cpu::irq_lock_probe();
     rearm(now);
 }
 
 /// Vector 0x30 body: ISA IRQ0, delivered by the 8259 (legacy path) or the IOAPIC.
-pub fn isa_irq0_interrupt() {
+pub fn isa_irq0_interrupt(user: bool) {
     if apic::mode() == ApicMode::Disabled {
         apic::pic_eoi_irq0();
     } else {
@@ -294,8 +332,24 @@ pub fn isa_irq0_interrupt() {
     IRQ0.fetch_add(1, Ordering::Relaxed);
     if EVENT.load(Ordering::Relaxed) == EVENT_PIT && TICK_ON.load(Ordering::Relaxed) {
         TICKS.fetch_add(1, Ordering::Relaxed);
+        crate::userspace::account_ticks(user, 1);
         cpu::irq_lock_probe();
     }
+}
+
+/// Restart the periodic tick after the boot proofs masked it, for the task that
+/// is about to run (`tick_sched` keeps the tick while a task runs; only idle
+/// stops it). A clockevent that never proved tick delivery stays off. Context:
+/// BSP, IF clear.
+pub fn resume_tick() {
+    if !TICK_VERIFIED.load(Ordering::Relaxed) {
+        return;
+    }
+    cpu::timer_transaction(|| {
+        TICK_ON.store(true, Ordering::Relaxed);
+        NEXT_TICK_NS.store(ktime_get_ns() + TICK_NSEC, Ordering::Relaxed);
+        rearm(ktime_get_ns());
+    });
 }
 
 /// Stop the tick and the clockevent (Linux `clockevents_shutdown`). A pending
@@ -914,6 +968,7 @@ unsafe fn init_clock(mmio: &Mmio, fadt: Fadt, has_pic: bool) -> Result<(), Error
     TSC_KHZ.store(tsc.khz, Ordering::Relaxed);
     let tsc_start = rdtsc();
     let (wall, rtc_ok) = rtc_read(fadt.century);
+    RTC_OK.store(rtc_ok, Ordering::Relaxed);
     // Monotonic time is zero at the TSC sample taken just before the RTC read;
     // the RTC is whole seconds, so realtime is the RTC second + monotonic.
     let khz = u32::try_from(tsc.khz).map_err(|_| Error::Calibration)?;
