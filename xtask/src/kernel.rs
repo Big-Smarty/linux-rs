@@ -982,7 +982,7 @@ const SUITE_CASES: &[DebugCase] = &[
     DebugCase {
         name: "baremetal-suite-stops",
         cmdline: Some(
-            "suite_pause_ms=50 suite_timeout_s=1 suite_groups=fault,io_uring,spin,spinchild,orphan,ids",
+            "suite_pause_ms=50 suite_timeout_s=1 suite_groups=fault,io_uring,spin,spinchild,orphan,block,ids",
         ),
         cpu: "qemu64",
         expected_exit: 35,

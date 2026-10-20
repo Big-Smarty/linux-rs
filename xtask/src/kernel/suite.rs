@@ -31,16 +31,19 @@ pub(super) const ALL_PASS: &[(&str, bool)] = &[
     ("fs", true),
     ("signal", true),
     ("fork", true),
+    ("proc", true),
+    ("jobctl", true),
 ];
-/// A run that selects five probes ending abnormally (a SIGSEGV, an unimplemented
+/// A run that selects six probes ending abnormally (a SIGSEGV, an unimplemented
 /// syscall, a loop that outruns the one-second group bound, that loop in a child while init
-/// waits, init exiting with a spinning child), then one real group.
+/// waits, init exiting with a spinning child, a sleep nothing can end), then one real group.
 pub(super) const STOPS: &[(&str, bool)] = &[
     ("fault", false),
     ("io_uring", false),
     ("spin", false),
     ("spinchild", false),
     ("orphan", false),
+    ("block", false),
     ("ids", true),
 ];
 
@@ -123,7 +126,7 @@ pub(super) fn validate(
     for &(group, must_pass) in groups {
         let prefix = format!("  {group} stopped: FAIL ");
         if !must_pass
-            && matches!(group, "io_uring" | "spin" | "spinchild")
+            && matches!(group, "io_uring" | "spin" | "spinchild" | "block")
             && !lines[complete_at..]
                 .iter()
                 .any(|line| line.starts_with(&prefix))
@@ -193,7 +196,7 @@ fn check_group(
     let cause = match group {
         "fault" => "init signal 11",
         "io_uring" => "kernel stop",
-        "spin" | "spinchild" => "timeout",
+        "spin" | "spinchild" | "block" => "timeout",
         _ => "init exit 0",
     };
     if !result.contains(&format!("cause=\"{cause}\"")) {
@@ -203,13 +206,16 @@ fn check_group(
     if group == "io_uring" && !body.contains(&"FAIL syscall unimplemented nr=425") {
         return Err("io_uring probe must end in the unimplemented-syscall stop".to_owned());
     }
-    if matches!(group, "spin" | "spinchild") && !body.contains(&"FAIL group timeout after 1 s") {
+    if matches!(group, "spin" | "spinchild" | "block")
+        && !body.contains(&"FAIL group timeout after 1 s")
+    {
         return Err(format!("{group} probe must end in the group time bound"));
     }
     // The scenario really happened: a child was forked before the group ended.
     for (probe, line) in [
         ("spinchild", "init: child spinning on purpose"),
         ("orphan", "init: leaving an orphan spinning"),
+        ("block", "init: blocking on an empty pipe on purpose"),
     ] {
         if group == probe && !body.contains(&line) {
             return Err(format!("{probe} probe must print `{line}`"));
@@ -339,10 +345,9 @@ WHAT THIS IS
   with Limine 12.9.3 (the BOOTX64.EFI of your /usr/share/limine). The kernel
   runs its boot self-tests, prints a hardware inventory (CPU, memory map, ACPI,
   APIC/timers, framebuffers, PCI ids), runs the oracle syscall groups ids,
-  time, mm, fs, signal and fork each as a fresh /init on a fresh rootfs, compares
-  each group's output line by line with what the pinned Linux 6.18.57 printed,
-  and ends on a summary screen. The group proc is not run (the kernel has no
-  procfs yet; the summary says so).
+  time, mm, fs, signal, fork, proc and jobctl each as a fresh /init on a fresh
+  rootfs, compares each group's output line by line with what the pinned
+  Linux 6.18.57 printed, and ends on a summary screen.
 
 WHAT IT NEVER DOES
   It has no disk, USB-storage, network or sound driver and calls no firmware
@@ -864,9 +869,12 @@ mod tests {
             } else if group == "orphan" {
                 writeln!(log, "init: leaving an orphan spinning").unwrap();
                 writeln!(log, "SUITE group {group} result=fail cause=\"init exit 0\" matched=0 expected=0 observed=0 mismatches=0 millis=1").unwrap();
-            } else if matches!(group, "spin" | "spinchild") {
+            } else if matches!(group, "spin" | "spinchild" | "block") {
                 if group == "spinchild" {
                     writeln!(log, "init: child spinning on purpose").unwrap();
+                }
+                if group == "block" {
+                    writeln!(log, "init: blocking on an empty pipe on purpose").unwrap();
                 }
                 writeln!(log, "FAIL group timeout after 1 s").unwrap();
                 writeln!(log, "SUITE group {group} result=fail cause=\"timeout\" matched=0 expected=0 observed=0 mismatches=0 millis=1000").unwrap();
@@ -913,7 +921,7 @@ mod tests {
             for &(group, must_pass) in groups {
                 let stop = match group {
                     "io_uring" => "FAIL syscall unimplemented nr=425",
-                    "spin" | "spinchild" => "FAIL group timeout after 1 s",
+                    "spin" | "spinchild" | "block" => "FAIL group timeout after 1 s",
                     _ => continue,
                 };
                 if !must_pass {

@@ -729,11 +729,15 @@ fn exec_and_setpgid(t: &mut T) {
     reap_all();
     let (ready_r, ready_w) = pipe();
     let (in_r, in_w) = pipe();
+    // The new image prints init's banner: to a pipe nobody reads, not to the console.
+    let (sink_r, sink_w) = pipe();
     let mut ready = [0u8; 1];
     let c = spawn(|| {
         close(ready_r);
         close(in_w);
+        close(sink_r);
         let _ = sys(Sysno::dup3, &[in_r, 0, 0]);
+        let _ = sys(Sysno::dup3, &[sink_w, 1, 0]);
         let _ = sys(Sysno::dup3, &[ready_w, 40, 0]);
         let argv = [addr(b"/init\0"), addr(b"jobwait\0"), 0];
         let envp = [0usize];
@@ -742,6 +746,8 @@ fn exec_and_setpgid(t: &mut T) {
     });
     close(ready_w);
     close(in_r);
+    close(sink_r);
+    close(sink_w);
     let _ = read_all(ready_r, &mut ready);
     close(ready_r);
     t.eq("exec-image-is-running", ready, [1]);

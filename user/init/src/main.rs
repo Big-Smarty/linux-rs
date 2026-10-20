@@ -440,6 +440,32 @@ fn run(stack: &Stack) {
             out!("init: leaving an orphan spinning");
             fork_spinner();
         }
+        // Every task asleep and nothing to wake it: init reads an empty pipe whose write
+        // end it holds itself, as Linux would sleep on it forever. The suite's time bound
+        // must end the group from the idle CPU.
+        Some(b"block") => {
+            out!("init: blocking on an empty pipe on purpose");
+            let mut fds = [0u32; 2];
+            // SAFETY: `fds` is a live 8-byte buffer for the two descriptors; a one-byte
+            // read into a live stack byte.
+            let (made, read) = unsafe {
+                let made = syscalls::syscall2(
+                    Sysno::pipe2,
+                    ptr::from_mut(&mut fds).expose_provenance(),
+                    0,
+                );
+                let mut byte = 0u8;
+                let read = syscalls::syscall3(
+                    Sysno::read,
+                    fds[0] as usize,
+                    ptr::from_mut(&mut byte).expose_provenance(),
+                    1,
+                );
+                (made, read)
+            };
+            expect("block-pipe", made, Ok(0));
+            fail("block", read);
+        }
         Some(b"fault") => {
             out!("init: faulting on purpose");
             // SAFETY: not sound, deliberately: the read of address 0 must raise SIGSEGV.

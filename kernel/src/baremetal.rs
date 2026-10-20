@@ -95,11 +95,12 @@ const MAX_GROUPS: usize = 10;
 /// Extra `suite_groups=` words of the QEMU harness: `/init` modes that end a
 /// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not; a
 /// loop that never ends; the same loop in a child while init waits for it, so the time bound
-/// finds a child on the CPU; init exiting with a child still spinning), proving that a bad
+/// finds a child on the CPU; init exiting with a child still spinning; every task asleep
+/// with nothing to wake it, so the bound finds the CPU idle), proving that a bad
 /// group ends only itself and ends as a whole. They have no expected output, so they always
 /// count as failed.
 #[cfg(feature = "qemu-self-test")]
-const PROBES: [&str; 5] = ["fault", "io_uring", "spin", "spinchild", "orphan"];
+const PROBES: [&str; 6] = ["fault", "io_uring", "spin", "spinchild", "orphan", "block"];
 #[cfg(not(feature = "qemu-self-test"))]
 const PROBES: [&str; 0] = [];
 /// Longest log line kept whole by the replay and the stop-line search.
