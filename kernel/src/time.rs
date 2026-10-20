@@ -195,6 +195,52 @@ pub fn calc_pmtimer_ref(delta_tsc: u64, pm1: u32, pm2: u32, width_bits: u32) -> 
     (ns != 0).then(|| ((u128::from(delta_tsc) * 1_000_000) / ns) as u64)
 }
 
+/// Why a reference-counter wait gave up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferenceError {
+    /// A sample could not be taken undisturbed (`tsc_read_refs` exhausted its retries).
+    Disturbed,
+    /// The counter did not advance by the target within the TSC-time limit: it is
+    /// stopped, disabled or not the device it claims to be.
+    Stuck,
+}
+
+/// One `(tsc, counter)` reading of a reference clock.
+pub type RefSample = (u64, u32);
+
+/// Cap on TSC cycles one reference wait may take. The nominal wait is 50 ms; this
+/// is 0.4 s at 5 GHz and 2 s at 1 GHz, long enough for any SMI/VM-exit storm
+/// that still leaves a usable measurement, short enough that a dead UC read
+/// shows up as a reported failure instead of a frozen screen.
+pub const REFERENCE_LIMIT_CYCLES: u64 = 2_000_000_000;
+
+/// Wait until a reference counter advanced by `target_ticks` (modulo `mask`) and
+/// return the first and last `(tsc, counter)` samples. The bound is elapsed TSC
+/// time, not an iteration count of a possibly stuck uncached read; a secondary
+/// iteration cap only guards a TSC that does not advance at all.
+///
+/// # Errors
+/// [`ReferenceError::Disturbed`] if `sample` yields `None`; [`ReferenceError::Stuck`]
+/// if the target was not reached within `limit_cycles` TSC cycles.
+pub fn wait_reference(
+    mut sample: impl FnMut() -> Option<RefSample>,
+    target_ticks: u64,
+    mask: u64,
+    limit_cycles: u64,
+) -> Result<(RefSample, RefSample), ReferenceError> {
+    let first = sample().ok_or(ReferenceError::Disturbed)?;
+    for _ in 0..(1u64 << 32) {
+        let now = sample().ok_or(ReferenceError::Disturbed)?;
+        if u64::from(now.1.wrapping_sub(first.1)) & mask >= target_ticks {
+            return Ok((first, now));
+        }
+        if now.0.wrapping_sub(first.0) > limit_cycles {
+            return Err(ReferenceError::Stuck);
+        }
+    }
+    Err(ReferenceError::Stuck)
+}
+
 /// `tsc_refine_calibration_work`'s window: the refined value replaces the
 /// early one only if within 1% of it.
 #[must_use]
@@ -514,6 +560,74 @@ mod tests {
         let khz = pit_quick_khz(delta, i).unwrap();
         assert!(khz.abs_diff(3_000_000) < 3, "{khz}");
         assert_eq!(pit_quick_khz(1, 0), None);
+    }
+
+    #[test]
+    fn reference_wait_is_bounded_in_tsc_time() {
+        // A counter that never advances gives up after the cycle limit, not after
+        // an iteration count: 1000 cycles per sample, limit 1,000,000 => ~1000 reads.
+        let mut tsc = 0u64;
+        let mut reads = 0u64;
+        let result = wait_reference(
+            || {
+                tsc += 1000;
+                reads += 1;
+                Some((tsc, 7))
+            },
+            1000,
+            u64::from(u32::MAX),
+            1_000_000,
+        );
+        assert_eq!(result, Err(ReferenceError::Stuck));
+        assert!((1000..=1003).contains(&reads), "{reads}");
+        // A healthy 24 MHz counter against a 3 GHz TSC (125 cycles per tick) finishes.
+        let mut tsc = 0u64;
+        let mut counter = 0xffff_ff00u32;
+        let (a, b) = wait_reference(
+            || {
+                tsc += 5_000;
+                counter = counter.wrapping_add(40);
+                Some((tsc, counter))
+            },
+            1_000_000,
+            u64::from(u32::MAX),
+            REFERENCE_LIMIT_CYCLES,
+        )
+        .unwrap();
+        assert!(u64::from(b.1.wrapping_sub(a.1)) >= 1_000_000);
+        // A 24-bit PM timer wraps inside the mask.
+        let mut tsc = 0u64;
+        let mut counter = 0x00ff_fff0u32;
+        let (a, b) = wait_reference(
+            || {
+                tsc += 100;
+                counter = (counter + 1000) & 0xff_ffff;
+                Some((tsc, counter))
+            },
+            5000,
+            0xff_ffff,
+            REFERENCE_LIMIT_CYCLES,
+        )
+        .unwrap();
+        assert_eq!((u64::from(b.1.wrapping_sub(a.1))) & 0xff_ffff, 5000);
+        // Disturbed samples are reported, not retried forever.
+        assert_eq!(
+            wait_reference(|| None, 1, u64::MAX, 1),
+            Err(ReferenceError::Disturbed)
+        );
+        let mut n = 0;
+        assert_eq!(
+            wait_reference(
+                || {
+                    n += 1;
+                    (n < 3).then_some((n, 0))
+                },
+                10,
+                u64::MAX,
+                100,
+            ),
+            Err(ReferenceError::Disturbed)
+        );
     }
 
     #[test]

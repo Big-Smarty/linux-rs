@@ -26,30 +26,59 @@ pub const BASE_EXTD: u64 = 1 << 10;
 pub const BASE_EN: u64 = 1 << 11;
 pub const BASE_ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 
-// xAPIC register offsets (apicdef.h).
-pub const REG_ID: u32 = 0x20;
-pub const REG_VERSION: u32 = 0x30;
-pub const REG_TPR: u32 = 0x80;
-pub const REG_EOI: u32 = 0xb0;
-pub const REG_LDR: u32 = 0xd0;
-pub const REG_SPIV: u32 = 0xf0;
-pub const REG_ISR: u32 = 0x100;
-pub const REG_ESR: u32 = 0x280;
-pub const REG_LVT_CMCI: u32 = 0x2f0;
-pub const REG_LVT_TIMER: u32 = 0x320;
-pub const REG_LVT_THERMAL: u32 = 0x330;
-pub const REG_LVT_PERF: u32 = 0x340;
-pub const REG_LVT_LINT0: u32 = 0x350;
-pub const REG_LVT_LINT1: u32 = 0x360;
-pub const REG_LVT_ERROR: u32 = 0x370;
-pub const REG_TIMER_INITIAL: u32 = 0x380;
-pub const REG_TIMER_CURRENT: u32 = 0x390;
-pub const REG_TIMER_DIVIDE: u32 = 0x3e0;
+/// A local APIC register: an architectural 16-byte aligned offset inside the
+/// 4 KiB register page, usable both as an xAPIC MMIO offset and (shifted) as an
+/// x2APIC MSR. The field is private: only the constants below and [`LapicReg::isr`]
+/// exist, so safe code cannot name an out-of-page offset or an arbitrary MSR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LapicReg(u32);
 
-/// x2APIC MSR of an xAPIC register offset (`APIC_BASE_MSR + (reg >> 4)`).
+impl LapicReg {
+    /// xAPIC MMIO offset from the page base.
+    #[must_use]
+    pub const fn offset(self) -> u32 {
+        self.0
+    }
+    /// x2APIC MSR (`APIC_BASE_MSR + (reg >> 4)`), always in `0x800..0x840`.
+    #[must_use]
+    pub const fn x2apic_msr(self) -> u32 {
+        0x800 + (self.0 >> 4)
+    }
+    /// In-service register `index` (0..8, 32 vectors each); `None` otherwise.
+    #[must_use]
+    pub const fn isr(index: u32) -> Option<Self> {
+        if index < 8 {
+            Some(Self(0x100 + 0x10 * index))
+        } else {
+            None
+        }
+    }
+}
+
+// xAPIC register offsets (apicdef.h).
+pub const REG_ID: LapicReg = LapicReg(0x20);
+pub const REG_VERSION: LapicReg = LapicReg(0x30);
+pub const REG_TPR: LapicReg = LapicReg(0x80);
+pub const REG_EOI: LapicReg = LapicReg(0xb0);
+pub const REG_SPIV: LapicReg = LapicReg(0xf0);
+pub const REG_ESR: LapicReg = LapicReg(0x280);
+pub const REG_LVT_CMCI: LapicReg = LapicReg(0x2f0);
+pub const REG_LVT_TIMER: LapicReg = LapicReg(0x320);
+pub const REG_LVT_THERMAL: LapicReg = LapicReg(0x330);
+pub const REG_LVT_PERF: LapicReg = LapicReg(0x340);
+pub const REG_LVT_LINT0: LapicReg = LapicReg(0x350);
+pub const REG_LVT_LINT1: LapicReg = LapicReg(0x360);
+pub const REG_LVT_ERROR: LapicReg = LapicReg(0x370);
+pub const REG_TIMER_INITIAL: LapicReg = LapicReg(0x380);
+pub const REG_TIMER_CURRENT: LapicReg = LapicReg(0x390);
+pub const REG_TIMER_DIVIDE: LapicReg = LapicReg(0x3e0);
+
+/// Whether `address` is addressable with `width_bits` physical address bits
+/// (CPUID 0x80000008 EAX[7:0]); a page-table entry above it has reserved bits
+/// set and faults on first use.
 #[must_use]
-pub const fn x2apic_msr(offset: u32) -> u32 {
-    0x800 + (offset >> 4)
+pub const fn physical_address_valid(address: u64, width_bits: u32) -> bool {
+    width_bits >= 64 || address >> width_bits == 0
 }
 pub const MSR_TSC_DEADLINE: u32 = 0x6e0;
 
@@ -126,10 +155,20 @@ impl Redirection {
 pub const fn ioapic_redirection_register(pin: u32) -> u32 {
     0x10 + 2 * pin
 }
-/// Pin count from the IOAPIC version register (bits 16..24 are max entry).
+/// Most redirection entries reachable through the 8-bit IOREGSEL: register
+/// `0x10 + 2*pin + 1 <= 0xff` gives pin <= 119. Larger values of the (8-bit)
+/// maximum-entry field would alias the ID/version registers.
+pub const IOAPIC_MAX_PINS: u32 = 120;
+/// Pin count from the IOAPIC version register (bits 16..24 are max entry),
+/// clamped to what the register window can address.
 #[must_use]
 pub const fn ioapic_pins(version: u32) -> u32 {
-    ((version >> 16) & 0xff) + 1
+    let pins = ((version >> 16) & 0xff) + 1;
+    if pins > IOAPIC_MAX_PINS {
+        IOAPIC_MAX_PINS
+    } else {
+        pins
+    }
 }
 
 /// Everything the local APIC mode decision depends on.
@@ -203,11 +242,11 @@ pub fn plan_apic_mode(i: &ApicInputs) -> ApicPlan {
     if i.nolapic || !i.cpu_has_apic {
         let reason = if i.nolapic { "nolapic" } else { "no-apic" };
         if firmware_x2apic && !i.hw_locked {
-            let [first, second] = x2apic_off(base);
-            // Then also drop EN: the legacy PIC path runs with the LAPIC off.
+            // Clearing EXTD and EN in one write leaves exactly the disabled xAPIC
+            // state the legacy PIC path runs with.
             return plan(
                 ApicMode::Disabled,
-                [first, second.map(|v| v & !BASE_EN)],
+                [Some(base & !(BASE_EXTD | BASE_EN)), None],
                 reason,
             );
         }
@@ -362,7 +401,7 @@ mod tests {
         i.nolapic = true;
         let p = plan_apic_mode(&i);
         assert_eq!(p.mode, ApicMode::Disabled);
-        assert_eq!(p.writes, [Some(XAPIC & !BASE_EN), Some(XAPIC & !BASE_EN)]);
+        assert_eq!(p.writes, [Some(XAPIC & !BASE_EN), None]);
         i.hw_locked = true;
         assert_eq!(plan_apic_mode(&i).mode, ApicMode::X2apic);
         let mut i = inputs(XAPIC);
@@ -372,10 +411,34 @@ mod tests {
 
     #[test]
     fn encodings() {
-        assert_eq!(x2apic_msr(REG_EOI), 0x80b);
-        assert_eq!(x2apic_msr(REG_LVT_TIMER), 0x832);
-        assert_eq!(x2apic_msr(REG_TIMER_DIVIDE), 0x83e);
-        assert_eq!(x2apic_msr(REG_SPIV), 0x80f);
+        assert_eq!(REG_EOI.x2apic_msr(), 0x80b);
+        assert_eq!(REG_LVT_TIMER.x2apic_msr(), 0x832);
+        assert_eq!(REG_TIMER_DIVIDE.x2apic_msr(), 0x83e);
+        assert_eq!(REG_SPIV.x2apic_msr(), 0x80f);
+        assert_eq!(LapicReg::isr(7).unwrap().offset(), 0x170);
+        assert_eq!(LapicReg::isr(8), None);
+        // Every nameable register is 16-byte aligned, in the page, in the MSR window.
+        for r in [
+            REG_ID,
+            REG_VERSION,
+            REG_TPR,
+            REG_EOI,
+            REG_SPIV,
+            REG_ESR,
+            REG_LVT_CMCI,
+            REG_LVT_TIMER,
+            REG_LVT_THERMAL,
+            REG_LVT_PERF,
+            REG_LVT_LINT0,
+            REG_LVT_LINT1,
+            REG_LVT_ERROR,
+            REG_TIMER_INITIAL,
+            REG_TIMER_CURRENT,
+            REG_TIMER_DIVIDE,
+        ] {
+            assert!(r.offset() % 16 == 0 && r.offset() < 0x400);
+            assert!((0x800..0x840).contains(&r.x2apic_msr()));
+        }
         assert_eq!(lvt_timer(TimerMode::OneShot, false), 0xec);
         assert_eq!(lvt_timer(TimerMode::TscDeadline, false), 0x4_00ec);
         assert_eq!(lvt_timer(TimerMode::Periodic, true), 0x3_00ec);
@@ -398,6 +461,15 @@ mod tests {
         assert_eq!(Redirection::MASKED.low(), 1 << 16);
         assert_eq!(ioapic_redirection_register(2), 0x14);
         assert_eq!(ioapic_pins(0x0017_0020), 24);
+        // A bogus max-entry byte must not reach registers that alias ID/version.
+        assert_eq!(ioapic_pins(0x00ff_0020), IOAPIC_MAX_PINS);
+        assert_eq!(ioapic_pins(0x0077_0020), 120);
+        assert_eq!(ioapic_pins(0x0078_0020), IOAPIC_MAX_PINS);
+        assert!(ioapic_redirection_register(IOAPIC_MAX_PINS - 1) < 0xff);
+        assert!(physical_address_valid(0xfee0_0000, 36));
+        assert!(!physical_address_valid(1 << 40, 36));
+        assert!(physical_address_valid(u64::MAX, 64));
+        assert!(physical_address_valid((1 << 40) - 1, 40));
         assert!(has_legacy_pic(true, || unreachable!(
             "PCAT_COMPAT skips the probe"
         )));
