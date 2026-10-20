@@ -4,7 +4,8 @@
 // (`__access_ok`, `USER_PTR_MAX`), arch/x86/include/asm/page_64_types.h
 // (`TASK_SIZE_MAX`), lib/usercopy.c (`_copy_from_user` zero-fills the
 // uncopied tail), include/linux/uaccess.h (copy_{to,from}_user return the
-// number of bytes NOT copied). All GPL-2.0.
+// number of bytes NOT copied), lib/strncpy_from_user.c, arch/x86/include/asm/uaccess.h
+// (`put_user` is one store). All GPL-2.0.
 // Transformation: the exception-table fixup is replaced by a software page
 // table walk performed before each page is touched; no user virtual address is
 // ever dereferenced.
@@ -104,6 +105,49 @@ pub fn copy_from_user<P: UserPages>(pages: &mut P, to: &mut [u8], from: u64) -> 
     missing
 }
 
+/// `put_user` of one value: a single store, so it either happens completely
+/// or not at all (a store that crosses into an unwritable page faults before
+/// any byte changes). Returns whether it was stored. Unlike [`copy_to_user`],
+/// there is no short copy to report.
+pub fn put_user<P: UserPages>(pages: &mut P, to: u64, value: &[u8]) -> bool {
+    if !access_ok(to, value.len() as u64) {
+        return false;
+    }
+    let first = to & !(PAGE - 1);
+    let last = (to + value.len().saturating_sub(1) as u64) & !(PAGE - 1);
+    let writable = |pages: &mut P, page: u64| pages.page(page, true).is_some();
+    if value.is_empty() {
+        return true;
+    }
+    writable(pages, first) && writable(pages, last) && copy_to_user(pages, to, value) == 0
+}
+
+/// `strncpy_from_user` (`lib/strncpy_from_user.c`): copy the NUL-terminated
+/// string at `from` into `to`, at most `to.len()` bytes, stopping after the NUL.
+/// Returns the length without the NUL (`to.len()` when no NUL was found within
+/// the limit), or `None` for `-EFAULT`: `from` outside `TASK_SIZE_MAX` or an
+/// inaccessible byte before the NUL. Bytes of `to` after the copy are untouched.
+pub fn strncpy_from_user<P: UserPages>(pages: &mut P, to: &mut [u8], from: u64) -> Option<usize> {
+    if from >= TASK_SIZE_MAX {
+        return if to.is_empty() { Some(0) } else { None };
+    }
+    // Clamp as Linux does (`max = min(count, TASK_SIZE_MAX - src)`).
+    let limit = to
+        .len()
+        .min(usize::try_from(TASK_SIZE_MAX - from).unwrap_or(usize::MAX));
+    for (index, slot) in to.iter_mut().take(limit).enumerate() {
+        let mut byte = [0u8];
+        if copy_from_user(pages, &mut byte, from + index as u64) != 0 {
+            return None;
+        }
+        *slot = byte[0];
+        if byte[0] == 0 {
+            return Some(index);
+        }
+    }
+    Some(limit)
+}
+
 #[cfg(test)]
 pub(crate) mod fake {
     extern crate std;
@@ -130,7 +174,10 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use super::{TASK_SIZE_MAX, access_ok, copy_from_user, copy_to_user, fake::Space};
+    use super::{
+        TASK_SIZE_MAX, access_ok, copy_from_user, copy_to_user, fake::Space, put_user,
+        strncpy_from_user,
+    };
 
     #[test]
     fn access_ok_edges_match_linux_runtime_size_branch() {
@@ -207,5 +254,38 @@ mod tests {
         // Address zero is just an unmapped page, not special-cased.
         assert_eq!(copy_to_user(&mut space, 0, &[1]), 1);
         assert_eq!(copy_to_user(&mut space, 0, &[]), 0);
+    }
+
+    #[test]
+    fn put_user_is_all_or_nothing() {
+        let mut space = Space::default();
+        space.map(0x1000, true);
+        assert!(put_user(&mut space, 0x1ff8, &[1; 8]));
+        // Straddles into the unmapped page: nothing is stored.
+        assert!(!put_user(&mut space, 0x1ffc, &[2; 8]));
+        assert_eq!(space.0[&0x1000].0[0xffc], 1);
+        assert!(!put_user(&mut space, 0x5000, &[1]));
+        assert!(put_user(&mut space, 0x5000, &[]));
+        assert!(!put_user(&mut space, TASK_SIZE_MAX, &[1]));
+    }
+
+    #[test]
+    fn strncpy_stops_at_the_nul_and_reports_faults() {
+        let mut space = Space::default();
+        space.map(0x1000, true);
+        space.0.get_mut(&0x1000).unwrap().0[0xff8..].copy_from_slice(b"abc\0defg");
+        let mut to = [0x55u8; 16];
+        assert_eq!(strncpy_from_user(&mut space, &mut to, 0x1ff8), Some(3));
+        assert_eq!(&to[..5], b"abc\0\x55");
+        // No NUL within the limit: the limit, no terminator written.
+        assert_eq!(strncpy_from_user(&mut space, &mut to[..2], 0x1ff8), Some(2));
+        // The string runs into the unmapped page before its NUL.
+        assert_eq!(strncpy_from_user(&mut space, &mut to, 0x1ffc), None);
+        assert_eq!(strncpy_from_user(&mut space, &mut to, 0), None);
+        assert_eq!(strncpy_from_user(&mut space, &mut to, TASK_SIZE_MAX), None);
+        assert_eq!(
+            strncpy_from_user(&mut space, &mut to[..0], TASK_SIZE_MAX),
+            Some(0)
+        );
     }
 }

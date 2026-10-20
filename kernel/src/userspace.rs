@@ -43,7 +43,8 @@ use kernel::{
         stack::{self, ARG_PAGES, Aux, ENVP, EXPAND_PAGES, STACK_START, STACK_TOP, StackError},
     },
     image::{cpio::FileType, elf::Elf},
-    syscall::{self, Console, Context, Outcome},
+    syscall::{self, Console, Context, Machine, Outcome},
+    task::{self, Attributes},
     usercopy::{self, UserPages},
 };
 use syscalls::Errno;
@@ -361,7 +362,6 @@ fn load_init(
 /// re-enter), so a field needs no lock of its own.
 pub struct Process {
     /// Task id; `pid == tgid` for the single-threaded init.
-    #[allow(dead_code, reason = "read by gettid and the identity group")]
     pub pid: u32,
     /// Thread-group id: what `getpid` reports.
     pub tgid: u32,
@@ -375,6 +375,9 @@ pub struct Process {
     /// `mm->start_brk`, and the initial `mm->brk`.
     #[allow(dead_code, reason = "read by the brk syscall (mm group)")]
     pub brk: u64,
+    /// Credentials, rlimits, filesystem context, comm, personality and the
+    /// user pointers libc registers (`task::Attributes`, the identity group).
+    pub attrs: Attributes,
 }
 
 static PROCESS: Service<Process> = Service::new();
@@ -399,6 +402,37 @@ impl Context for Syscall<'_> {
     }
     fn tgid(&self) -> u32 {
         self.process.tgid
+    }
+    fn tid(&self) -> u32 {
+        self.process.pid
+    }
+    fn attrs(&mut self) -> &mut Attributes {
+        &mut self.process.attrs
+    }
+    fn fs_base(&self) -> u64 {
+        cpu::user_fs_base()
+    }
+    fn set_fs_base(&mut self, base: u64) {
+        cpu::set_user_fs_base(base);
+    }
+    fn gs_base(&self) -> u64 {
+        cpu::user_gs_base()
+    }
+    fn set_gs_base(&mut self, base: u64) {
+        cpu::set_user_gs_base(base);
+    }
+    fn machine(&self) -> Machine {
+        // shortcut: the boot clock is the PIT tick count (divisor 11932 of
+        // 1193182 Hz, `cpu::ticks`) until a clocksource exists; it counts from
+        // timer start, not from kernel entry. Upgrade with the timekeeping lane.
+        let nanoseconds = u128::from(cpu::ticks()) * 11_932 * 1_000_000_000 / 1_193_182;
+        // Lock order: `FRAMES` is the leaf below `PROCESS` -> `TABLES` -> heap.
+        let frames = services::FRAMES.lock();
+        Machine {
+            uptime_ns: u64::try_from(nanoseconds).unwrap_or(u64::MAX),
+            total_pages: frames.total() as u64,
+            free_pages: frames.available() as u64,
+        }
     }
 }
 
@@ -624,12 +658,15 @@ fn start(init: &Loaded) -> ! {
         protection.smap
     );
     let (entry, sp) = (init.entry, init.sp);
+    // `fork_init`: RLIMIT_NPROC and RLIMIT_SIGPENDING derive from free memory.
+    let free_pages = services::FRAMES.lock().available() as u64;
     PROCESS.install(Process {
         pid: 1,
         tgid: 1,
         mm: &services::TABLES,
         vmas: init.vmas,
         brk: init.brk,
+        attrs: Attributes::init(task::max_threads(free_pages)),
     });
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all

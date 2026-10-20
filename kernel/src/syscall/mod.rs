@@ -26,12 +26,13 @@
 //! [`Context`] offers by adding methods to the trait (the binary's `Process`
 //! implements it; tests use `testing::Task`), never by reaching for globals.
 
+mod ids;
 mod io;
 mod process;
 #[cfg(test)]
 mod testing;
 
-use crate::{config, usercopy::UserPages};
+use crate::{config, task::Attributes, usercopy::UserPages};
 use syscalls::{Errno, Sysno};
 
 pub use io::{MAX_RW_COUNT, TTY_CHUNK};
@@ -59,6 +60,33 @@ pub trait Context: UserPages {
     fn console(&mut self) -> &mut dyn Console;
     /// `task_tgid_vnr(current)`: what `getpid` returns.
     fn tgid(&self) -> u32;
+    /// `task_pid_vnr(current)`: what `gettid` returns.
+    fn tid(&self) -> u32;
+    /// The identity, limits, filesystem context and small per-task state of the
+    /// caller (`task`); see [`Attributes`].
+    fn attrs(&mut self) -> &mut Attributes;
+    /// The user `%fs` base as the CPU holds it (`x86_fsbase_read_cpu`).
+    fn fs_base(&self) -> u64;
+    /// `loadseg(FS, 0)` then `x86_fsbase_write_cpu`: select the null segment
+    /// and write the base. The caller has checked `base < TASK_SIZE_MAX`.
+    fn set_fs_base(&mut self, base: u64);
+    /// The user `%gs` base (`x86_gsbase_read_cpu_inactive`).
+    fn gs_base(&self) -> u64;
+    /// `loadseg(GS, 0)` then `x86_gsbase_write_cpu_inactive`.
+    fn set_gs_base(&mut self, base: u64);
+    /// Clock and memory totals for `sysinfo`.
+    fn machine(&self) -> Machine;
+}
+
+/// What `sysinfo` reads from the machine rather than from the task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Machine {
+    /// `ktime_get_boottime_ts64` in nanoseconds.
+    pub uptime_ns: u64,
+    /// `totalram_pages()`, in 4 KiB pages.
+    pub total_pages: u64,
+    /// `NR_FREE_PAGES`, in 4 KiB pages.
+    pub free_pages: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +122,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
     // One line per group, in table order of their first number.
     io::dispatch(ctx, sysno, args)
         .or_else(|| process::dispatch(ctx, sysno, args))
+        .or_else(|| ids::dispatch(ctx, sysno, args))
         // shortcut: single-init only. A syscall Linux implements but this slice
         // does not ends the kernel (explicitly, never as success or ENOSYS);
         // with a second task this must become the real syscall or an error

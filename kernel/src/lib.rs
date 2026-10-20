@@ -20,5 +20,6 @@ pub mod mm;
 pub mod signal;
 pub mod sync;
 pub mod syscall;
+pub mod task;
 pub mod time;
 pub mod usercopy;
