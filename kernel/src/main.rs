@@ -128,7 +128,7 @@ extern "C" fn kernel_main() -> ! {
     // reservation (checked against the not-yet-validated map, see
     // take_framebuffers), mapped by the loader, never republished, and no Rust
     // references to it are created.
-    let framebuffer = unsafe { console::init(boot::BootInfo::take_framebuffers()) } > 0;
+    let framebuffer = unsafe { console::init(&boot::BootInfo::take_framebuffers()) } > 0;
     log!("linux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
     #[cfg(feature = "qemu-self-test")]
     require(console::self_test(), "console-scroll");

@@ -109,7 +109,7 @@ static SHADOW: [AtomicU8; MAX_COLS * MAX_ROWS] = [const { AtomicU8::new(0) }; MA
 /// validated loader reservation and all mappings remain live. Layout atomics
 /// must never be republished while normal/emergency readers run. `COUNT`
 /// release publishes immutable fields.
-pub unsafe fn init(list: Framebuffers) -> usize {
+pub unsafe fn init(list: &Framebuffers) -> usize {
     let mut accepted = [None; MAX_FRAMEBUFFERS];
     let mut rejected = [None; MAX_FRAMEBUFFERS];
     let (mut count, mut cols, mut rows) = (0, MAX_COLS, MAX_ROWS);

@@ -8,9 +8,9 @@
 //! `font_8x16.c:4632`), `VGA8x8` (`pref` 0, `font_8x8.c:2583`) and `TER16x32`
 //! (`pref` -1, `font_ter16x32.c:2068`), the fonts `fbcon` falls back to
 //! (`fbcon.c:995-998`). We hold only the 8x8 glyph table, so each candidate is
-//! an integer scaling of it: 8x8 is scale (1,1), VGA8x16 is (1,2) (the existing
-//! line-doubled look) and TER16x32 is (2,4). Larger scales (3,6) and (4,8) use
-//! TER16x32's `pref`; they only win where Linux's own formula already prefers
+//! an integer scaling of it: 8x8 is scale (1,1), `VGA8x16` is (1,2) (the existing
+//! line-doubled look) and `TER16x32` is (2,4). Larger scales (3,6) and (4,8) use
+//! `TER16x32`'s `pref`; they only win where Linux's own formula already prefers
 //! a bigger font than 16x32 and Linux has none (an extension for >4K panels).
 
 use crate::boot::Framebuffer;
@@ -150,7 +150,7 @@ pub fn validate(fb: &Framebuffer) -> Result<Layout, Reject> {
     })
 }
 
-/// Candidate cells as (scale_x, scale_y, `pref`), see the module header.
+/// Candidate cells as (`scale_x`, `scale_y`, `pref`), see the module header.
 const CANDIDATES: [(usize, usize, i64); 5] =
     [(1, 1, 0), (1, 2, 0), (2, 4, -1), (3, 6, -1), (4, 8, -1)];
 
