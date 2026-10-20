@@ -701,7 +701,7 @@ ws-drivers-cache	drivers/cache	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-cdrom	drivers/cdrom	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-cdx	drivers/cdx	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-cdx-controller	drivers/cdx/controller	docs/subsystems/drivers.md	P2	not_started
-ws-drivers-char	drivers/char	docs/subsystems/drivers.md	P1	not_started
+ws-drivers-char	drivers/char	docs/subsystems/drivers.md	P1	in_progress
 ws-drivers-char-agp	drivers/char/agp	docs/subsystems/drivers.md	P1	not_started
 ws-drivers-char-hw-random	drivers/char/hw_random	docs/subsystems/drivers.md	P1	not_started
 ws-drivers-char-ipmi	drivers/char/ipmi	docs/subsystems/drivers.md	P1	not_started
@@ -2070,7 +2070,7 @@ ws-mm-readahead-c	mm/readahead.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-rmap-c	mm/rmap.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-rodata-test-c	mm/rodata_test.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-secretmem-c	mm/secretmem.c	docs/subsystems/memory.md	P0	not_started
-ws-mm-shmem-c	mm/shmem.c	docs/subsystems/memory.md	P0	not_started
+ws-mm-shmem-c	mm/shmem.c	docs/subsystems/memory.md	P0	in_progress
 ws-mm-shmem-quota-c	mm/shmem_quota.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-show-mem-c	mm/show_mem.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-shrinker-c	mm/shrinker.c	docs/subsystems/memory.md	P0	not_started
