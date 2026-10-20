@@ -435,11 +435,60 @@ fn run(stack: &Stack) {
             out!("init: rseq enosys");
         }
         Some(b"sse") => fpu_checks(),
+        Some(b"demand") => {
+            demand_paging();
+            out!("init: demand ok");
+        }
         // Oracle syscall suite groups (`user/init/src/tests`): `mm ids time signal fs proc`.
         Some(mode) if tests::run_mode(mode) => {}
         _ => {}
     }
     out!("init: ok");
+}
+
+/// Page faults taken by init itself, in ring 3: demand-zero read and write faults on a fresh
+/// anonymous mapping (zero page, then a private frame replacing it), and stack growth far below
+/// the initial stack VMA. Every access must retry transparently; a refused fault would end init
+/// with SIGSEGV instead of `init: demand ok`.
+fn demand_paging() {
+    const PAGE: usize = 4096;
+    // SAFETY: an anonymous private read/write mapping of three pages; no pointer is passed.
+    let mapped = Errno::from_ret(unsafe {
+        raw::syscall6(Sysno::mmap as usize, 0, 3 * PAGE, 3, 0x22, usize::MAX, 0)
+    });
+    let Ok(base) = mapped else {
+        fail("demand_mmap", mapped);
+    };
+    let pages = ptr::with_exposed_provenance_mut::<u8>(base);
+    // SAFETY: `base..base + 3 * PAGE` is the live private mapping made above; every access is
+    // one byte inside it, and nothing else aliases it.
+    unsafe {
+        expect("demand_read_zero", pages.add(PAGE).read_volatile(), 0);
+        pages.add(PAGE).write_volatile(0x5a);
+        expect(
+            "demand_write_after_zero",
+            pages.add(PAGE).read_volatile(),
+            0x5a,
+        );
+        pages.write_volatile(0xa5);
+        expect("demand_write_absent", pages.read_volatile(), 0xa5);
+        expect("demand_untouched", pages.add(2 * PAGE).read_volatile(), 0);
+    }
+    expect("demand_stack", grow_stack(), 0x77);
+}
+
+/// Touch the lowest page of a 320 KiB frame, far below the initial stack VMA (the argument
+/// pages plus Linux's 128 KiB expansion), so ring-3 faults must grow it.
+#[inline(never)]
+fn grow_stack() -> u8 {
+    let mut frame = [0u8; 320 * 1024];
+    let frame = core::hint::black_box(&mut frame);
+    // SAFETY: indices 0 and the last are inside the array; volatile so the stores happen.
+    unsafe {
+        ptr::addr_of_mut!(frame[0]).write_volatile(0x77);
+        ptr::addr_of_mut!(frame[frame.len() - 1]).write_volatile(0x11);
+        ptr::addr_of!(frame[0]).read_volatile()
+    }
 }
 
 /// Initial x87/SSE state and arithmetic: Linux gives a new task FCW 0x37f,

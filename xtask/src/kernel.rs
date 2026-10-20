@@ -257,7 +257,9 @@ const HEAP_RECORD: &str = "CHECK heap ok vec=1000 box=4096 align=4096 growth=bud
 const IRQ_GUARD_RECORD: &str = "CHECK irq-guard ok nested=2 out_of_order=true saved_on=true saved_off=true exclusive=true blocked_periods=2 blocked_delta=0 resumed=true";
 /// Printed by `userspace::start` before ring 3 (self-test builds): the memory syscalls and the
 /// one user-copy mechanism on the real tables, faulting pages in with Linux's short-copy results.
-const MM_USERCOPY_RECORD: &str = "CHECK mm-usercopy ok fault_in=read,write short_write=4 hole=8 readonly=refused zero_page=shared range=refused unmap=restored";
+/// What init's `demand` mode prints after taking its own ring-3 page faults.
+const DEMAND_MODE_LINE: &str = "init: demand ok";
+const MM_USERCOPY_RECORD: &str = "CHECK mm-usercopy ok fault_in=read,write short_write=4 hole=8 readonly=refused zero_page=shared range=refused protnone=inverted,restored fixed=replaced stack=grown unmap=restored";
 const PF_GPR_RECORD: &str = "CHECK page-fault-gprs ok gprs=15";
 const MEMORY_RUNTIME_RECORD: &str = "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true";
 
@@ -514,6 +516,25 @@ const DEBUG_CASES: &[DebugCase] = &[
         user: User::Ok {
             argc: 2,
             mode_line: Some("init: sse ok"),
+            exact_summary: true,
+            protection: (false, false),
+        },
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    // Ring-3 demand paging: init faults pages in itself (anonymous zero/private pages and stack
+    // growth), so `CHECK user-faults` must count at least one handled fault.
+    DebugCase {
+        name: "demand",
+        cmdline: Some("-- demand"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some(DEMAND_MODE_LINE),
             exact_summary: true,
             protection: (false, false),
         },
@@ -4126,7 +4147,12 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
             positions.push(last);
         }
     }
-    positions.extend(user_tail(&find, user, init)?);
+    positions.extend(user_tail(
+        &find,
+        user,
+        init,
+        mode_line == Some(DEMAND_MODE_LINE),
+    )?);
     if positions.windows(2).all(|pair| pair[0] < pair[1]) {
         Ok(())
     } else {
@@ -4241,16 +4267,31 @@ fn segfault_line_matches(line: &str, init: &fixture::ElfFacts) -> bool {
         })
 }
 
+/// `CHECK user-faults ok handled=N`: the ring-3 page faults the address-space model resolved and
+/// returned from. `demand` (init's `-- demand` mode: anonymous zero/private pages and stack growth
+/// taken by init itself) requires N >= 1; the other modes never fault (the loader populated their
+/// pages) but must still report the counter.
+fn user_faults_handled(line: &str, demand: bool) -> bool {
+    line.strip_prefix("CHECK user-faults ok handled=")
+        .and_then(|count| count.parse::<u64>().ok())
+        .is_some_and(|count| count >= u64::from(demand))
+}
+
 /// The records after the summary line, by what init did.
 fn user_tail(
     find: &Finder<'_>,
     user: User,
     init: &fixture::ElfFacts,
+    demand: bool,
 ) -> Result<Vec<usize>, String> {
     const DEATH: &str = "Kernel panic - not syncing: Attempted to kill init! exitcode=";
     Ok(match user {
         User::Ok { .. } | User::Oracle(_) => vec![
             find.exact("init: ok", "init: ok")?,
+            find.at(
+                &|line| user_faults_handled(line, demand),
+                "handled ring-3 page faults record",
+            )?,
             find.exact(&format!("{DEATH}0x00000000"), "init death panic")?,
             find.exact("RESULT success", "RESULT success")?,
         ],
@@ -6347,6 +6388,14 @@ mod tests {
                 ),
             ),
             (
+                "no handled ring-3 fault record",
+                serial.replace("CHECK user-faults ok handled=7\n", ""),
+            ),
+            (
+                "unparsable handled ring-3 fault count",
+                serial.replace("handled=7", "handled=many"),
+            ),
+            (
                 "duplicate init: ok",
                 serial.replace("init: ok", "init: ok\ninit: ok"),
             ),
@@ -6359,7 +6408,11 @@ mod tests {
     fn userspace_modes_require_their_own_records() {
         let base = success_serial();
         // sse and rseq: argc=2 summary plus the mode line before `init: ok`.
-        for (name, line) in [("sse", "init: sse ok"), ("rseq", "init: rseq enosys")] {
+        for (name, line) in [
+            ("sse", "init: sse ok"),
+            ("rseq", "init: rseq enosys"),
+            ("demand", DEMAND_MODE_LINE),
+        ] {
             let serial = base
                 .replace("argc=1", "argc=2")
                 .replace("\ninit: ok", &format!("\n{line}\ninit: ok"));
@@ -6373,6 +6426,14 @@ mod tests {
                 "argc=1 expected"
             );
         }
+        // Only `demand` takes ring-3 faults: it needs a non-zero count, the others accept zero.
+        let demand = base
+            .replace("argc=1", "argc=2")
+            .replace("\ninit: ok", &format!("\n{DEMAND_MODE_LINE}\ninit: ok"));
+        let none = demand.replace("handled=7", "handled=0");
+        assert!(!validate(case("demand"), &exit(33), &none).0);
+        let quiet = base.replace("handled=7", "handled=0");
+        assert!(validate(case("success"), &exit(33), &quiet).0);
         // cpu-max: protection must be reported on, the summary only by prefix.
         let max = base
             .replace("argc=1", "argc=2")
@@ -6398,7 +6459,7 @@ mod tests {
             .unwrap()
             .replace("argc=1", "argc=2")
             .replace(
-                "\ninit: ok\nKernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
+                "\ninit: ok\nCHECK user-faults ok handled=7\nKernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
                 "",
             );
         let segfault = format!(
@@ -6557,6 +6618,7 @@ mod tests {
             "init: hello from userspace",
             &fixture::init_summary(&expected().init, 1),
             "init: ok",
+            "CHECK user-faults ok handled=7",
             "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
             "RESULT success",
         ]

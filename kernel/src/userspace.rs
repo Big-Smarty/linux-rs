@@ -432,6 +432,12 @@ pub fn account_ticks(user: bool, periods: u64) {
     CPUTIME.tick(user, periods);
 }
 
+/// Ring-3 page faults the address-space model resolved (`page_fault`); the
+/// self-test build reports it when init exits, as evidence that demand paging
+/// of init's own bss/stack through the real tables returned to user mode.
+#[cfg(feature = "qemu-self-test")]
+static USER_FAULTS_HANDLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Syscall context: the process plus its user-memory view (a borrow of the
 /// locked tables, so no map/unmap can run mid-syscall) and the console.
 struct Syscall<'a> {
@@ -576,6 +582,13 @@ impl Console for Tty {
 /// `kernel/exit.c`: init exiting for any reason panics. In a `qemu-self-test`
 /// build the result mirrors the exit code; the default build halts.
 fn init_died(code: u32) -> ! {
+    #[cfg(feature = "qemu-self-test")]
+    if code == 0 {
+        crate::log!(
+            "CHECK user-faults ok handled={}\n",
+            USER_FAULTS_HANDLED.load(core::sync::atomic::Ordering::Relaxed)
+        );
+    }
     crate::log!("{}\n", InitDeath(code));
     #[cfg(feature = "qemu-self-test")]
     {
@@ -676,7 +689,10 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
             .handle_user_fault(&process.env, &mut space, address, error | mm::PF_USER);
     drop(tables);
     match outcome {
-        FaultOutcome::Handled => {}
+        FaultOutcome::Handled => {
+            #[cfg(feature = "qemu-self-test")]
+            USER_FAULTS_HANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         FaultOutcome::Segv { address, .. } => {
             // Both refusals (MAPERR, ACCERR) print the same line; the code only
             // reaches siginfo, which no handler can read yet.
@@ -735,6 +751,105 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
     }
 }
 
+/// One system call through the dispatcher in the self-test (stops loudly on an
+/// unimplemented number).
+#[cfg(feature = "qemu-self-test")]
+fn call(context: &mut Syscall<'_>, number: syscalls::Sysno, args: [u64; 6]) -> i64 {
+    match syscall::dispatch(context, number as u64, args) {
+        Outcome::Return(value) => value,
+        _ => crate::unwrap(Err::<i64, _>("mm-usercopy-syscall"), "mm-usercopy"),
+    }
+}
+
+/// `PROT_NONE` round trip of [`mm_usercopy_faults`] on pages `a` and `a + P`
+/// (which hold `pattern` across their boundary).
+#[cfg(feature = "qemu-self-test")]
+fn mm_usercopy_protnone(context: &mut Syscall<'_>, a: u64, pattern: [u8; 8]) {
+    use kernel::mm::{PROT_NONE, PROT_READ, PROT_WRITE};
+    use kernel::usercopy::{copy_from_user, copy_to_user};
+    use syscalls::Sysno;
+
+    const P: u64 = PAGE;
+    // PROT_NONE keeps the frame and its data: the entry is not present, holds
+    // the complemented frame bits (Linux's L1TF guard), the kernel is refused,
+    // and protecting back restores the same bytes (the un-inverted frame).
+    let before = context.space.raw_entry(a + P);
+    crate::require(
+        call(context, Sysno::mprotect, [a, 2 * P, PROT_NONE, 0, 0, 0]) == 0,
+        "mm-usercopy-protnone",
+    );
+    crate::require(
+        paging::UserSpace::protnone_guard(before, context.space.raw_entry(a + P)),
+        "mm-usercopy-protnone-inverted",
+    );
+    let mut refused = [0xffu8; 8];
+    crate::require(
+        copy_from_user(context, &mut refused, a + P - 4) == 8 && refused == [0; 8],
+        "mm-usercopy-protnone-refused",
+    );
+    crate::require(
+        copy_to_user(context, a + P, &[1]) == 1,
+        "mm-usercopy-protnone-write-refused",
+    );
+    crate::require(
+        call(
+            context,
+            Sysno::mprotect,
+            [a, 2 * P, PROT_READ | PROT_WRITE, 0, 0, 0],
+        ) == 0,
+        "mm-usercopy-protnone-restore",
+    );
+    let mut kept = [0u8; 8];
+    crate::require(
+        copy_from_user(context, &mut kept, a + P - 4) == 0 && kept == pattern,
+        "mm-usercopy-protnone-data",
+    );
+}
+
+/// `MAP_FIXED` replacement of [`mm_usercopy_faults`] over the two touched pages at `a`.
+#[cfg(feature = "qemu-self-test")]
+fn mm_usercopy_fixed(context: &mut Syscall<'_>, a: u64) {
+    use kernel::mm::{
+        MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE, Pte, UserPages as _,
+    };
+    use kernel::usercopy::copy_from_user;
+    use syscalls::Sysno;
+
+    const P: u64 = PAGE;
+    // `MAP_FIXED` over two touched private pages drops their frames (the final
+    // accounting would show a leak) and leaves demand-zero pages.
+    crate::require(
+        context.space.lookup(a) != Pte::Absent && context.space.lookup(a + P) != Pte::Absent,
+        "mm-usercopy-fixed-before",
+    );
+    crate::require(
+        call(
+            context,
+            Sysno::mmap,
+            [
+                a,
+                2 * P,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                u64::MAX,
+                0,
+            ],
+        )
+        .cast_unsigned()
+            == a,
+        "mm-usercopy-fixed",
+    );
+    crate::require(
+        context.space.lookup(a) == Pte::Absent && context.space.lookup(a + P) == Pte::Absent,
+        "mm-usercopy-fixed-unmapped",
+    );
+    let mut fresh = [0xffu8; 8];
+    crate::require(
+        copy_from_user(context, &mut fresh, a + P - 4) == 0 && fresh == [0; 8],
+        "mm-usercopy-fixed-zero",
+    );
+}
+
 /// The kernel-access cases of [`check_mm_usercopy`]: `a` is three writable
 /// anonymous pages whose last is `PROT_NONE`, `b` one untouched read-only page.
 #[cfg(feature = "qemu-self-test")]
@@ -761,6 +876,7 @@ fn mm_usercopy_faults(context: &mut Syscall<'_>, a: u64, b: u64) {
             && context.space.lookup(a + P) == Pte::Anon { writable: true },
         "mm-usercopy-private-frames",
     );
+    mm_usercopy_protnone(context, a, pattern);
     // A read of an untouched readable page maps the shared zero page; a write
     // to that read-only mapping is refused (EFAULT: nothing copied) and keeps it.
     let mut zeros = [0xffu8; 8];
@@ -805,6 +921,7 @@ fn mm_usercopy_faults(context: &mut Syscall<'_>, a: u64, b: u64) {
         copy_to_user(context, kernel::usercopy::TASK_SIZE_MAX - 1, &[1, 2]) == 2,
         "mm-usercopy-range",
     );
+    mm_usercopy_fixed(context, a);
 }
 
 /// QEMU proof of the kernel-access page-fault path through the real syscall
@@ -814,7 +931,10 @@ fn mm_usercopy_faults(context: &mut Syscall<'_>, a: u64, b: u64) {
 /// short-copy results. Context: BSP, IF clear, `PROCESS` installed, no lock held.
 #[cfg(feature = "qemu-self-test")]
 fn check_mm_usercopy() {
-    use kernel::mm::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE};
+    use kernel::mm::{
+        MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE, Pte, UserPages as _, VmFlags,
+    };
+    use kernel::usercopy::{copy_from_user, copy_to_user};
     use syscalls::Sysno;
 
     const P: u64 = PAGE;
@@ -827,14 +947,6 @@ fn check_mm_usercopy() {
         space: tables.user_space(),
         process: &mut guard,
         tty: Tty,
-    };
-    let call = |context: &mut Syscall<'_>, number: Sysno, args: [u64; 6]| match syscall::dispatch(
-        context,
-        number as u64,
-        args,
-    ) {
-        Outcome::Return(value) => value,
-        _ => crate::unwrap(Err::<i64, _>("mm-usercopy-syscall"), "mm-usercopy"),
     };
     let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
     let a = call(
@@ -850,7 +962,7 @@ fn check_mm_usercopy() {
     )
     .cast_unsigned();
     crate::require(
-        a % P == 0 && b % P == 0 && a < kernel::usercopy::TASK_SIZE_MAX,
+        a.is_multiple_of(P) && b.is_multiple_of(P) && a < kernel::usercopy::TASK_SIZE_MAX,
         "mm-usercopy-mmap",
     );
     crate::require(
@@ -870,14 +982,43 @@ fn check_mm_usercopy() {
         call(&mut context, Sysno::munmap, [b, P, 0, 0, 0, 0]) == 0,
         "mm-usercopy-munmap-b",
     );
+    // A kernel access one page below the growable stack VMA expands it
+    // (`expand_downwards` through the fault path) and maps a private frame:
+    // the only accounting change left, one frame and one page.
+    let top = context
+        .process
+        .space
+        .vmas()
+        .iter()
+        .find(|vma| vma.flags.intersects(VmFlags::GROWSDOWN))
+        .map(|vma| vma.start);
+    let grown = crate::unwrap(top.ok_or("no stack VMA"), "mm-usercopy-stack-vma") - P;
     crate::require(
-        data_frames(&tables) == frames0 && guard.space.total_vm == vm0,
+        copy_to_user(&mut context, grown, &[7]) == 0,
+        "mm-usercopy-stack-grow",
+    );
+    let mut byte = [0u8];
+    crate::require(
+        copy_from_user(&mut context, &mut byte, grown) == 0 && byte == [7],
+        "mm-usercopy-stack-readback",
+    );
+    crate::require(
+        context
+            .process
+            .space
+            .find_vma(grown)
+            .is_some_and(|vma| vma.start == grown && vma.flags.intersects(VmFlags::GROWSDOWN))
+            && context.space.lookup(grown) == (Pte::Anon { writable: true }),
+        "mm-usercopy-stack-vma-grown",
+    );
+    crate::require(
+        data_frames(&tables) == frames0 + 1 && guard.space.total_vm == vm0 + 1,
         "mm-usercopy-accounting",
     );
     drop(tables);
     drop(guard);
     crate::log!(
-        "CHECK mm-usercopy ok fault_in=read,write short_write=4 hole=8 readonly=refused zero_page=shared range=refused unmap=restored\n"
+        "CHECK mm-usercopy ok fault_in=read,write short_write=4 hole=8 readonly=refused zero_page=shared range=refused protnone=inverted,restored fixed=replaced stack=grown unmap=restored\n"
     );
 }
 
