@@ -1432,3 +1432,28 @@ fn a_full_rt_quota_never_loses_a_fault_siginfo() {
     assert_eq!(info[8..12], SEGV_MAPERR.to_le_bytes());
     assert_eq!(info[16..24], 0xdead000u64.to_le_bytes());
 }
+
+#[test]
+fn sigreturn_restores_every_general_register() {
+    // restore_sigcontext COPY(r8..r15, di, si, bp, bx, dx, ax, cx, ip, sp):
+    // 15 distinct values restored into zeroed registers.
+    let mut cpu = FakeCpu::new();
+    let mut st = handler_state();
+    let mut space = user_space();
+    let before = Regs {
+        flags: 0x246,
+        ..regs()
+    };
+    let mut r = before;
+    send(&mut st, SIGUSR1);
+    do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu);
+    let mut ret = Regs {
+        sp: r.sp + 8,
+        ss: USER_DS,
+        cs: USER_CS,
+        flags: 0x202,
+        ..Regs::default()
+    };
+    assert!(!rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu).bad_frame);
+    assert_eq!(ret, before);
+}
