@@ -119,7 +119,7 @@ The first maintained run, `target/kernel-tooling/integrated-001/`, really execut
 | Empty boot module | The generated archive plus a real zero-byte second payload | Exit33 and **all** positive proofs, plus exact second-module bytes0/reserved4096/all archive/ELF counts0, and post-CR3 module epoch2. Neither missing evidence nor a synthetic serial line is accepted. |
 | Corrupt boot module | A gzip-magic garbage module 0, then the generated archive | Exit33 and **all** positive proofs; exactly one `WARN Initramfs unpacking failed: module=0 ...` skip record, no module-0 inspection, the archive as `module=1`, post-CR3 module epoch2. |
 
-Every case must also print `CHECK console ok framebuffers=N scrolled=true tail=true stale=false readback=true` ([console record](implementation.md#framebuffer-console-on-real-hardware)): `N` is `DebugCase.framebuffers`, 2 for `success` (its QEMU adds `-device ramfb` so OVMF publishes a second GOP handle) and 1 elsewhere.
+Every case must also print `CHECK console ok framebuffers=N scrolled=true tail=true stale=false readback=true wrap=true` (exactly once, before `CHECKPOINT`) ([console record](implementation.md#framebuffer-console-on-real-hardware)): `N` is `DebugCase.framebuffers`, 2 for `success` (its QEMU adds `-device ramfb` so OVMF publishes a second GOP handle) and 1 elsewhere.
 
 Each of the eighteen current cases has a separate FAT image, QEMU process, copied variable store, serial log, QEMU stdout/stderr and `result.tsv`. Timeouts always fail; the runner kills the guest process group and reaps QEMU. It deliberately omits `-no-shutdown`, which would hide the debug-exit result. Port `0xf4` and assumed COM1 output are confined to the explicit QEMU self-test feature/device profile.
 

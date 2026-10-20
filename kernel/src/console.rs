@@ -113,6 +113,8 @@ pub unsafe fn init(list: &Framebuffers) -> usize {
     let mut accepted = [None; MAX_FRAMEBUFFERS];
     let mut rejected = [None; MAX_FRAMEBUFFERS];
     let (mut count, mut cols, mut rows) = (0, MAX_COLS, MAX_ROWS);
+    // The accepted framebuffer that currently bounds the shared grid.
+    let mut limit = 0;
     for (index, entry) in list.entries.iter().enumerate() {
         let Some(fb) = entry else { continue };
         match fbtext::validate(fb) {
@@ -120,6 +122,9 @@ pub unsafe fn init(list: &Framebuffers) -> usize {
                 SLOTS[count].store(&layout);
                 accepted[count] = Some((index, layout));
                 count += 1;
+                if layout.cols < cols || layout.rows < rows {
+                    limit = index;
+                }
                 cols = cols.min(layout.cols);
                 rows = rows.min(layout.rows);
             }
@@ -127,6 +132,10 @@ pub unsafe fn init(list: &Framebuffers) -> usize {
         }
     }
     if count == 0 {
+        // Nothing can be drawn. The reasons still reach COM1 under the QEMU
+        // self-test profile; the default profile has no other sink, so the
+        // screen stays blank (documented limitation, not a silent success).
+        report_rejects(list, &rejected);
         return 0;
     }
     COLS.store(cols, Ordering::Relaxed);
@@ -139,11 +148,12 @@ pub unsafe fn init(list: &Framebuffers) -> usize {
     // are ever formed to the framebuffer. Cursor only allocates cell numbers.
     COUNT.store(count, Ordering::Release);
     crate::log!(
-        "console: framebuffers used={} reported={} grid={}x{}\n",
+        "console: framebuffers used={} reported={} grid={}x{} limit=fb{}\n",
         count,
         list.reported,
         cols,
-        rows
+        rows,
+        limit
     );
     for (index, layout) in accepted.iter().flatten() {
         crate::log!(
@@ -156,6 +166,12 @@ pub unsafe fn init(list: &Framebuffers) -> usize {
             layout.cell_height()
         );
     }
+    report_rejects(list, &rejected);
+    count
+}
+
+/// One line per loader entry that cannot be drawn on (to every working sink).
+fn report_rejects(list: &Framebuffers, rejected: &[Option<fbtext::Reject>; MAX_FRAMEBUFFERS]) {
     for (index, entry) in list.entries.iter().enumerate() {
         if let Some(reason) = rejected[index] {
             crate::log!("console: fb{} rejected: {}\n", index, reason.name());
@@ -163,7 +179,6 @@ pub unsafe fn init(list: &Framebuffers) -> usize {
             crate::log!("console: fb{} rejected: loader validation\n", index);
         }
     }
-    count
 }
 
 /// Store one pixel; the only place framebuffer bytes are written.
@@ -228,29 +243,78 @@ fn draw_cell(l: &Layout, col: usize, row: usize, glyph: u8) {
     }
 }
 
-/// Shift the text up one line and redraw every cell on every framebuffer.
-/// Scanline-major so each framebuffer row is written in one ascending run
-/// (write-combining friendly), not cell by cell.
+/// Cell glyph with the never-written `0` shown as a space.
+const fn shown(glyph: u8) -> u8 {
+    if glyph == 0 { b' ' } else { glyph }
+}
+
+/// Shift the text up one line and redraw the cells whose glyph changed on every
+/// framebuffer. Most of a log screen is blank over blank, so skipping equal
+/// cells removes most of the writes (a full redraw is `width*height*bytes` per
+/// scrolled line). Trade-off: a cell garbled by a reentrant or interleaved
+/// writer is no longer repaired by the next scroll, only by being rewritten.
+/// Per row, changed cells are drawn scanline-major so adjacent changed cells are
+/// written in ascending runs (write-combining friendly).
 fn scroll(count: usize) {
     let (cols, rows) = (COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed));
-    for i in 0..cols * (rows - 1) {
-        SHADOW[i].store(SHADOW[i + cols].load(Ordering::Relaxed), Ordering::Relaxed);
-    }
-    for cell in &SHADOW[cols * (rows - 1)..cols * rows] {
-        cell.store(0, Ordering::Relaxed);
-    }
-    for slot in &SLOTS[..count] {
-        let l = slot.load();
-        for row in 0..rows {
+    for row in 0..rows {
+        // Rows are processed top to bottom, so row+1 still holds its old text.
+        let mut changed = [0u64; MAX_COLS / 64];
+        for col in 0..cols {
+            let old = SHADOW[row * cols + col].load(Ordering::Relaxed);
+            let new = if row + 1 < rows {
+                SHADOW[(row + 1) * cols + col].load(Ordering::Relaxed)
+            } else {
+                0
+            };
+            SHADOW[row * cols + col].store(new, Ordering::Relaxed);
+            if shown(old) != shown(new) {
+                changed[col / 64] |= 1 << (col % 64);
+            }
+        }
+        if changed.iter().all(|&word| word == 0) {
+            continue;
+        }
+        for slot in &SLOTS[..count] {
+            let l = slot.load();
             for line in 0..l.cell_height() {
                 for col in 0..cols {
-                    let glyph = SHADOW[row * cols + col].load(Ordering::Relaxed);
-                    scanline(&l, col, row, line, glyph);
+                    if changed[col / 64] & (1 << (col % 64)) != 0 {
+                        let glyph = SHADOW[row * cols + col].load(Ordering::Relaxed);
+                        scanline(&l, col, row, line, glyph);
+                    }
                 }
             }
         }
     }
     SCROLLS.fetch_add(1, Ordering::Relaxed);
+    drain();
+}
+
+/// Make everything written so far leave the CPU's write-combining buffers.
+///
+/// The framebuffer is mapped write-combining (`paging.rs`, PAT[5]); Intel and
+/// AMD drain a partly filled WC buffer at their discretion, so the last lines
+/// before `cli; hlt` could stay invisible. `SFENCE` orders and drains WC
+/// stores (Intel SDM vol. 3, buffering of write-combining memory; AMD APM vol. 2,
+/// write-combining memory type).
+///
+/// `core::arch::x86_64::_mm_sfence` is an intrinsic, not `asm!`. It is declared
+/// with `#[target_feature(enable = "sse")]`, which this soft-float target cannot
+/// enable on our own functions (`x86_softfloat_sse` deny), so it is called as an
+/// out-of-line `unsafe` call from a function without the feature. The callee only
+/// executes `sfence`: no registers or flags other than RIP, no XMM/MMX state (the
+/// kernel never saves FP state in the kernel), no stack effect, and a compiler
+/// memory barrier. The emitted instruction is checked in the disassembly (see
+/// docs/implementation.md, "Framebuffer console on real hardware").
+fn drain() {
+    if COUNT.load(Ordering::Relaxed) != 0 {
+        // SAFETY: SFENCE exists on every x86_64 CPU (SSE is architectural there),
+        // has no operands, and has no effect besides ordering/draining stores; it
+        // is valid at any CPL and in any interrupt context. The only reason the
+        // call is `unsafe` is the callee's `sse` target-feature attribute.
+        unsafe { core::arch::x86_64::_mm_sfence() };
+    }
 }
 
 struct Console;
@@ -268,6 +332,9 @@ pub fn write_bytes(bytes: &[u8]) {
         crate::cpu::serial_byte(byte);
         pixel_byte(byte);
     }
+    // One drain per call: the chunk just written must be visible before a caller
+    // can halt.
+    drain();
 }
 
 pub fn write(arguments: fmt::Arguments<'_>) {
@@ -280,6 +347,14 @@ fn pixel_byte(byte: u8) {
         return;
     }
     let (cols, rows) = (COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed));
+    if byte == b'\t' {
+        // fbcon/vt: advance to the next multiple of 8 columns (spaces, no glyph).
+        let column = (CURSOR.load(Ordering::Relaxed) >> 1) % cols;
+        for _ in 0..8 - column % 8 {
+            pixel_byte(b' ');
+        }
+        return;
+    }
     // Atomically take the next cell even if an exception interrupted output;
     // the winner of the exchange owns any scroll this character implies.
     let mut old = CURSOR.load(Ordering::Relaxed);
@@ -350,39 +425,57 @@ pub fn self_test() -> bool {
     let before = SCROLLS.load(Ordering::Relaxed);
     pixel_byte(b'\n');
     let lines = rows + 2;
+    // Six varying characters per line so a scroll changes several cells per row.
+    let letter = |i: usize, k: usize| b'A' + u8::try_from((i + k) % 26).unwrap_or(0);
     for i in 0..lines {
-        pixel_byte(b'A' + u8::try_from(i % 26).unwrap_or(0));
+        for k in 0..6.min(cols) {
+            pixel_byte(letter(i, k));
+        }
         pixel_byte(b'\n');
     }
     let scrolled = SCROLLS.load(Ordering::Relaxed) - before >= 2;
     let (mut tail, mut stale) = (true, false);
     for row in 0..rows {
-        let want = b'A' + u8::try_from((lines - rows + row) % 26).unwrap_or(0);
-        tail &= SHADOW[row * cols].load(Ordering::Relaxed) == want;
-        stale |= (1..cols).any(|col| SHADOW[row * cols + col].load(Ordering::Relaxed) != 0);
+        for k in 0..6.min(cols) {
+            tail &= SHADOW[row * cols + k].load(Ordering::Relaxed) == letter(lines - rows + row, k);
+        }
+        stale |= (6..cols).any(|col| SHADOW[row * cols + col].load(Ordering::Relaxed) != 0);
     }
+    // Pixels of whole rows (top, middle, bottom) must equal their shadow.
     let mut readback = true;
     for slot in &SLOTS[..count] {
         let l = slot.load();
-        for (col, row) in [
-            (0, 0),
-            (1, 0),
-            (0, rows / 2),
-            (0, rows - 1),
-            (cols - 1, rows - 1),
-        ] {
-            readback &= cell_matches(&l, col, row);
+        for row in [0, rows / 2, rows - 1] {
+            for col in 0..cols {
+                readback &= cell_matches(&l, col, row);
+            }
         }
     }
-    let ok = scrolled && tail && !stale && readback;
+    // Deferred wrap: a line of exactly `cols` characters plus '\n' leaves no blank
+    // line, so the next line starts directly under it.
+    pixel_byte(b'\n');
+    for _ in 0..cols {
+        pixel_byte(b'x');
+    }
+    pixel_byte(b'\n');
+    pixel_byte(b'W');
+    let cell = (CURSOR.load(Ordering::Relaxed) >> 1).saturating_sub(1);
+    let wrap = cols >= 2
+        && cell % cols == 0
+        && cell >= cols
+        && SHADOW[cell].load(Ordering::Relaxed) == b'W'
+        && SHADOW[cell - 1].load(Ordering::Relaxed) == b'x'
+        && SHADOW[cell - cols].load(Ordering::Relaxed) == b'x';
+    let ok = scrolled && tail && !stale && readback && wrap;
     crate::log!(
-        "CHECK console {} framebuffers={} scrolled={} tail={} stale={} readback={}\n",
+        "CHECK console {} framebuffers={} scrolled={} tail={} stale={} readback={} wrap={}\n",
         if ok { "ok" } else { "FAILED" },
         count,
         scrolled,
         tail,
         stale,
-        readback
+        readback,
+        wrap
     );
     ok
 }

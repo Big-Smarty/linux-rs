@@ -3510,11 +3510,39 @@ fn validate_debug_case(
         );
     }
     let console = format!(
-        "CHECK console ok framebuffers={} scrolled=true tail=true stale=false readback=true",
+        "CHECK console ok framebuffers={} scrolled=true tail=true stale=false readback=true wrap=true",
         case.framebuffers
     );
-    if !lines.contains(&console.as_str()) {
-        return (false, format!("missing console record: {console}"));
+    // Exactly one console record (a second one could come from a later stage or
+    // userspace), and it precedes the bootstrap checkpoint when that is reached.
+    let console_lines = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("CHECK console"))
+        .collect::<Vec<_>>();
+    match console_lines.as_slice() {
+        [(position, line)] if **line == console.as_str() => {
+            if lines
+                .iter()
+                .position(|line| line.starts_with("CHECKPOINT"))
+                .is_some_and(|checkpoint| checkpoint < *position)
+            {
+                return (false, "console record must precede CHECKPOINT".to_owned());
+            }
+        }
+        [] => return (false, format!("missing console record: {console}")),
+        [(_, line)] => {
+            return (
+                false,
+                format!("console record {line:?} differs from expected {console:?}"),
+            );
+        }
+        more => {
+            return (
+                false,
+                format!("expected exactly one console record, found {}", more.len()),
+            );
+        }
     }
     if !case.forbid_success
         && let Err(diagnostic) =
@@ -5587,7 +5615,7 @@ mod tests {
 
     fn console_record(framebuffers: usize) -> String {
         format!(
-            "CHECK console ok framebuffers={framebuffers} scrolled=true tail=true stale=false readback=true"
+            "CHECK console ok framebuffers={framebuffers} scrolled=true tail=true stale=false readback=true wrap=true"
         )
     }
 
@@ -5623,6 +5651,14 @@ mod tests {
         }
         let (ok, why) = validate_debug_case(success, &process, &serial, &expected());
         assert!(!ok && why.contains("missing console record"), "{why}");
+        // Exactly one record, before CHECKPOINT.
+        let good = console_record(2);
+        let twice = format!("{good}\n{good}\n{serial}");
+        let (ok, why) = validate_debug_case(success, &process, &twice, &expected());
+        assert!(!ok && why.contains("exactly one"), "{why}");
+        let late = format!("{serial}\n{good}");
+        let (ok, why) = validate_debug_case(success, &process, &late, &expected());
+        assert!(!ok && why.contains("precede CHECKPOINT"), "{why}");
     }
 
     fn case(name: &str) -> DebugCase {

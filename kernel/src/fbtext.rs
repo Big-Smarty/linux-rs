@@ -108,7 +108,14 @@ pub fn validate(fb: &Framebuffer) -> Result<Layout, Reject> {
     ) else {
         return Err(Reject::Size);
     };
-    if pitch < width * bytes || pitch.checked_mul(height).is_none() {
+    // The extent [address, address + pitch*height) must not wrap, so `put`'s
+    // bound argument is local to this function's output.
+    if pitch < width * bytes
+        || pitch
+            .checked_mul(height)
+            .and_then(|extent| address.checked_add(extent))
+            .is_none()
+    {
         return Err(Reject::Pitch);
     }
     // 2- and 4-byte pixels are written as one aligned store; 3-byte as bytes.
@@ -182,42 +189,58 @@ pub fn choose_scale(xres: usize, yres: usize) -> Option<(usize, usize)> {
     best.map(|(scale, _)| scale)
 }
 
-/// One cursor transition. `pos` counts cells in `0..=cols*rows`; `cols*rows`
-/// means "the next character first scrolls" (so the last line is not wasted).
+/// One cursor transition. The cursor state is `pos << 1 | wrap`: `pos` counts
+/// cells in `0..=cols*rows` and `cols*rows` means "the next character first
+/// scrolls" (so the last line is not wasted). `wrap` is Linux's deferred wrap
+/// (`vc_need_wrap`): set after a character fills the last column, so a newline
+/// right after a full line only ends that line instead of adding a blank one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Step {
     /// Scroll the text up one line before placing the character.
     pub scroll: bool,
     /// Cell to draw, absent for a newline.
     pub cell: Option<usize>,
+    /// Encoded next cursor state.
     pub next: usize,
+}
+
+/// Encode a cursor state (see [`Step`]).
+#[must_use]
+pub const fn cursor(pos: usize, wrap: bool) -> usize {
+    pos << 1 | wrap as usize
 }
 
 /// Advance the cursor for a newline or a printable character.
 ///
-/// Requires `cols >= 1`, `rows >= 1` and `pos <= cols * rows`; a larger `pos`
-/// is treated as the pending-scroll position so hostile state cannot index out
-/// of the grid.
+/// Requires `cols >= 1` and `rows >= 1`; a `pos` beyond `cols * rows` is
+/// treated as the pending-scroll position so hostile state cannot index out of
+/// the grid.
 #[must_use]
-pub fn step(pos: usize, cols: usize, rows: usize, newline: bool) -> Step {
+pub fn step(state: usize, cols: usize, rows: usize, newline: bool) -> Step {
     let total = cols * rows;
+    let wrap = state & 1 == 1;
+    let pos = (state >> 1).min(total);
     let pending = pos >= total;
     if newline {
+        // After a full line `pos` already is the start of the next row.
+        let next = if wrap {
+            pos
+        } else if pending {
+            total
+        } else {
+            (pos / cols + 1) * cols
+        };
         return Step {
-            scroll: pending,
+            scroll: pending && !wrap,
             cell: None,
-            next: if pending {
-                total
-            } else {
-                (pos / cols + 1) * cols
-            },
+            next: cursor(next, false),
         };
     }
     let cell = if pending { total - cols } else { pos };
     Step {
         scroll: pending,
         cell: Some(cell),
-        next: cell + 1,
+        next: cursor(cell + 1, (cell + 1) % cols == 0),
     }
 }
 
@@ -325,6 +348,10 @@ mod tests {
         f.width = 2560;
         f.address += 2;
         assert_eq!(validate(&f), Err(Reject::Alignment));
+        // The extent may not wrap the address space.
+        let mut f = fb(32, [8; 3], [16, 8, 0]);
+        f.address = u64::MAX - 0xfff;
+        assert_eq!(validate(&f), Err(Reject::Pitch));
         // 24 bpp needs no alignment.
         let mut f = fb(24, [8; 3], [16, 8, 0]);
         f.address += 1;
@@ -372,57 +399,58 @@ mod tests {
     fn cursor_scrolls_lazily() {
         let (cols, rows) = (4, 3);
         let total = cols * rows;
+        let c = |pos| cursor(pos, false);
         // Ordinary character and newline.
         assert_eq!(
-            step(0, cols, rows, false),
+            step(c(0), cols, rows, false),
             Step {
                 scroll: false,
                 cell: Some(0),
-                next: 1
+                next: c(1)
             }
         );
         assert_eq!(
-            step(1, cols, rows, true),
+            step(c(1), cols, rows, true),
             Step {
                 scroll: false,
                 cell: None,
-                next: 4
+                next: c(4)
             }
         );
         // Newline on the last row makes the scroll pending, not performed.
         assert_eq!(
-            step(total - 1, cols, rows, true),
+            step(c(total - 2), cols, rows, true),
             Step {
                 scroll: false,
                 cell: None,
-                next: total
+                next: c(total)
             }
         );
-        // The last cell advances to pending too.
+        // The last cell advances to pending with the deferred wrap set.
         assert_eq!(
-            step(total - 1, cols, rows, false),
+            step(c(total - 1), cols, rows, false),
             Step {
                 scroll: false,
                 cell: Some(total - 1),
-                next: total
+                next: cursor(total, true)
             }
         );
         // A character from pending scrolls once and lands on column 0 of the last row.
         assert_eq!(
-            step(total, cols, rows, false),
+            step(c(total), cols, rows, false),
             Step {
                 scroll: true,
                 cell: Some(total - cols),
-                next: total - cols + 1
+                next: c(total - cols + 1)
             }
         );
         // A newline from pending scrolls once and leaves a blank line.
         assert_eq!(
-            step(total, cols, rows, true),
+            step(c(total), cols, rows, true),
             Step {
                 scroll: true,
                 cell: None,
-                next: total
+                next: c(total)
             }
         );
         // Out-of-range state is clamped, never indexes outside the grid.
@@ -430,14 +458,41 @@ mod tests {
     }
 
     #[test]
+    fn full_line_then_newline_has_no_blank_line() {
+        let (cols, rows) = (4, 3);
+        // Fill row 0 (cells 0..4): the last character sets the deferred wrap.
+        let mut state = cursor(0, false);
+        for cell in 0..cols {
+            let s = step(state, cols, rows, false);
+            assert_eq!(s.cell, Some(cell));
+            state = s.next;
+        }
+        assert_eq!(state, cursor(cols, true));
+        // The newline only clears the wrap: the next line starts on row 1.
+        let s = step(state, cols, rows, true);
+        assert_eq!(
+            (s.scroll, s.cell, s.next),
+            (false, None, cursor(cols, false))
+        );
+        // Without the newline the next character wraps to row 1 column 0.
+        assert_eq!(step(state, cols, rows, false).cell, Some(cols));
+        // A full last row followed by a newline does not scroll or add a line;
+        // the next character then scrolls.
+        let full = cursor(cols * rows, true);
+        let s = step(full, cols, rows, true);
+        assert_eq!((s.scroll, s.next), (false, cursor(cols * rows, false)));
+        assert!(step(s.next, cols, rows, false).scroll);
+    }
+
+    #[test]
     fn simulated_log_keeps_the_tail() {
         // Model the shadow: 1-char lines through a 4x3 grid.
         let (cols, rows) = (4, 3);
         let mut cells = [0u8; 12];
-        let mut pos = 0;
+        let mut state = cursor(0, false);
         for line in 0..10u8 {
             for newline in [false, true] {
-                let s = step(pos, cols, rows, newline);
+                let s = step(state, cols, rows, newline);
                 if s.scroll {
                     cells.copy_within(cols.., 0);
                     cells[cols * (rows - 1)..].fill(0);
@@ -445,7 +500,7 @@ mod tests {
                 if let Some(cell) = s.cell {
                     cells[cell] = b'a' + line;
                 }
-                pos = s.next;
+                state = s.next;
             }
         }
         assert_eq!([cells[0], cells[4], cells[8]], [b'h', b'i', b'j']);
