@@ -5,64 +5,30 @@
 // (`iterate_tty_write`), drivers/tty/n_tty.c (`do_output_char`). GPL-2.0-only.
 // Transformation: the VFS/tty stack is reduced to the one open file the init
 // process owns (/dev/console on fds 0-2) with its default termios.
-//! File I/O syscalls: `write`.
+//! The console tty's write path (the `->write` of `/dev/console`).
 
-use super::{Context, Outcome, error};
-use crate::usercopy::{access_ok, copy_from_user};
-use syscalls::{Errno, Sysno};
+use super::Context;
+use crate::usercopy::copy_from_user;
+use syscalls::Errno;
 
 /// `MAX_RW_COUNT = INT_MAX & PAGE_MASK`.
 pub const MAX_RW_COUNT: u32 = 0x7fff_f000;
 /// `iterate_tty_write`'s default chunk (no `TTY_NO_WRITE_SPLIT`).
 pub const TTY_CHUNK: u32 = 2048;
 
-pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) -> Option<Outcome> {
-    match sysno {
-        Sysno::write => Some(Outcome::Return(write(ctx, args[0], args[1], args[2]))),
-        _ => None,
-    }
-}
-
-/// What `do_mmap` reads from the open file behind `fd` (`fget(fd)`): fds 0-2
-/// are init's `/dev/console` (`console_fops`, opened `O_RDWR`), which has no
-/// `->mmap` (so `do_mmap` answers `-ENODEV` after its argument checks), is a
-/// character device (`file_mmap_size_max` is `ULONG_MAX`) and is not a regular
-/// file; every other descriptor is closed.
-pub(super) fn console_file(fd: u32) -> Option<crate::mm::FileInfo> {
-    matches!(fd, 0..=2).then_some(crate::mm::FileInfo {
-        id: 2,
-        readable: true,
-        writable: true,
-        noexec: false,
-        swapfile: false,
-        append_only: false,
-        can_mmap: false,
-        mmap_size_max: u64::MAX,
-        mmap_sync: false,
-        hugepages: false,
-    })
-}
-
-/// `write(2)` on the console. fds 0, 1 and 2 are init's `/dev/console`
-/// (opened `O_RDWR`, then duplicated); every other fd is closed.
+/// `tty_write` on `/dev/console`, called by `vfs_write` after the descriptor,
+/// access and clamp checks: `count` is already at most `MAX_RW_COUNT` and
+/// `[buffer, buffer + count)` passed `access_ok` on the unclamped count.
 ///
-/// Order as in `ksys_write` -> `vfs_write`: fd lookup (`-EBADF`), `access_ok`
-/// on the UNCLAMPED count (`-EFAULT`), clamp to `MAX_RW_COUNT`, then the tty
-/// copies at most 2048 bytes at a time. A chunk that cannot be fully copied
-/// from user memory is not written at all: the call returns the bytes of the
-/// earlier chunks, or `-EFAULT` when there are none.
+/// The tty copies at most 2048 bytes at a time (`iterate_tty_write`). A chunk
+/// that cannot be fully copied from user memory is not written at all: the
+/// call returns the bytes of the earlier chunks, or `-EFAULT` when there are
+/// none.
 ///
 /// Output processing is the default `tty_std_termios` (`OPOST | ONLCR`):
 /// `\n` becomes `\r\n`, nothing else changes, and the return value counts
 /// input bytes. (The pinned oracle's serial log shows the same `\r\n`.)
-fn write<C: Context>(ctx: &mut C, fd: u64, buffer: u64, count: u64) -> i64 {
-    #[allow(clippy::cast_possible_truncation)]
-    if !matches!(fd as u32, 0..=2) {
-        return error(Errno::EBADF);
-    }
-    if !access_ok(buffer, count) {
-        return error(Errno::EFAULT);
-    }
+pub(super) fn tty_write<C: Context>(ctx: &mut C, buffer: u64, count: u64) -> Result<i64, Errno> {
     // The clamp is below 2^31, so everything below fits u32/i64 exactly.
     let mut remaining = u32::try_from(count.min(u64::from(MAX_RW_COUNT))).unwrap_or(MAX_RW_COUNT);
     let mut at = buffer;
@@ -73,9 +39,9 @@ fn write<C: Context>(ctx: &mut C, fd: u64, buffer: u64, count: u64) -> i64 {
         let bytes = &mut chunk[..step as usize];
         if copy_from_user(ctx, bytes, at) != 0 {
             return if written > 0 {
-                i64::from(written)
+                Ok(i64::from(written))
             } else {
-                error(Errno::EFAULT)
+                Err(Errno::EFAULT)
             };
         }
         let console = ctx.console();
@@ -89,7 +55,7 @@ fn write<C: Context>(ctx: &mut C, fd: u64, buffer: u64, count: u64) -> i64 {
         at += u64::from(step);
         remaining -= step;
     }
-    i64::from(written)
+    Ok(i64::from(written))
 }
 
 #[cfg(test)]

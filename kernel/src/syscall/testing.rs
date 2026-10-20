@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Host fakes for the syscall tests: a task whose user memory is the sparse
-//! `usercopy::fake::Space` and whose console collects bytes.
+//! `usercopy::fake::Space`, whose console collects bytes, and whose files are a
+//! real tmpfs rootfs (`/dev/console`, `/root`, optional extra entries) with
+//! descriptors 0-2 on the console, as `console_on_rootfs` leaves init.
 
 use super::{
-    AddressSpace, Console, Context, Machine,
+    AddressSpace, Console, Context, Files, Machine,
     time::{ClockState, Clocks, RestartBlock},
 };
 use crate::{
@@ -11,6 +13,7 @@ use crate::{
     mm::{Env, Mm, tests::Fake},
     task::Attributes,
     usercopy::{UserPages, fake::Space},
+    vfs::{FdTable, Timespec, Vfs},
 };
 extern crate std;
 use std::vec::Vec;
@@ -79,16 +82,28 @@ pub struct Task<P = Space, C = Sink> {
     pub mm: Mm,
     pub env: Env,
     pub tables: Fake,
+    pub vfs: Vfs,
+    pub fdt: FdTable,
+}
+
+fn clock() -> Timespec {
+    Timespec { sec: 0, nsec: 0 }
 }
 
 impl<P, C> Task<P, C> {
     pub fn new(pages: P, sink: C) -> Self {
         let env = Env::init(1 << 17, 0);
+        let mut vfs = Vfs::new(1 << 20, 1 << 20, clock).expect("rootfs");
+        vfs.default_rootfs().expect("default rootfs");
+        let mut fdt = FdTable::default();
+        vfs.console_on_rootfs(&mut fdt).expect("console");
+        let mut attrs = Attributes::init(1000);
+        attrs.fs = vfs.new_fs_struct(0o022);
         Self {
             pages,
             sink,
             tgid: 1,
-            attrs: Attributes::init(1000),
+            attrs,
             fs_base: 0,
             gs_base: 0,
             machine: Machine {
@@ -102,6 +117,8 @@ impl<P, C> Task<P, C> {
             mm: Mm::new(&env),
             env,
             tables: Fake::default(),
+            vfs,
+            fdt,
         }
     }
 }
@@ -152,6 +169,13 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
             mm: &mut self.mm,
             env: &self.env,
             pages: &mut self.tables,
+        }
+    }
+    fn files(&mut self) -> Files<'_> {
+        Files {
+            vfs: &mut self.vfs,
+            fdt: &mut self.fdt,
+            fs: &mut self.attrs.fs,
         }
     }
 }

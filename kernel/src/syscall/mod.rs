@@ -5,10 +5,11 @@
 // arch/x86/entry/syscalls/syscall_64.tbl. The per-group files carry their own
 // provenance (`io`: fs/read_write.c, drivers/tty; `memory`: mm/mmap.c,
 // mm/mprotect.c, mm/madvise.c; `process`: kernel/exit.c, kernel/sys.c). All
-// GPL-2.0-only. Syscall names/numbers come from the `syscalls` crate
-// (BSD-2-Clause), whose x86_64 table was compared against the pinned tbl.
-// Transformation: the VFS/tty stack is reduced to the one open file the init
-// process owns (/dev/console on fds 0-2) with its default termios.
+// GPL-2.0-only. Syscall names/numbers come from the
+// `syscalls` crate (BSD-2-Clause), whose x86_64 table was compared against the
+// pinned tbl.
+// Transformation: the VFS/tty stack is reduced to the tmpfs rootfs, the pipe
+// and the console/memory character devices (see `vfs`), with default termios.
 #![forbid(unsafe_code)]
 //! The syscall layer as pure functions over a [`Context`].
 //!
@@ -26,6 +27,8 @@
 //! [`Context`] offers by adding methods to the trait (the binary's `Process`
 //! implements it; tests use `testing::Task`), never by reaching for globals.
 
+mod fd;
+mod fs;
 mod ids;
 mod io;
 mod memory;
@@ -33,12 +36,15 @@ mod process;
 #[cfg(test)]
 mod testing;
 mod time;
+#[cfg(test)]
+mod vfs_tests;
 
 use crate::{
     config,
     mm::{Env, FileInfo, Mm, UserPages as PageTables},
-    task::Attributes,
+    task::{Attributes, RLIMIT_NOFILE},
     usercopy::UserPages,
+    vfs::{Cred, FdTable, FsStruct, Vfs},
 };
 use syscalls::{Errno, Sysno};
 
@@ -60,11 +66,20 @@ pub trait Console {
     fn write(&mut self, bytes: &[u8]);
 }
 
+/// The file-system state of the calling task: the system-wide VFS, the task's
+/// `files_struct` and its `fs_struct` (`Attributes::fs`), borrowed together
+/// because most file syscalls need all three.
+pub struct Files<'a> {
+    pub vfs: &'a mut Vfs,
+    pub fdt: &'a mut FdTable,
+    pub fs: &'a mut FsStruct,
+}
+
 /// Everything a syscall may touch: the calling task's user memory (the one
-/// user-copy mechanism, `usercopy`) and its identity and devices. The binary
-/// implements it for its `Process`; host tests for a fake.
+/// user-copy mechanism, `usercopy`) and its identity, devices and files. The
+/// binary implements it for its `Process`; host tests for a fake.
 pub trait Context: UserPages + Clocks {
-    /// init's `/dev/console`.
+    /// The console tty's byte sink (what `/dev/console` writes reach).
     fn console(&mut self) -> &mut dyn Console;
     /// `task_tgid_vnr(current)`: what `getpid` returns.
     fn tgid(&self) -> u32;
@@ -92,10 +107,21 @@ pub trait Context: UserPages + Clocks {
     /// memory syscalls edit.
     fn address_space(&mut self) -> AddressSpace<'_>;
     /// `fget(fd)` for `mmap`: the facts `do_mmap` reads from the open file, or
-    /// `None` for a closed descriptor (`-EBADF`). The default is the file table
-    /// of init today: fds 0-2 are `/dev/console`. The VFS owner overrides it.
+    /// `None` for a closed descriptor (`-EBADF`).
     fn mmap_file(&mut self, fd: u32) -> Option<FileInfo> {
-        io::console_file(fd)
+        let Files { vfs, fdt, .. } = self.files();
+        vfs.mmap_info(fdt, fd)
+    }
+    /// `current->files`, `current->fs` (the same value as `attrs().fs`) and the
+    /// mounted rootfs.
+    fn files(&mut self) -> Files<'_>;
+    /// `current_cred()` as the VFS needs it.
+    fn cred(&mut self) -> Cred {
+        Cred::of_task(&self.attrs().cred)
+    }
+    /// `rlimit(RLIMIT_NOFILE)`: the soft limit.
+    fn rlimit_nofile(&mut self) -> u64 {
+        self.attrs().rlimits.get(RLIMIT_NOFILE).cur
     }
 }
 
@@ -129,6 +155,41 @@ pub enum Outcome {
     Exit(u32),
     /// A syscall inside Linux's table that this slice does not implement.
     Unimplemented(u32),
+    /// The single task would sleep (an empty pipe, a full pipe, console input)
+    /// and there is no other task or interrupt-driven source to wake it:
+    /// Linux would block forever, so the kernel stops loudly.
+    Blocked(u32),
+}
+
+/// Why a file syscall ends other than with a value (internal to the groups).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stop {
+    Errno(Errno),
+    /// [`Outcome::Blocked`].
+    Blocked,
+    /// A Linux behaviour that is not ported yet ([`Outcome::Unimplemented`]).
+    Unimplemented,
+    /// `send_sig(SIGPIPE)` with `-EPIPE`: signal delivery is not wired yet.
+    SigPipe,
+}
+
+impl From<Errno> for Stop {
+    fn from(errno: Errno) -> Self {
+        Self::Errno(errno)
+    }
+}
+
+/// The result of a file syscall body.
+pub(crate) type Sys = Result<i64, Stop>;
+
+/// Map a syscall body's result to the dispatcher's [`Outcome`].
+pub(crate) fn outcome(number: u32, result: Sys) -> Outcome {
+    match result {
+        Ok(value) => Outcome::Return(value),
+        Err(Stop::Errno(errno)) => Outcome::Return(error(errno)),
+        Err(Stop::Blocked) => Outcome::Blocked(number),
+        Err(Stop::Unimplemented | Stop::SigPipe) => Outcome::Unimplemented(number),
+    }
 }
 
 fn error(errno: Errno) -> i64 {
@@ -152,7 +213,8 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         return Outcome::Return(error(Errno::ENOSYS));
     }
     // One line per group, in table order of their first number.
-    io::dispatch(ctx, sysno, args)
+    fd::dispatch(ctx, sysno, args)
+        .or_else(|| fs::dispatch(ctx, sysno, args))
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
         .or_else(|| ids::dispatch(ctx, sysno, args))
@@ -218,8 +280,8 @@ mod tests {
     #[test]
     fn implemented_in_linux_but_not_here_is_reported_not_faked() {
         let mut task = task();
-        let read = dispatch(&mut task, Sysno::read as u64, [0; 6]);
-        assert_eq!(read, Outcome::Unimplemented(0));
+        let writev = dispatch(&mut task, Sysno::writev as u64, [0; 6]);
+        assert_eq!(writev, Outcome::Unimplemented(20));
         let mremap = dispatch(&mut task, Sysno::mremap as u64, [0; 6]);
         assert_eq!(mremap, Outcome::Unimplemented(25));
     }
