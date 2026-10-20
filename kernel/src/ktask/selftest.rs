@@ -454,7 +454,7 @@ pub fn preempt_report() {
 // Every figure is an upper bound with a floor. A repaint stops `PAINT_MARGIN`
 // below the frame of `measure`, so the words from there up to the entry's own
 // frame (the dead frames of `entry_begin`/`entry_end`/`measure`, the margin)
-// stay dirty and every later reading includes them: about 880 bytes, the
+// stay dirty and every later reading includes them: about 896 bytes, the
 // smallest `between` ever recorded, is the shallowest depth a path can show.
 
 /// The fill of an untouched stack word.

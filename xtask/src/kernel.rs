@@ -4691,7 +4691,7 @@ fn user_faults_handled(line: &str, demand: bool) -> bool {
 /// `CHECK kstack-usage max_used=N usable=M ...` (printed by the self-test kernel when init exits):
 /// the deepest kernel stack use any measured system call, exception or exit reached. A regression
 /// guard, not Linux behaviour: some use is recorded and it stays within half of the usable stack
-/// (0 would mean the measurement did not run; observed 15,408 of 65,536 bytes, deepest in `fork`).
+/// (0 would mean the measurement did not run; observed 15,424 of 65,536 bytes, deepest in `fork`).
 fn kstack_usage_ok(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("CHECK kstack-usage max_used=") else {
         return false;

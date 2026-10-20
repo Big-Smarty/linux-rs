@@ -1371,7 +1371,7 @@ pub fn unexpected_interrupt() -> ! {
 // Kernel stack: ring-3 -> ring-0 transitions of every kind (exception, IRQ and
 // SYSCALL) run on the top of the running task's own kernel stack, a slot of the
 // `KSTACKS` pool (4 KiB unmapped guard page, 64 KiB usable; the deepest path
-// measured, `fork` at 15,408 bytes by `ktask::selftest`'s `CHECK kstack-usage`,
+// measured, `fork` at 15,424 bytes by `ktask::selftest`'s `CHECK kstack-usage`,
 // is under a quarter of that), whose top `ktask` makes both `TSS.RSP0` and
 // `KERNEL_STACK_TOP` on every switch. The boot stack is the idle task's. NMI,
 // #DF, #MC and #DB keep their IST stacks.
