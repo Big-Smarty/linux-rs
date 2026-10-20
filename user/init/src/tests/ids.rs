@@ -6,7 +6,7 @@
 
 use syscalls::{Errno, Sysno};
 
-use super::{R, T, addr, addr_mut, getpid, gettid, suite_start, sys};
+use super::{R, T, addr, addr_mut, getpid, gettid, ram_ceiling, suite_start, sys};
 
 const BAD: usize = 0xdead_0000_0000;
 const INF: u64 = u64::MAX;
@@ -639,14 +639,14 @@ fn misc(t: &mut T) {
     );
     t.holds(
         "sysinfo-ram",
-        // The 512 MiB reference VM bounds the total; the bare-metal suite
-        // (docs/bare-metal-suite.md) runs on whatever RAM the machine has.
+        // The total cannot exceed the machine's RAM: the 512 MiB reference VM, or
+        // under the bare-metal suite (docs/bare-metal-suite.md) the memory map's.
         si.totalram > 64 << 20
-            && (suite_start().is_some() || si.totalram <= 512 << 20)
+            && si.totalram <= ram_ceiling()
             && si.freeram <= si.totalram
             && si.freeram > 0,
         (si.totalram, si.freeram),
-        "64 MiB < total (<= 512 MiB outside the suite), 0 < free <= total",
+        "64 MiB < total <= RAM (512 MiB outside the suite), 0 < free <= total",
     );
     t.eq("sysinfo-mem_unit", si.mem_unit, 1);
     t.eq("sysinfo-no-swap", (si.totalswap, si.freeswap), (0, 0));

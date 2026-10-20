@@ -480,6 +480,20 @@ pub fn set_itimer_ns(expiry: Option<u64>) {
     });
 }
 
+/// Forget every wake-up the finished process programmed (a sleep deadline that
+/// a timed-out group abandoned, its `ITIMER_REAL` expiry), so the next group
+/// starts with no stale clockevent. Context: BSP, interrupts masked, no task.
+#[cfg(feature = "baremetal-suite")]
+pub fn clear_waits() {
+    cpu::timer_transaction(|| {
+        DEADLINE_NS.store(u64::MAX, Ordering::Relaxed);
+        ITIMER_NS.store(u64::MAX, Ordering::Relaxed);
+        if EVENT.load(Ordering::Relaxed) != EVENT_NONE {
+            rearm(ktime_get_ns());
+        }
+    });
+}
+
 /// One interruptible sleep: halt until the next interrupt (a signal source or
 /// the clockevent armed for `deadline_ns` or the interval timer) and return, so
 /// the caller can re-check its condition; a deadline already reached returns at

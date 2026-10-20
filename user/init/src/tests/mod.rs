@@ -31,6 +31,7 @@
 
 use core::fmt::{self, Debug, Write as _};
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 use syscalls::{Errno, Sysno};
 
 use crate::exit;
@@ -48,24 +49,41 @@ pub type R = Result<usize, Errno>;
 /// Kernel uptime in whole seconds when the bare-metal suite started this group
 /// (`argv[2]`, see `docs/bare-metal-suite.md`); `u64::MAX` outside the suite
 /// (the oracle reference and the harness cells pass no such word).
-static SUITE_START_S: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static SUITE_START_S: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Bytes of RAM the suite's memory map declares (`argv[3]`); `u64::MAX` outside it.
+static SUITE_RAM: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Record the `argv[2]` word of a suite group: decimal seconds, else ignored.
-pub fn set_suite_start(word: &[u8]) {
-    if let Some(seconds) = core::str::from_utf8(word)
-        .ok()
-        .and_then(|text| text.parse::<u64>().ok())
-    {
-        SUITE_START_S.store(seconds, core::sync::atomic::Ordering::Relaxed);
+fn decimal(word: &[u8]) -> Option<u64> {
+    core::str::from_utf8(word).ok()?.parse().ok()
+}
+
+/// Record the `argv[2]` and `argv[3]` words of a suite group: decimal numbers
+/// (start uptime in seconds, RAM bytes), else ignored.
+pub fn set_suite_args(uptime: &[u8], ram: Option<&[u8]>) {
+    if let Some(seconds) = decimal(uptime) {
+        SUITE_START_S.store(seconds, Ordering::Relaxed);
+    }
+    if let Some(bytes) = ram.and_then(decimal) {
+        SUITE_RAM.store(bytes, Ordering::Relaxed);
+    }
+}
+
+fn stored(cell: &AtomicU64) -> Option<u64> {
+    match cell.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        value => Some(value),
     }
 }
 
 /// The suite's group start uptime in seconds; `None` when not run by the suite.
 pub fn suite_start() -> Option<u64> {
-    match SUITE_START_S.load(core::sync::atomic::Ordering::Relaxed) {
-        u64::MAX => None,
-        seconds => Some(seconds),
-    }
+    stored(&SUITE_START_S)
+}
+
+/// The most RAM a machine can have: the 512 MiB of the reference VM outside the
+/// suite, the memory map's declared RAM inside it.
+pub fn ram_ceiling() -> u64 {
+    stored(&SUITE_RAM).unwrap_or(512 << 20)
 }
 
 pub const PAGE: usize = 4096;

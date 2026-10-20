@@ -24,8 +24,13 @@ use std::time::{Duration, Instant};
 pub(super) const TIMEOUT: Duration = Duration::from_secs(180);
 
 /// The groups of a normal run, in the kernel's order, all expected to pass.
-pub(super) const ALL_PASS: &[(&str, bool)] =
-    &[("ids", true), ("time", true), ("mm", true), ("fs", true)];
+pub(super) const ALL_PASS: &[(&str, bool)] = &[
+    ("ids", true),
+    ("time", true),
+    ("mm", true),
+    ("fs", true),
+    ("signal", true),
+];
 /// A run that selects three probes ending abnormally (a SIGSEGV, an unimplemented
 /// syscall, a loop that outruns the one-second group bound), then one real group.
 pub(super) const STOPS: &[(&str, bool)] = &[
@@ -321,10 +326,10 @@ WHAT THIS IS
   with Limine 12.9.3 (the BOOTX64.EFI of your /usr/share/limine). The kernel
   runs its boot self-tests, prints a hardware inventory (CPU, memory map, ACPI,
   APIC/timers, framebuffers, PCI ids), runs the oracle syscall groups ids,
-  time, mm and fs each as a fresh /init on a fresh rootfs, compares each
-  group's output line by line with what the pinned Linux 6.18.57 printed, and
-  ends on a summary screen. The groups signal and proc are not run (the kernel
-  does not support them yet; the summary says so).
+  time, mm, fs and signal each as a fresh /init on a fresh rootfs, compares
+  each group's output line by line with what the pinned Linux 6.18.57 printed,
+  and ends on a summary screen. The group proc is not run (the kernel has no
+  procfs yet; the summary says so).
 
 WHAT IT NEVER DOES
   It has no disk, USB-storage, network or sound driver and calls no firmware

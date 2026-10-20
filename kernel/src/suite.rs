@@ -23,16 +23,12 @@
 pub const ORACLE_EXPECTED: &[u8] = include_bytes!("../../xtask/oracle/expected.tsv");
 
 /// Oracle groups the kernel can run today, in run order.
-pub const GROUPS: [&str; 4] = ["ids", "time", "mm", "fs"];
+pub const GROUPS: [&str; 5] = ["ids", "time", "mm", "fs", "signal"];
 
 /// Oracle groups that exist in `user/init` but are not run, with the reason
-/// that appears on the summary screen. `signal` leaves this list when the
-/// signal syscalls are wired into the dispatcher and `oracle_case!(signal)`
-/// exists in the host harness.
-pub const UNSUPPORTED: [(&str, &str); 2] = [
-    ("signal", "not yet supported (signal delivery not wired)"),
-    ("proc", "not yet supported (no procfs)"),
-];
+/// that appears on the summary screen. `proc` leaves this list when procfs
+/// exists and `oracle_case!(proc)` is in the host harness.
+pub const UNSUPPORTED: [(&str, &str); 1] = [("proc", "not yet supported (no procfs)")];
 
 /// Longest line text kept for a report; longer lines are cut (and end in `~`).
 pub const LINE_MAX: usize = 100;

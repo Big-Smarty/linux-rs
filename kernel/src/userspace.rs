@@ -1617,39 +1617,52 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
 }
 
 /// The bare-metal suite's group load (decision A21): a fresh rootfs from the
-/// retained archive copies, then `/init` with `-- <group> <uptime_s>` as its
-/// arguments (`uptime_s`: whole seconds of boot time at the group's start, so
-/// the group's uptime bounds count from there).
+/// retained archive copies, then `/init` with `-- <group> <uptime_s> <ram>` as
+/// its arguments (`uptime_s`: whole seconds of boot time at the group's start,
+/// so the group's uptime bounds count from there; `ram`: bytes of RAM the
+/// memory map declares, the ceiling of `ids.sysinfo-ram` on any machine).
 /// The module payloads are unreadable once the owned tables are active, so the
 /// suite keeps heap copies (`baremetal::retain_archives`).
 ///
 /// Context: BSP, IF clear, no group running, no lock held. Locks `TABLES`
 /// for the load (`TABLES` -> heap -> `FRAMES`, the documented order).
 #[cfg(feature = "baremetal-suite")]
-pub fn load_group(archives: &[Vec<u8>], group: &str, uptime_s: u64) -> Result<Loaded, Error> {
+pub fn load_group(
+    archives: &[Vec<u8>],
+    group: &str,
+    uptime_s: u64,
+    ram_bytes: u64,
+) -> Result<Loaded, Error> {
+    /// Decimal digits of `value` right-aligned in `digits`; the start index.
+    fn decimal(digits: &mut [u8; 20], mut value: u64) -> usize {
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+            value /= 10;
+            if value == 0 {
+                return start;
+            }
+        }
+    }
     let mut rootfs = new_rootfs()?;
     for (index, bytes) in archives.iter().enumerate() {
         rootfs.unpack(index, bytes);
     }
-    // "-- <group> <decimal uptime>", at most 20 digits.
-    let mut digits = [0u8; 20];
-    let (mut start, mut rest) = (digits.len(), uptime_s);
-    loop {
-        start -= 1;
-        digits[start] = b'0' + u8::try_from(rest % 10).unwrap_or(0);
-        rest /= 10;
-        if rest == 0 {
-            break;
-        }
-    }
+    // "-- <group> <decimal uptime> <decimal ram>", at most 20 digits each.
+    let (mut up, mut ram) = ([0u8; 20], [0u8; 20]);
+    let (up_start, ram_start) = (decimal(&mut up, uptime_s), decimal(&mut ram, ram_bytes));
+    let (up, ram) = (&up[up_start..], &ram[ram_start..]);
     let mut line = Vec::new();
-    line.try_reserve_exact(4 + group.len() + digits.len() - start)
+    line.try_reserve_exact(5 + group.len() + up.len() + ram.len())
         .map_err(|_| Error::Vfs(Errno::ENOMEM))?;
     for &byte in b"-- "
         .iter()
         .chain(group.as_bytes())
         .chain(b" ")
-        .chain(&digits[start..])
+        .chain(up)
+        .chain(b" ")
+        .chain(ram)
     {
         let _ = line.push_within_capacity(byte);
     }
@@ -1676,6 +1689,9 @@ pub fn teardown() {
         tables.mm_unmap(&mut frames, 0, usercopy::TASK_SIZE_MAX / PAGE);
     }
     drop(process);
+    // The process's signal state (handlers, queues, `ITIMER_REAL`) died with it;
+    // its clockevent wake-ups must not outlive it.
+    timer::clear_waits();
 }
 
 /// Whether every lock a group's teardown takes is free (see `Service::is_free`).

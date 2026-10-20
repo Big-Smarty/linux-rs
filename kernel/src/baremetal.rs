@@ -83,7 +83,7 @@ const DEFAULT_PAUSE_MS: usize = 6000;
 /// slow framebuffer should not come near this.
 const DEFAULT_TIMEOUT_S: u64 = 120;
 /// Groups that sleep on the monotonic clock and so cannot run without it.
-const NEEDS_CLOCK: [&str; 1] = ["time"];
+const NEEDS_CLOCK: [&str; 2] = ["time", "signal"];
 const CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_PROOFS: usize = 40;
 /// Inventory facts the summary repeats: cpu, memory, platform, time, display, pci, adapters.
@@ -597,6 +597,13 @@ fn inventory_memory(boot: &BootInfo) {
     }
     log!(" other={}KiB\n", other >> 10);
     let ram = (totals[0] + totals[5]) >> 20;
+    // Every kind that can be RAM the kernel might count as its own (usable,
+    // ACPI-reclaimable, bootloader, kernel+modules): `ids.sysinfo-ram` must
+    // not report more than the machine's memory map holds.
+    RAM_BOUND.store(
+        totals[0] + totals[2] + totals[5] + totals[6],
+        Ordering::Relaxed,
+    );
     key(
         1,
         Text::from_args(format_args!(
@@ -783,6 +790,9 @@ pub fn inventory(boot: &BootInfo, acpi: &Acpi) {
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static CURRENT: AtomicUsize = AtomicUsize::new(NONE);
+/// Bytes of RAM the memory map declares (see `inventory_memory`); passed to every
+/// group as its third argument, the ceiling of `ids.sysinfo-ram`.
+static RAM_BOUND: AtomicU64 = AtomicU64::new(0);
 static GROUP_START: AtomicUsize = AtomicUsize::new(0);
 static GROUP_T0: AtomicU64 = AtomicU64::new(0);
 static ENTERED: AtomicBool = AtomicBool::new(false);
@@ -821,7 +831,12 @@ fn start_next() -> ! {
         GROUP_START.store(stored(), Ordering::Relaxed);
         GROUP_T0.store(timer::ktime_get_ns(), Ordering::Relaxed);
         CURRENT.store(index, Ordering::Relaxed);
-        let loaded = userspace::load_group(&ARCHIVES.lock(), group, uptime_s);
+        let loaded = userspace::load_group(
+            &ARCHIVES.lock(),
+            group,
+            uptime_s,
+            RAM_BOUND.load(Ordering::Relaxed),
+        );
         let cycles = timer::tsc_khz_or_assumed()
             .saturating_mul(1000)
             .saturating_mul(TIMEOUT_S.load(Ordering::Relaxed));
