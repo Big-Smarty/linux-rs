@@ -306,7 +306,10 @@ fn scroll(count: usize) {
 /// executes `sfence`: no registers or flags other than RIP, no XMM/MMX state (the
 /// kernel never saves FP state in the kernel), no stack effect, and a compiler
 /// memory barrier. The emitted instruction is checked in the disassembly (see
-/// docs/implementation.md, "Framebuffer console on real hardware").
+/// docs/implementation.md, "Framebuffer console on real hardware"). SFENCE's
+/// only exceptions are `#UD` when CPUID.01H:EDX.SSE is clear or with a LOCK
+/// prefix (Intel SDM vol. 2 and AMD APM vol. 3, SFENCE exception tables); it is
+/// not subject to CR0.EM/TS or CR4.OSFXSR, and every x86-64 CPU has SSE.
 fn drain() {
     if COUNT.load(Ordering::Relaxed) != 0 {
         // SAFETY: SFENCE exists on every x86_64 CPU (SSE is architectural there),
