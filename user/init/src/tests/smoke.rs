@@ -2,11 +2,13 @@
 //! `signals` mode: a short, self-contained signal-delivery smoke test for the kernel's own
 //! `kernel-test` case. Unlike the oracle `signal` group it needs only syscalls that exist on every
 //! branch (`rt_sigaction`, `rt_sigprocmask`, `rt_sigpending`, `kill`, `setitimer`, `pause`,
-//! `rt_sigsuspend`, `rt_sigtimedwait`, `sigaltstack`, `write`, `getpid`), and it checks the
+//! `rt_sigsuspend`, `rt_sigtimedwait`, `sigaltstack`, `write`, `getpid`, plus the VFS and memory
+//! syscalls of the last block), and it checks the
 //! delivery mechanism rather than Linux's error table: handler entry and return, the siginfo of
 //! `kill`, a synchronous fault recovered by the handler (`#PF`, `#UD`, `#DE`), an interval timer
-//! interrupting a busy loop in ring 3, `pause`/`rt_sigsuspend`/`rt_sigtimedwait` waking, and the
-//! alternate signal stack. Timing is checked against the TSC, calibrated by the 20 ms busy-loop
+//! interrupting a busy loop in ring 3, `pause`/`rt_sigsuspend`/`rt_sigtimedwait` waking, the
+//! alternate signal stack, and the signals the kernel itself sends for `EPIPE`, `RLIMIT_FSIZE` and
+//! a file page past `i_size`. Timing is checked against the TSC, calibrated by the 20 ms busy-loop
 //! timer of check 4 (a wait that returns at once must not pass). On Linux it prints the same
 //! line, so it is also an oracle run.
 //! Any mismatch exits with status 1 after printing `init: FAIL <check> got=<value>`.
@@ -32,6 +34,13 @@ const SIG_SETMASK: usize = 2;
 const SI_USER: i32 = 0;
 const SI_KERNEL: i32 = 0x80;
 const SEGV_MAPERR: i32 = 1;
+const SIGBUS: usize = 7;
+const SIGPIPE: usize = 13;
+const SIGXFSZ: usize = 25;
+const BUS_ADRERR: i32 = 2;
+const RLIMIT_FSIZE: usize = 1;
+/// `O_CREAT | O_RDWR`.
+const O_CREAT_RDWR: usize = 0o102;
 
 /// `ucontext` word index of `uc_mcontext.rip` (`gregs[REG_RIP]` at byte `40 + 8 * 16`).
 const UC_RIP: usize = (40 + 8 * 16) / 8;
@@ -554,6 +563,88 @@ pub fn run() {
     expect("bad-frame-signo", SIGNO.load(Relaxed), SIGSEGV as u64);
     expect("bad-frame-code", CODE.load(Relaxed), SI_KERNEL as u64);
     expect("bad-frame-onstack", ON_ALT.load(Relaxed), 1);
+
+    // 10. Signals the VFS and memory lanes send. `SIGPIPE` with `EPIPE` for a pipe without readers
+    //     and `SIGXFSZ` with `EFBIG` past `RLIMIT_FSIZE` (both `send_sig`: `SI_USER` from this
+    //     process), and `SIGBUS`/`BUS_ADRERR` with the faulting address for a page of a file
+    //     mapping past `i_size` (`shmem_fault` -> `do_sigbus`).
+    install(SIGPIPE, 0);
+    reset();
+    let mut fds = [0i32; 2];
+    expect("pipe2", sys(Sysno::pipe2, &[addr_mut(&mut fds), 0]), Ok(0));
+    let [reader, writer] = fds.map(|fd| usize::try_from(fd).unwrap_or(usize::MAX));
+    expect("pipe-close-reader", sys(Sysno::close, &[reader]), Ok(0));
+    expect(
+        "pipe-epipe",
+        sys(Sysno::write, &[writer, addr(b"x"), 1]),
+        Err(Errno::EPIPE),
+    );
+    expect("sigpipe-handler", COUNT.load(Relaxed), 1);
+    expect("sigpipe-signo", SIGNO.load(Relaxed), SIGPIPE as u64);
+    expect("sigpipe-code", CODE.load(Relaxed), SI_USER as u64);
+    expect("sigpipe-pid", PID.load(Relaxed), getpid() as u64);
+    expect("pipe-close-writer", sys(Sysno::close, &[writer]), Ok(0));
+
+    install(SIGXFSZ, 0);
+    reset();
+    let file = sys(Sysno::open, &[addr(b"/sig-xfsz\0"), O_CREAT_RDWR, 0o600]);
+    expect("open-xfsz", file.is_ok(), true);
+    let file = file.unwrap_or(usize::MAX);
+    let limit = [4u64, u64::MAX];
+    expect(
+        "setrlimit-fsize",
+        sys(Sysno::setrlimit, &[RLIMIT_FSIZE, addr(&limit)]),
+        Ok(0),
+    );
+    expect(
+        "write-clamped",
+        sys(Sysno::write, &[file, addr(b"0123456789"), 10]),
+        Ok(4),
+    );
+    expect("clamped-sends-nothing", COUNT.load(Relaxed), 0);
+    expect(
+        "write-efbig",
+        sys(Sysno::write, &[file, addr(b"0123456789"), 10]),
+        Err(Errno::EFBIG),
+    );
+    expect("sigxfsz-handler", COUNT.load(Relaxed), 1);
+    expect("sigxfsz-signo", SIGNO.load(Relaxed), SIGXFSZ as u64);
+    expect("sigxfsz-code", CODE.load(Relaxed), SI_USER as u64);
+    let unlimited = [u64::MAX; 2];
+    expect(
+        "setrlimit-unlimited",
+        sys(Sysno::setrlimit, &[RLIMIT_FSIZE, addr(&unlimited)]),
+        Ok(0),
+    );
+    expect("close-xfsz", sys(Sysno::close, &[file]), Ok(0));
+
+    install(SIGBUS, 0);
+    reset();
+    let file = sys(Sysno::open, &[addr(b"/sig-bus\0"), O_CREAT_RDWR, 0o600]);
+    expect("open-bus", file.is_ok(), true);
+    let file = file.unwrap_or(usize::MAX);
+    expect("write-bus", sys(Sysno::write, &[file, addr(b"x"), 1]), Ok(1));
+    let map = sys(Sysno::mmap, &[0, 2 * 4096, 1, 2, file, 0]);
+    expect("mmap-bus", map.is_ok(), true);
+    let map = map.unwrap_or(0);
+    // SAFETY: a read through a private file mapping of two pages; page 0 is backed by the file's
+    // one byte. The `mov rax, [rcx]` (3 bytes) only writes `rax`.
+    unsafe {
+        asm!("mov rax, [rcx]", in("rcx") map, out("rax") _, options(nostack));
+    }
+    expect("inside-i_size-no-signal", COUNT.load(Relaxed), 0);
+    SKIP.store(3, Relaxed);
+    // SAFETY: as above on page 1, which lies past `i_size`: the access raises SIGBUS and the
+    // handler advances `rip` past the 3-byte instruction.
+    unsafe {
+        asm!("mov rax, [rcx]", in("rcx") map + 4096, out("rax") _, options(nostack));
+    }
+    expect("sigbus-handler", COUNT.load(Relaxed), 1);
+    expect("sigbus-signo", SIGNO.load(Relaxed), SIGBUS as u64);
+    expect("sigbus-code", CODE.load(Relaxed), BUS_ADRERR as u64);
+    expect("sigbus-addr", ADDRESS.load(Relaxed), (map + 4096) as u64);
+    expect("munmap-bus", sys(Sysno::munmap, &[map, 2 * 4096]), Ok(0));
+    expect("close-bus", sys(Sysno::close, &[file]), Ok(0));
 
     super::emit(format_args!("init: signals ok"));
 }
