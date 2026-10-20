@@ -56,6 +56,7 @@ use kernel::{
     image::elf::Elf,
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
+    ratelimit::RateLimit,
     signal::{
         self, State, USER_CS,
         deliver::{self, Outcome as SignalOutcome},
@@ -480,22 +481,9 @@ pub struct Process {
     /// `sighand` + `signal_struct` + the task's signal fields (the pure model
     /// in `kernel::signal`), boxed because the two pending queues are ~16 KiB.
     pub signal: Box<State>,
-    /// The synchronous fault whose signal was raised and not yet delivered,
-    /// for `show_unhandled_signals` when it turns out to kill init.
-    fault: Option<UserFault>,
-}
-
-/// What `show_signal` / `show_signal_msg` print about a user fault.
-#[derive(Clone, Copy)]
-struct UserFault {
-    vector: u64,
-    /// The hardware error code.
-    error: u64,
-    ip: u64,
-    sp: u64,
-    address: u64,
-    /// The signal the fault forced.
-    signal: u8,
+    /// `printk_ratelimit_state`: the limiter of the `show_unhandled_signals`
+    /// lines (global in Linux; one process here).
+    printk_ratelimit: RateLimit,
 }
 
 static PROCESS: Service<Process> = Service::new();
@@ -840,7 +828,6 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
             let mm = process.mm;
             let mut tables = mm.lock();
             let mut space = tables.user_space();
-            let compat = regs.cs != USER_CS;
             let outcome = deliver::handle_pending_signals(
                 &mut process.signal,
                 regs,
@@ -849,21 +836,10 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
             );
             drop(tables);
             match outcome {
-                SignalOutcome::Handled | SignalOutcome::FrameFailed if compat => {
-                    // The ia32 frame (`ia32_setup_rt_frame`) is not modelled.
-                    crate::log!("FAIL signal delivery in compatibility mode unimplemented\n");
-                    crate::fail();
-                }
                 // `handle_pending_signals` loops while a forced SIGSEGV is pending.
                 SignalOutcome::Resume | SignalOutcome::Handled | SignalOutcome::FrameFailed => {}
                 SignalOutcome::Exit { exit_code, .. } => {
-                    let fault = process.fault.take();
-                    let fault = fault.filter(|f| report::signal_exit_code(f.signal) == exit_code);
-                    let region = fault.and_then(|f| region_of(&process, f.ip));
                     drop(process);
-                    if let Some(fault) = fault {
-                        show_unhandled_signal(&fault, region);
-                    }
                     init_died(exit_code);
                 }
                 SignalOutcome::Stop(sig) => {
@@ -872,12 +848,11 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
                 }
             }
         }
-        process.fault = None;
         // A return frame the CPU would refuse in ring 0 (a hostile `rt_sigreturn`
         // frame or handler address): Linux's `.Lbad_iret` turns that into a user
         // #GP, and so does this.
-        if bad_iret_frame(regs) {
-            raise_fault(&mut process, regs, 13, 0, 0);
+        if let Some(error) = bad_iret_error(regs) {
+            raise_fault(&mut process, regs, 13, error);
             continue;
         }
         // Wake the CPU for the next interval-timer expiry while ring 3 runs.
@@ -888,52 +863,85 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
 
 /// Would `iretq` to this frame fault in ring 0? 64-bit CS needs a canonical
 /// RIP, any frame a canonical RSP, a user code selector and a usable user SS.
-fn bad_iret_frame(regs: &cpu::PtRegs) -> bool {
+/// The answer is the `#GP` error code the CPU reports, in the order it checks
+/// (SDM, IRET to an outer level): an unusable CS or SS is the selector (0 for
+/// a null one), a non-canonical RIP or RSP is 0.
+fn bad_iret_error(regs: &cpu::PtRegs) -> Option<u64> {
     use kernel::signal::Cpu;
     const fn canonical(address: u64) -> bool {
         // 4-level paging: bits 63..47 equal.
         (address.cast_signed() << 16 >> 16).cast_unsigned() == address
     }
-    let cs_ok = regs.cs == USER_CS || regs.cs == 0x23;
+    if regs.cs != USER_CS && regs.cs != 0x23 {
+        return Some(regs.cs & 0xfffc);
+    }
     #[allow(clippy::cast_possible_truncation)]
-    let ss_ok = regs.ss & 3 == 3 && cpu::UserCpu::new().ss_is_valid_user_data(regs.ss as u16);
-    !cs_ok || !ss_ok || !canonical(regs.sp) || (regs.cs == USER_CS && !canonical(regs.ip))
+    if regs.ss & 3 != 3 || !cpu::UserCpu::new().ss_is_valid_user_data(regs.ss as u16) {
+        return Some(regs.ss & 0xfffc);
+    }
+    (!canonical(regs.sp) || (regs.cs == USER_CS && !canonical(regs.ip))).then_some(0)
 }
 
-/// `show_signal` / `show_signal_msg` for a user fault that killed init (Linux
-/// prints them when the signal is unhandled; for the global init every fault
-/// signal is unhandled, shortcut: the line is printed only when the signal
-/// then kills init, and `printk_ratelimit` is not modelled). `region` is the
-/// file-backed VMA containing `fault.ip` ([`region_of`]).
-fn show_unhandled_signal(fault: &UserFault, region: Option<FileRegion>) {
-    if fault.vector == 14 {
+/// `show_signal` / `show_signal_msg`: Linux prints the fault line when
+/// `show_unhandled_signals && unhandled_signal(current, sig) && printk_ratelimit()`;
+/// for the global init `unhandled_signal` is always true, handler or not.
+/// `message` is whether this fault has a line at all (a page fault that ends in
+/// `SIGSEGV`, or a vector with a `show_signal` message). The limiter allows ten
+/// lines per five seconds and reports the suppressed ones when it re-opens.
+/// shortcut: no `Code:` line (`show_opcodes`) after the `segfault at` line.
+fn show_unhandled_signal(
+    process: &mut Process,
+    regs: &cpu::PtRegs,
+    vector: u64,
+    error: u64,
+    address: u64,
+) {
+    let message = u8::try_from(vector)
+        .ok()
+        .and_then(report::user_exception)
+        .and_then(|signal| signal.message);
+    if vector != 14 && message.is_none() {
+        return;
+    }
+    let func = if vector == 14 {
+        "show_signal_msg"
+    } else {
+        "show_signal"
+    };
+    let jiffies = timer::ktime_get_ns() / kernel::time::TICK_NSEC;
+    let verdict = process.printk_ratelimit.check(jiffies);
+    if verdict.suppressed > 0 {
+        crate::log!("{}: {} callbacks suppressed\n", func, verdict.suppressed);
+    }
+    if !verdict.allowed {
+        return;
+    }
+    let region = region_of(process, regs.ip);
+    if vector == 14 {
         let line = Segfault {
-            address: fault.address,
-            ip: fault.ip,
-            sp: fault.sp,
-            error: fault.error,
+            address,
+            ip: regs.ip,
+            sp: regs.sp,
+            error,
             region,
         };
         crate::log!("{}\n", line);
-    } else if let Some((kind, desc)) = u8::try_from(fault.vector)
-        .ok()
-        .and_then(report::user_exception)
-        .and_then(|signal| signal.message)
-    {
+    } else if let Some((kind, desc)) = message {
         let line = TrapLine {
             kind,
             desc,
-            ip: fault.ip,
-            sp: fault.sp,
-            error: fault.error,
+            ip: regs.ip,
+            sp: regs.sp,
+            error,
             region,
         };
         crate::log!("{}\n", line);
     }
 }
 
-/// Force the signal of a synchronous user-mode fault (`force_sig_*`): record
-/// what `show_signal` prints and what the signal frame reports. `Fault`'s
+/// Force the signal of a synchronous user-mode fault (`force_sig_*`) and print
+/// what `show_signal` / `show_signal_msg` print for it (`do_sigbus` prints
+/// nothing, a refused page access prints the `segfault at` line). `Fault`'s
 /// absent siginfo is a spurious `#MF`/`#XM` that raises nothing.
 fn force(
     process: &mut Process,
@@ -943,19 +951,13 @@ fn force(
     error: u64,
     address: u64,
 ) -> bool {
-    let Some(signal) = fault.info.map(|i| i.signo) else {
+    let Some(signo) = fault.info.map(|i| i.signo) else {
         return false;
     };
+    if vector != 14 || signo == i32::from(signal::SIGSEGV) {
+        show_unhandled_signal(process, regs, vector, error, address);
+    }
     process.signal.force_fault(&fault);
-    process.fault = Some(UserFault {
-        vector,
-        error,
-        ip: regs.ip,
-        sp: regs.sp,
-        address,
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        signal: signal as u8,
-    });
     true
 }
 
@@ -1565,7 +1567,7 @@ fn start(mut init: Loaded) -> ! {
         vfs: init.vfs,
         fdt,
         signal,
-        fault: None,
+        printk_ratelimit: RateLimit::printk(kernel::time::HZ),
     });
     #[cfg(feature = "qemu-self-test")]
     check_mm_usercopy();

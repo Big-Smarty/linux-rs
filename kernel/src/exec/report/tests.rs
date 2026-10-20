@@ -134,7 +134,7 @@ fn trap_line_formats_like_show_signal() {
     };
     assert_eq!(
         line.to_string(),
-        "init[1] general protection fault ip:2055b4 sp:7ffd2010a150 error:0 in init[45b4,204000+7000]"
+        "traps: init[1] general protection fault ip:2055b4 sp:7ffd2010a150 error:0 in init[45b4,204000+7000]"
     );
     let divide = TrapLine {
         kind: "trap ",
@@ -146,6 +146,6 @@ fn trap_line_formats_like_show_signal() {
     };
     assert_eq!(
         divide.to_string(),
-        "init[1] trap divide error ip:1 sp:2 error:0"
+        "traps: init[1] trap divide error ip:1 sp:2 error:0"
     );
 }

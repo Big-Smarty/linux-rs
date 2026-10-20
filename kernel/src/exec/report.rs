@@ -178,7 +178,9 @@ pub const fn user_exception(vector: u8) -> Option<UserSignal> {
     Some(UserSignal { signal, message })
 }
 
-/// `show_signal`: `init[1] <type><desc> ip:%lx sp:%lx error:%lx[ in init[...]]`.
+/// `show_signal`: `traps: init[1] <type><desc> ip:%lx sp:%lx error:%lx[ in init[...]]`
+/// (`traps.c` defines `pr_fmt` as `"traps: " fmt`; the pinned reference prints
+/// `traps: init[1] trap int3 ip:...`).
 pub struct TrapLine {
     pub kind: &'static str,
     pub desc: &'static str,
@@ -192,7 +194,7 @@ impl fmt::Display for TrapLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "init[1] {}{} ip:{:x} sp:{:x} error:{:x}{}",
+            "traps: init[1] {}{} ip:{:x} sp:{:x} error:{:x}{}",
             self.kind,
             self.desc,
             self.ip,

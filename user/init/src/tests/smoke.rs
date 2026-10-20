@@ -42,6 +42,22 @@ struct Itimerval {
     value: [i64; 2],
 }
 
+/// Which part of the interrupted state `corrupt` damages before the handler returns (`BAD_*`).
+static CORRUPT: AtomicU64 = AtomicU64::new(0);
+static SAVED_RIP: AtomicU64 = AtomicU64::new(0);
+static SAVED_SEGS: AtomicU64 = AtomicU64::new(0);
+const BAD_RIP: u64 = 1;
+const BAD_CS: u64 = 2;
+const BAD_SS: u64 = 3;
+/// `ucontext` word holding `cs`, `gs`, `fs`, `ss` (`sigcontext` bytes 144..152).
+const UC_SEGS: usize = (40 + 144) / 8;
+
+static ERR: AtomicU64 = AtomicU64::new(0);
+static TRAPNO: AtomicU64 = AtomicU64::new(0);
+/// `ucontext` words of `sigcontext.err` and `.trapno` (`gregs[REG_ERR]`, `gregs[REG_TRAPNO]`).
+const UC_ERR: usize = (40 + 8 * 19) / 8;
+const UC_TRAPNO: usize = UC_ERR + 1;
+
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static SIGNO: AtomicU64 = AtomicU64::new(0);
 static CODE: AtomicU64 = AtomicU64::new(0);
@@ -75,6 +91,8 @@ extern "C" fn handler(sig: i32, info: *const u64, uc: *mut u64) {
         let sp = core::ptr::addr_of!(marker).addr();
         let (lo, hi) = alt_range();
         ON_ALT.store(usize::from(sp >= lo && sp < hi), Relaxed);
+        ERR.store(uc.add(UC_ERR).read(), Relaxed);
+        TRAPNO.store(uc.add(UC_TRAPNO).read(), Relaxed);
         let skip = SKIP.swap(0, Relaxed);
         if skip != 0 {
             let rip = uc.add(UC_RIP);
@@ -84,6 +102,52 @@ extern "C" fn handler(sig: i32, info: *const u64, uc: *mut u64) {
         let _ = uc.add(UC_STACK_SP).read();
     }
     FLAG.store(1, Relaxed);
+}
+
+/// Handler that returns a damaged state to `rt_sigreturn`: a non-canonical `rip`, a kernel `cs` or a
+/// null `ss`, each of which makes the CPU refuse the return to ring 3. Linux turns that into a
+/// `SIGSEGV` (`SI_KERNEL`) of the same task; `repair` (the SIGSEGV handler) then puts the saved
+/// state back.
+extern "C" fn corrupt(sig: i32, info: *const u64, uc: *mut u64) {
+    handler(sig, info, uc);
+    // SAFETY: `uc` is the ucontext the kernel built on this stack.
+    unsafe {
+        SAVED_RIP.store(uc.add(UC_RIP).read(), Relaxed);
+        SAVED_SEGS.store(uc.add(UC_SEGS).read(), Relaxed);
+        match CORRUPT.load(Relaxed) {
+            BAD_RIP => uc.add(UC_RIP).write(0x8000_0000_0000_0000),
+            BAD_CS => uc
+                .add(UC_SEGS)
+                .write(SAVED_SEGS.load(Relaxed) & !0xffff | 0x10),
+            _ => uc
+                .add(UC_SEGS)
+                .write(SAVED_SEGS.load(Relaxed) & 0x0000_ffff_ffff_ffff),
+        }
+    }
+}
+
+/// The `SIGSEGV` handler of the bad-return checks: restore what `corrupt` saved.
+extern "C" fn repair(sig: i32, info: *const u64, uc: *mut u64) {
+    handler(sig, info, uc);
+    // SAFETY: as in `corrupt`.
+    unsafe {
+        uc.add(UC_RIP).write(SAVED_RIP.load(Relaxed));
+        uc.add(UC_SEGS).write(SAVED_SEGS.load(Relaxed));
+    }
+}
+
+fn install_fn(sig: usize, f: extern "C" fn(i32, *const u64, *mut u64), flags: u64) {
+    let sa = KSigaction {
+        handler: fn_addr(f as *const ()),
+        flags: SA_SIGINFO | SA_RESTORER | flags,
+        restorer: fn_addr(restorer as *const ()),
+        mask: 0,
+    };
+    expect(
+        "rt_sigaction",
+        sys(Sysno::rt_sigaction, &[sig, addr(&sa), 0, 8]),
+        Ok(0),
+    );
 }
 
 fn install(sig: usize, flags: u64) {
@@ -258,6 +322,29 @@ pub fn run() {
     expect("sigtimedwait-no-handler", COUNT.load(Relaxed), 0);
     expect("sigtimedwait-info", info[0] as i32, SIGALRM as i32);
     let _ = sys(Sysno::rt_sigprocmask, &[SIG_SETMASK, addr(&0u64), 0, 8]);
+
+    // 7b. A handler that returns a state the CPU would refuse to `iret` to (hostile `rt_sigreturn`
+    //     frame): the kernel must survive and raise SIGSEGV for the task instead.
+    install_fn(SIGUSR1, corrupt, 0);
+    install_fn(SIGSEGV, repair, 0);
+    // (name, damage, the #GP error code the CPU reports: the bad selector, 0 for a bad address).
+    for (name, kind, err) in [("rip", BAD_RIP, 0), ("cs", BAD_CS, 0x10), ("ss", BAD_SS, 0)] {
+        reset();
+        CORRUPT.store(kind, Relaxed);
+        expect(
+            "bad-return-kill",
+            sys(Sysno::kill, &[getpid(), SIGUSR1]),
+            Ok(0),
+        );
+        // SIGUSR1's handler ran, then the return failed and SIGSEGV's handler ran.
+        expect(name, COUNT.load(Relaxed), 2);
+        expect(name, SIGNO.load(Relaxed), SIGSEGV as u64);
+        expect(name, CODE.load(Relaxed), SI_KERNEL as u64);
+        expect(name, TRAPNO.load(Relaxed), 13);
+        expect(name, ERR.load(Relaxed), err);
+    }
+    install(SIGUSR1, 0);
+    install(SIGSEGV, 0);
 
     // 8. SA_ONSTACK runs the handler on the alternate stack.
     let stack = [core::ptr::addr_of!(ALT).addr() as u64, 0, 16384];
