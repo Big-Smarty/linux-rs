@@ -1421,7 +1421,7 @@ fn replacing_a_file_vma_by_map_fixed_releases_the_description() {
         };
         assert_eq!(replaced, ok(addr as i64), "zero={zero}");
         assert_eq!(t.vfs.pin_count(), 0, "zero={zero}");
-        assert!(t.vfs.zero_mapped() == zero);
+        assert_eq!(t.vfs.zero_mapped(), zero);
     }
 }
 
