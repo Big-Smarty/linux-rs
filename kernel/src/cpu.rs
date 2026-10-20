@@ -252,17 +252,18 @@ impl Drop for LocalInterruptGuard {
     }
 }
 
-/// The only blocking lock currently reachable here protects PIC programming
-/// and PIT latch/low/high transactions. The IRQ EOI path never blocks on it;
-/// NMI/fault/emergency output never acquires it. No callbacks or allocation.
-struct IrqSpinLock(RawSpinLock);
+/// IRQ-saving spinlock. Besides PIC programming and PIT latch/low/high
+/// transactions (the IRQ EOI path never blocks on it), `services::IrqMutex`
+/// builds the kernel's allocator/heap/page-table/process locks from it.
+/// NMI/fault/emergency output never acquires it. Holders run no callbacks.
+pub(crate) struct IrqSpinLock(RawSpinLock);
 
 impl IrqSpinLock {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self(RawSpinLock::new())
     }
 
-    fn lock(&self) -> IrqSpinGuard<'_> {
+    pub(crate) fn lock(&self) -> IrqSpinGuard<'_> {
         let irq = LocalInterruptGuard::disable();
         IrqSpinGuard {
             raw: self.0.lock(),
@@ -279,7 +280,7 @@ impl IrqSpinLock {
     }
 }
 
-struct IrqSpinGuard<'a> {
+pub(crate) struct IrqSpinGuard<'a> {
     // Rust drops fields in declaration order: unlock BEFORE restoring IF.
     // The real IRQ probe below attempts this same lock on the first pending IRQ.
     raw: RawSpinGuard<'a>,

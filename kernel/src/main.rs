@@ -15,6 +15,7 @@ use linux_rs_runtime as _;
 mod console;
 mod cpu;
 mod paging;
+mod services;
 mod userspace;
 
 use boot::TestMode;
@@ -137,16 +138,19 @@ extern "C" fn kernel_main() -> ! {
     // SAFETY: _start has established our BSS stack, long mode and IF/DF=0. This
     // is the one BSP handoff; loader memory is never reclaimed in this cell.
     let (boot, acpi) = loader_handoff(framebuffer);
-    inspect_boot_images(&boot);
+    // The handoff is immutable from here on; `'static` lets the allocator
+    // borrow it and keeps it reachable after this frame is abandoned.
+    let boot = services::BOOT.init(boot);
+    inspect_boot_images(boot);
     // SAFETY: one constructor call consumes usable RAM ownership from the
     // trusted handoff, no DMA/AP/firmware mutation or competing allocator.
-    let mut allocator = unwrap(unsafe { Allocator::new(&boot) }, "allocator");
+    let mut allocator = unwrap(unsafe { Allocator::new(boot) }, "allocator");
     check_frame_ownership(&mut allocator);
-    let mut tables = unwrap(paging::Tables::build(&boot, &mut allocator), "tables-build");
+    let mut tables = unwrap(paging::Tables::build(boot, &mut allocator), "tables-build");
     #[cfg(feature = "qemu-self-test")]
     {
         unwrap(
-            paging::Tables::failure_tests(&boot, &mut allocator, tables.pages),
+            paging::Tables::failure_tests(boot, &mut allocator, tables.pages),
             "table-allocation-rollback",
         );
         log!(
@@ -155,13 +159,13 @@ extern "C" fn kernel_main() -> ! {
         );
     }
     require(
-        unwrap(tables.check_permissions(&boot), "permissions"),
+        unwrap(tables.check_permissions(boot), "permissions"),
         "table-permissions",
     );
-    // Kernel tables only; user mappings below are added to the same unpublished
-    // tree, so the published root is still written only before CR3 loads.
+    // Kernel tables only; init's mappings below are added before CR3 loads,
+    // which `paging`'s update rules allow but no longer require.
     let table_pages = tables.pages;
-    let user = userspace::load(&boot, &mut allocator, &mut tables);
+    let user = userspace::load(boot, &mut allocator, &mut tables);
     // SAFETY: the fully constructed tree covers current image/stack, descriptor,
     // loader/firmware/metadata and framebuffer resources at unchanged addresses;
     // guard/image-alias holes are intentional; no SMP/PCID/global translations.
@@ -169,7 +173,7 @@ extern "C" fn kernel_main() -> ! {
         tables.activate();
     }
     require(tables.is_active(), "cr3-owned-root");
-    check_module_epoch(&boot, &tables);
+    check_module_epoch(boot, &tables);
     require(
         unwrap(tables.lookup(Virtual(cpu::guards()[0])), "guard-lookup").is_none(),
         "stack-guard-unmapped",
@@ -178,9 +182,18 @@ extern "C" fn kernel_main() -> ! {
         "CHECK paging ok tables={} wx=separated guards=5 image_alias=absent\n",
         table_pages
     );
-    check_exceptions(&boot, &mut allocator);
+    check_exceptions(boot, &mut allocator);
     #[cfg(feature = "qemu-self-test")]
     check_allocator_recovery(&mut allocator);
+    #[cfg(feature = "qemu-self-test")]
+    unwrap(
+        paging::Tables::user_mm_tests(&mut tables, &mut allocator),
+        "user-mm",
+    );
+    #[cfg(feature = "qemu-self-test")]
+    log!(
+        "CHECK user-mm ok pages=3 rollback_points=3 tlb=invlpg protect=ro unmap=3 conflict=rolled-back accounting=restored\n"
+    );
     unwrap(cpu::start_timer(acpi.legacy_pic), "timer-init");
     unwrap(
         cpu::irq_guard_test(
@@ -221,6 +234,11 @@ extern "C" fn kernel_main() -> ! {
         allocator.available(),
         tables.pages
     );
+    // The boot-phase locals end here: the frame allocator and the published
+    // tables move into their statics, since this frame becomes init's kernel
+    // stack and the syscall/fault paths allocate and edit tables from there.
+    services::FRAMES.install(allocator);
+    services::TABLES.install(tables);
     // Diverges: init runs and its death ends the boot, or Linux's failure text.
     userspace::run(user)
 }

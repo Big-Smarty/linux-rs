@@ -194,6 +194,7 @@ const INIT_OK: User = User::Ok {
 };
 
 const BUDDY_ORDER_RECORD: &str = "CHECK buddy-orders ok max_order=10 contiguous=true zeroed=true split=true coalesced=true fragmented=true aligned=131072 rollback=true";
+const USER_MM_RECORD: &str = "CHECK user-mm ok pages=3 rollback_points=3 tlb=invlpg protect=ro unmap=3 conflict=rolled-back accounting=restored";
 const IRQ_GUARD_RECORD: &str = "CHECK irq-guard ok nested=2 out_of_order=true saved_on=true saved_off=true exclusive=true blocked_wraps=2 blocked_delta=0 resumed=true";
 const PF_GPR_RECORD: &str = "CHECK page-fault-gprs ok gprs=15";
 const MEMORY_RUNTIME_RECORD: &str = "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true";
@@ -212,6 +213,7 @@ const SUCCESS_MARKERS: &[&str] = &[
     PF_GPR_RECORD,
     "CHECK exhaustion ok",
     BUDDY_ORDER_RECORD,
+    USER_MM_RECORD,
     IRQ_GUARD_RECORD,
     "CHECK timer ok",
     "TIMER mask observation pit_wraps=2 irq_delta=0",
@@ -3864,6 +3866,9 @@ fn validate_success_serial(
     if !unique_exact_record(lines, "CHECK buddy-orders", BUDDY_ORDER_RECORD) {
         return Err("positive case must report the exact multi-order allocator proof".to_owned());
     }
+    if !unique_exact_record(lines, "CHECK user-mm", USER_MM_RECORD) {
+        return Err("positive case must report the exact post-activation user-mm proof".to_owned());
+    }
     if !unique_exact_record(lines, "CHECK irq-guard", IRQ_GUARD_RECORD)
         || !observed_irq_restore(lines, true)
     {
@@ -5826,6 +5831,7 @@ mod tests {
             PF_GPR_RECORD,
             "CHECK exhaustion ok",
             BUDDY_ORDER_RECORD,
+            USER_MM_RECORD,
             IRQ_GUARD_RECORD,
             "IRQ restore observation pit_wraps=2 irq_delta=2 lock_acquired=true",
             "CHECK timer ok pit_wraps=2 gprs=15",
@@ -5960,6 +5966,34 @@ mod tests {
                 )
                 .0,
                 "accepted invalid multi-order proof: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_mm_proof_rejects_missing_changed_and_duplicate_records() {
+        let success = ProcessResult {
+            exit_code: Some(33),
+            timed_out: false,
+        };
+        let serial = success_serial();
+        for invalid in [
+            String::new(),
+            USER_MM_RECORD.replace("tlb=invlpg", "tlb=none"),
+            USER_MM_RECORD.replace("rollback_points=3", "rollback_points=2"),
+            USER_MM_RECORD.replace("accounting=restored", "accounting=leaked"),
+            format!("{USER_MM_RECORD} extra=true"),
+            format!("{USER_MM_RECORD}\n{USER_MM_RECORD}"),
+            "CHECK user-mm".to_owned(),
+        ] {
+            assert!(
+                !validate(
+                    DEBUG_CASES[0],
+                    &success,
+                    &serial.replace(USER_MM_RECORD, &invalid),
+                )
+                .0,
+                "accepted invalid user-mm proof: {invalid}"
             );
         }
     }

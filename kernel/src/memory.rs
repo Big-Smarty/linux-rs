@@ -84,6 +84,14 @@ pub struct Allocator<'a> {
     allocation_budget: Option<usize>,
 }
 
+// SAFETY: the allocator exclusively owns its metadata slices and the usable-RAM
+// extents behind them (`new`'s contract); the only raw pointers are address
+// identities (`origin`) compared, never dereferenced, to reject foreign
+// tokens. It has no thread affinity, so moving it to another CPU (inside the
+// static `services::FRAMES`, which serializes all use) is sound. `Frame`
+// tokens stay `!Send`.
+unsafe impl Send for Allocator<'_> {}
+
 fn metadata_start(boot: &BootInfo, length: u64) -> Result<u64, Error> {
     for i in 0..boot.region_count() {
         let region = boot.region(i)?;
@@ -335,6 +343,28 @@ impl<'a> Allocator<'a> {
         // retirement. Buddy independently checks exact live head/order identity.
         let block = unsafe { self.buddy.reserved_block(physical.0 / PAGE, order)? };
         self.buddy.release(block)
+    }
+
+    /// Linux `split_page`: make each page of one live reservation an
+    /// independently owned order-zero reservation (releasable with
+    /// `reclaim_reserved`). Accounting is unchanged.
+    /// # Errors
+    /// Rejects a foreign, misaligned, wrong-order, interior or free extent
+    /// without changing state.
+    /// # Safety
+    /// As `reclaim_reserved_order`: the caller owns exactly the live
+    /// `(physical, order)` reservation made by `Frame::into_reserved`, with no
+    /// remaining token. Afterwards the caller owns `2^order` order-zero pages.
+    pub unsafe fn split_reserved_order(
+        &mut self,
+        physical: Physical,
+        order: u32,
+    ) -> Result<(), Error> {
+        if !physical.0.is_multiple_of(PAGE) {
+            return Err(Error::Alignment);
+        }
+        // SAFETY: forwarded caller contract; buddy re-checks head and order.
+        unsafe { self.buddy.split_reserved(physical.0 / PAGE, order) }
     }
 
     #[cfg(feature = "qemu-self-test")]

@@ -483,6 +483,34 @@ impl<'a> Buddy<'a> {
         Ok(())
     }
 
+    /// Linux `split_page`: turn one live order-`n` head into `2^n` live
+    /// order-zero heads over the same pages. Accounting and the free bitmap do
+    /// not change; only head ownership is refined, so each page can later be
+    /// released on its own.
+    ///
+    /// # Safety
+    /// As `reserved_block`: the caller owns the exact live `(pfn, order)`
+    /// reservation, and afterwards owns each of its pages separately.
+    pub(super) unsafe fn split_reserved(&mut self, pfn: u64, order: u32) -> Result<(), Error> {
+        // SAFETY: forwarded caller contract; the token is consumed below.
+        let block = unsafe { self.reserved_block(pfn, order)? };
+        let arena = &self.arenas[block.arena];
+        let head = arena.index(pfn, order).ok_or(Error::Ownership)?;
+        // `reserved_block` proved a live head at `head`, so the block lies in
+        // this arena, and each page slot below exists and is not a head: the
+        // partition invariant gives every page exactly one covering head.
+        let pages = block.pages() as u64;
+        for page in 0..pages {
+            arena.index(pfn + page, 0).ok_or(Error::Ownership)?;
+        }
+        self.heads.replace(head, false);
+        for page in 0..pages {
+            let slot = arena.index(pfn + page, 0).ok_or(Error::Ownership)?;
+            self.heads.replace(slot, true);
+        }
+        Ok(())
+    }
+
     /// # Safety
     /// Caller owns this exact live reservation with no token or other remaining
     /// users. All CPU/device/mapping access must have ended before reconstitution.
@@ -735,6 +763,32 @@ mod tests {
                 buddy.release(whole).expect("whole release");
             });
         }
+    }
+
+    #[test]
+    fn split_reserved_refines_ownership_to_pages() {
+        with_buddy(&[(1024, 1040)], 0..0, |buddy| {
+            let block = buddy.allocate(2, 1).expect("order two");
+            let pfn = block.pfn();
+            core::mem::forget(block); // the reservation outlives its token
+            // SAFETY: the test owns the live order-two head it just made.
+            unsafe { buddy.split_reserved(pfn, 2).expect("split") };
+            check_partition(buddy);
+            // The old head is gone; interior and wrong-order lookups fail.
+            // SAFETY: lookups only; no block is released through them.
+            unsafe {
+                assert!(buddy.reserved_block(pfn, 2).is_err());
+                assert!(buddy.split_reserved(pfn, 2).is_err());
+            }
+            // Pages release independently, out of order, and recoalesce.
+            for page in [2, 0, 3, 1] {
+                // SAFETY: each page is a separately owned live order-zero head.
+                let block = unsafe { buddy.reserved_block(pfn + page, 0).expect("page") };
+                buddy.release(block).expect("release page");
+            }
+            assert_eq!(buddy.available(), 16);
+            assert_eq!(buddy.allocate(4, 1).expect("whole").pfn(), 1024);
+        });
     }
 
     #[test]
