@@ -190,10 +190,13 @@ fn stops(t: &mut T) {
         0
     });
     let _ = wait4(c as isize, WUNTRACED);
+    let sent = kill(c, SIGTERM);
+    // Time enough for a child that did die of it to be a zombie.
+    nap(40);
     t.eq(
         "sigterm-waits-for-the-continue",
         (
-            kill(c, SIGTERM),
+            sent,
             wait4(c as isize, WNOHANG | WUNTRACED),
             waitid(1, c, WEXITED | WNOHANG).1[3],
         ),

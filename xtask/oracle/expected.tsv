@@ -1281,6 +1281,7 @@ pipe	check	read-waits-for-the-last-writer-and-then-sees-eof	init: test pipe.read
 pipe	check	pipe-with-a-duplicate-writer-is-not-at-eof	init: test pipe.pipe-with-a-duplicate-writer-is-not-at-eof ok
 pipe	check	pipe-without-writers-is-at-eof	init: test pipe.pipe-without-writers-is-at-eof ok
 pipe	check	blocked-write-completes-when-the-reader-drains	init: test pipe.blocked-write-completes-when-the-reader-drains ok
+pipe	check	sleeping-reader-and-sleeping-writer-hand-over-pages	init: test pipe.sleeping-reader-and-sleeping-writer-hand-over-pages ok
 pipe	check	blocked-write-returns-the-partial-count-when-the-reader-leaves	init: test pipe.blocked-write-returns-the-partial-count-when-the-reader-leaves ok
 pipe	check	blocked-write-sees-epipe-when-the-reader-leaves	init: test pipe.blocked-write-sees-epipe-when-the-reader-leaves ok
 pipe	check	blocked-write-dies-of-sigpipe-when-the-reader-leaves	init: test pipe.blocked-write-dies-of-sigpipe-when-the-reader-leaves ok
@@ -1299,4 +1300,4 @@ pipe	check	poll-reports-the-pipe-that-got-the-data	init: test pipe.poll-reports-
 pipe	check	poll-resumes-until-its-original-end	init: test pipe.poll-resumes-until-its-original-end ok
 pipe	check	poll-interrupted-by-a-handler-is-eintr	init: test pipe.poll-interrupted-by-a-handler-is-eintr ok
 pipe	check	poll-without-timeout-resumes-and-finds-the-data	init: test pipe.poll-without-timeout-resumes-and-finds-the-data ok
-pipe	summary	-	init: tests pipe passed=34 failed=0
+pipe	summary	-	init: tests pipe passed=35 failed=0

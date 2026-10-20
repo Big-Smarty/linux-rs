@@ -334,6 +334,23 @@ fn blocking_writes(t: &mut T) {
         (Ok(8192), (Ok(c), 0), true),
     );
     close(w);
+    // The reader is already asleep when the writer starts: what the writer copied before it
+    // sleeps for room is what wakes the reader, page after page.
+    let (r, w) = small_pipe();
+    let c = spawn(|| {
+        close(r);
+        nap(30);
+        usize::from(write(w, &data) != Ok(8192))
+    });
+    close(w);
+    let mut got = [0u8; 8192];
+    let n = read_full(r, &mut got);
+    t.eq(
+        "sleeping-reader-and-sleeping-writer-hand-over-pages",
+        (n, got == data, wait4(c as isize, 0)),
+        (8192, true, (Ok(c), 0)),
+    );
+    close(r);
     // A reader that leaves while the writer sleeps: the pages written so far are the result.
     let _ = sigaction(SIGPIPE, SIG_IGN, 0);
     let (r, w) = small_pipe();
