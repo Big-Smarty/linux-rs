@@ -416,8 +416,14 @@ pub fn wait_until_ns(deadline_ns: u64) {
 /// [`wait_event`] and before the return to ring 3. Context: task or interrupt
 /// return path, interrupts masked, BSP.
 pub fn set_itimer_ns(expiry: Option<u64>) {
+    let expiry = expiry.unwrap_or(u64::MAX);
+    // Every syscall exit republishes; reprogramming the clockevent (an MSR or
+    // MMIO write, a VM exit under virtualization) only when it changed.
+    if ITIMER_NS.load(Ordering::Relaxed) == expiry {
+        return;
+    }
     cpu::timer_transaction(|| {
-        ITIMER_NS.store(expiry.unwrap_or(u64::MAX), Ordering::Relaxed);
+        ITIMER_NS.store(expiry, Ordering::Relaxed);
         if EVENT.load(Ordering::Relaxed) != EVENT_NONE {
             rearm(ktime_get_ns());
         }
