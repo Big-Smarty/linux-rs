@@ -135,7 +135,7 @@ pub unsafe fn init(list: &Framebuffers) -> usize {
         // Nothing can be drawn. The reasons still reach COM1 under the QEMU
         // self-test profile; the default profile has no other sink, so the
         // screen stays blank (documented limitation, not a silent success).
-        report_rejects(list, &rejected);
+        report_rejects(list, rejected);
         return 0;
     }
     COLS.store(cols, Ordering::Relaxed);
@@ -166,12 +166,12 @@ pub unsafe fn init(list: &Framebuffers) -> usize {
             layout.cell_height()
         );
     }
-    report_rejects(list, &rejected);
+    report_rejects(list, rejected);
     count
 }
 
 /// One line per loader entry that cannot be drawn on (to every working sink).
-fn report_rejects(list: &Framebuffers, rejected: &[Option<fbtext::Reject>; MAX_FRAMEBUFFERS]) {
+fn report_rejects(list: &Framebuffers, rejected: [Option<fbtext::Reject>; MAX_FRAMEBUFFERS]) {
     for (index, entry) in list.entries.iter().enumerate() {
         if let Some(reason) = rejected[index] {
             crate::log!("console: fb{} rejected: {}\n", index, reason.name());

@@ -3471,6 +3471,45 @@ fn unique_exact_record(lines: &[&str], prefix: &str, expected: &str) -> bool {
     records.next() == Some(&expected) && records.next().is_none()
 }
 
+/// The console self-test record: exactly one, as expected for the display count,
+/// and before the bootstrap checkpoint when that is reached.
+fn validate_console_record(lines: &[&str], framebuffers: usize) -> Result<(), String> {
+    let console = format!(
+        "CHECK console ok framebuffers={framebuffers} scrolled=true tail=true stale=false readback=true wrap=true"
+    );
+    // Exactly one console record (a second one could come from a later stage or
+    // userspace), and it precedes the bootstrap checkpoint when that is reached.
+    let console_lines = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("CHECK console"))
+        .collect::<Vec<_>>();
+    match console_lines.as_slice() {
+        [(position, line)] if **line == console.as_str() => {
+            if lines
+                .iter()
+                .position(|line| line.starts_with("CHECKPOINT"))
+                .is_some_and(|checkpoint| checkpoint < *position)
+            {
+                return Err("console record must precede CHECKPOINT".to_owned());
+            }
+        }
+        [] => return Err(format!("missing console record: {console}")),
+        [(_, line)] => {
+            return Err(format!(
+                "console record {line:?} differs from expected {console:?}"
+            ));
+        }
+        more => {
+            return Err(format!(
+                "expected exactly one console record, found {}",
+                more.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_debug_case(
     case: DebugCase,
     process: &ProcessResult,
@@ -3509,40 +3548,8 @@ fn validate_debug_case(
             format!("missing serial assertions: {}", missing.join(", ")),
         );
     }
-    let console = format!(
-        "CHECK console ok framebuffers={} scrolled=true tail=true stale=false readback=true wrap=true",
-        case.framebuffers
-    );
-    // Exactly one console record (a second one could come from a later stage or
-    // userspace), and it precedes the bootstrap checkpoint when that is reached.
-    let console_lines = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.starts_with("CHECK console"))
-        .collect::<Vec<_>>();
-    match console_lines.as_slice() {
-        [(position, line)] if **line == console.as_str() => {
-            if lines
-                .iter()
-                .position(|line| line.starts_with("CHECKPOINT"))
-                .is_some_and(|checkpoint| checkpoint < *position)
-            {
-                return (false, "console record must precede CHECKPOINT".to_owned());
-            }
-        }
-        [] => return (false, format!("missing console record: {console}")),
-        [(_, line)] => {
-            return (
-                false,
-                format!("console record {line:?} differs from expected {console:?}"),
-            );
-        }
-        more => {
-            return (
-                false,
-                format!("expected exactly one console record, found {}", more.len()),
-            );
-        }
+    if let Err(diagnostic) = validate_console_record(&lines, case.framebuffers) {
+        return (false, diagnostic);
     }
     if !case.forbid_success
         && let Err(diagnostic) =
