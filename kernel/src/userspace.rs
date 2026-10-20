@@ -422,14 +422,12 @@ impl Context for Syscall<'_> {
         cpu::set_user_gs_base(base);
     }
     fn machine(&self) -> Machine {
-        // shortcut: the boot clock is the PIT tick count (divisor 11932 of
-        // 1193182 Hz, `cpu::ticks`) until a clocksource exists; it counts from
-        // timer start, not from kernel entry. Upgrade with the timekeeping lane.
-        let nanoseconds = u128::from(cpu::ticks()) * 11_932 * 1_000_000_000 / 1_193_182;
+        // `ktime_get_boottime_ns` is the boot clock `do_sysinfo` reads.
+        let uptime_ns = crate::timer::ktime_get_boottime_ns();
         // Lock order: `FRAMES` is the leaf below `PROCESS` -> `TABLES` -> heap.
         let frames = services::FRAMES.lock();
         Machine {
-            uptime_ns: u64::try_from(nanoseconds).unwrap_or(u64::MAX),
+            uptime_ns,
             total_pages: frames.total() as u64,
             free_pages: frames.available() as u64,
         }

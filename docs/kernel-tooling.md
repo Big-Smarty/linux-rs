@@ -125,9 +125,7 @@ The first maintained run, `target/kernel-tooling/integrated-001/`, really execut
 
 Every case must also print `CHECK console ok framebuffers=N scrolled=true tail=true stale=false readback=true wrap=true` (exactly once, before `CHECKPOINT`) ([console record](implementation.md#framebuffer-console-on-real-hardware)): `N` is `DebugCase.framebuffers`, 2 for `success` (its QEMU adds `-device ramfb` so OVMF publishes a second GOP handle) and 1 elsewhere.
 
-Each case (the eighteen fixed ones and every oracle-group case) has a separate FAT image, QEMU process, copied variable store, serial log, QEMU stdout/stderr and `result.tsv`. Timeouts always fail; the runner kills the guest process group and reaps QEMU. It deliberately omits `-no-shutdown`, which would hide the debug-exit result. Port `0xf4` and assumed COM1 output are confined to the explicit QEMU self-test feature/device profile.
-
-Each of the twenty-five current cases has a separate FAT image, QEMU process, copied variable store, serial log, QEMU stdout/stderr and `result.tsv`. Timeouts always fail; the runner kills the guest process group and reaps QEMU. It deliberately omits `-no-shutdown`, which would hide the debug-exit result. Port `0xf4` and assumed COM1 output are confined to the explicit QEMU self-test feature/device profile.
+Each of the twenty-five fixed cases and every oracle-group case has a separate FAT image, QEMU process, copied variable store, serial log, QEMU stdout/stderr and `result.tsv`. Timeouts always fail; the runner kills the guest process group and reaps QEMU. It deliberately omits `-no-shutdown`, which would hide the debug-exit result. Port `0xf4` and assumed COM1 output are confined to the explicit QEMU self-test feature/device profile.
 
 ### Platform cases
 
