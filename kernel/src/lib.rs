@@ -17,6 +17,7 @@ pub mod intc;
 pub mod memory;
 extern crate alloc;
 pub mod mm;
+pub mod signal;
 pub mod sync;
 pub mod syscall;
 pub mod time;
