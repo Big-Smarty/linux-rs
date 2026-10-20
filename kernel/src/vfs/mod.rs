@@ -30,6 +30,7 @@
 //! | [`path`] | component walk, `..`, symlink following, parents for create | `fs/namei.c` |
 //! | [`file`] | open files, `files_struct`, `fs_struct` | `fs/file.c`, `fs/file_table.c`, `fs/fs_struct.c` |
 //! | [`pipe`] | pipe ring of page buffers | `fs/pipe.c` |
+//! | [`mapping`] | what `mmap` needs of an open file, the page of a private file fault | `mm/mmap.c`, `mm/shmem.c` (`shmem_fault`) |
 //! | [`ops`] | path-based operations (`open`, `mknod`, `unlink`, ...) | `fs/{open,namei,stat}.c` |
 //! | [`initramfs`] | the cpio state machine | `init/initramfs.c` |
 //!
@@ -59,6 +60,7 @@
 
 pub mod file;
 pub mod initramfs;
+pub mod mapping;
 pub mod ops;
 pub mod path;
 pub mod pipe;
@@ -86,6 +88,13 @@ impl InodeId {
 /// An open file description (`struct file`; arena index in [`FileTable`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileId(pub(crate) u32);
+impl FileId {
+    /// The arena index: a stable identity while the description is open.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
 /// A pipe (`pipe_inode_info`; arena index in [`Vfs`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PipeId(pub(crate) u32);
@@ -352,6 +361,10 @@ pub struct Vfs {
     pub files: FileTable,
     pipes: Vec<Option<pipe::Pipe>>,
     next_pipe_ino: u64,
+    /// Open file descriptions held by mappings (`vma->vm_file`).
+    pins: Vec<mapping::Pin>,
+    /// A write or truncate hit a file whose mapped pages are private copies.
+    coherence_lost: bool,
 }
 
 impl Vfs {
@@ -367,6 +380,8 @@ impl Vfs {
             files: FileTable::default(),
             pipes: Vec::new(),
             next_pipe_ino: 1,
+            pins: Vec::new(),
+            coherence_lost: false,
         })
     }
 }

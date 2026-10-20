@@ -1072,3 +1072,187 @@ fn timestamps_follow_linux_for_failed_writes_and_for_reads() {
     assert_eq!(call(&mut t, Sysno::readlink, &[l, OUT, 100]), ok(2));
     assert_ne!(t.vfs.fs.inode(link).atime, before);
 }
+
+const PROT_READ: u64 = 1;
+const PROT_RW: u64 = 3;
+const MAP_SHARED: u64 = 1;
+const MAP_PRIVATE: u64 = 2;
+
+fn mknod_char(t: &mut Task, path: &str, major: u32, minor: u32) {
+    let at = cstr(t, PATH, path);
+    let dev = u64::from(new_encode_dev(mkdev(major, minor)));
+    assert_eq!(
+        call(t, Sysno::mknod, &[at, u64::from(S_IFCHR | 0o666), dev]),
+        ok(0)
+    );
+}
+
+/// src: mm/mmap.c `ksys_mmap_pgoff` (`fget`, `file_mmap_ok`), mm/shmem.c
+/// `shmem_mmap`, drivers/char/mem.c `mmap_zero`.
+#[test]
+fn file_mmap_pins_the_description_and_follows_the_file_kind() {
+    let mut t = t();
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    let content: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    for (offset, chunk) in content.chunks(1000).enumerate() {
+        put(&mut t, BUF, chunk);
+        assert_eq!(
+            call(
+                &mut t,
+                Sysno::pwrite64,
+                &[f, BUF, 1000, offset as u64 * 1000]
+            ),
+            ok(1000)
+        );
+    }
+    // A private mapping commits a file VMA and pins the description.
+    let Outcome::Return(addr) = call(&mut t, Sysno::mmap, &[0, 8192, PROT_RW, MAP_PRIVATE, f, 0])
+    else {
+        panic!()
+    };
+    assert!(addr > 0, "{addr}");
+    let vma = *t.mm.find_vma(addr as u64).unwrap();
+    let id = vma.file.expect("file-backed VMA");
+    assert_eq!(
+        (vma.start, vma.end, vma.pgoff),
+        (addr as u64, addr as u64 + 8192, 0)
+    );
+    assert_eq!(t.vfs.pin_count(), 1);
+    // The pin keeps the file open after the descriptor is closed.
+    assert_eq!(call(&mut t, Sysno::close, &[f]), ok(0));
+    assert_eq!(t.vfs.pin_count(), 1);
+    // shmem_fault: page 0 is the file, page 1 holds the rest then zeros,
+    // page 2 starts at 8192 >= i_size (SIGBUS).
+    let mut page = [0u8; 4096];
+    t.vfs.fault_page(id, 0, &mut page).unwrap();
+    assert_eq!(&page[..], &content[..4096]);
+    t.vfs.fault_page(id, 1, &mut page).unwrap();
+    assert_eq!(&page[..904], &content[4096..]);
+    assert!(page[904..].iter().all(|&byte| byte == 0));
+    assert_eq!(
+        t.vfs.fault_page(id, 2, &mut page),
+        Err(crate::vfs::mapping::FileFault::Bus)
+    );
+    // The page was copied: writing the file now would differ from Linux's
+    // shared page, so the call that does it stops the kernel loudly.
+    let again = fd(open(&mut t, "/f", O_RDWR, 0));
+    put(&mut t, BUF, b"x");
+    assert_eq!(
+        call(&mut t, Sysno::write, &[again, BUF, 1]),
+        Outcome::Unimplemented(Sysno::write as u32)
+    );
+    assert_eq!(
+        call(&mut t, Sysno::write, &[again, BUF, 1]),
+        Outcome::Unimplemented(Sysno::write as u32),
+        "the copy stays until the mapping goes"
+    );
+    // Unmapping drops the pin; afterwards writes are ordinary.
+    assert_eq!(call(&mut t, Sysno::munmap, &[addr as u64, 8192]), ok(0));
+    assert_eq!(t.vfs.pin_count(), 0);
+    assert_eq!(call(&mut t, Sysno::write, &[again, BUF, 1]), ok(1));
+}
+
+#[test]
+fn file_mmap_checks_come_from_the_descriptor() {
+    let mut t = t();
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    let ro = fd(open(&mut t, "/f", O_RDONLY, 0));
+    let wo = fd(open(&mut t, "/f", O_WRONLY, 0));
+    let mut map =
+        |t: &mut Task, prot, flags, fd: u64| call(t, Sysno::mmap, &[0, 4096, prot, flags, fd, 0]);
+    // fget first; then the model's order (write-only: EACCES; shared writable
+    // on a read-only description: EACCES).
+    assert_eq!(map(&mut t, PROT_READ, MAP_PRIVATE, 99), err(Errno::EBADF));
+    assert_eq!(map(&mut t, PROT_READ, MAP_PRIVATE, wo), err(Errno::EACCES));
+    assert_eq!(map(&mut t, PROT_RW, MAP_SHARED, ro), err(Errno::EACCES));
+    // Descriptors without ->mmap: directory, console, pipe, null, full.
+    let dir = fd(open(&mut t, "/", O_RDONLY | O_DIRECTORY, 0));
+    assert_eq!(map(&mut t, PROT_READ, MAP_PRIVATE, dir), err(Errno::ENODEV));
+    assert_eq!(map(&mut t, PROT_READ, MAP_PRIVATE, 0), err(Errno::ENODEV));
+    mknod_char(&mut t, "/null", 1, 3);
+    mknod_char(&mut t, "/full", 1, 7);
+    for name in ["/null", "/full"] {
+        let node = fd(open(&mut t, name, O_RDWR, 0));
+        assert_eq!(
+            map(&mut t, PROT_READ, MAP_PRIVATE, node),
+            err(Errno::ENODEV)
+        );
+    }
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    let pipe = u64::from(u32_at(&mut t, OUT));
+    assert_eq!(
+        map(&mut t, PROT_READ, MAP_PRIVATE, pipe),
+        err(Errno::ENODEV)
+    );
+    // O_PATH descriptors are refused by fget.
+    let at = cstr(&mut t, PATH, "/f");
+    let path = fd(call(
+        &mut t,
+        Sysno::open,
+        &[at, u64::from(crate::vfs::O_PATH), 0],
+    ));
+    assert_eq!(map(&mut t, PROT_READ, MAP_PRIVATE, path), err(Errno::EBADF));
+    // A shared writable file mapping needs pages shared with the file: not
+    // ported, stops loudly and maps nothing.
+    let vmas = t.mm.vmas().len();
+    assert_eq!(
+        map(&mut t, PROT_RW, MAP_SHARED, f),
+        Outcome::Unimplemented(Sysno::mmap as u32)
+    );
+    assert_eq!((t.mm.vmas().len(), t.vfs.pin_count()), (vmas, 0));
+    // A device with a driver we lack stops before any result is guessed.
+    mknod_char(&mut t, "/ptmx", 5, 2);
+    let tty = fd(open(&mut t, "/ptmx", O_RDWR, 0));
+    assert_eq!(
+        map(&mut t, PROT_READ, MAP_PRIVATE, tty),
+        Outcome::Unimplemented(Sysno::mmap as u32)
+    );
+}
+
+#[test]
+fn private_dev_zero_is_anonymous_and_shared_is_not_ported() {
+    let mut t = t();
+    mknod_char(&mut t, "/zero", 1, 5);
+    let zero = fd(open(&mut t, "/zero", O_RDWR, 0));
+    let Outcome::Return(addr) = call(
+        &mut t,
+        Sysno::mmap,
+        &[0, 4096, PROT_RW, MAP_PRIVATE, zero, 0],
+    ) else {
+        panic!()
+    };
+    let vma = *t.mm.find_vma(addr as u64).unwrap();
+    assert!(vma.file.is_none(), "vma_set_anonymous");
+    assert_eq!(t.vfs.pin_count(), 0);
+    assert_eq!(
+        call(
+            &mut t,
+            Sysno::mmap,
+            &[0, 4096, PROT_RW, MAP_SHARED, zero, 0]
+        ),
+        Outcome::Unimplemented(Sysno::mmap as u32),
+        "shmem_zero_setup"
+    );
+}
+
+#[test]
+fn truncating_a_file_with_a_touched_mapping_stops_loudly() {
+    let mut t = t();
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 100]), ok(0));
+    let Outcome::Return(addr) = call(
+        &mut t,
+        Sysno::mmap,
+        &[0, 4096, PROT_READ, MAP_PRIVATE, f, 0],
+    ) else {
+        panic!()
+    };
+    // Untouched mapping: no copy exists, so truncation is ordinary.
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 200]), ok(0));
+    let id = t.mm.find_vma(addr as u64).unwrap().file.unwrap();
+    t.vfs.fault_page(id, 0, &mut [0; 4096]).unwrap();
+    assert_eq!(
+        call(&mut t, Sysno::ftruncate, &[f, 50]),
+        Outcome::Unimplemented(Sysno::ftruncate as u32)
+    );
+}

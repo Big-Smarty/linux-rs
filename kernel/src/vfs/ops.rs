@@ -530,6 +530,7 @@ impl Vfs {
     /// size and both times.
     pub fn do_truncate(&mut self, cred: &Cred, inode: InodeId, length: u64) {
         self.remove_privs(cred, inode);
+        self.note_modified(inode);
         self.fs.set_size(inode, length);
     }
 

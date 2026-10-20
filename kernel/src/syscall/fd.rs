@@ -543,6 +543,7 @@ fn write_regular<C: Context>(
     let files = ctx.files();
     files.vfs.remove_privs(&cred, inode);
     files.vfs.fs.touch(inode);
+    files.vfs.note_modified(inode);
     let mut bounce = [0u8; PAGE_SIZE];
     let mut written: u64 = 0;
     let mut status = None;

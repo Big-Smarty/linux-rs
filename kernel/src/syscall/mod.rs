@@ -41,10 +41,10 @@ mod vfs_tests;
 
 use crate::{
     config,
-    mm::{Env, FileInfo, Mm, UserPages as PageTables},
+    mm::{Env, Mm, UserPages as PageTables},
     task::{Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE},
     usercopy::UserPages,
-    vfs::{Cred, FdTable, FsStruct, Vfs},
+    vfs::{Cred, FdTable, FsStruct, Vfs, mapping::Mappable},
 };
 use syscalls::{Errno, Sysno};
 
@@ -108,7 +108,7 @@ pub trait Context: UserPages + Clocks {
     fn address_space(&mut self) -> AddressSpace<'_>;
     /// `fget(fd)` for `mmap`: the facts `do_mmap` reads from the open file, or
     /// `None` for a closed descriptor (`-EBADF`).
-    fn mmap_file(&mut self, fd: u32) -> Option<FileInfo> {
+    fn mmap_file(&mut self, fd: u32) -> Option<Mappable> {
         let Files { vfs, fdt, .. } = self.files();
         vfs.mmap_info(fdt, fd)
     }
@@ -220,17 +220,23 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         return Outcome::Return(error(Errno::ENOSYS));
     }
     // One line per group, in table order of their first number.
-    fd::dispatch(ctx, sysno, args)
+    let outcome = fd::dispatch(ctx, sysno, args)
         .or_else(|| fs::dispatch(ctx, sysno, args))
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
         .or_else(|| ids::dispatch(ctx, sysno, args))
-        .or_else(|| time::dispatch(ctx, sysno, args))
-        // shortcut: single-init only. A syscall Linux implements but this slice
-        // does not ends the kernel (explicitly, never as success or ENOSYS);
-        // with a second task this must become the real syscall or an error
-        // returned to that task, since a user must never be able to stop the kernel.
-        .unwrap_or(Outcome::Unimplemented(number))
+        .or_else(|| time::dispatch(ctx, sysno, args));
+    // A write or truncate under a private copy of a mapped file page (see
+    // `vfs::mapping`): the call has run, the kernel stops loudly rather than
+    // let the copy and the file diverge from Linux's shared page.
+    if ctx.files().vfs.take_coherence_loss() {
+        return Outcome::Unimplemented(number);
+    }
+    // shortcut: single-init only. A syscall Linux implements but this slice
+    // does not ends the kernel (explicitly, never as success or ENOSYS);
+    // with a second task this must become the real syscall or an error
+    // returned to that task, since a user must never be able to stop the kernel.
+    outcome.unwrap_or(Outcome::Unimplemented(number))
 }
 
 #[cfg(test)]

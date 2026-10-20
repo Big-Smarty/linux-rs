@@ -44,7 +44,7 @@ use kernel::{
     cputime::{CpuAccount, CpuSample},
     exec::{
         args::{ArgsError, InitArgv, Word},
-        load::{exec_file, insert_stack, map_segments},
+        load::{Pager, exec_file, insert_stack, map_segments},
         plan::{LoadError, LoadPlan, Unsupported},
         report::{
             self, ExecFailed, FileRegion, InitDeath, NO_INIT, NO_ROOT, NO_ROOT_PANIC, Segfault,
@@ -63,8 +63,8 @@ use kernel::{
     task::{self, Attributes},
     usercopy::{self, UserPages},
     vfs::{
-        self, FdTable, MAY_EXEC, O_LARGEFILE, O_RDONLY, Timespec, Vfs, initramfs::Unpacker,
-        ops::OpenFlags, path::LOOKUP_FOLLOW,
+        self, FdTable, FileId, MAY_EXEC, O_LARGEFILE, O_RDONLY, Timespec, Vfs, initramfs::Unpacker,
+        mapping::FileFault, ops::OpenFlags, path::LOOKUP_FOLLOW,
     },
 };
 use syscalls::Errno;
@@ -158,6 +158,9 @@ impl From<ArgsError> for Error {
 pub struct Loaded {
     /// The unpacked rootfs; moves into [`Process`] when init starts.
     pub vfs: Vfs,
+    /// The open file `/init` was read from (`bprm->file`); the VMAs of its
+    /// segments pin it when init starts, then this reference is dropped.
+    pub exec: FileId,
     pub entry: u64,
     pub sp: u64,
     pub loads: usize,
@@ -274,20 +277,31 @@ fn exec_open() -> OpenFlags {
     }
 }
 
-/// `do_open_execat` + `kernel_read` of the whole file.
-fn open_exec(vfs: &mut Vfs, path: &[u8]) -> Result<(Vec<u8>, u64), Errno> {
+/// `do_open_execat` + `kernel_read` of the whole file; the open file stays
+/// open (`bprm->file`) for the caller to hand to the VMAs or `fput`.
+fn open_exec_file(vfs: &mut Vfs, path: &[u8]) -> Result<(Vec<u8>, FileId), Errno> {
     let env = vfs.kernel_env();
     let file = vfs.open(&env, path, &exec_open())?;
     let inode = vfs.files.get(file).inode;
     let bytes = match inode {
-        Some(inode) if vfs.fs.inode(inode).is_reg() => {
-            vfs.fs.read_all(inode).map(|bytes| (bytes, u64::from(inode.index())))
-        }
         // do_open_execat: only regular files execute.
+        Some(inode) if vfs.fs.inode(inode).is_reg() => vfs.fs.read_all(inode),
         _ => Err(Errno::EACCES),
     };
+    match bytes {
+        Ok(bytes) => Ok((bytes, file)),
+        Err(errno) => {
+            vfs.fput(file);
+            Err(errno)
+        }
+    }
+}
+
+/// [`open_exec_file`] for a caller that only needs the bytes.
+fn open_exec(vfs: &mut Vfs, path: &[u8]) -> Result<Vec<u8>, Errno> {
+    let (bytes, file) = open_exec_file(vfs, path)?;
     vfs.fput(file);
-    bytes
+    Ok(bytes)
 }
 
 /// The first fallback init present in the rootfs.
@@ -324,7 +338,7 @@ fn load_init(boot: &BootInfo, mut vfs: Vfs, tables: &mut Tables) -> Result<Loade
     if vfs.lookup(&env, FILENAME, LOOKUP_FOLLOW).is_err() {
         return Err(Error::NoInit);
     }
-    let (file_bytes, inode_id) = open_exec(&mut vfs, FILENAME).map_err(Error::Exec)?;
+    let (file_bytes, exec) = open_exec_file(&mut vfs, FILENAME).map_err(Error::Exec)?;
     let file = file_bytes.as_slice();
     match script::interpreter(file) {
         Err(errno) => return Err(Error::Exec(errno)),
@@ -361,7 +375,7 @@ fn load_init(boot: &BootInfo, mut vfs: Vfs, tables: &mut Tables) -> Result<Loade
     map_segments(
         &plan,
         file,
-        &exec_file(inode_id),
+        &exec_file(u64::from(exec.index())),
         &mut mm,
         &env,
         &mut tables.user_space(),
@@ -404,6 +418,7 @@ fn load_init(boot: &BootInfo, mut vfs: Vfs, tables: &mut Tables) -> Result<Loade
 
     Ok(Loaded {
         vfs,
+        exec,
         entry: plan.entry,
         sp: built.sp,
         loads: plan.segments().len(),
@@ -515,13 +530,56 @@ struct Syscall<'a> {
     tty: Tty,
 }
 
+/// `handle_mm_fault` for one user address: the model's decision, and for a
+/// page of a private file mapping (`NeedsFile`) `shmem_fault` + `do_cow_fault`:
+/// a private frame holding the file page ([`Vfs::fault_page`]; `SIGBUS` past
+/// `i_size`), mapped with the VMA's protection.
+fn user_fault(
+    process: &mut Process,
+    space: &mut UserSpace<'_>,
+    address: u64,
+    error: u64,
+) -> FaultOutcome {
+    let outcome = process
+        .space
+        .handle_user_fault(&process.env, space, address, error);
+    let FaultOutcome::NeedsFile { address, .. } = outcome else {
+        return outcome;
+    };
+    let page = address & !(PAGE - 1);
+    // The model only reports `NeedsFile` for an address inside a file VMA.
+    let Some(vma) = process.space.find_vma(page).copied() else {
+        crate::log!(
+            "FAIL mm file fault outside any VMA address={:#x}\n",
+            address
+        );
+        crate::fail();
+    };
+    let Some(file) = vma.file else {
+        crate::log!(
+            "FAIL mm file fault in an anonymous VMA address={:#x}\n",
+            address
+        );
+        crate::fail();
+    };
+    let mut bytes = [0u8; PAGE_BYTES];
+    let pgoff = vma.pgoff + ((page - vma.start) >> 12);
+    match process.vfs.fault_page(file, pgoff, &mut bytes) {
+        Err(FileFault::Bus) => FaultOutcome::Bus { address },
+        Ok(()) => match space.install(page, mm::page_prot(vma.flags), &bytes) {
+            Ok(()) => FaultOutcome::Handled,
+            Err(mm::OutOfMemory) => FaultOutcome::Oom,
+        },
+    }
+}
+
 /// A kernel access to a user page that is not resident takes the fault Linux
 /// would: `exc_page_fault` -> `do_user_addr_fault` with the kernel-mode error
 /// code (no `X86_PF_USER`) on a user address. A fault the model resolves is
 /// retried (once: it must now succeed); any refusal is the exception-table
 /// fixup, i.e. a short copy and `-EFAULT`, with no signal (`__bad_area_nosemaphore`
 /// only signals in user mode; OOM, SIGBUS and the vsyscall page behave the
-/// same for a kernel-mode access). A file page we cannot supply stops loudly.
+/// same for a kernel-mode access).
 /// No lock is held across the fault that is not already held by the syscall
 /// (`PROCESS`, `TABLES`): the handler takes neither again and only `FRAMES`
 /// (a leaf) below them.
@@ -531,20 +589,8 @@ impl UserPages for Syscall<'_> {
             // Present-but-read-only (write) is `X86_PF_PROT`, an absent page is
             // not; the model's decision does not depend on it for a write.
             let error = if write { PF_WRITE } else { 0 };
-            let process = &mut *self.process;
-            match process
-                .space
-                .handle_user_fault(&process.env, &mut self.space, page, error)
-            {
+            match user_fault(&mut *self.process, &mut self.space, page, error) {
                 FaultOutcome::Handled => {}
-                FaultOutcome::NeedsFile { address, write } => {
-                    crate::log!(
-                        "FAIL mm unimplemented file-backed fault address={:#x} write={} (kernel access)\n",
-                        address,
-                        write
-                    );
-                    crate::fail();
-                }
                 _ => return None,
             }
         }
@@ -600,6 +646,14 @@ impl Context for Syscall<'_> {
             pages: &mut self.space,
         }
     }
+    fn files(&mut self) -> Files<'_> {
+        let process = &mut *self.process;
+        Files {
+            vfs: &mut process.vfs,
+            fdt: &mut process.fdt,
+            fs: &mut process.attrs.fs,
+        }
+    }
 }
 
 impl Clocks for Syscall<'_> {
@@ -637,14 +691,6 @@ impl Clocks for Syscall<'_> {
     }
     fn alarm_rtc(&self) -> bool {
         timer::rtc_present()
-    }
-    fn files(&mut self) -> Files<'_> {
-        let process = &mut *self.process;
-        Files {
-            vfs: &mut process.vfs,
-            fdt: &mut process.fdt,
-            fs: &mut process.attrs.fs,
-        }
     }
 }
 
@@ -756,19 +802,18 @@ pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) {
 ///   `show_signal_msg` (the `init[1]: segfault at ...` line); init has no
 ///   handler, so it dies with exit code 11.
 /// * `Bus`: `do_sigbus` -> `SIGBUS` (no console line), exit code 7.
-/// * `Oom`, `PgtableBad`, `Vsyscall`, `NeedsFile`: Linux runs the OOM killer
-///   (which finds init unkillable and panics), oopses and kills the task,
-///   emulates the vsyscall page, or reads the page cache. None is implemented:
-///   a loud `FAIL mm ...` stop, never a signal that did not happen.
+/// * `Oom`, `PgtableBad`, `Vsyscall`: Linux runs the OOM killer (which finds
+///   init unkillable and panics), oopses and kills the task, or emulates the
+///   vsyscall page. None is implemented: a loud `FAIL mm ...` stop, never a
+///   signal that did not happen.
+/// * `NeedsFile` (a page of a private file mapping) is resolved by
+///   [`user_fault`] into `Handled`, `Bus` or `Oom`.
 fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
     let mut guard = PROCESS.lock();
     let process = &mut *guard;
     let mut tables = process.mm.lock();
     let mut space = tables.user_space();
-    let outcome =
-        process
-            .space
-            .handle_user_fault(&process.env, &mut space, address, error | mm::PF_USER);
+    let outcome = user_fault(process, &mut space, address, error | mm::PF_USER);
     drop(tables);
     match outcome {
         FaultOutcome::Handled => {
@@ -821,15 +866,7 @@ fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
             );
             crate::fail();
         }
-        FaultOutcome::NeedsFile { address, write } => {
-            crate::log!(
-                "FAIL mm unimplemented file-backed fault address={:#x} write={} ip={:#x}\n",
-                address,
-                write,
-                ip
-            );
-            crate::fail();
-        }
+        FaultOutcome::NeedsFile { .. } => unreachable!("resolved by user_fault"),
     }
 }
 
@@ -1260,6 +1297,11 @@ fn start(mut init: Loaded) -> ! {
     // then follow the real wall clock.
     init.vfs
         .start_timekeeping(timer::ktime_get_real, timer::ktime_get_real());
+    // The segments' VMAs hold /init (`vm_file`); the loader's own reference
+    // (`bprm->file`) goes.
+    crate::unwrap(init.vfs.reserve_pin(), "exec-pin");
+    init.vfs.pin(u64::from(init.exec.index()));
+    init.vfs.fput(init.exec);
     let mut fdt = FdTable::default();
     // console_on_rootfs: descriptors 0-2 are one /dev/console open file.
     if init.vfs.console_on_rootfs(&mut fdt).is_err() {
