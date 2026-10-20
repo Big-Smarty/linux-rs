@@ -558,6 +558,26 @@ const DEBUG_CASES: &[DebugCase] = &[
         framebuffers: 1,
         plat: Q35_TCG,
     },
+    // Signal delivery from the exit-to-user path: handler entry and `rt_sigreturn`, synchronous
+    // faults recovered by handlers, an `ITIMER_REAL` interrupting a busy loop, `pause`,
+    // `rt_sigsuspend`, `rt_sigtimedwait` and the alternate stack (`user/init` mode `signals`).
+    DebugCase {
+        name: "signals",
+        cmdline: Some("-- signals"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some("init: signals ok"),
+            exact_summary: true,
+            protection: (false, false),
+        },
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
     DebugCase {
         name: "cpu-max",
         cmdline: Some("-- sse"),
@@ -6414,6 +6434,7 @@ mod tests {
             ("sse", "init: sse ok"),
             ("rseq", "init: rseq enosys"),
             ("demand", DEMAND_MODE_LINE),
+            ("signals", "init: signals ok"),
         ] {
             let serial = base
                 .replace("argc=1", "argc=2")

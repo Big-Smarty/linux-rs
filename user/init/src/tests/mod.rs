@@ -40,6 +40,7 @@ pub mod ids;
 pub mod mm;
 pub mod proc;
 pub mod signal;
+pub mod smoke;
 pub mod time;
 
 pub type R = Result<usize, Errno>;
@@ -283,6 +284,11 @@ pub fn run_mode(mode: &[u8]) -> bool {
         b"ids" => ids::run(),
         b"time" => time::run(),
         b"signal" => signal::run(),
+        // The kernel-test smoke case of the signal wiring (not an oracle group): see `smoke`.
+        b"signals" => {
+            smoke::run();
+            return true;
+        }
         b"fs" => fs::run(),
         b"proc" => proc::run(),
         _ => return false,
