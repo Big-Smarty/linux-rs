@@ -397,7 +397,7 @@ const NR_ACTIVE: i64 = 1;
 /// periodic tick is masked before init starts, so `timer::ticks()` does not
 /// advance; the boot clock (`ktime_get_boottime_ns`) does.
 fn jiffies_of(boot_ns: u64) -> u64 {
-    boot_ns / crate::time::TICK_NSEC
+    boot_ns / kernel::time::TICK_NSEC
 }
 
 /// `!X86_FEATURE_CPUID_FAULT`, decided only where CPUID can prove it. AMD sets
