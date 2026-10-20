@@ -1429,7 +1429,13 @@ Port I/O added: `0xCF8` (address, written) and `0xCFC` (data, read) only, standa
 
 ### Evidence
 
-Filled in at the end of this section with the gate run and the QEMU results.
+Source: branch `feat/baremetal-suite` at `a1b3160` (three commits on `main` fbd89b4; Ryzen 9 9900X workstation, QEMU TCG, KVM `-cpu host`; **no physical run**).
+
+* Gates, `bash target/gates.sh "$PWD" bms-2 target/gates-bms-2`, every line `exit=0`: `fmt`, `host-clippy`, `host-test` (xtask 84, baremetal 10), `nightly-clippy`, `nightly-test` (kernel library 379 tests including 12 in `suite`), `kernel-test` **30/30 debug-exit cases and 4/4 baremetal-suite cases** (the 30 include the unchanged-expectation `oracle-ids` and `oracle-time` runs of the two relaxed assertions; the KVM suite case ran, not `unavailable`), `target-clippy-qemu-self-test`, `target-clippy-freestanding`, `check`, `status`. A first run (`bms-1`) failed exactly the four suite cases on the host's digest check (it began the transcript at the wrong line); the corrected start line reproduced the kernel's digest for all four logs offline before the rerun. `gates.sh` does not lint the new profiles, so `-D warnings` target Clippy of `baremetal-suite` and `qemu-self-test,baremetal-suite` was run separately (clean).
+* Suite cases (`target/kernel-tooling/bms-2/cases/baremetal-suite*`): exit 33 (35 for `-stops`), 23/23 `PROOF ... PASS`, `ids` 158/158, `time` 119/119, `mm` 122/122, `fs` 286/286 on the kernel's comparison **and** the host `validate_oracle`, the recomputed log digest equal to the printed one; in `-stops` the `fault` probe ended `init signal 11`, the `io_uring` probe `kernel stop` (`FAIL syscall unimplemented nr=425`), and `ids` after them passed.
+* The produced tree and its QEMU boot: `xtask baremetal-suite --output target/kernel-tooling/bms-final` (build id `a1b31603908f`): `usb/` holds `EFI/BOOT/BOOTX64.EFI` (376,832 B, sha256 `94308b4e...ad51`), `limine.conf` (174 B), `linux-rs-kernel` (10,911,792 B, sha256 `bf4612a4...eb6d`), `initramfs.cpio` (375,136 B), `SHA256SUMS`, `README.txt`; booted unchanged in QEMU to the final HLT; `tree-boot/summary-screen.png` shows `RESULT: ALL PASS (4 groups, 23 self-tests)` in about 19 s of guest time on 512 MiB (per-group times 88/218/98/148 ms; a 30 GiB machine adds the exhaustion walk and the replay pauses: unmeasured), and `tree-boot/page-NN.ppm` are the replay pages. A person read the screens; no program parsed them.
+* Exploratory, not in the gates: with 8 GiB of guest RAM the two since-relaxed assertions failed (`ids.sysinfo-ram`, and once `time.monotonic-coarse-near-monotonic`), which is why they were relaxed; every other line passed.
+* The signal lane (`feat/signals`) was not on `main` while this was written, so the `signal` group is listed as skipped; it joins `GROUPS` in `kernel/src/suite.rs` when its syscalls land.
 
 ### Not done (named, not hidden)
 
