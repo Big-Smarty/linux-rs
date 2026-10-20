@@ -4145,6 +4145,11 @@ fn oracle_rows(group: &str) -> impl Iterator<Item = (&'static str, &'static str)
 /// `printk`s, `init:` banner lines) is not part of the comparison.
 const ORACLE_PREFIXES: [&str; 3] = ["init: test ", "init: tests ", "init: info "];
 
+/// `init: info <group>.<name>`: the part of an info line that must match.
+fn oracle_key(line: &str) -> Vec<&str> {
+    line.splitn(4, ' ').take(3).collect()
+}
+
 /// The oracle group's output on this kernel must equal the pinned Linux's: the lines starting with
 /// [`ORACLE_PREFIXES`], in order, none missing and none extra. `check` and `summary` rows compare
 /// exactly (a `FAIL` line, a different count or a reordering is a mismatch); an `info` row is a
@@ -4166,12 +4171,9 @@ fn validate_oracle(lines: &[&str], group: &str) -> Result<(usize, usize), String
         })
         .map(|(index, line)| (index, *line))
         .collect::<Vec<_>>();
-    fn key(line: &str) -> Vec<&str> {
-        line.splitn(4, ' ').take(3).collect()
-    }
     for (position, ((kind, want), (_, got))) in expected.iter().zip(&observed).enumerate() {
         let same = if *kind == "info" {
-            key(want) == key(got)
+            oracle_key(want) == oracle_key(got)
         } else {
             want == got
         };
@@ -7083,7 +7085,7 @@ mod tests {
             (
                 "wrong count",
                 mutate(&|l| {
-                    *l.last_mut().unwrap() = "init: tests ids passed=156 failed=1".to_owned()
+                    *l.last_mut().unwrap() = "init: tests ids passed=156 failed=1".to_owned();
                 }),
             ),
             ("reordered", mutate(&|l| l.swap(3, 4))),

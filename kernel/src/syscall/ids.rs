@@ -545,6 +545,7 @@ fn prctl<C: Context>(ctx: &mut C, option: i32, args: [u64; 4]) -> Res {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::too_many_lines, clippy::items_after_statements)]
     extern crate std;
     use crate::syscall::{
         Machine, Outcome, dispatch, error,
@@ -887,7 +888,7 @@ mod tests {
         let mut t = user_task();
         const GET_FS: u64 = 0x1003;
         const GET_GS: u64 = 0x1004;
-        let mut get = |t: &mut Task, code| {
+        let get = |t: &mut Task, code| {
             put(t, BUF, &[0xff; 8]);
             (call(t, Sysno::arch_prctl, &[code, BUF]), word(t, BUF))
         };
