@@ -251,6 +251,19 @@ mod tests {
         assert_eq!(max_threads(0), MIN_THREADS);
         assert_eq!(max_threads(31), MIN_THREADS);
         assert_eq!(max_threads(128 * 1024), 128 * 1024 * 4096 / (16384 * 8));
+        // 512 MiB of 4 KiB pages: 4096 threads, RLIMIT_NPROC/SIGPENDING 2048.
+        assert_eq!(max_threads(131_072), 4096);
+        let limits = Attributes::init(max_threads(131_072)).rlimits;
+        assert_eq!(limits.0[6], limits.0[11]);
+        assert_eq!(
+            limits.0[6],
+            Rlimit {
+                cur: 2048,
+                max: 2048
+            }
+        );
+        // 64 GiB: still below MAX_THREADS (0x3fffffff).
+        assert_eq!(max_threads(16 * 1024 * 1024), 524_288);
         assert_eq!(max_threads(1 << 52), MAX_THREADS);
         assert_eq!(max_threads(u64::MAX), MAX_THREADS);
     }

@@ -161,6 +161,14 @@ fn getgroups<C: Context>(ctx: &mut C, size: i32, list: u64) -> Res {
 
 /// `nice_to_rlimit(task_nice(p))` of a task at the default nice 0 (nothing
 /// changes it: `setpriority` is not implemented and stops the kernel).
+///
+/// Exact for `PRIO_PROCESS`. For `PRIO_PGRP` (own group) and `PRIO_USER`
+/// (own uid) Linux returns the maximum of `20 - nice` over *every* task in the
+/// group or of that uid, and a booted 6.18 has kernel threads of uid 0 and of
+/// the idle/init group with nice -20 (the high-priority `kworker/*H`), so it
+/// reports 40 there. This kernel has no kernel threads, so 20 is the answer
+/// for this kernel's task set, not the value a stock Linux would print; the
+/// two cases become exact when scheduler state and kernel threads exist.
 const NICE_TO_RLIMIT_DEFAULT: i64 = 20;
 
 fn getpriority<C: Context>(ctx: &mut C, which: i32, who: i32) -> Res {
@@ -335,9 +343,11 @@ fn getcwd<C: Context>(ctx: &mut C, buffer: u64, size: u64) -> Res {
     if len as u64 > size {
         return Err(Errno::ERANGE.into());
     }
-    let mut path = [0u8; PATH_MAX];
-    path[..cwd.len()].copy_from_slice(cwd);
-    if copy_to_user(ctx, buffer, &path[..len]) != 0 {
+    // The path, then its NUL: the bytes before an inaccessible page are
+    // written either way, exactly as one `copy_to_user` of both would.
+    if copy_to_user(ctx, buffer, cwd) != 0
+        || copy_to_user(ctx, buffer + cwd.len() as u64, &[0]) != 0
+    {
         return Err(Errno::EFAULT.into());
     }
     Ok(i64::try_from(len).unwrap_or(i64::MAX))
@@ -410,21 +420,28 @@ fn uname<C: Context>(ctx: &mut C, name: u64) -> Res {
 /// `struct sysinfo` on x86-64: 112 bytes.
 const SYSINFO_BYTES: usize = 112;
 
-/// `do_sysinfo`. `uptime` is the boot clock rounded up to whole seconds; the
-/// load averages are zero (nothing is ever runnable but the caller); `procs`
-/// is `nr_threads`, which counts the one task this kernel has; there is no
-/// swap, no highmem, no shared memory and no buffer cache. `mem_unit` is 1
-/// (the page counts are scaled to bytes, as `do_sysinfo` does).
+/// `do_sysinfo`. `uptime` is the boot clock rounded up to whole seconds;
+/// `loads` are `avenrun << (SI_LOAD_SHIFT - FSHIFT)` from [`Machine::loads`];
+/// `procs` is `nr_threads`, which counts the one task this kernel has (Linux's
+/// count includes kernel threads); there is no swap, no highmem, no shared
+/// memory and no buffer cache. The page counts are scaled to bytes with
+/// `mem_unit` 1 unless that would overflow 64 bits, in which case they stay in
+/// pages with `mem_unit` 4096, as `do_sysinfo` does.
 fn sysinfo<C: Context>(ctx: &mut C, pointer: u64) -> Res {
     let machine = ctx.machine();
     let seconds = machine.uptime_ns.div_ceil(1_000_000_000);
+    let scaled = machine.total_pages.leading_zeros() >= 12;
+    let (shift, mem_unit) = if scaled { (12, 1u32) } else { (0, 4096) };
     let mut info = [0u8; SYSINFO_BYTES];
     let mut put = |at: usize, bytes: &[u8]| info[at..at + bytes.len()].copy_from_slice(bytes);
     put(0, &seconds.to_le_bytes());
-    put(32, &(machine.total_pages << 12).to_le_bytes());
-    put(40, &(machine.free_pages << 12).to_le_bytes());
+    for (index, load) in machine.loads.iter().enumerate() {
+        put(8 + 8 * index, &load.to_le_bytes());
+    }
+    put(32, &(machine.total_pages << shift).to_le_bytes());
+    put(40, &(machine.free_pages << shift).to_le_bytes());
     put(80, &1u16.to_le_bytes());
-    put(104, &1u32.to_le_bytes());
+    put(104, &mem_unit.to_le_bytes());
     if copy_to_user(ctx, pointer, &info) != 0 {
         return Err(Errno::EFAULT.into());
     }
@@ -441,8 +458,10 @@ const ARCH_GET_XCOMP_SUPP: i32 = 0x1021;
 const ARCH_REQ_XCOMP_GUEST_PERM: i32 = 0x1025;
 
 /// `arch_prctl` (arch/x86/kernel/process.c:1063, `do_arch_prctl_64`).
-/// `ARCH_SET_CPUID` and the `XCOMP` family need CPUID faulting and the xstate
-/// permission model and stop the kernel. `ARCH_MAP_VDSO_*`
+/// `ARCH_SET_CPUID` is `-ENODEV` on a CPU known to lack CPUID faulting
+/// ([`Context::cpuid_fault_absent`]); with faulting present, or not
+/// determinable, it and the `XCOMP` family (xstate permission model) stop the
+/// kernel. `ARCH_MAP_VDSO_*`
 /// (`CONFIG_CHECKPOINT_RESTORE`), the `ADDRESS_MASKING` options and the
 /// `SHSTK` options (`shstk_prctl` is a `-EINVAL` stub without
 /// `X86_USER_SHADOW_STACK`) all fall to the `default: -EINVAL` of the pinned
@@ -452,6 +471,8 @@ fn arch_prctl<C: Context>(ctx: &mut C, option: i32, arg2: u64) -> Res {
     match option {
         // `!test_thread_flag(TIF_NOCPUID)`: CPUID is not faulting.
         ARCH_GET_CPUID => Ok(1),
+        // `set_cpuid_mode`: without CPUID faulting the answer is `-ENODEV`.
+        ARCH_SET_CPUID if ctx.cpuid_fault_absent() => Err(Errno::ENODEV.into()),
         ARCH_SET_CPUID | ARCH_GET_XCOMP_SUPP..=ARCH_REQ_XCOMP_GUEST_PERM => {
             Err(Stop::Unimplemented)
         }
@@ -483,6 +504,8 @@ fn arch_prctl<C: Context>(ctx: &mut C, option: i32, arg2: u64) -> Res {
 }
 
 const PR_GET_DUMPABLE: i32 = 3;
+const PR_GET_TIMING: i32 = 13;
+const PR_SET_TIMING: i32 = 14;
 const PR_SET_NAME: i32 = 15;
 const PR_GET_NAME: i32 = 16;
 const PR_GET_TIMERSLACK: i32 = 30;
@@ -494,10 +517,31 @@ const SUID_DUMP_USER: i64 = 1;
 /// not implemented, so it stays the default.
 const TIMER_SLACK_NS: i64 = 50_000;
 
+/// `PR_*` options whose handler on x86-64 under the pinned reference
+/// configuration is nothing but `-EINVAL` (`kernel/sys.c:84-159` defaults for
+/// the architecture hooks x86 does not define, the explicit `MPX` returns, and
+/// the weak shadow-stack hooks, `X86_USER_SHADOW_STACK` being off): `UNALIGN`
+/// 5-6, `FPEMU` 9-10, `FPEXC` 11-12, `ENDIAN` 19-20, `MPX` 43-44, `FP_MODE`
+/// 45-46, `SVE` 50-51, `PAC` 54, 60-61, `TAGGED_ADDR` 55-56, `SME` 63-64,
+/// `RISCV` 69-71, `PPC` `DEXCR` 72-73, `SHADOW_STACK` 74-76. `SCHED_CORE` (62)
+/// and `SET/GET_MEMORY_MERGE` (67-68) have no `case` in the switch because
+/// `# CONFIG_SCHED_CORE` and `# CONFIG_KSM` are not set (sys.c:2790-2794,
+/// 2819-2838), so they reach `default: -EINVAL`. Every argument check on the
+/// other paths also ends in `-EINVAL`. `PR_SET_PTRACER` (0x59616d61)
+/// is Yama's; the reference configuration has `# CONFIG_SECURITY_YAMA is not
+/// set`, so it reaches the switch's `default: -EINVAL` too. (A declared
+/// configuration that enabled Yama would make it stateful.)
+fn prctl_is_plain_einval(option: i32) -> bool {
+    matches!(
+        option,
+        5 | 6 | 9..=12 | 19 | 20 | 43..=46 | 50 | 51 | 54..=56 | 60..=64 | 67..=76 | 0x5961_6d61
+    )
+}
+
 /// Whether `option` is a `PR_*` number of `include/uapi/linux/prctl.h` (or one
-/// the Yama and capabilities LSMs claim before the switch): Linux does
-/// something with these, so an unimplemented one must not be answered with
-/// the `-EINVAL` that every other number gets.
+/// the capabilities LSM claims before the switch) that has real behaviour and
+/// state: an unimplemented one must not be answered with the `-EINVAL` that
+/// every other number gets.
 fn known_prctl_option(option: i32) -> bool {
     // 17-18 and 48-49 are unassigned; `PR_SET_PTRACER`, `PR_SET_VMA` and
     // `PR_GET_AUXV` are the three 32-bit magic numbers.
@@ -507,8 +551,10 @@ fn known_prctl_option(option: i32) -> bool {
     )
 }
 
-/// `prctl`: the options init uses. Every other option Linux implements stops
-/// the kernel; every number Linux does not know is `-EINVAL`.
+/// `prctl`: the options init uses, the two timing options (constants) and the
+/// options that are plain `-EINVAL` on this architecture. Every other option
+/// Linux implements stops the kernel; every number Linux does not know is
+/// `-EINVAL`.
 fn prctl<C: Context>(ctx: &mut C, option: i32, args: [u64; 4]) -> Res {
     match option {
         PR_GET_DUMPABLE => Ok(SUID_DUMP_USER),
@@ -538,6 +584,11 @@ fn prctl<C: Context>(ctx: &mut C, option: i32, args: [u64; 4]) -> Res {
             }
             Ok(0)
         }
+        // `PR_TIMING_STATISTICAL` (0) is the only timing method.
+        PR_GET_TIMING => Ok(0),
+        PR_SET_TIMING if args[0] != 0 => Err(Errno::EINVAL.into()),
+        PR_SET_TIMING => Ok(0),
+        option if prctl_is_plain_einval(option) => Err(Errno::EINVAL.into()),
         option if known_prctl_option(option) => Err(Stop::Unimplemented),
         _ => Err(Errno::EINVAL.into()),
     }
@@ -958,13 +1009,24 @@ mod tests {
             ok(0)
         );
         assert_eq!(call(&mut t, Sysno::arch_prctl, &[0x1011, 0]), ok(1));
-        // CPUID faulting control and the xstate permission calls are Linux's, not ours.
+        // CPUID faulting control (when the CPU may have it) and the xstate
+        // permission calls are Linux's, not ours.
         for code in [0x1012, 0x1021, 0x1022, 0x1023, 0x1024, 0x1025] {
             assert_eq!(
                 call(&mut t, Sysno::arch_prctl, &[code, 0]),
                 Outcome::Unimplemented(158)
             );
         }
+        // A CPU without CPUID faulting: `set_cpuid_mode` is `-ENODEV`.
+        t.cpuid_fault_absent = true;
+        assert_eq!(
+            call(&mut t, Sysno::arch_prctl, &[0x1012, 0]),
+            err(Errno::ENODEV)
+        );
+        assert_eq!(
+            call(&mut t, Sysno::arch_prctl, &[0x1021, 0]),
+            Outcome::Unimplemented(158)
+        );
     }
 
     fn limit(t: &mut Task, resource: u64) -> (Outcome, Rlimit) {
@@ -1179,13 +1241,14 @@ mod tests {
             uptime_ns: 2_000_000_001,
             total_pages: 1000,
             free_pages: 250,
+            loads: [5280, 1088, 352],
         };
         put(&mut t, BUF, &[0xaa; 112]);
         assert_eq!(call(&mut t, Sysno::sysinfo, &[BUF]), ok(0));
         let info = bytes(&mut t, BUF, 112);
         let field = |at: usize| u64::from_le_bytes(info[at..at + 8].try_into().unwrap());
         assert_eq!(field(0), 3, "uptime is rounded up");
-        assert_eq!([field(8), field(16), field(24)], [0; 3]);
+        assert_eq!([field(8), field(16), field(24)], [5280, 1088, 352]);
         assert_eq!((field(32), field(40)), (1000 * 4096, 250 * 4096));
         assert_eq!([field(48), field(56), field(64), field(72)], [0; 4]);
         assert_eq!(&info[80..84], [1, 0, 0, 0]);
@@ -1198,6 +1261,19 @@ mod tests {
         t.machine.uptime_ns = 5_000_000_000;
         assert_eq!(call(&mut t, Sysno::sysinfo, &[BUF]), ok(0));
         assert_eq!(word(&mut t, BUF), 5);
+        // 2^52 pages or more cannot be scaled to bytes: pages with mem_unit 4096.
+        t.machine.total_pages = 1 << 52;
+        t.machine.free_pages = 7;
+        assert_eq!(call(&mut t, Sysno::sysinfo, &[BUF]), ok(0));
+        assert_eq!(
+            (word(&mut t, BUF + 32), word(&mut t, BUF + 40)),
+            (1 << 52, 7)
+        );
+        assert_eq!(bytes(&mut t, BUF + 104, 4), [0, 16, 0, 0]);
+        t.machine.total_pages = (1 << 52) - 1;
+        assert_eq!(call(&mut t, Sysno::sysinfo, &[BUF]), ok(0));
+        assert_eq!(word(&mut t, BUF + 32), ((1 << 52) - 1) << 12);
+        assert_eq!(bytes(&mut t, BUF + 104, 4), [1, 0, 0, 0]);
         assert_eq!(call(&mut t, Sysno::sysinfo, &[BAD]), err(Errno::EFAULT));
     }
 
@@ -1243,16 +1319,39 @@ mod tests {
                 "{option:#x}"
             );
         }
-        // Options Linux implements but this slice does not.
+        // Timing: a constant method.
+        assert_eq!(call(&mut t, Sysno::prctl, &[13]), ok(0));
+        assert_eq!(call(&mut t, Sysno::prctl, &[14, 0]), ok(0));
+        assert_eq!(call(&mut t, Sysno::prctl, &[14, 1]), err(Errno::EINVAL));
+        // Architecture hooks x86-64 does not define, and Yama's option without Yama.
+        for option in (5u64..=6)
+            .chain(9..=12)
+            .chain(19..=20)
+            .chain(43..=46)
+            .chain([50, 51, 54, 55, 56])
+            .chain(60..=64)
+            .chain(67..=76)
+            .chain([0x5961_6d61])
+        {
+            assert_eq!(
+                call(&mut t, Sysno::prctl, &[option, 1, 2, 3, 4]),
+                err(Errno::EINVAL),
+                "{option:#x}"
+            );
+        }
+        // Options with real behaviour that this slice does not have.
         for option in [
             1u64,
             4,
             22,
+            25,
+            52,
+            77,
+            78,
             35,
             38,
             41,
             47,
-            0x5961_6d61,
             0x5356_4d41,
             0x4155_5856,
         ] {

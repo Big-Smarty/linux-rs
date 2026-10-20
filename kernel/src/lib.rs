@@ -14,6 +14,7 @@ pub mod firmware;
 pub mod heap;
 pub mod image;
 pub mod intc;
+pub mod loadavg;
 pub mod memory;
 extern crate alloc;
 pub mod mm;

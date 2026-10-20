@@ -76,6 +76,10 @@ pub trait Context: UserPages {
     fn set_gs_base(&mut self, base: u64);
     /// Clock and memory totals for `sysinfo`.
     fn machine(&self) -> Machine;
+    /// `!boot_cpu_has(X86_FEATURE_CPUID_FAULT)`, true only when the CPU is
+    /// known to lack CPUID faulting (`set_cpuid_mode` then returns `-ENODEV`).
+    /// False means present or not determinable.
+    fn cpuid_fault_absent(&self) -> bool;
 }
 
 /// What `sysinfo` reads from the machine rather than from the task.
@@ -87,6 +91,8 @@ pub struct Machine {
     pub total_pages: u64,
     /// `NR_FREE_PAGES`, in 4 KiB pages.
     pub free_pages: u64,
+    /// `get_avenrun(loads, 0, SI_LOAD_SHIFT - FSHIFT)`: see [`crate::loadavg`].
+    pub loads: [u64; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

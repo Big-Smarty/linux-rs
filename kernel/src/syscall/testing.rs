@@ -24,6 +24,7 @@ pub struct Task<P = Space, C = Sink> {
     pub fs_base: u64,
     pub gs_base: u64,
     pub machine: Machine,
+    pub cpuid_fault_absent: bool,
 }
 
 impl<P, C> Task<P, C> {
@@ -39,7 +40,9 @@ impl<P, C> Task<P, C> {
                 uptime_ns: 0,
                 total_pages: 100,
                 free_pages: 40,
+                loads: [0; 3],
             },
+            cpuid_fault_absent: false,
         }
     }
 }
@@ -81,5 +84,8 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
     }
     fn machine(&self) -> Machine {
         self.machine
+    }
+    fn cpuid_fault_absent(&self) -> bool {
+        self.cpuid_fault_absent
     }
 }

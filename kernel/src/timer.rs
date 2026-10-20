@@ -270,7 +270,8 @@ fn tick_bookkeeping(now_ns: u64) {
     if now_ns >= next {
         // hrtimer_forward: count every missed period, never fewer than one.
         let periods = (now_ns - next) / TICK_NSEC + 1;
-        TICKS.fetch_add(periods, Ordering::Relaxed);
+        let jiffies = TICKS.fetch_add(periods, Ordering::Relaxed) + periods;
+        crate::userspace::loadavg_tick(jiffies);
         NEXT_TICK_NS.store(next + periods * TICK_NSEC, Ordering::Relaxed);
     }
 }
@@ -293,7 +294,8 @@ pub fn isa_irq0_interrupt() {
     }
     IRQ0.fetch_add(1, Ordering::Relaxed);
     if EVENT.load(Ordering::Relaxed) == EVENT_PIT && TICK_ON.load(Ordering::Relaxed) {
-        TICKS.fetch_add(1, Ordering::Relaxed);
+        let jiffies = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::userspace::loadavg_tick(jiffies);
         cpu::irq_lock_probe();
     }
 }
