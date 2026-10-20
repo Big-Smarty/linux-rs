@@ -23,12 +23,15 @@
 pub const ORACLE_EXPECTED: &[u8] = include_bytes!("../../xtask/oracle/expected.tsv");
 
 /// Oracle groups the kernel can run today, in run order.
-pub const GROUPS: [&str; 6] = ["ids", "time", "mm", "fs", "signal", "fork"];
+pub const GROUPS: [&str; 8] = [
+    "ids", "time", "mm", "fs", "signal", "fork", "proc", "jobctl",
+];
 
 /// Oracle groups that exist in `user/init` but are not run, with the reason
-/// that appears on the summary screen. `proc` leaves this list when procfs
-/// exists and `oracle_case!(proc)` is in the host harness.
-pub const UNSUPPORTED: [(&str, &str); 1] = [("proc", "not yet supported (no procfs)")];
+/// that appears on the summary screen. None today: `proc` needed pipes between
+/// tasks, `poll` and job control, not procfs, and runs since the
+/// [job-control lane](../../docs/implementation.md#pipes-poll-and-job-control).
+pub const UNSUPPORTED: [(&str, &str); 0] = [];
 
 /// Longest line text kept for a report; longer lines are cut (and end in `~`).
 pub const LINE_MAX: usize = 100;

@@ -55,11 +55,6 @@ pub const PF_FORKNOEXEC: u32 = 0x40;
 /// `PF_SIGNALED`: killed by a signal.
 pub const PF_SIGNALED: u32 = 0x400;
 
-/// `JOBCTL_STOPPED`: mirrors `__TASK_STOPPED`, set by `do_signal_stop`. The
-/// scheduler's task state is the authority once it exists; the wait code reads
-/// this bit as `task_is_stopped()`.
-pub const JOBCTL_STOPPED: u32 = 1 << 26;
-
 /// `exit_state` (`EXIT_ZOMBIE`, `EXIT_DEAD`; `EXIT_TRACE` needs ptrace).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitState {
@@ -134,8 +129,6 @@ pub struct TaskStruct {
     pub(super) parent_exec_id: u64,
     /// `PF_*`.
     pub flags: u32,
-    /// `jobctl` (`JOBCTL_*`).
-    pub jobctl: u32,
     pub cred: CredSnapshot,
     /// `signal->leader`: a session leader.
     pub session_leader: bool,
@@ -239,7 +232,6 @@ impl Tasklist {
                 self_exec_id: 0,
                 parent_exec_id: 0,
                 flags: 0,
-                jobctl: 0,
                 cred: CredSnapshot::of(cred),
                 session_leader: false,
                 utime_ns: 0,
@@ -347,7 +339,6 @@ impl Tasklist {
             self_exec_id: exec_id,
             parent_exec_id: exec_id,
             flags: PF_FORKNOEXEC,
-            jobctl: 0,
             cred,
             session_leader: false,
             utime_ns: 0,
@@ -656,19 +647,29 @@ impl Tasklist {
 
     /// The ids a signal sent by `task` carries (derived, not stored twice).
     #[must_use]
-    pub fn signal_ids(&self, task: TaskId) -> Option<Ids> {
+    pub fn signal_ids(&self, task: TaskId, curr: bool) -> Option<Ids> {
         let t = self.tasks.get(task)?;
         Some(Ids {
             pid: self.task_pid_vnr(task),
             tgid: self.task_tgid_vnr(task),
             uid: t.cred.uid,
             global_init: self.is_global_init(task),
+            exiting: t.flags & PF_EXITING != 0,
+            curr,
         })
     }
 
-    /// The `State` view of `task`'s signal objects.
+    /// The `State` view of `task`'s signal objects, as seen by another task
+    /// (`task_curr` false): what a sender, a waiter or a test examines.
     pub fn signal_state(&mut self, task: TaskId) -> Option<State<'_>> {
-        let ids = self.signal_ids(task)?;
+        self.signal_state_as(task, false)
+    }
+
+    /// [`Tasklist::signal_state`] with `curr` = `task_curr(task)`: the task is
+    /// the one running this code (its own state, or the target of a signal it
+    /// sends itself), which `wants_signal` reads.
+    pub fn signal_state_as(&mut self, task: TaskId, curr: bool) -> Option<State<'_>> {
+        let ids = self.signal_ids(task, curr)?;
         Some(self.tasks.get_mut(task)?.signals.view(ids))
     }
 

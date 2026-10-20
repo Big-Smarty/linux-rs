@@ -65,6 +65,19 @@ pub const CLASS_TEST: u32 = u32::MAX;
 /// waiting thread group's leader (`task::exit::chldexit_key`).
 pub const CLASS_CHLDEXIT: u32 = 1;
 
+/// Wait-key class of the pipe wait queues (`pipe_inode_info::rd_wait` and
+/// `wr_wait`) and of `poll` sleepers on pipes: one key for every pipe
+/// (id 0, [`PIPE_KEY`]). Every state change of any pipe wakes all of its
+/// sleepers, who re-check their condition (spurious wake-ups are legal by
+/// construction). shortcut: one key and a wake-all instead of a queue per pipe
+/// end with exclusive waiters, so which of several blocked readers gets the
+/// data is not Linux's (FIFO of exclusive waiters); per-pipe keys or intrusive
+/// wait entries when tasks that share a pipe become many (plan S5).
+pub const CLASS_PIPE: u32 = 2;
+
+/// The key every pipe sleeper uses ([`CLASS_PIPE`]).
+pub const PIPE_KEY: WaitKey = WaitKey::new(CLASS_PIPE, 0);
+
 /// A task handle: slot index plus the slot's generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedId {
@@ -110,6 +123,11 @@ pub enum TaskState {
     Interruptible,
     /// `TASK_UNINTERRUPTIBLE`: asleep, only its key or timer wakes it.
     Uninterruptible,
+    /// `TASK_STOPPED` (`__TASK_STOPPED | TASK_WAKEKILL`): a job-control stop
+    /// (`do_signal_stop`). `SIGCONT` ([`Rq::wake_stopped`]) and a fatal signal
+    /// ([`Rq::signal_wake_up_state`] with `resume`) end it; no key and no
+    /// timer does, and `TASK_NORMAL` wake-ups skip it.
+    Stopped,
     /// `TASK_DEAD`: past `do_task_dead`, waiting for the next task to free it.
     Dead,
 }
@@ -459,16 +477,54 @@ impl Rq {
         }
     }
 
-    /// `signal_wake_up_state(t, 0)`: wake only an interruptible sleeper. (The
-    /// `TASK_WAKEKILL` stopped/traced case arrives with job control.)
-    pub fn wake_interruptible(&mut self, id: SchedId) -> bool {
+    /// `signal_wake_up_state(t, state)` as `signal_wake_up(t, resume)` calls it
+    /// (`wake_up_state(t, state | TASK_INTERRUPTIBLE)`): an interruptible
+    /// sleeper wakes; with `resume` (`TASK_WAKEKILL`: the signal is `SIGKILL`
+    /// or starts a group exit) a stopped task wakes too, to handle its death.
+    /// Whether it was asleep in a state this wakes.
+    pub fn signal_wake_up_state(&mut self, id: SchedId, resume: bool) -> bool {
         match self.slot(id) {
-            Some(slot) if slot.state == TaskState::Interruptible => {
+            Some(slot)
+                if slot.state == TaskState::Interruptible
+                    || (resume && slot.state == TaskState::Stopped) =>
+            {
                 self.wake(id.index);
                 true
             }
             _ => false,
         }
+    }
+
+    /// `signal_wake_up(t, 0)`: wake only an interruptible sleeper.
+    pub fn wake_interruptible(&mut self, id: SchedId) -> bool {
+        self.signal_wake_up_state(id, false)
+    }
+
+    /// `wake_up_state(t, __TASK_STOPPED)` (`prepare_signal`'s `SIGCONT`): end a
+    /// job-control stop. Whether the task was stopped.
+    pub fn wake_stopped(&mut self, id: SchedId) -> bool {
+        match self.slot(id) {
+            Some(slot) if slot.state == TaskState::Stopped => {
+                self.wake(id.index);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `set_special_state(TASK_STOPPED)` for the current task: it stops once it
+    /// calls [`Rq::schedule`]. No key and no timer wakes it. Unlike
+    /// [`Rq::prepare_to_wait`] it is unconditional (a special state is not
+    /// undone by a pending signal: `do_signal_stop` tests for a fatal one
+    /// itself, under the same exclusion).
+    ///
+    /// # Panics
+    /// When the idle task stops.
+    pub fn stop_current(&mut self) {
+        assert!(self.curr != IDLE, "the idle task cannot stop");
+        let slot = &mut self.slots[self.curr as usize];
+        slot.state = TaskState::Stopped;
+        slot.key = WaitKey::NONE;
     }
 
     /// `__wake_up(key, mode, nr_exclusive)` (`__wake_up_common`): the sleepers

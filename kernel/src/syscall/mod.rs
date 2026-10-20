@@ -33,6 +33,7 @@ mod fs;
 mod ids;
 mod io;
 mod memory;
+mod poll;
 mod process;
 mod signal;
 #[cfg(test)]
@@ -212,19 +213,12 @@ pub enum Outcome {
     Exit { code: u32, group: bool },
     /// A syscall inside Linux's table that this slice does not implement.
     Unimplemented(u32),
-    /// The task would sleep (an empty pipe, a full pipe, console input). Linux
-    /// would wait for a writer, a reader or input; the wake-ups between tasks
-    /// (pipe ends, tty) are not implemented, so the kernel stops loudly rather
-    /// than return early or sleep forever.
-    Blocked(u32),
 }
 
 /// Why a file syscall ends other than with a value (internal to the groups).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stop {
     Errno(Errno),
-    /// [`Outcome::Blocked`].
-    Blocked,
     /// A Linux behaviour that is not ported yet ([`Outcome::Unimplemented`]).
     Unimplemented,
 }
@@ -243,7 +237,6 @@ pub(crate) fn outcome(number: u32, result: Sys) -> Outcome {
     match result {
         Ok(value) => Outcome::Return(value),
         Err(Stop::Errno(errno)) => Outcome::Return(error(errno)),
-        Err(Stop::Blocked) => Outcome::Blocked(number),
         Err(Stop::Unimplemented) => Outcome::Unimplemented(number),
     }
 }
@@ -271,6 +264,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
     // One line per group, in table order of their first number.
     let outcome = fd::dispatch(ctx, sysno, args)
         .or_else(|| fs::dispatch(ctx, sysno, args))
+        .or_else(|| poll::dispatch(ctx, sysno, args))
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
         .or_else(|| exec::dispatch(ctx, sysno, args))

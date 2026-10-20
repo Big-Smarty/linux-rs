@@ -32,21 +32,10 @@ use crate::{
     },
 };
 
-/// `SIGNAL_STOP_STOPPED`: a job-control stop is in effect.
-pub const SIGNAL_STOP_STOPPED: u32 = 0x1;
-/// `SIGNAL_STOP_CONTINUED`: `SIGCONT` since the last `WCONTINUED` report.
-pub const SIGNAL_STOP_CONTINUED: u32 = 0x2;
-/// `SIGNAL_CLD_STOPPED`: the parent owes a stop notification.
-pub const SIGNAL_CLD_STOPPED: u32 = 0x10;
-/// `SIGNAL_CLD_CONTINUED`: the parent owes a continue notification.
-pub const SIGNAL_CLD_CONTINUED: u32 = 0x20;
-
-/// `CLD_*` (`si_code` of `SIGCHLD`).
-pub const CLD_EXITED: i32 = 1;
-pub const CLD_KILLED: i32 = 2;
-pub const CLD_DUMPED: i32 = 3;
-pub const CLD_STOPPED: i32 = 5;
-pub const CLD_CONTINUED: i32 = 6;
+pub use crate::signal::jobctl::{
+    CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, SIGNAL_CLD_CONTINUED,
+    SIGNAL_CLD_STOPPED, SIGNAL_STOP_CONTINUED, SIGNAL_STOP_STOPPED,
+};
 
 /// `USER_HZ`: `clock_t` ticks per second in `siginfo` and `times`.
 const USER_HZ: u64 = 100;
@@ -58,10 +47,14 @@ pub trait Waker {
     /// `__wake_up_parent`: a child of `parent` changed state (exited, stopped,
     /// continued): `wait4`/`waitid` sleepers of `parent` re-check.
     fn child_event(&mut self, parent: TaskId);
-    /// `signal_wake_up`: `task` has a signal queued. `sched` is its
+    /// `signal_wake_up(t, resume)`: `task` has a signal queued. `sched` is its
     /// scheduling handle ([`Tasklist::set_sched`]), `None` for a task that has
-    /// none bound (the host fakes).
-    fn signal_wake(&mut self, task: TaskId, sched: Option<SchedId>);
+    /// none bound (the host fakes). `resume` (`TASK_WAKEKILL`) is set when the
+    /// signal is fatal, so a job-control-stopped task wakes to die.
+    fn signal_wake(&mut self, task: TaskId, sched: Option<SchedId>, resume: bool);
+    /// `wake_up_state(t, __TASK_STOPPED)`: `SIGCONT` ended `task`'s job-control
+    /// stop (`prepare_signal`).
+    fn wake_stopped(&mut self, task: TaskId, sched: Option<SchedId>);
 }
 
 /// The wait queue `signal_struct::wait_chldexit` of `parent`'s thread group:
@@ -78,7 +71,8 @@ pub struct NoWake;
 
 impl Waker for NoWake {
     fn child_event(&mut self, _parent: TaskId) {}
-    fn signal_wake(&mut self, _task: TaskId, _sched: Option<SchedId>) {}
+    fn signal_wake(&mut self, _task: TaskId, _sched: Option<SchedId>, _resume: bool) {}
+    fn wake_stopped(&mut self, _task: TaskId, _sched: Option<SchedId>) {}
 }
 
 /// Why a task cannot go through [`Tasklist::exit_notify`].
@@ -136,13 +130,13 @@ impl Tasklist {
     /// `PF_SIGNALED` (killed by a signal).
     pub fn exit_prepare(&mut self, task: TaskId, code: u32, signaled: bool) -> ExitPrep {
         let init = self.is_global_init(task);
-        let Some(state) = self.signal_state(task) else {
+        let Some(mut state) = self.signal_state(task) else {
             return ExitPrep::Proceed { group_dead: true };
         };
         // synchronize_group_exit: the last thread starts the group exit if
         // nobody did; `signal->flags = SIGNAL_GROUP_EXIT` drops the stop bits.
         if state.sig.group_exit.is_none() {
-            state.sig.start_group_exit(code);
+            state.start_group_exit(code);
         }
         let group_code = state.sig.group_exit.unwrap_or(0);
         // The one thread: `live` drops to zero.
@@ -322,7 +316,7 @@ impl Tasklist {
                 // Only a real-time signal sent with `si_code < 0` can fail.
                 let _ = state.send_signal(sig, info, Target::Process);
                 let sched = self.sched_of(parent);
-                w.signal_wake(parent, sched);
+                w.signal_wake(parent, sched, false);
             }
         }
         w.child_event(parent);
@@ -358,7 +352,7 @@ impl Tasklist {
             if action.handler != SIG_IGN && action.flags & SA_NOCLDSTOP == 0 {
                 let _ = state.send_signal(SIGCHLD, info, Target::Process);
                 let sched = self.sched_of(parent);
-                w.signal_wake(parent, sched);
+                w.signal_wake(parent, sched, false);
             }
         }
         w.child_event(parent);

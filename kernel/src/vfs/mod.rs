@@ -361,6 +361,11 @@ pub struct Vfs {
     pub files: FileTable,
     pipes: Vec<Option<pipe::Pipe>>,
     next_pipe_ino: u64,
+    /// Pipe state changes so far (every mutable access to a pipe, every end
+    /// released) and how many of them the scheduler has been told about
+    /// ([`Vfs::take_pipe_events`]): the VFS is pure and cannot wake a sleeper.
+    pipe_events: u64,
+    pipe_events_seen: u64,
     /// Open file descriptions held by mappings (`vma->vm_file`).
     pins: Vec<mapping::Pin>,
     /// A write or truncate hit a file whose mapped pages are private copies.
@@ -382,6 +387,8 @@ impl Vfs {
             files: FileTable::default(),
             pipes: Vec::new(),
             next_pipe_ino: 1,
+            pipe_events: 0,
+            pipe_events_seen: 0,
             pins: Vec::new(),
             coherence_lost: false,
             zero_mapped: false,

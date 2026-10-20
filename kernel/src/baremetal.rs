@@ -85,13 +85,13 @@ const DEFAULT_PAUSE_MS: usize = 6000;
 /// slow framebuffer should not come near this.
 const DEFAULT_TIMEOUT_S: u64 = 120;
 /// Groups that sleep on the monotonic clock and so cannot run without it.
-const NEEDS_CLOCK: [&str; 3] = ["time", "signal", "fork"];
+const NEEDS_CLOCK: [&str; 5] = ["time", "signal", "fork", "proc", "jobctl"];
 const CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_PROOFS: usize = 40;
 /// Inventory facts the summary repeats: cpu, memory, platform, time, display, pci, adapters.
 const KEYS: usize = 7;
 const NONE: usize = usize::MAX;
-const MAX_GROUPS: usize = 8;
+const MAX_GROUPS: usize = 10;
 /// Extra `suite_groups=` words of the QEMU harness: `/init` modes that end a
 /// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not; a
 /// loop that never ends; the same loop in a child while init waits for it, so the time bound

@@ -9,8 +9,9 @@
 // Transformation: no LSM or audit hook; a signal reaches the target's
 // [`crate::signal::State`] through its [`super::tasklist::Tasklist`] slot;
 // waking the target is [`super::exit::Waker::signal_wake`]. Kernel threads do
-// not exist, so `kill(-1)` here reaches only user tasks (the binary keeps
-// stopping loudly on it until they do).
+// not exist, so `kill(-1)` here reaches only user tasks. The stop and continue
+// effects of a signal are `crate::signal::jobctl`'s; this file wakes what they
+// release.
 #![forbid(unsafe_code)]
 //! The `kill` family over the task list: target selection, permission and
 //! delivery.
@@ -20,7 +21,7 @@ use super::{
     pid::{PidId, PidType},
     tasklist::{TaskId, Tasklist},
 };
-use crate::signal::{NSIG, info::SigInfo, state::Target, valid_signal};
+use crate::signal::{NSIG, info::SigInfo, jobctl::JOBCTL_STOPPED, state::Target, valid_signal};
 use syscalls::Errno;
 
 /// `PIDTYPE_PID` (a thread) or the group (`PIDTYPE_TGID`, `PGID`, `MAX`).
@@ -75,6 +76,7 @@ impl Tasklist {
 
     fn deliver(
         &mut self,
+        sender: Option<TaskId>,
         target: TaskId,
         sig: i32,
         info: SigInfo,
@@ -90,10 +92,22 @@ impl Tasklist {
             SendTo::Thread => Target::Thread,
             SendTo::Group => Target::Process,
         };
-        let mut state = self.signal_state(target).ok_or(Errno::ESRCH)?;
+        // `task_curr(target)`: a task signalling itself (a single CPU runs one
+        // task, and the sender is it).
+        let mut state = self
+            .signal_state_as(target, sender == Some(target))
+            .ok_or(Errno::ESRCH)?;
+        let was_stopped = state.me.jobctl & JOBCTL_STOPPED != 0;
         let result = state.send_signal(sig, info, kind);
+        // `signal_wake_up(t, fatal)`: a fatal signal also wakes a stopped
+        // task; `SIGCONT` ended the stop in `prepare_signal`.
+        let resume = state.fatal_signal_pending();
+        let continued = was_stopped && state.me.jobctl & JOBCTL_STOPPED == 0;
         let sched = self.sched_of(target);
-        w.signal_wake(target, sched);
+        if continued {
+            w.wake_stopped(target, sched);
+        }
+        w.signal_wake(target, sched, resume);
         result
     }
 
@@ -116,7 +130,7 @@ impl Tasklist {
         if sig == 0 {
             return Ok(());
         }
-        self.deliver(target, sig, info, to, w)
+        self.deliver(sender, target, sig, info, to, w)
     }
 
     /// `__kill_pgrp_info`: success if any member accepted the signal, else

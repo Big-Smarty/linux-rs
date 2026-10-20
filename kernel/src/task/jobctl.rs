@@ -4,20 +4,37 @@
 // `setpgid` 1114-1190, `do_getpgid` 1192-1214, `getpgid`, `getpgrp`, `getsid`
 // 1229-1252, `set_special_pids` 1254-1263, `ksys_setsid` 1265-1302),
 // kernel/fork.c and fs/exec.c (`PF_FORKNOEXEC` set by `copy_process` and
-// cleared by `begin_new_exec`). All GPL-2.0-only.
+// cleared by `begin_new_exec`), kernel/signal.c (`do_signal_stop` 2636-2722 and
+// the `SIGNAL_CLD_MASK` step of `get_signal` 2913-2940, whose state half is
+// `crate::signal::jobctl`). All GPL-2.0-only.
 // Transformation: no LSM hook (`security_task_*` allow); no `proc_clear_tty`
 // (no controlling terminal: `signal->tty` does not exist), no
 // `sched_autogroup_create_attach`, no connector event; the pid re-linking
 // reserves its capacity first, so `ENOMEM` can replace success only when the
 // heap is exhausted.
 #![forbid(unsafe_code)]
-//! Process groups and sessions: `setpgid`, `getpgid`, `getsid`, `setsid`.
+//! Process groups and sessions: `setpgid`, `getpgid`, `getsid`, `setsid`; and
+//! the task-list half of a group stop.
 
 use super::{
+    exit::{CLD_STOPPED, Waker},
     pid::PidType,
     tasklist::{PF_FORKNOEXEC, TaskId, Tasklist},
 };
+use crate::signal::jobctl::SignalStop;
 use syscalls::Errno;
+
+/// What [`Tasklist::signal_stop`] decided for the running task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopPlan {
+    /// The group stop was cancelled in the meantime (`SIGCONT`, `SIGKILL`):
+    /// carry on with the next signal.
+    Carry,
+    /// The task is committed to stop and the parent has been told. `fatal`: a
+    /// fatal signal is already pending, so the task must not sleep
+    /// (`signal_pending_state` in `__schedule` returns it to the run queue).
+    Stop { fatal: bool },
+}
 
 impl Tasklist {
     /// `setpgid(pid, pgid)` as `current` (`group_leader`) calls it; `pid` and
@@ -135,5 +152,40 @@ impl Tasklist {
             t.self_exec_id = t.self_exec_id.wrapping_add(1);
         }
         self.publish_cred(task, cred);
+    }
+
+    /// `do_signal_stop(signr)` for the running task `task`, up to the sleep:
+    /// the group stop is started and joined ([`crate::signal::State::do_signal_stop`]),
+    /// and when this task completed a fresh stop the real parent is told
+    /// `CLD_STOPPED` (`do_notify_parent_cldstop`: `SIGCHLD` unless ignored or
+    /// `SA_NOCLDSTOP`, the `wait` sleepers woken either way). The caller then
+    /// leaves the CPU in `TASK_STOPPED` unless [`StopPlan::Stop::fatal`].
+    pub fn signal_stop(&mut self, task: TaskId, signr: u8, w: &mut dyn Waker) -> StopPlan {
+        let Some(mut state) = self.signal_state_as(task, true) else {
+            return StopPlan::Carry;
+        };
+        match state.do_signal_stop(signr) {
+            SignalStop::NotStopped => StopPlan::Carry,
+            SignalStop::Stop { notify } => {
+                let fatal = state.fatal_signal_pending();
+                if notify {
+                    self.do_notify_parent_cldstop(task, CLD_STOPPED, w);
+                }
+                StopPlan::Stop { fatal }
+            }
+        }
+    }
+
+    /// The `SIGNAL_CLD_MASK` step at the top of `get_signal`: a task that was
+    /// stopped and woke (or a group whose stop `SIGCONT` cancelled) owes its
+    /// parent the `CLD_CONTINUED` (or `CLD_STOPPED`) notification; the bits are
+    /// cleared first. A no-op when nothing is owed.
+    pub fn notify_job_control(&mut self, task: TaskId, w: &mut dyn Waker) {
+        let why = self
+            .signal_state_as(task, true)
+            .and_then(|mut state| state.take_cld_notification());
+        if let Some(why) = why {
+            self.do_notify_parent_cldstop(task, why, w);
+        }
     }
 }

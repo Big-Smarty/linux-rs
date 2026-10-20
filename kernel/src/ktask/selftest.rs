@@ -220,7 +220,7 @@ extern "C" fn controller(_: usize) {
             || wake_up_key(WaitKey::NONE, WakeMode::Normal, 0) != 0,
     );
     bad_if(state(keyed) != Some(TaskState::Interruptible));
-    bad_if(!signal_wake_up(keyed));
+    bad_if(!signal_wake_up(keyed, false));
     for _ in 0..4 {
         schedule();
     }
@@ -238,7 +238,7 @@ extern "C" fn controller(_: usize) {
     // The unkeyed sleeper is woken by a signal wake-up (and not by the key).
     bad_if(wake_up_key(KEY_WAITED, WakeMode::Normal, 0) != 0);
     SIGNAL_FLAG.store(true, Ordering::Relaxed);
-    bad_if(!signal_wake_up(signalled));
+    bad_if(!signal_wake_up(signalled, false));
     DONE.fetch_add(1, Ordering::Relaxed);
 }
 

@@ -915,14 +915,28 @@ impl Vfs {
             .expect("stale pipe handle")
     }
 
-    /// Mutable access to a pipe.
+    /// Mutable access to a pipe. Counts as a state change for the sleepers of
+    /// the pipe ([`Vfs::take_pipe_events`]): data written or consumed, the
+    /// capacity changed.
     ///
     /// # Panics
     /// On a stale handle (a kernel bug).
     pub fn pipe_mut(&mut self, id: super::PipeId) -> &mut Pipe {
+        self.pipe_events = self.pipe_events.wrapping_add(1);
         self.pipes[id.0 as usize]
             .as_mut()
             .expect("stale pipe handle")
+    }
+
+    /// Whether any pipe changed since the last call: the owner of the
+    /// scheduler then wakes the pipe sleepers (`wake_up_interruptible` on
+    /// `rd_wait`/`wr_wait`, which the pure VFS cannot do), before it sleeps
+    /// itself and when the system call ends. A pipe end released (`pipe_release`
+    /// wakes both queues) is a change too.
+    pub fn take_pipe_events(&mut self) -> bool {
+        let changed = self.pipe_events != self.pipe_events_seen;
+        self.pipe_events_seen = self.pipe_events;
+        changed
     }
 
     /// Shared access for the syscall layer.

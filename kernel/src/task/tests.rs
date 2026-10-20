@@ -19,17 +19,17 @@ use super::{
         CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, ExitPrep, Notified, Waker,
     },
     pid::PidType,
-    tasklist::{
-        CredSnapshot, ExitState, ForkParams, JOBCTL_STOPPED, PF_FORKNOEXEC, TaskId, Tasklist,
-    },
+    tasklist::{CredSnapshot, ExitState, ForkParams, PF_FORKNOEXEC, TaskId, Tasklist},
     wait::{
         P_ALL, P_PGID, P_PID, P_PIDFD, WALL, WCLONE, WCONTINUED, WEXITED, WNOHANG, WNOWAIT,
         WUNTRACED, WaitOpts,
     },
 };
+use super::{jobctl::StopPlan, kill::SendTo};
 use crate::signal::{
     SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_DFL, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, SIGKILL, SIGSTOP,
-    SIGTERM, SIGUSR1, SigAction, SigSet, deliver::ERESTARTSYS, info::SigInfo,
+    SIGTERM, SIGTSTP, SIGUSR1, SigAction, SigSet, deliver::ERESTARTSYS, info::SigInfo,
+    jobctl::JOBCTL_STOPPED,
 };
 use std::vec::Vec;
 use syscalls::Errno;
@@ -46,13 +46,20 @@ const FORK: ForkParams = ForkParams {
 struct Rec {
     child_events: Vec<TaskId>,
     signal_wakes: Vec<TaskId>,
+    /// `(task, resume)` of every `signal_wake`.
+    resumes: Vec<(TaskId, bool)>,
+    stopped_wakes: Vec<TaskId>,
 }
 impl Waker for Rec {
     fn child_event(&mut self, parent: TaskId) {
         self.child_events.push(parent);
     }
-    fn signal_wake(&mut self, task: TaskId, _sched: Option<crate::sched::SchedId>) {
+    fn signal_wake(&mut self, task: TaskId, _sched: Option<crate::sched::SchedId>, resume: bool) {
         self.signal_wakes.push(task);
+        self.resumes.push((task, resume));
+    }
+    fn wake_stopped(&mut self, task: TaskId, _sched: Option<crate::sched::SchedId>) {
+        self.stopped_wakes.push(task);
     }
 }
 
@@ -557,7 +564,7 @@ fn stop_and_continue_are_reported_once() {
     assert_eq!(wait_pid(&mut l, init, 2, WUNTRACED | WNOHANG).0, 0);
     {
         let t = l.task_mut(child).unwrap();
-        t.jobctl |= JOBCTL_STOPPED;
+        t.signals.thread.jobctl |= JOBCTL_STOPPED;
         t.signals.signal.job_flags = super::exit::SIGNAL_STOP_STOPPED;
         t.signals.signal.stop_code = u32::from(SIGSTOP);
     }
@@ -581,7 +588,7 @@ fn stop_and_continue_are_reported_once() {
     // Continue: the task runs again, SIGNAL_STOP_CONTINUED is pending.
     {
         let t = l.task_mut(child).unwrap();
-        t.jobctl &= !JOBCTL_STOPPED;
+        t.signals.thread.jobctl &= !JOBCTL_STOPPED;
         t.signals.signal.job_flags = super::exit::SIGNAL_STOP_CONTINUED;
     }
     assert_eq!(wait_pid(&mut l, init, 2, WNOHANG).0, 0, "needs WCONTINUED");
@@ -1088,14 +1095,19 @@ impl Waker for RqWaker<'_> {
             1,
         );
     }
-    fn signal_wake(&mut self, task: TaskId, sched: Option<crate::sched::SchedId>) {
+    fn signal_wake(&mut self, task: TaskId, sched: Option<crate::sched::SchedId>, resume: bool) {
         if task == self.init.0 {
             assert_eq!(
                 sched,
                 Some(self.init.1),
                 "the model passes the bound handle"
             );
-            self.rq.wake_interruptible(self.init.1);
+            self.rq.signal_wake_up_state(self.init.1, resume);
+        }
+    }
+    fn wake_stopped(&mut self, task: TaskId, sched: Option<crate::sched::SchedId>) {
+        if task == self.init.0 {
+            self.rq.wake_stopped(sched.unwrap());
         }
     }
 }
@@ -1231,4 +1243,235 @@ fn clone_clear_sighand_flushes_like_exec_and_keeps_sig_ign() {
     };
     assert_eq!(hand(&mut l, plain), ((0x1000, 4, 0x2000), (SIG_IGN, 0)));
     assert_eq!(hand(&mut l, cleared), ((SIG_DFL, 0, 0), (SIG_IGN, 0)));
+}
+
+// ---- job control: group stop, SIGCONT, wake-ups ---------------------------------
+
+/// `child` has dequeued stop signal `sig` (`get_signal`'s `dequeue_signal`).
+fn dequeue_stop(l: &mut Tasklist, child: TaskId, sig: u8) {
+    let mut state = l.signal_state_as(child, true).unwrap();
+    state
+        .send_signal(
+            sig,
+            SigInfo::kernel(sig),
+            crate::signal::state::Target::Process,
+        )
+        .unwrap();
+    assert_eq!(state.dequeue_signal().unwrap().0, sig);
+}
+
+/// The queued `SIGCHLD` of `parent`, taken even when it is blocked.
+fn sigchld_info(l: &mut Tasklist, parent: TaskId) -> Option<SigInfo> {
+    l.signal_state(parent)
+        .unwrap()
+        .dequeue_signal_masked(SigSet::EMPTY)
+        .map(|(_, info)| info)
+}
+
+#[test]
+fn a_group_stop_tells_the_parent_once_and_wait_reports_it() {
+    let (mut l, init) = list();
+    let child = l.fork(init, FORK).unwrap();
+    // SIGCHLD is ignored by default: block it to see what is queued.
+    l.signal_state(init).unwrap().me.blocked.add(SIGCHLD);
+    let mut w = Rec::default();
+    // No stop signal dequeued (a SIGCONT overruled it): nothing happens.
+    assert_eq!(l.signal_stop(child, SIGTSTP, &mut w), StopPlan::Carry);
+    assert!(w.child_events.is_empty());
+    dequeue_stop(&mut l, child, SIGTSTP);
+    assert_eq!(
+        l.signal_stop(child, SIGTSTP, &mut w),
+        StopPlan::Stop { fatal: false }
+    );
+    assert_eq!(w.child_events, [init]);
+    let info = sigchld_info(&mut l, init).unwrap();
+    assert_eq!(
+        (info.code, info.to_bytes()[24], i32::from(SIGCHLD)),
+        (CLD_STOPPED, SIGTSTP, info.signo)
+    );
+    // wait4(WUNTRACED) sees it, once.
+    let (ret, wo) = wait_pid(&mut l, init, 2, WUNTRACED);
+    assert_eq!((ret, wo.stat), (2, (i32::from(SIGTSTP) << 8) | 0x7f));
+    assert_eq!(wait_pid(&mut l, init, 2, WUNTRACED | WNOHANG).0, 0);
+    // A second stop signal while stopped: the task stops again, nobody is told.
+    dequeue_stop(&mut l, child, SIGSTOP);
+    assert_eq!(
+        l.signal_stop(child, SIGSTOP, &mut w),
+        StopPlan::Stop { fatal: false }
+    );
+    assert_eq!(w.child_events, [init], "no new notification");
+    assert!(sigchld_info(&mut l, init).is_none());
+}
+
+#[test]
+fn a_fatal_signal_pending_keeps_the_task_from_sleeping() {
+    let (mut l, init) = list();
+    let child = l.fork(init, FORK).unwrap();
+    dequeue_stop(&mut l, child, SIGSTOP);
+    l.signal_state_as(child, true).unwrap().start_group_exit(9);
+    // do_signal_stop refuses a dying group outright ...
+    assert_eq!(
+        l.signal_stop(child, SIGSTOP, &mut Rec::default()),
+        StopPlan::Carry
+    );
+    // ... and a SIGKILL that is pending for a task that cannot start a group exit (it is
+    // exiting) is reported to the caller, which then does not sleep.
+    let (mut l, init) = list();
+    let child = l.fork(init, FORK).unwrap();
+    let _ = init;
+    dequeue_stop(&mut l, child, SIGSTOP);
+    l.task_mut(child).unwrap().flags |= super::tasklist::PF_EXITING;
+    l.signal_state_as(child, true)
+        .unwrap()
+        .send_signal(
+            SIGKILL,
+            SigInfo::kernel(SIGKILL),
+            crate::signal::state::Target::Process,
+        )
+        .unwrap();
+    assert_eq!(
+        l.signal_stop(child, SIGSTOP, &mut Rec::default()),
+        StopPlan::Stop { fatal: true }
+    );
+}
+
+#[test]
+fn sigcont_wakes_the_stopped_task_and_the_woken_task_notifies_the_parent() {
+    let (mut l, init) = list();
+    let child = l.fork(init, FORK).unwrap();
+    l.signal_state(init).unwrap().me.blocked.add(SIGCHLD);
+    dequeue_stop(&mut l, child, SIGSTOP);
+    let mut w = Rec::default();
+    l.signal_stop(child, SIGSTOP, &mut w);
+    let _ = sigchld_info(&mut l, init);
+    let me = Some(init);
+    let info = SigInfo::from_kill(SIGCONT, false, 1, 0);
+    // SIGCONT from the parent: the stop ends, the stopped task is woken, nothing is
+    // queued (default action: ignore) and the notification is still owed.
+    let mut w = Rec::default();
+    l.group_send_sig_info(me, i32::from(SIGCONT), info, child, SendTo::Group, &mut w)
+        .unwrap();
+    assert_eq!(w.stopped_wakes, [child]);
+    assert_eq!(pending(&mut l, child).0, 0);
+    // wait: the stop report is gone, the continue is there.
+    assert_eq!(wait_pid(&mut l, init, 2, WUNTRACED | WNOHANG).0, 0);
+    let (ret, wo) = wait_pid(&mut l, init, 2, WCONTINUED);
+    assert_eq!((ret, wo.stat), (2, 0xffff));
+    // The task, once awake, tells the parent (`get_signal`'s SIGNAL_CLD_MASK step), once.
+    let mut w = Rec::default();
+    l.notify_job_control(child, &mut w);
+    let info = sigchld_info(&mut l, init).unwrap();
+    assert_eq!((info.code, info.to_bytes()[24]), (CLD_CONTINUED, SIGCONT));
+    assert_eq!(w.child_events, [init]);
+    let mut w = Rec::default();
+    l.notify_job_control(child, &mut w);
+    assert!(w.child_events.is_empty() && sigchld_info(&mut l, init).is_none());
+    // SIGCONT to a task that is not stopped wakes no stopped task.
+    let mut w = Rec::default();
+    l.group_send_sig_info(
+        me,
+        i32::from(SIGCONT),
+        info_of(SIGCONT),
+        child,
+        SendTo::Group,
+        &mut w,
+    )
+    .unwrap();
+    assert!(w.stopped_wakes.is_empty());
+}
+
+fn info_of(sig: u8) -> SigInfo {
+    SigInfo::from_kill(sig, false, 1, 0)
+}
+
+#[test]
+fn only_a_fatal_signal_resumes_a_stopped_task_besides_sigcont() {
+    let (mut l, init) = list();
+    let child = l.fork(init, FORK).unwrap();
+    dequeue_stop(&mut l, child, SIGSTOP);
+    l.signal_stop(child, SIGSTOP, &mut Rec::default());
+    let send = |l: &mut Tasklist, sig: u8| {
+        let mut w = Rec::default();
+        l.group_send_sig_info(
+            Some(init),
+            i32::from(sig),
+            info_of(sig),
+            child,
+            SendTo::Group,
+            &mut w,
+        )
+        .unwrap();
+        w
+    };
+    // SIGTERM would kill a running task; a stopped one keeps it pending and sleeps on.
+    let w = send(&mut l, SIGTERM);
+    assert_eq!(w.resumes, [(child, false)]);
+    assert!(pending(&mut l, child).contains(SIGTERM));
+    assert_eq!(l.task(child).unwrap().signals.signal.group_exit, None);
+    // A signal with a handler is queued the same way.
+    l.signal_state(child).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+    let w = send(&mut l, SIGUSR1);
+    assert_eq!(w.resumes, [(child, false)]);
+    // SIGKILL starts the group exit and asks for a resume.
+    let w = send(&mut l, SIGKILL);
+    assert_eq!(w.resumes, [(child, true)]);
+    assert_eq!(l.task(child).unwrap().signals.signal.group_exit, Some(9));
+}
+
+#[test]
+fn a_task_signalling_itself_is_the_current_task() {
+    // wants_signal: `task_curr(p) || !task_sigpending(p)`.
+    let (mut l, init) = list();
+    let child = l.fork(init, FORK).unwrap();
+    l.signal_state(child).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+    let mut w = Rec::default();
+    let send = |l: &mut Tasklist, sender: TaskId, sig: u8, w: &mut Rec| {
+        l.group_send_sig_info(
+            Some(sender),
+            i32::from(sig),
+            info_of(sig),
+            child,
+            SendTo::Group,
+            w,
+        )
+        .unwrap();
+    };
+    // Another task sends a handled signal, then a fatal one: the first is pending, so the
+    // second is left to the child (not yet a group exit) ...
+    send(&mut l, init, SIGUSR1, &mut w);
+    send(&mut l, init, SIGTERM, &mut w);
+    assert_eq!(l.task(child).unwrap().signals.signal.group_exit, None);
+    // ... while the child's own fatal signal, with those pending, starts it.
+    send(&mut l, child, SIGHUP, &mut w);
+    assert_eq!(
+        l.task(child).unwrap().signals.signal.group_exit,
+        Some(u32::from(SIGHUP))
+    );
+}
+
+#[test]
+fn a_stopped_member_of_a_newly_orphaned_group_is_hung_up_then_continued() {
+    // kill_orphaned_pgrp: SIGHUP, then SIGCONT; the SIGCONT wakes the stopped member, which
+    // then dequeues the SIGHUP (here: queued behind the stop, as a stopped task wants nothing).
+    let (mut l, init) = list();
+    let shell = l.fork(init, FORK).unwrap();
+    l.setsid(shell).unwrap();
+    let job = l.fork(shell, FORK).unwrap();
+    let pgid = pid(&l, job);
+    l.setpgid(shell, pgid, pgid).unwrap();
+    dequeue_stop(&mut l, job, SIGSTOP);
+    l.signal_stop(job, SIGSTOP, &mut Rec::default());
+    let mut w = Rec::default();
+    exit(&mut l, shell, 0, &mut w);
+    assert_eq!(w.stopped_wakes, [job], "SIGCONT woke the stopped member");
+    assert!(pending(&mut l, job).contains(SIGHUP));
+    assert_eq!(
+        l.task(job).unwrap().signals.signal.group_exit,
+        None,
+        "stopped when SIGHUP arrived"
+    );
+    assert_ne!(
+        l.task(job).unwrap().signals.signal.job_flags & super::exit::SIGNAL_CLD_CONTINUED,
+        0
+    );
 }

@@ -352,15 +352,13 @@ fn status(result: Result<(), Errno>) -> i64 {
     result.map_or_else(err, |()| 0)
 }
 
-/// `kill(pid, sig)`. `None` means the target selection (`pid == 0`: the
-/// caller's process group, `pid == -1`: every process) depends on a process
-/// table this model does not have; the caller reports an unimplemented
-/// syscall instead of guessing.
-///
-/// shortcut: a positive `pid` other than this process is `ESRCH` and a
-/// `pid < -1` (a process group other than init's, which has pgid <= 1) is
-/// `ESRCH`; that is exact for a system with one process and wrong the moment a
-/// second exists. Upgrade with the pid table (`find_vpid`, `__kill_pgrp_info`).
+/// `kill(pid, sig)` for a process table of one: the caller's own pid, a
+/// positive `pid` other than it and a `pid < -1` are `ESRCH`. `None` for
+/// `pid == 0` (the caller's group) and `pid == -1` (everyone), which need the
+/// task list: the binary sends the caller's own pid through here (the signal
+/// state is the caller's own, so the delivery needs no lock) and everything else
+/// through `Tasklist::kill_something_info`, which is exact for any number of
+/// processes.
 pub fn sys_kill(state: &mut State, pid: u64, sig: u64) -> Option<i64> {
     let (pid, sig) = (int(pid), int(sig));
     Some(if pid > 0 {

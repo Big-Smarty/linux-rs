@@ -44,7 +44,8 @@
 //!   list knows it, [`cancel_new_task`] gives it back if the fork fails;
 //! * [`start_init`] for the first user task;
 //! * [`sleep_current`] for every blocking wait (`signal::Task::wait` is its only
-//!   caller), [`wake_up_key`] / [`signal_wake_up`] to end one, and
+//!   caller), [`wake_up_key`] / [`signal_wake_up`] to end one, [`stop_current`] /
+//!   [`wake_stopped`] for a job-control stop and its `SIGCONT`, and
 //!   [`exit_current`] at the end of `do_exit`;
 //! * [`current`] to find out who it is running as, [`cpu_account`] for the
 //!   task's CPU-time account.
@@ -531,10 +532,37 @@ pub fn wake_up_key(key: WaitKey, mode: WakeMode, nr_exclusive: usize) -> usize {
     RQ.lock().wake_up_key(key, mode, nr_exclusive)
 }
 
-/// `signal_wake_up`: wake an interruptible sleeper (the signal sender calls it
-/// after queueing the signal). Whether it was asleep.
-pub fn signal_wake_up(id: SchedId) -> bool {
-    RQ.lock().wake_interruptible(id)
+/// `signal_wake_up(t, resume)`: wake an interruptible sleeper (the signal
+/// sender calls it after queueing the signal); with `resume` (a fatal signal,
+/// `TASK_WAKEKILL`) a job-control-stopped task too. Whether it was asleep.
+pub fn signal_wake_up(id: SchedId, resume: bool) -> bool {
+    RQ.lock().signal_wake_up_state(id, resume)
+}
+
+/// `wake_up_state(t, __TASK_STOPPED)`: `SIGCONT` ends a job-control stop.
+/// Whether the task was stopped.
+pub fn wake_stopped(id: SchedId) -> bool {
+    RQ.lock().wake_stopped(id)
+}
+
+/// The tail of `do_signal_stop`: `set_special_state(TASK_STOPPED)` and
+/// `schedule()`. The current task leaves the CPU until [`wake_stopped`]
+/// (`SIGCONT`) or a fatal signal's [`signal_wake_up`] with `resume` ends the
+/// stop, then returns. The caller has decided to stop (no fatal signal was
+/// pending) with IF=0 just before, so nothing can wake the task between the
+/// state change and the switch (single CPU, no preemption of ring 0).
+///
+/// Context: task, IF=0, no lock held (nothing is held across `schedule()`).
+///
+/// # Panics
+/// With interrupts enabled, before [`init`], or from the idle task.
+pub fn stop_current() {
+    assert!(
+        !cpu::interrupts_enabled(),
+        "stop_current with interrupts on"
+    );
+    RQ.lock().stop_current();
+    schedule();
 }
 
 /// `schedule()`: give the CPU to the next runnable task, or to idle. A caller

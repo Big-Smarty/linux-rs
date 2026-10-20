@@ -16,7 +16,8 @@
 // fs/open.c (`do_sys_ftruncate`). All GPL-2.0 / GPL-2.0-only.
 // Transformation: the user-space iterators become `Dest`/bounce-buffer loops
 // with the same page-sized fault granularity; waits are interruptible sleeps
-// that end in `Stop::Blocked` when nothing could wake the one task.
+// on `sched::PIPE_KEY` (the pipe wait queues), woken when another task changes
+// a pipe ([`crate::vfs::Vfs::take_pipe_events`]).
 // x86_64 only: `usize` is 64 bits, and the narrowing/sign casts below are the
 // C types of the Linux ABI (`unsigned int` descriptors, `off_t`, `umode_t`,
 // 32-bit inode numbers) reproduced on purpose.
@@ -27,20 +28,25 @@
 )]
 //! Descriptor-based file syscalls.
 //!
-//! Context: task context. The one task cannot be woken by another one or by a
-//! device, so an operation that would sleep (an empty pipe or console, a full
-//! pipe) sleeps interruptibly ([`interruptible_wait`]): it ends with
-//! `-ERESTARTSYS` when a signal arrives (an `ITIMER_REAL` expiry is the only
-//! source), and in [`Stop::Blocked`], a loud stop, when nothing could ever wake
-//! it. `SIGPIPE` and `SIGXFSZ` are sent with `send_sig` as in Linux.
+//! Context: task context. An operation that would sleep (an empty pipe or
+//! console, a full pipe) sleeps interruptibly
+//! ([`wait_event_interruptible`](crate::signal::wait::wait_event_interruptible)):
+//! a pipe operation on [`PIPE_KEY`], woken by whichever task changes the pipe
+//! or closes an end of it, and the console read until a signal arrives (no
+//! input source exists). It ends with `-ERESTARTSYS` when a signal is pending
+//! and nothing was transferred; a partial transfer is returned as it is. No
+//! guard of the shared state is held while the task sleeps (the context drops
+//! it in [`signal::Task::wait`](crate::signal::Task::wait)), so another task
+//! runs system calls meanwhile and the loops re-read everything after a sleep.
+//! `SIGPIPE` and `SIGXFSZ` are sent with `send_sig` as in Linux.
 
 use alloc::vec::Vec;
 use syscalls::{Errno, Sysno};
 
 use super::{Context, MAX_RW_COUNT, Outcome, Stop, Sys, io, outcome};
 use crate::{
-    sched::WaitKey,
-    signal::{SIGPIPE, SIGXFSZ, wait::ERESTARTSYS},
+    sched::{PIPE_KEY, WaitKey},
+    signal::{SIGPIPE, SIGXFSZ, wait::wait_event_interruptible},
     task::RLIM_INFINITY,
     usercopy::{access_ok, copy_from_user, copy_to_user},
     vfs::{
@@ -70,6 +76,8 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         Sysno::readv => readv(ctx, a[0], a[1], a[2]),
         Sysno::preadv => preadv(ctx, a[0], a[1], a[2], a[3]),
         Sysno::ioctl => ioctl(ctx, a[0], a[1], a[2]),
+        // `SYSCALL_DEFINE1(pipe, ...)`: `do_pipe2(fildes, 0)`.
+        Sysno::pipe => pipe2(ctx, a[0], 0),
         Sysno::pipe2 => pipe2(ctx, a[0], a[1]),
         Sysno::dup => dup(ctx, a[0]),
         Sysno::dup2 => dup2(ctx, a[0], a[1]),
@@ -323,9 +331,12 @@ fn read_kind<C: Context>(ctx: &mut C, view: &View, dest: &mut Dest, pos: Option<
             if view.flags & O_NONBLOCK != 0 {
                 Err(Errno::EAGAIN.into())
             } else {
-                // `n_tty_read`: `signal_pending` -> `-ERESTARTSYS`.
-                interruptible_wait(ctx)?;
-                Ok(-ERESTARTSYS)
+                // `n_tty_read`: `signal_pending` -> `-ERESTARTSYS`. Nothing ever
+                // delivers console input, so only a signal ends the sleep.
+                match wait_event_interruptible(ctx, WaitKey::NONE, |_| false) {
+                    Err(restart) => Ok(restart),
+                    Ok(()) => unreachable!("the condition never holds"),
+                }
             }
         }
         FileKind::Pipe {
@@ -389,6 +400,15 @@ fn read_zero<C: Context>(ctx: &mut C, dest: &mut Dest) -> Result<i64, Stop> {
     Ok(written)
 }
 
+/// `pipe_readable`: data, or no writer left (EOF).
+fn pipe_readable<C: Context>(ctx: &mut C, pipe: crate::vfs::PipeId) -> bool {
+    let p = ctx.files().vfs.pipe_ref(pipe);
+    !p.is_empty() || p.writers == 0
+}
+
+/// `anon_pipe_read`: copies buffer by buffer; a read that got something returns
+/// it (a short read), one that found nothing sleeps for a writer (`rd_wait`)
+/// unless the pipe has none (EOF) or is non-blocking.
 fn pipe_read<C: Context>(
     ctx: &mut C,
     view: &View,
@@ -402,18 +422,15 @@ fn pipe_read<C: Context>(
     let mut ret: i64 = 0;
     let mut bounce = [0u8; PAGE_SIZE];
     loop {
-        let (chars, empty) = {
+        let chars = {
             let p = ctx.files().vfs.pipe_ref(pipe);
-            match p.front() {
-                Some(front) => {
-                    let n = front
-                        .len()
-                        .min(usize::try_from(total_len).unwrap_or(usize::MAX));
-                    bounce[..n].copy_from_slice(&front[..n]);
-                    (Some(n), false)
-                }
-                None => (None, true),
-            }
+            p.front().map(|front| {
+                let n = front
+                    .len()
+                    .min(usize::try_from(total_len).unwrap_or(usize::MAX));
+                bounce[..n].copy_from_slice(&front[..n]);
+                n
+            })
         };
         if let Some(chars) = chars {
             let written = dest.copy_out(ctx, &bounce[..chars]);
@@ -434,38 +451,19 @@ fn pipe_read<C: Context>(
                 continue;
             }
         }
-        let _ = empty;
         if ctx.files().vfs.pipe_ref(pipe).writers == 0 || ret > 0 {
             break;
         }
         if view.flags & O_NONBLOCK != 0 {
             return Err(Errno::EAGAIN.into());
         }
-        // `wait_event_interruptible_exclusive(pipe->rd_wait, ...) < 0`: nothing
-        // was read, so the call restarts with no side effect.
-        interruptible_wait(ctx)?;
-        return Ok(-ERESTARTSYS);
+        // `wait_event_interruptible_exclusive(pipe->rd_wait, pipe_readable(pipe))
+        // < 0`: nothing was read, so the call restarts with no side effect.
+        if let Err(restart) = wait_event_interruptible(ctx, PIPE_KEY, |c| pipe_readable(c, pipe)) {
+            return Ok(restart);
+        }
     }
     Ok(ret)
-}
-
-/// `wait_event_interruptible` on a condition only another task or a device
-/// interrupt could make true, which the single task has none of: sleep until a
-/// signal is pending (`Ok`; the caller returns `-ERESTARTSYS`, or its partial
-/// result). The `ITIMER_REAL` expiry is the only wake-up source, so with none
-/// armed and no signal pending Linux would sleep forever and the kernel stops
-/// loudly ([`Stop::Blocked`]) instead of halting.
-fn interruptible_wait<C: Context>(ctx: &mut C) -> Result<(), Stop> {
-    // Checked on every wake-up, after the timers are brought up to date: an
-    // `ITIMER_REAL` that expired into an ignored or blocked `SIGALRM` leaves
-    // nothing that could end the wait.
-    let mut dead = false;
-    let _ = crate::signal::wait::wait_event_interruptible(ctx, WaitKey::NONE, |c| {
-        let state = c.state();
-        dead = !state.signal_pending() && state.sig.itimer.next_event().is_none();
-        dead
-    });
-    if dead { Err(Stop::Blocked) } else { Ok(()) }
 }
 
 // ---- write --------------------------------------------------------------------
@@ -672,6 +670,7 @@ fn pipe_write<C: Context>(
             }
             continue;
         }
+        // Wait for buffer space to become available.
         if view.flags & O_NONBLOCK != 0 {
             if ret == 0 {
                 return Err(Errno::EAGAIN.into());
@@ -679,15 +678,24 @@ fn pipe_write<C: Context>(
             break;
         }
         // `signal_pending` after the full-pipe checks: a partial write is
-        // returned, an empty one restarts; otherwise sleep until space (a
-        // signal, here) and look again.
-        interruptible_wait(ctx)?;
-        if ret == 0 {
-            return Ok(-ERESTARTSYS);
+        // returned, an empty one restarts; otherwise sleep for a reader to make
+        // room (`wr_wait`) or leave, then look at everything again.
+        // `wait_event_interruptible` tests its condition before the signals, so
+        // `Err` is a signal with the pipe still full (and a reader present).
+        if let Err(restart) = wait_event_interruptible(ctx, PIPE_KEY, |c| pipe_writable(c, pipe)) {
+            if ret == 0 {
+                return Ok(restart);
+            }
+            break;
         }
-        break;
     }
     Ok(i64::try_from(ret).unwrap_or(i64::MAX))
+}
+
+/// `pipe_writable`: room for a buffer, or no reader left (the write fails).
+fn pipe_writable<C: Context>(ctx: &mut C, pipe: crate::vfs::PipeId) -> bool {
+    let p = ctx.files().vfs.pipe_ref(pipe);
+    !p.is_full() || p.readers == 0
 }
 
 // ---- lseek --------------------------------------------------------------------
@@ -912,7 +920,7 @@ fn fcntl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
         F_GETFL => Ok(i64::from(view.flags)),
         F_SETFL => setfl(ctx, &view, argi),
         F_SETPIPE_SZ => match view.kind {
-            FileKind::Pipe { .. } => Err(Stop::Unimplemented),
+            FileKind::Pipe { pipe, .. } => pipe_set_size(ctx, pipe, argi),
             _ => Err(Errno::EBADF.into()),
         },
         F_GETPIPE_SZ => match view.kind {
@@ -927,6 +935,31 @@ fn fcntl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
         | F_SET_RW_HINT => Err(Stop::Unimplemented),
         _ => Err(Errno::EINVAL.into()),
     }
+}
+
+/// `pipe_set_size` (`F_SETPIPE_SZ`): the capacity becomes `arg` rounded up to a
+/// power of two pages (`round_pipe_size`); the call answers the new size.
+/// `EBUSY` when more buffers hold data than the new capacity has slots.
+/// The ring is not preallocated, so `ENOMEM` cannot happen here.
+///
+/// A task without `CAP_SYS_RESOURCE` is limited to `pipe_max_size` and to the
+/// per-user buffer budget (`account_pipe_buffers`, `pipe-user-pages-*`), which
+/// this kernel does not account: every task is root today (every credential
+/// syscall stops the kernel), and a non-root one stops loudly instead of
+/// skipping the checks.
+fn pipe_set_size<C: Context>(ctx: &mut C, pipe: crate::vfs::PipeId, arg: u32) -> Sys {
+    let Some(size) = crate::vfs::pipe::Pipe::round_pipe_size(arg) else {
+        return Err(Errno::EINVAL.into());
+    };
+    let nr_slots = (size >> 12) as usize;
+    if nr_slots == 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    if ctx.attrs().cred.euid != 0 {
+        return Err(Stop::Unimplemented);
+    }
+    ctx.files().vfs.pipe_mut(pipe).set_slots(nr_slots)?;
+    Ok(i64::from(size))
 }
 
 /// `f_dupfd`: `from` is the unsigned view of an `int`.

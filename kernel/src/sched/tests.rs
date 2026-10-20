@@ -338,3 +338,37 @@ fn a_task_that_never_ran_can_be_cancelled_and_its_slot_reused() {
     assert_eq!(rq.schedule().unwrap().next, queued);
     assert!(!rq.cancel_new_task(queued));
 }
+
+#[test]
+fn a_stopped_task_leaves_the_queue_and_only_sigcont_or_a_fatal_signal_wakes_it() {
+    // TASK_STOPPED = __TASK_STOPPED | TASK_WAKEKILL (do_signal_stop's set_special_state).
+    let mut rq = rq(6);
+    let [a, b] = [spawn(&mut rq), spawn(&mut rq)];
+    assert_eq!(rq.schedule().unwrap().next, a);
+    rq.stop_current();
+    let switch = rq.schedule().unwrap();
+    assert_eq!((switch.prev, switch.next), (a, b));
+    assert_eq!(rq.state(a), Some(TaskState::Stopped));
+    // Not on the queue, not counted as load (only uninterruptible sleepers are).
+    assert_eq!(rq.nr_active(), 1);
+    // No key, no TASK_NORMAL wake-up, no ordinary signal wake-up reaches it.
+    assert_eq!(rq.wake_up_key(WaitKey::NONE, WakeMode::Normal, 0), 0);
+    assert!(!rq.try_to_wake_up(a));
+    assert!(!rq.wake_interruptible(a));
+    assert!(!rq.signal_wake_up_state(a, false));
+    assert_eq!(rq.state(a), Some(TaskState::Stopped));
+    // SIGCONT wakes only a stopped task; a fatal signal (resume) wakes it too.
+    assert!(!rq.wake_stopped(b), "b is running");
+    assert!(rq.wake_stopped(a));
+    assert_eq!(rq.state(a), Some(TaskState::Running));
+    assert!(!rq.wake_stopped(a), "once");
+    // It runs again in queue order.
+    rq.prepare_to_wait(key(1), TaskState::Interruptible);
+    assert_eq!(rq.schedule().unwrap().next, a);
+    rq.stop_current();
+    assert_eq!(rq.schedule().unwrap().next, rq.idle());
+    assert!(rq.signal_wake_up_state(a, true));
+    assert!(rq.has_runnable());
+    // An interruptible sleeper still wakes without `resume`.
+    assert!(rq.signal_wake_up_state(b, false));
+}

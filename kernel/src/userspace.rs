@@ -78,9 +78,9 @@ use kernel::{
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     ratelimit::RateLimit,
-    sched::{SchedId, WaitKey, WakeMode},
+    sched::{PIPE_KEY, SchedId, WaitKey, WakeMode},
     signal::{
-        self, State,
+        self, SIGSTOP, State,
         deliver::{self, Outcome as SignalOutcome},
         frame::Sigreturn,
         info,
@@ -93,6 +93,7 @@ use kernel::{
         self, Attributes, TaskId, Tasklist,
         exit::{ExitPrep, Waker, chldexit_key},
         fork::ForkRequest,
+        jobctl::StopPlan,
         tasklist::ForkParams,
     },
     usercopy::{self, UserPages},
@@ -509,19 +510,38 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
 /// The task model's [`Waker`] on the scheduler's wait queues: `child_event` is
 /// `__wake_up_parent` (`__wake_up_sync_key` on the parent's `wait_chldexit`,
 /// `TASK_INTERRUPTIBLE`, one exclusive waiter), `signal_wake` is
-/// `signal_wake_up` on the task's scheduling handle (which the task list keeps,
-/// `Tasklist::set_sched`). Both take `RQ`, a leaf that any lock may precede
-/// (`services`).
+/// `signal_wake_up(t, resume)` on the task's scheduling handle (which the task
+/// list keeps, `Tasklist::set_sched`; `resume` also ends a job-control stop),
+/// and `wake_stopped` is `SIGCONT`'s `wake_up_state(t, __TASK_STOPPED)`. All
+/// take `RQ`, a leaf that any lock may precede (`services`).
 struct SchedWaker;
 
 impl Waker for SchedWaker {
     fn child_event(&mut self, parent: TaskId) {
         ktask::wake_up_key(chldexit_key(parent), WakeMode::Interruptible, 1);
     }
-    fn signal_wake(&mut self, _task: TaskId, sched: Option<SchedId>) {
+    fn signal_wake(&mut self, _task: TaskId, sched: Option<SchedId>, resume: bool) {
         if let Some(sched) = sched {
-            ktask::signal_wake_up(sched);
+            ktask::signal_wake_up(sched, resume);
         }
+    }
+    fn wake_stopped(&mut self, _task: TaskId, sched: Option<SchedId>) {
+        if let Some(sched) = sched {
+            ktask::wake_stopped(sched);
+        }
+    }
+}
+
+/// A pipe changed (data written or consumed, an end closed, the capacity
+/// changed) since the last look: wake its sleepers (`wake_up_interruptible` on
+/// `rd_wait`/`wr_wait`, and the `poll` sleepers, which share the key). The
+/// pure VFS only counts the changes ([`Vfs::take_pipe_events`]); this runs
+/// before a task sleeps itself (what it just wrote may be what the others wait
+/// for), when a system call ends, and when a task exits. Takes `RQ` under the
+/// caller's `PROCESS` lock, which the lock order allows.
+fn wake_pipe_sleepers(vfs: &mut Vfs) {
+    if vfs.take_pipe_events() {
+        ktask::wake_up_key(PIPE_KEY, WakeMode::Interruptible, 0);
     }
 }
 
@@ -847,7 +867,7 @@ struct FaultPages<'a, 'b> {
 /// The `State` view of a task's signal objects (`me` is in the task list for as
 /// long as it runs).
 fn current_signals(tasks: &mut Tasklist, me: TaskId) -> State<'_> {
-    if let Some(state) = tasks.signal_state(me) {
+    if let Some(state) = tasks.signal_state_as(me, true) {
         state
     } else {
         crate::log!("FAIL current task is not in the task list\n");
@@ -1279,6 +1299,10 @@ impl<'a> signal::Task for Syscall<'a> {
             .into_iter()
             .flatten()
             .min();
+        // What this call changed in a pipe may be what the sleepers wait for.
+        if let Some(process) = self.shared.guard.as_mut() {
+            wake_pipe_sleepers(&mut process.vfs);
+        }
         // No lock is held while the task is off the CPU: another task runs
         // system calls meanwhile. The time until it is chosen again is not
         // the task's (the switch marks it off the CPU).
@@ -1386,6 +1410,8 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
     shared.vfs.fput(own.exe_file);
     shared.vfs.close_files(&mut own.fdt);
     shared.vfs.put_fs(&own.attrs.fs);
+    // An end of a pipe closed with the last descriptor wakes the other side.
+    wake_pipe_sleepers(&mut shared.vfs);
     // The task's CPU time is what its parent's wait reports (cputime_adjust).
     let (utime, stime) = ktask::cpu_account(own.sched).adjusted(timer::ktime_get_ns());
     if let Some(task) = shared.tasks.task_mut(own.me) {
@@ -1456,24 +1482,17 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
             regs: &mut *regs,
             tty: Tty,
         };
-        syscall::dispatch(&mut context, number, args)
+        let outcome = syscall::dispatch(&mut context, number, args);
+        if let Some(process) = context.shared.guard.as_mut() {
+            wake_pipe_sleepers(&mut process.vfs);
+        }
+        outcome
     };
     match outcome {
         Outcome::Return(value) => regs.ax = value.cast_unsigned(),
         Outcome::Exit { code, group } => do_exit(code, group, false),
         Outcome::Unimplemented(number) => {
             crate::log!("FAIL syscall unimplemented nr={}\n", number);
-            crate::fail();
-        }
-        Outcome::Blocked(number) => {
-            // Linux would sleep on the pipe or the console. The wake-ups between
-            // tasks (a pipe end written or closed by another task, console input)
-            // are not ported, so the kernel stops loudly instead of returning
-            // early or sleeping forever.
-            crate::log!(
-                "FAIL syscall would block nr={}: cross-task wake-ups not implemented\n",
-                number
-            );
             crate::fail();
         }
     }
@@ -1495,6 +1514,11 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
 /// (the shared lock order). A fatal signal never returns: it ends the task
 /// ([`do_exit`]), and init's death panics, as Linux's `do_exit` does for pid 1.
 pub fn exit_to_user(regs: &mut cpu::PtRegs) {
+    // A job-control stop ended: `get_signal` carries on in the same call after
+    // `schedule()` returns (`goto relock`), so the restart rules of
+    // `arch_do_signal_or_restart` still run for a system call interrupted before
+    // the stop, though no signal is pending any more.
+    let mut after_stop = false;
     loop {
         // `exit_to_user_mode_loop`: `TIF_NEED_RESCHED` first; this task continues,
         // with everything re-examined below, when it is chosen again.
@@ -1502,6 +1526,12 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
         let mut local = current_local();
         let TaskLocal { tables, own } = &mut *local;
         let mut process = PROCESS.lock();
+        // `get_signal`'s `SIGNAL_CLD_MASK` step: a task that woke from a stop
+        // owes its parent the continue notification.
+        {
+            let Process { tasks, wake, .. } = &mut *process;
+            tasks.notify_job_control(own.me, wake);
+        }
         // Nothing to expire or dequeue: skip the clock read (`now_ns` is only
         // used when a pending SIGALRM leaves the queue).
         let pending = {
@@ -1510,7 +1540,7 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
                 state.sync_timers(timer::ktime_get_ns());
             }
             state.signal_pending()
-        };
+        } || core::mem::take(&mut after_stop);
         if pending {
             let outcome = {
                 let mut space = tables.user_space();
@@ -1532,8 +1562,30 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
                     do_exit(exit_code, true, true);
                 }
                 SignalOutcome::Stop(sig) => {
-                    crate::log!("FAIL signal stop unimplemented sig={}\n", sig);
-                    crate::fail();
+                    // The default action of a stop signal. "The job control
+                    // signals do nothing in an orphaned pgrp, but SIGSTOP always
+                    // works": the dequeued signal is dropped (`goto relock`).
+                    if sig != SIGSTOP && process.tasks.is_pgrp_orphaned(own.me) {
+                        after_stop = true;
+                        continue;
+                    }
+                    let me = own.me;
+                    let Process { tasks, wake, .. } = &mut *process;
+                    if let StopPlan::Stop { fatal } = tasks.signal_stop(me, sig, wake) {
+                        // `set_special_state(TASK_STOPPED)` and `schedule()`: no
+                        // guard is held while the task is off the CPU, and a
+                        // fatal signal already pending keeps it running (it
+                        // dies in the next pass). `SIGCONT` or `SIGKILL` wakes
+                        // it; the next pass is the `relock` that tells the
+                        // parent about the continue.
+                        drop(process);
+                        drop(local);
+                        if !fatal {
+                            ktask::stop_current();
+                        }
+                    }
+                    after_stop = true;
+                    continue;
                 }
             }
         }

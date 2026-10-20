@@ -14,9 +14,11 @@
 //!   syscall, interrupt or exception, only when [`State::signal_pending`] (or
 //!   a restart is possible; calling it when nothing is pending is harmless
 //!   and applies the restart rules, as `arch_do_signal_or_restart` does).
-//! * Not modelled, named blockers: ptrace stops, group stop/job control (a
-//!   default stop action is returned as [`Outcome::Stop`] and must not be
-//!   treated as success), core dumps (`RLIMIT_CORE` 0 for init: the exit code
+//! * Group stop is the caller's: a default stop action is returned as
+//!   [`Outcome::Stop`] and the task list and the scheduler carry it out
+//!   (`Tasklist::signal_stop`, then the sleep); after the task wakes the
+//!   caller runs the restart rules again, as `get_signal`'s `relock` does.
+//! * Not modelled, named blockers: ptrace stops, core dumps (`RLIMIT_CORE` 0 for init: the exit code
 //!   is just the signal), `TIF_SINGLESTEP`, uprobes, cgroup freezer.
 
 use super::{
@@ -114,7 +116,7 @@ pub enum GetSignal {
     /// code recorded when the group exit started). `core` means Linux would
     /// attempt a core dump for this signal.
     Fatal { exit_code: u32, core: bool },
-    /// The default action is a group stop (not modelled further).
+    /// The default action is a group stop.
     Stop(u8),
 }
 
@@ -157,8 +159,8 @@ pub fn get_signal(state: &mut State) -> GetSignal {
             continue;
         }
         if sig_kernel_stop(sig) {
-            // shortcut: group stop / job control is not modelled; the caller must
-            // treat this as unimplemented until the scheduler step exists.
+            // The caller does `do_signal_stop` (after the orphaned-group rule for
+            // the terminal stop signals), which needs the task list.
             return GetSignal::Stop(sig);
         }
         let exit_code = state.group_exit_code(u32::from(sig));

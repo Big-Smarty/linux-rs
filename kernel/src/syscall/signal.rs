@@ -96,10 +96,9 @@ fn kill_info<C: Context>(ctx: &mut C, sig: i32, thread: bool) -> SigInfo {
 /// own process, the `State`-level send for it.
 fn kill<C: Context>(ctx: &mut C, a: [u64; 6]) -> Outcome {
     let (pid, sig) = (int(a[0]), int(a[1]));
-    if i64::from(pid) == i64::from(ctx.tgid()) {
-        let Some(value) = sys_kill(&mut ctx.state(), a[0], a[1]) else {
-            return Outcome::Unimplemented(Sysno::kill as u32);
-        };
+    if i64::from(pid) == i64::from(ctx.tgid())
+        && let Some(value) = sys_kill(&mut ctx.state(), a[0], a[1])
+    {
         return Outcome::Return(value);
     }
     let info = kill_info(ctx, sig, false);

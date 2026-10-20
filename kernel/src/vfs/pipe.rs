@@ -2,13 +2,15 @@
 // Selected semantics from Linux 6.18.57, commit
 // 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: fs/pipe.c (GPL-2.0:
 // `anon_pipe_read`, `anon_pipe_write`, `create_pipe_files`, `alloc_pipe_info`,
-// `pipe_release`, `pipe_ioctl` FIONREAD, `pipe_fcntl`), include/linux/pipe_fs_i.h
-// (`PIPE_DEF_BUFFERS`, `pipe_buffer`). Copyright of the original: Linus
-// Torvalds and contributors.
+// `pipe_release`, `pipe_ioctl` FIONREAD, `pipe_fcntl`, `pipe_poll` 660,
+// `round_pipe_size` 1272, `pipe_resize_ring` 1291, `pipe_set_size` 1364),
+// include/linux/pipe_fs_i.h (`PIPE_DEF_BUFFERS`, `pipe_buffer`). Copyright of
+// the original: Linus Torvalds and contributors.
 // Transformation: the ring of `pipe_buffer`s is a vector of at most
-// `max_usage` page buffers; waiting is the caller's decision (a single task
-// that would sleep has nobody to wake it); no wait queues, fasync, watch queue,
-// packet mode or splice.
+// `max_usage` page buffers; waiting is the caller's decision (`syscall::fd`
+// sleeps on `sched::PIPE_KEY` and the owner of the scheduler wakes it when
+// [`crate::vfs::Vfs::take_pipe_events`] reports a change); no wait queues,
+// fasync, watch queue, packet mode, splice or per-user buffer accounting.
 #![forbid(unsafe_code)]
 //! Anonymous pipes. The syscall layer moves bytes between user memory and the
 //! buffers one page at a time, exactly as `anon_pipe_read`/`anon_pipe_write`
@@ -118,6 +120,33 @@ impl Pipe {
         let end = buf.offset + buf.len;
         buf.page[end..end + data.len()].copy_from_slice(data);
         buf.len += data.len();
+        Ok(())
+    }
+
+    /// `round_pipe_size`: the capacity in bytes `F_SETPIPE_SZ` gives for a
+    /// request of `size`, `None` (`0`: `EINVAL`) above `1 << 31`.
+    #[must_use]
+    pub fn round_pipe_size(size: u32) -> Option<u32> {
+        const PAGE: u32 = PAGE_SIZE as u32;
+        if size > 1 << 31 {
+            return None;
+        }
+        // Minimum pipe size, as required by POSIX.
+        if size < PAGE {
+            return Some(PAGE);
+        }
+        Some(size.next_power_of_two())
+    }
+
+    /// `pipe_resize_ring(pipe, nr_slots)`: the new capacity in pages.
+    ///
+    /// # Errors
+    /// `EBUSY` when more buffers than `nr_slots` hold data.
+    pub fn set_slots(&mut self, nr_slots: usize) -> KResult<()> {
+        if nr_slots < self.bufs.len() {
+            return Err(Errno::EBUSY);
+        }
+        self.max_usage = nr_slots;
         Ok(())
     }
 

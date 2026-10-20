@@ -76,6 +76,22 @@ impl Default for FakeClocks {
     }
 }
 
+/// What another task does to the shared state while this one sleeps.
+pub type WaitHook = Box<dyn FnOnce(&mut Vfs, &mut FdTable)>;
+
+/// The unwind payload of a fake wait that would sleep forever ([`would_hang`]).
+pub struct Hang;
+
+/// Run `call`; whether it ended in a wait that nothing could end (the state
+/// the call left is whatever it had done before sleeping).
+pub fn would_hang<R>(call: impl FnOnce() -> R) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(_) => false,
+        Err(payload) if payload.is::<Hang>() => true,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 pub struct Task<P = Space, C = Sink> {
     pub pages: P,
     pub sink: C,
@@ -118,6 +134,12 @@ pub struct Task<P = Space, C = Sink> {
     pub now: u64,
     /// Number of `Task::wait` calls.
     pub waits: usize,
+    /// Waits that no timer, signal or scripted event could end ([`Hang`]).
+    pub hangs: usize,
+    /// What other tasks do while this one sleeps: the next `wait` runs (and
+    /// consumes) the first hook against the shared state and returns, as the
+    /// wake-up it stands for would.
+    pub on_wait: Vec<WaitHook>,
     /// Signals the fake delivers to the process when the clock reaches `at`.
     pub script: Vec<(u64, u8)>,
     /// The value the fake `rt_sigreturn` reports.
@@ -175,6 +197,8 @@ impl<P, C> Task<P, C> {
             state,
             now: 0,
             waits: 0,
+            hangs: 0,
+            on_wait: Vec::new(),
             script: Vec::new(),
             sigreturn_ret: 0,
             forked: Vec::new(),
@@ -350,12 +374,22 @@ impl<P: UserPages, C> signal::Task for Task<P, C> {
     /// and the scripted signals, then deliver the scripted ones that are due.
     fn wait(&mut self, _key: WaitKey, deadline_ns: Option<u64>) {
         self.waits += 1;
-        let next = deadline_ns
+        if !self.on_wait.is_empty() {
+            let hook = self.on_wait.remove(0);
+            hook(&mut self.vfs, &mut self.fdt);
+            return;
+        }
+        let Some(next) = deadline_ns
             .into_iter()
             .chain(self.state.sig.itimer.next_event())
             .chain(self.script.iter().map(|&(at, _)| at))
             .min()
-            .expect("a wait with no wake-up source would hang the kernel");
+        else {
+            // Nothing could ever wake the task (the real kernel sleeps forever,
+            // as Linux would): unwind to the test without the panic hook.
+            self.hangs += 1;
+            std::panic::resume_unwind(Box::new(Hang));
+        };
         self.now = self.now.max(next);
         let now = self.now;
         let (due, later): (Vec<_>, Vec<_>) = self.script.drain(..).partition(|&(at, _)| at <= now);
