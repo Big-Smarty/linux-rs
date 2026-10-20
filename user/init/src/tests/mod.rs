@@ -283,8 +283,7 @@ pub fn run_mode(mode: &[u8]) -> bool {
         b"ids" => ids::run(),
         b"time" => time::run(),
         b"signal" => signal::run(),
-        b"fs" => fs::run(false),
-        b"fs-nommap" => fs::run(true),
+        b"fs" => fs::run(),
         b"proc" => proc::run(),
         _ => return false,
     };

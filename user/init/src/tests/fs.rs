@@ -171,10 +171,8 @@ fn list(path: &[u8], names: &mut [u8; 512]) -> Result<usize, Errno> {
     Ok(used)
 }
 
-/// The `fs` group. With `skip_mmap` (mode `fs-nommap`) the 14 checks that call `mmap` (the 13
-/// `mmap-*` checks and `dev-zero-mmap-private`) are not run, for a kernel whose memory-mapping
-/// syscalls are not wired yet: every other check is unchanged and prints the same line.
-pub fn run(skip_mmap: bool) -> bool {
+/// The `fs` group.
+pub fn run() -> bool {
     let mut t = T::new("fs");
     console(&mut t);
     initramfs_files(&mut t);
@@ -184,10 +182,8 @@ pub fn run(skip_mmap: bool) -> bool {
     descriptors(&mut t);
     links(&mut t);
     creating(&mut t);
-    if !skip_mmap {
-        mapping(&mut t);
-    }
-    devices(&mut t, skip_mmap);
+    mapping(&mut t);
+    devices(&mut t);
     t.finish()
 }
 
@@ -1538,7 +1534,7 @@ fn mapping(t: &mut T) {
     let _ = close(wfd);
 }
 
-fn devices(t: &mut T, skip_mmap: bool) {
+fn devices(t: &mut T) {
     // Under this boot no devtmpfs is mounted: /dev is the archive's directory, holding only the
     // /dev/console node `default_rootfs` made. Nothing else exists until userspace runs mknod.
     let mut names = [0u8; 512];
@@ -1627,13 +1623,11 @@ fn devices(t: &mut T, skip_mmap: bool) {
         sys(Sysno::read, &[zero, BAD, 16]),
         Err(Errno::EFAULT),
     );
-    if !skip_mmap {
-        t.eq(
-            "dev-zero-mmap-private",
-            mmap(0, PAGE, 3, 0x02, zero, 0).map(peek),
-            Ok(0),
-        );
-    }
+    t.eq(
+        "dev-zero-mmap-private",
+        mmap(0, PAGE, 3, 0x02, zero, 0).map(peek),
+        Ok(0),
+    );
     let _ = close(zero);
     t.eq(
         "mknod-full",
