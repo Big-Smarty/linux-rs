@@ -461,7 +461,7 @@ pub fn self_test() -> bool {
     pixel_byte(b'W');
     let cell = (CURSOR.load(Ordering::Relaxed) >> 1).saturating_sub(1);
     let wrap = cols >= 2
-        && cell % cols == 0
+        && cell.is_multiple_of(cols)
         && cell >= cols
         && SHADOW[cell].load(Ordering::Relaxed) == b'W'
         && SHADOW[cell - 1].load(Ordering::Relaxed) == b'x'
