@@ -626,6 +626,7 @@ fs	check	console-no-seek	init: test fs.console-no-seek ok
 fs	check	console-pread	init: test fs.console-pread ok
 fs	check	console-write-zero	init: test fs.console-write-zero ok
 fs	check	console-tcgets-fault	init: test fs.console-tcgets-fault ok
+fs	check	console-tcgets-termios	init: test fs.console-tcgets-termios ok
 fs	check	console-ioctl-unknown	init: test fs.console-ioctl-unknown ok
 fs	check	console-tiocgwinsz	init: test fs.console-tiocgwinsz ok
 fs	check	console-tiocgpgrp	init: test fs.console-tiocgpgrp ok
@@ -891,7 +892,7 @@ fs	check	mknod-existing	init: test fs.mknod-existing ok
 fs	check	mknod-fifo-regular-types	init: test fs.mknod-fifo-regular-types ok
 fs	check	mknod-directory-type	init: test fs.mknod-directory-type ok
 fs	check	dev-clean	init: test fs.dev-clean ok
-fs	summary	-	init: tests fs passed=283 failed=0
+fs	summary	-	init: tests fs passed=284 failed=0
 proc	check	fork-returns-child-pid	init: test proc.fork-returns-child-pid ok
 proc	check	child-sees-own-pid	init: test proc.child-sees-own-pid ok
 proc	check	child-getppid-is-parent	init: test proc.child-getppid-is-parent ok

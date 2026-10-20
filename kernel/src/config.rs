@@ -24,7 +24,13 @@ pub struct Declared {
     pub enosys: &'static [u32],
 }
 
-pub const DECLARED: [Declared; 9] = [
+pub const DECLARED: [Declared; 10] = [
+    Declared {
+        symbol: "boot: console=ttyS0",
+        value: "the console tty is the 8250 serial line at its default 9600n8: TCGETS reports tty_std_termios with c_cflag B9600|CS8|CREAD|HUPCL|CLOCAL (a vt console would differ: vt.c sets IUTF8 in UTF-8 mode)",
+        source: "drivers/tty/serial/serial_core.c:323-327 and 2240, drivers/tty/tty_io.c (tty_std_termios), drivers/tty/vt/vt.c:3700",
+        enosys: &[],
+    },
     Declared {
         symbol: "boot: norandmaps",
         value: "randomize_va_space=0: STACK_TOP fixed, no arch_align_stack/brk randomisation",

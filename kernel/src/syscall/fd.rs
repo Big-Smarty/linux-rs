@@ -983,15 +983,18 @@ fn is_tty_ioctl(cmd: u32) -> bool {
     (0x5401..=0x5470).contains(&cmd) || matches!(cmd, 0x802c_542a | 0x402c_542b | 0x402c_542c)
 }
 
-/// `tty_std_termios` (`include/linux/tty.h`, `drivers/tty/tty_io.c`) as a `struct termios`: iflag ICRNL|IXON, oflag OPOST|ONLCR, cflag B38400|CS8|CREAD|HUPCL,
-/// lflag ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN, `INIT_C_CC`.
-fn std_termios() -> [u8; 36] {
+/// `TCGETS` data of the declared console (`config.rs`: `console=ttyS0`, default 9600n8):
+/// `tty_std_termios` (`drivers/tty/tty_io.c`: iflag ICRNL|IXON, oflag OPOST|ONLCR, lflag
+/// ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN, `INIT_C_CC`) with the serial console's
+/// `c_cflag` (`uart_set_options`, `serial_core.c:2240`: B9600|CS8|CREAD|HUPCL|CLOCAL, applied to
+/// the tty at `serial_core.c:323-327`), as a 36-byte `struct termios`. Verified against the
+/// pinned Linux by the oracle check `fs.console-tcgets-termios`.
+fn console_termios() -> [u8; 36] {
     let mut out = [0u8; 36];
-    out[0..4].copy_from_slice(&0o2400u32.to_le_bytes());
-    out[4..8].copy_from_slice(&0o5u32.to_le_bytes());
-    out[8..12].copy_from_slice(&0o2277u32.to_le_bytes());
-    out[12..16].copy_from_slice(&0o105_073u32.to_le_bytes());
-    // c_line = N_TTY, then c_cc[19]
+    for (at, word) in [0o2400u32, 0o5, 0o6275, 0o105_073].into_iter().enumerate() {
+        out[4 * at..4 * at + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    // c_line = N_TTY (0), then c_cc[19]
     let cc: [u8; 17] = [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0];
     out[17..34].copy_from_slice(&cc);
     out
@@ -1094,7 +1097,7 @@ fn ioctl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
             put(ctx, arg, &n.to_le_bytes())
         }
         FileKind::Char(CharDev::Console) => match cmd {
-            TCGETS => put(ctx, arg, &std_termios()),
+            TCGETS => put(ctx, arg, &console_termios()),
             TIOCGWINSZ => put(ctx, arg, &[0u8; 8]),
             // tiocgpgrp: the console is not init's controlling terminal.
             TIOCGPGRP => Err(Errno::ENOTTY.into()),

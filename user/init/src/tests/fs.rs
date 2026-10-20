@@ -171,7 +171,10 @@ fn list(path: &[u8], names: &mut [u8; 512]) -> Result<usize, Errno> {
     Ok(used)
 }
 
-pub fn run() -> bool {
+/// The `fs` group. With `skip_mmap` (mode `fs-nommap`) the 14 checks that call `mmap` (the 13
+/// `mmap-*` checks and `dev-zero-mmap-private`) are not run, for a kernel whose memory-mapping
+/// syscalls are not wired yet: every other check is unchanged and prints the same line.
+pub fn run(skip_mmap: bool) -> bool {
     let mut t = T::new("fs");
     console(&mut t);
     initramfs_files(&mut t);
@@ -181,8 +184,10 @@ pub fn run() -> bool {
     descriptors(&mut t);
     links(&mut t);
     creating(&mut t);
-    mapping(&mut t);
-    devices(&mut t);
+    if !skip_mmap {
+        mapping(&mut t);
+    }
+    devices(&mut t, skip_mmap);
     t.finish()
 }
 
@@ -255,6 +260,23 @@ fn console(t: &mut T) {
         "console-tcgets-fault",
         sys(Sysno::ioctl, &[1, 0x5401, BAD]),
         Err(Errno::EFAULT),
+    );
+    // `tty_std_termios` with the ttyS0 console's `c_cflag` (`uart_set_options`: B9600 | CS8 |
+    // CREAD | HUPCL | CLOCAL): c_iflag ICRNL|IXON, c_oflag OPOST|ONLCR, c_lflag ISIG|ICANON|ECHO|
+    // ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN, c_line N_TTY, then INIT_C_CC.
+    let mut want = [0u8; 36];
+    for (i, word) in [0o2400u32, 0o5, 0o6275, 0o105_073].into_iter().enumerate() {
+        want[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    want[17..34].copy_from_slice(&[3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0]);
+    let mut termios = [0u8; 36];
+    t.eq(
+        "console-tcgets-termios",
+        (
+            sys(Sysno::ioctl, &[1, 0x5401, addr_mut(&mut termios)]),
+            termios,
+        ),
+        (Ok(0), want),
     );
     t.eq(
         "console-ioctl-unknown",
@@ -1516,7 +1538,7 @@ fn mapping(t: &mut T) {
     let _ = close(wfd);
 }
 
-fn devices(t: &mut T) {
+fn devices(t: &mut T, skip_mmap: bool) {
     // Under this boot no devtmpfs is mounted: /dev is the archive's directory, holding only the
     // /dev/console node `default_rootfs` made. Nothing else exists until userspace runs mknod.
     let mut names = [0u8; 512];
@@ -1605,11 +1627,13 @@ fn devices(t: &mut T) {
         sys(Sysno::read, &[zero, BAD, 16]),
         Err(Errno::EFAULT),
     );
-    t.eq(
-        "dev-zero-mmap-private",
-        mmap(0, PAGE, 3, 0x02, zero, 0).map(peek),
-        Ok(0),
-    );
+    if !skip_mmap {
+        t.eq(
+            "dev-zero-mmap-private",
+            mmap(0, PAGE, 3, 0x02, zero, 0).map(peek),
+            Ok(0),
+        );
+    }
     let _ = close(zero);
     t.eq(
         "mknod-full",
