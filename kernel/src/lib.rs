@@ -6,6 +6,7 @@ pub mod bitmap;
 pub mod boot;
 pub mod config;
 pub mod exec;
+pub mod fbtext;
 pub mod firmware;
 pub mod heap;
 pub mod image;

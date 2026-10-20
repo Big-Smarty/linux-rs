@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Kernel services foundation ([record](docs/implementation.md#kernel-services-foundation)): `BootInfo`, the frame allocator and the page tables live in synchronised statics (`services.rs`, lock order `PROCESS` -> `TABLES` -> heap -> `FRAMES`); user mappings can be mapped, unmapped, protected and freed after CR3 activation (`invlpg`, atomic PTE updates, rollback; `UserSpace` borrows `&mut Tables`); a fallible kernel heap (vendored `buddy_system_allocator` 0.13.0 over buddy frames) with `alloc` built `--cfg no_global_oom_handling` so infallible `Box::new`/`Vec::push` do not exist in the kernel; `Process` context and `syscall::dispatch(&mut impl Context, ..)` with `syscall/` split into `mod.rs`, `io.rs`, `process.rs`. New QEMU records `CHECK user-mm` and `CHECK heap`; no syscall added, no behavior visible to `/init` changed.
+- Framebuffer console on real hardware: draws on every Limine framebuffer (up to 8, each validated independently), accepts any 16/24/32 bpp RGB channel layout including 10-bit, scrolls instead of overwriting (shadow-cell redraw, no framebuffer reads), and picks the glyph scale by Linux's `get_default_font` rule (16x32 at 2560x1440). Pure parts in `kernel::fbtext` with host tests; the QEMU suite checks a scroll/readback record on one and two framebuffers. See [implementation](docs/implementation.md#framebuffer-console-on-real-hardware).
 
 ## v0.1.0 — 2026-10-19
 

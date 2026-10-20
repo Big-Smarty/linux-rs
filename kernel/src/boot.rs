@@ -261,6 +261,17 @@ pub struct Framebuffer {
     // Remaining revisioned fields are not read by this implementation.
 }
 
+/// Upper bound on loader framebuffers read (one per GOP handle).
+pub const MAX_FRAMEBUFFERS: usize = 8;
+
+/// Result of [`BootInfo::take_framebuffers`]; `None` marks an entry the loader
+/// listed that failed validation.
+pub struct Framebuffers {
+    pub entries: [Option<Framebuffer>; MAX_FRAMEBUFFERS],
+    /// The loader's own count, possibly above `MAX_FRAMEBUFFERS`.
+    pub reported: u64,
+}
+
 fn aligned(address: u64, alignment: usize) -> bool {
     address != 0 && address & (alignment as u64 - 1) == 0 && address >= 0xffff_8000_0000_0000
 }
@@ -336,11 +347,13 @@ impl BootInfo {
         })
     }
 
-    /// The loader framebuffer, found before any other fallible step so that every
-    /// later failure can reach the screen. A missing or invalid display is
-    /// explicit (`None`), never fabricated.
+    /// Every loader framebuffer (one per GOP handle), found before any other
+    /// fallible step so that every later failure can reach the screen. Each
+    /// entry is validated independently: a bad entry is `None` and does not
+    /// affect the others. A missing response yields no entries, never a fabricated
+    /// display. At most `MAX_FRAMEBUFFERS` are read; `reported` is the loader's count.
     ///
-    /// The extent is checked against the still-unvalidated memory map: a union
+    /// Each extent is checked against the still-unvalidated memory map: a union
     /// of loader-declared kind7 entries is sound for that question whatever the
     /// order, and a malformed map only fails the later `take`.
     ///
@@ -349,25 +362,44 @@ impl BootInfo {
     /// and mappings stay reserved and immutable. May run before `take`, which
     /// remains the single consuming handoff.
     #[must_use]
-    pub unsafe fn take_framebuffer() -> Option<Framebuffer> {
+    pub unsafe fn take_framebuffers() -> Framebuffers {
+        let mut list = Framebuffers {
+            entries: [None; MAX_FRAMEBUFFERS],
+            reported: 0,
+        };
         // SAFETY: same contract as this function.
-        let info = unsafe { Self::mapped() }.ok()?;
+        let Ok(info) = (unsafe { Self::mapped() }) else {
+            return list;
+        };
         // SAFETY: same response lifetime, optional response is handled as failure.
-        let fb = unsafe { response(ptr::addr_of!(FRAMEBUFFER), 3) }.ok()?;
-        if fb[1] == 0 || !info.contains_virtual(fb[2], 8, 5) {
-            return None;
+        let Ok(fb) = (unsafe { response(ptr::addr_of!(FRAMEBUFFER), 3) }) else {
+            return list;
+        };
+        list.reported = fb[1];
+        let count = usize::try_from(fb[1]).map_or(MAX_FRAMEBUFFERS, |n| n.min(MAX_FRAMEBUFFERS));
+        // The pointer array must lie inside reserved loader memory (count <= 8).
+        if count == 0 || !info.contains_virtual(fb[2], 8 * count as u64, 5) {
+            return list;
         }
-        // SAFETY: the first array slot lies inside reserved loader memory; the
-        // protocol does not promise its alignment, so read it unaligned.
-        let pointer = unsafe { ptr::read_unaligned(fb[2] as *const *const Framebuffer) };
-        if !info.contains_virtual(pointer as u64, mem::size_of::<Framebuffer>() as u64, 5) {
-            return None;
+        for (index, entry) in list.entries.iter_mut().enumerate().take(count) {
+            // SAFETY: slot `index` is inside the range just validated; the
+            // protocol does not promise its alignment, so read it unaligned.
+            let pointer = unsafe {
+                ptr::read_unaligned((fb[2] as *const *const Framebuffer).wrapping_add(index))
+            };
+            if !info.contains_virtual(pointer as u64, mem::size_of::<Framebuffer>() as u64, 5) {
+                continue;
+            }
+            // SAFETY: validated mapped loader storage; all fields integers.
+            let display = unsafe { ptr::read_unaligned(pointer) };
+            let Some(length) = display.pitch.checked_mul(display.height) else {
+                continue;
+            };
+            if info.contains_virtual(display.address, length, 7) {
+                *entry = Some(display);
+            }
         }
-        // SAFETY: validated mapped loader storage; all fields integers.
-        let display = unsafe { ptr::read_unaligned(pointer) };
-        let length = display.pitch.checked_mul(display.height)?;
-        info.contains_virtual(display.address, length, 7)
-            .then_some(display)
+        list
     }
 
     /// The loader command line without its NUL, at most 2047 bytes.
