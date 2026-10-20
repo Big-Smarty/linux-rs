@@ -67,6 +67,7 @@ pub fn run() -> bool {
     resolution(&mut t);
     wall_time(&mut t);
     sleeping(&mut t);
+    settime_and_cpu_sleep(&mut t);
     t.finish()
 }
 
@@ -585,6 +586,79 @@ fn sleeping(t: &mut T) {
     t.eq(
         "clock_nanosleep-invalid-flag-bits",
         clock_nanosleep(MONOTONIC, 2, &ms(1)),
+        Ok(0),
+    );
+}
+
+/// Paths that answer at once without a successful `clock_settime` or CPU-clock wait ever having
+/// been observed above: `do_settimeofday64` stores `xtime` exactly (`time` is the new second
+/// immediately), and `do_cpu_nanosleep` returns 0 for a zero expiry or an absolute one that has
+/// passed (`posix_cpu_timer_set` arms nothing, resp. fires at once).
+fn settime_and_cpu_sleep(t: &mut T) {
+    const SET: i64 = 2_000_000_000;
+    let (real0, mono0) = (now(REALTIME), now(MONOTONIC));
+    let set = Timespec { sec: SET, nsec: 0 };
+    t.eq(
+        "settime-realtime",
+        sys(Sysno::clock_settime, &[REALTIME, addr(&set)]),
+        Ok(0),
+    );
+    t.eq(
+        "settime-time-at-once",
+        sys(Sysno::time, &[0]),
+        Ok(SET as usize),
+    );
+    t.eq(
+        "settime-coarse-at-once",
+        gettime(REALTIME_COARSE).1.sec,
+        SET,
+    );
+    let read_back = now(REALTIME) - SET * 1_000_000_000;
+    t.holds(
+        "settime-realtime-reads-back",
+        (0..50_000_000).contains(&read_back),
+        read_back,
+        "0 <= elapsed < 50 ms after the set time",
+    );
+    // Put the clock back so later groups see the real time.
+    let back = real0 + (now(MONOTONIC) - mono0);
+    let restore = Timespec {
+        sec: back / 1_000_000_000,
+        nsec: back % 1_000_000_000,
+    };
+    t.eq(
+        "settime-restore",
+        sys(Sysno::clock_settime, &[REALTIME, addr(&restore)]),
+        Ok(0),
+    );
+
+    let zero = Timespec::default();
+    let one_ns = Timespec { sec: 0, nsec: 1 };
+    // `make_process_cpuclock(1, CPUCLOCK_SCHED)`: this process by pid.
+    let by_pid = (-14i32) as usize;
+    t.eq(
+        "cpu-nanosleep-zero",
+        clock_nanosleep(PROCESS_CPUTIME, 0, &zero),
+        Ok(0),
+    );
+    t.eq(
+        "cpu-nanosleep-abs-zero",
+        clock_nanosleep(PROCESS_CPUTIME, ABSTIME, &zero),
+        Ok(0),
+    );
+    t.eq(
+        "cpu-nanosleep-abs-past",
+        clock_nanosleep(PROCESS_CPUTIME, ABSTIME, &one_ns),
+        Ok(0),
+    );
+    t.eq(
+        "cpu-nanosleep-by-pid-zero",
+        clock_nanosleep(by_pid, 0, &zero),
+        Ok(0),
+    );
+    t.eq(
+        "cpu-nanosleep-by-pid-abs-past",
+        clock_nanosleep(by_pid, ABSTIME, &one_ns),
         Ok(0),
     );
 }
