@@ -299,7 +299,13 @@ extern "C" fn kernel_main() -> ! {
     #[cfg(feature = "baremetal-suite")]
     baremetal::run();
     #[cfg(not(feature = "baremetal-suite"))]
-    userspace::run(user)
+    {
+        userspace::run(user);
+        // Init's death ends the boot inside `userspace`; getting here means the
+        // task left the run queue some other way.
+        log!("FAIL init task left the run queue\n");
+        fail()
+    }
 }
 
 /// The boot-phase locals end here: the frame allocator and the published tables

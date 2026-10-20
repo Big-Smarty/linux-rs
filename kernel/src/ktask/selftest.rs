@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Scheduler self-tests of the QEMU suite (`test=sched-switch` and
-//! `test=kstack-overflow`; `docs/kernel-tooling.md`). Kernel threads only: the
-//! register switch, the run queue, keyed and signal wake-ups, the timer queue,
-//! the stack pool and its guard pages, with the same code paths the user task
-//! runs on. Nothing here is built outside `qemu-self-test`.
+//! Scheduler self-tests of the QEMU suite (`test=sched-switch`,
+//! `test=kstack-overflow` and `test=sched-preempt`; `docs/kernel-tooling.md`).
+//! `sched-switch` and `kstack-overflow` use kernel threads only: the register
+//! switch, the run queue, keyed and signal wake-ups, the timer queue, the stack
+//! pool and its guard pages, with the same code paths the user task runs on.
+//! `sched-preempt` keeps one kernel thread runnable beside `/init`. Nothing
+//! here is built outside `qemu-self-test`.
 
 use super::{
     Ordering, RQ, SLOTS, SWITCHES, SchedId, TaskState, WaitKey, current, idle_loop, schedule,
@@ -18,7 +20,10 @@ use core::{
     hint::black_box,
     sync::atomic::{AtomicBool, AtomicU64},
 };
-use kernel::{memory::Virtual, sched::CLASS_TEST};
+use kernel::{
+    memory::Virtual,
+    sched::{CLASS_TEST, WakeMode},
+};
 
 const ROUNDS: u64 = 256;
 /// Threads of the main run: two sleepers, a keyed and a signalled waiter, the
@@ -210,7 +215,10 @@ extern "C" fn controller(_: usize) {
     bad_if(state(signalled) != Some(TaskState::Interruptible));
     // The wrong key, the empty key and a signal wake-up of a keyed sleeper:
     // only the last wakes it, and it goes back to sleep (spurious wake-up).
-    bad_if(wake_up_key(KEY_OTHER) != 0 || wake_up_key(WaitKey::NONE) != 0);
+    bad_if(
+        wake_up_key(KEY_OTHER, WakeMode::Normal, 0) != 0
+            || wake_up_key(WaitKey::NONE, WakeMode::Normal, 0) != 0,
+    );
     bad_if(state(keyed) != Some(TaskState::Interruptible));
     bad_if(!signal_wake_up(keyed));
     for _ in 0..4 {
@@ -219,16 +227,16 @@ extern "C" fn controller(_: usize) {
     bad_if(KEYED_WAKES.load(Ordering::Relaxed) != 1);
     bad_if(state(keyed) != Some(TaskState::Interruptible));
     // The right key wakes it once more.
-    bad_if(wake_up_key(KEY_WAITED) != 1);
+    bad_if(wake_up_key(KEY_WAITED, WakeMode::Normal, 0) != 1);
     for _ in 0..4 {
         schedule();
     }
     bad_if(KEYED_WAKES.load(Ordering::Relaxed) != 2);
     // A keyed sleeper's condition becomes true: key wake-up ends it for good.
     FLAG.store(true, Ordering::Relaxed);
-    bad_if(wake_up_key(KEY_WAITED) != 1);
+    bad_if(wake_up_key(KEY_WAITED, WakeMode::Normal, 0) != 1);
     // The unkeyed sleeper is woken by a signal wake-up (and not by the key).
-    bad_if(wake_up_key(KEY_WAITED) != 0);
+    bad_if(wake_up_key(KEY_WAITED, WakeMode::Normal, 0) != 0);
     SIGNAL_FLAG.store(true, Ordering::Relaxed);
     bad_if(!signal_wake_up(signalled));
     DONE.fetch_add(1, Ordering::Relaxed);
@@ -344,17 +352,19 @@ pub fn sched_switch() {
     );
 }
 
-/// Recurse until the stack runs out. Each frame touches its buffer, so the
-/// compiler's stack probes and the guard page see real use.
+/// Recurse until the stack runs out. Each frame is 6 KiB, more than the 4 KiB
+/// guard page, and touches its buffer: the overflow must be caught by the
+/// compiler's per-page stack probes, which reach the guard page before any
+/// write can jump over it.
 #[inline(never)]
 extern "C" fn recurse(depth: usize) -> usize {
-    let mut buffer = [0u8; 2048];
-    buffer[depth % 2048] = 1;
+    let mut buffer = [0u8; 6144];
+    buffer[depth % 6144] = 1;
     black_box(&mut buffer);
     if black_box(depth) == usize::MAX {
         return 0;
     }
-    recurse(depth + 1) + usize::from(buffer[(depth + 1) % 2048])
+    recurse(depth + 1) + usize::from(buffer[(depth + 1) % 6144])
 }
 
 extern "C" fn overflow(_: usize) {
@@ -368,4 +378,58 @@ extern "C" fn overflow(_: usize) {
 pub fn kstack_overflow() {
     spawn_thread(overflow, 0, false);
     idle_loop(|| false);
+}
+
+/// Times the tick preempted `/init` at the return to ring 3 from an interrupt
+/// and the switch really happened (`ktask::preempt_user`).
+static USER_PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
+/// Loops of the `sched-preempt` kernel thread.
+static HOG_RUNS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn note_user_preemption() {
+    USER_PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Always runnable: yields at once, so `/init` and this thread alternate on
+/// every preemption. Ring 0 runs with interrupts masked and is never
+/// preempted, so a thread that only yields would starve the timer interrupt
+/// for a sleeping `/init`; the `sti`/`nop`/`cli` window lets a pending one in.
+extern "C" fn hog(_: usize) {
+    loop {
+        HOG_RUNS.fetch_add(1, Ordering::Relaxed);
+        cpu::interrupts_on();
+        core::hint::spin_loop();
+        cpu::interrupts_off();
+        schedule();
+    }
+}
+
+/// The `sched-preempt` case: start the runnable kernel thread before `/init`.
+pub fn start_preempt_hog() {
+    spawn_thread(hog, 0, false);
+}
+
+/// The `sched-preempt` check, at `/init`'s death: the thread ran, the tick
+/// preempted `/init` from the user-interrupt path more than once, and `/init`
+/// came back every time (the harness checks its output). A no-op in the other
+/// cases.
+pub fn preempt_report() {
+    if services::boot().test != kernel::boot::TestMode::SchedPreempt {
+        return;
+    }
+    let (hog, preempted) = (
+        HOG_RUNS.load(Ordering::Relaxed),
+        USER_PREEMPTIONS.load(Ordering::Relaxed),
+    );
+    if hog < 2 || preempted < 2 {
+        crate::log!(
+            "FAIL sched-preempt hog_runs={} user_preemptions={}\n",
+            hog,
+            preempted
+        );
+        crate::fail();
+    }
+    crate::log!(
+        "CHECK sched-preempt ok kthread=ran user_return_preemption=interrupt init=resumed\n"
+    );
 }

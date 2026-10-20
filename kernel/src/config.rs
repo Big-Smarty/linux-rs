@@ -87,8 +87,8 @@ pub const DECLARED: [Declared; 11] = [
     },
     Declared {
         symbol: "CONFIG_PREEMPT_VOLUNTARY",
-        value: "y (as the reference config): code in ring 0 is never preempted; a task in the kernel gives up the CPU only in schedule() (sleeps, yields), and a running task is rescheduled at the tick only on its way back to ring 3",
-        source: "kernel/Kconfig.preempt:36-52, kernel/sched/core.c:5597 (sched_tick sets need_resched) and 7025 (schedule), kernel/entry/common.c:19 (exit_to_user_mode_loop)",
+        value: "y, with the reference config's CONFIG_PREEMPT_DYNAMIC=y (so CONFIG_PREEMPTION=y and CONFIG_PREEMPT_RCU=y) whose boot default is the voluntary mode (core.c:7768-7778; `preempt=` could select another, the candidate has no such parameter): code in ring 0 is never preempted; a task in the kernel gives up the CPU only in schedule() (sleeps, yields), and a running task is rescheduled at the tick only on its way back to ring 3. Not modelled: the reference's CONFIG_NO_HZ_IDLE=y stops the tick in idle, the candidate's tick keeps running",
+        source: "kernel/Kconfig.preempt:36-52 and :126-131 (PREEMPT_DYNAMIC), kernel/sched/core.c:5597 (sched_tick sets need_resched), 7025 (schedule) and 7640-7780 (preempt_dynamic_mode), kernel/entry/common.c:19 (exit_to_user_mode_loop)",
         enosys: &[],
     },
 ];

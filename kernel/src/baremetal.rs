@@ -35,8 +35,8 @@
 //! group ends from `init_exited` (syscall or fault path, after it dropped
 //! `PROCESS`/`TABLES`), from `fatal` (a kernel stop) or from `timeout` (the
 //! group outran its bound): the latter two end the group only if
-//! `groups_lock_free` (`userspace::locks_free` and `ARCHIVES`, the locks the
-//! abandoned stack could still hold), else the suite aborts with its results
+//! `groups_lock_free` (`userspace::locks_free`, which covers the scheduler's `RQ`
+//! and `TIMERQ`, and `ARCHIVES`: the locks the abandoned stack could still hold), else the suite aborts with its results
 //! so far. The summary takes none of those locks.
 //!
 //! # Time bounds
@@ -57,7 +57,7 @@ use crate::{
     boot::BootInfo,
     console, cpu,
     firmware::Acpi,
-    log, pci,
+    ktask, log, pci,
     services::{self, IrqMutex},
     timer, userspace,
 };
@@ -801,10 +801,29 @@ fn selected(index: usize) -> Option<&'static str> {
     RESULTS.lock().selected().get(index).copied()
 }
 
-/// Run every group, then the late proofs and the summary. Never returns: each
-/// group's end (`init_exited`/`fatal`) starts the next.
+/// Run every group, then the late proofs and the summary. Never returns.
+///
+/// Runs on the boot stack, which is the idle task's: `userspace::run` starts a
+/// group's `/init` as a scheduled task and idles until it is gone. A group ends
+/// in that task's context (`init_exited`, `fatal`, `timeout`): [`group_ended`]
+/// records the result and the task leaves the CPU for good, which returns
+/// control here, on the boot stack, to tear the group down. Only an end that
+/// already is on the boot stack (the group never started, or a handler
+/// interrupted the idle loop) tears down in place and starts the next group
+/// from where it is.
+/// shortcut: that in-place start nests one `start_next` frame chain on the boot
+/// stack per such end (a failed load or a blocked group: rare, at most one per
+/// group); upgrade by letting the idle loop return through the handler.
 pub fn run() -> ! {
     start_next()
+}
+
+/// The group's process and scheduler state, on the boot stack with no task
+/// running: unmap and free the process, then forget the group's tasks and
+/// timed wake-ups.
+fn finish_group() {
+    userspace::teardown();
+    ktask::reset_group();
 }
 
 fn start_next() -> ! {
@@ -844,7 +863,9 @@ fn start_next() -> ! {
             timer::rdtsc().saturating_add(cycles).max(1),
             Ordering::Relaxed,
         );
-        userspace::run(loaded)
+        // Returns when the group's task is gone (`group_ended` records why).
+        userspace::run(loaded);
+        finish_group();
     }
 }
 
@@ -904,8 +925,17 @@ fn group_ended(cause: Cause) -> ! {
         millis,
     };
     record(index, group, &run);
-    userspace::teardown();
-    start_next()
+    if ktask::in_idle() {
+        // Nothing to switch away from: tear down here and go on.
+        finish_group();
+        start_next()
+    }
+    // The group's task, or a handler on its stack: leave the CPU for good. The
+    // idle loop that started the group sees the task gone, `userspace::run`
+    // returns to `start_next`, which tears the group down on the boot stack
+    // (the pool stack this runs on belongs to the task being freed).
+    cpu::interrupts_off();
+    ktask::exit_current()
 }
 
 /// Whether every lock the abandoned stack of a stopped group could still hold

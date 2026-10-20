@@ -495,8 +495,8 @@ pub fn set_itimer_ns(expiry: Option<u64>) {
 
 /// Forget every wake-up the finished process programmed (a sleep deadline that
 /// a timed-out group abandoned, its `ITIMER_REAL` expiry, the scheduler's
-/// queue head), so the next group
-/// starts with no stale clockevent. Context: BSP, interrupts masked, no task.
+/// queue head), so the next group starts with no stale clockevent. Context:
+/// BSP, interrupts masked, no task.
 #[cfg(feature = "baremetal-suite")]
 pub fn clear_waits() {
     cpu::timer_transaction(|| {

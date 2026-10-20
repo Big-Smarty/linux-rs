@@ -26,8 +26,11 @@
 //!   asks [`Rq::state`] and wakes through [`Rq::try_to_wake_up`],
 //!   [`Rq::wake_interruptible`] (`signal_wake_up`) and [`Rq::wake_up_key`].
 //! * A wait channel is a [`WaitKey`] = (class, id). Each owner registers one
-//!   class constant below and builds keys from its own ids; waking a key wakes
-//!   every sleeper on it, in the order they went to sleep.
+//!   class constant below and builds keys from its own ids; [`Rq::wake_up_key`]
+//!   wakes the sleepers of a key in the order Linux's wait queue yields them:
+//!   the non-exclusive ones newest first (`prepare_to_wait_event` adds them at
+//!   the head), then the exclusive ones oldest first (added at the tail), the
+//!   latter only up to `nr_exclusive`.
 //! * Blocking is a loop that re-checks the condition ([`Rq::prepare_to_wait`],
 //!   check, `schedule`, [`Rq::finish_wait`]): spurious wake-ups are legal by
 //!   construction, so the conditions stay pure functions of the owner's state.
@@ -113,6 +116,26 @@ impl TaskState {
     }
 }
 
+/// Which sleepers a key wake-up may wake: the `mode` argument of `__wake_up`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeMode {
+    /// `TASK_NORMAL` (`wake_up`, `wake_up_all`): interruptible and
+    /// uninterruptible sleepers.
+    Normal,
+    /// `TASK_INTERRUPTIBLE` (`wake_up_interruptible*`, used by pipe, tty and
+    /// poll wake-ups): interruptible sleepers only.
+    Interruptible,
+}
+
+impl WakeMode {
+    fn wakes(self, state: TaskState) -> bool {
+        match self {
+            Self::Normal => state.sleeping(),
+            Self::Interruptible => state == TaskState::Interruptible,
+        }
+    }
+}
+
 /// What a sleeper waits for besides a signal or its timer. `NONE` is woken by
 /// neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,8 +173,11 @@ struct Slot {
     used: bool,
     state: TaskState,
     key: WaitKey,
-    /// Order in which sleepers went to sleep: wake-up order of one key.
+    /// Order in which sleepers went to sleep: the position in the key's wait
+    /// queue (see [`Rq::wake_up_key`]).
     sleep_seq: u64,
+    /// `WQ_FLAG_EXCLUSIVE`: queued at the tail, and counted by `nr_exclusive`.
+    exclusive: bool,
     queued: bool,
     /// FIFO link while queued.
     next: Option<u32>,
@@ -165,6 +191,7 @@ impl Slot {
         state: TaskState::Running,
         key: WaitKey::NONE,
         sleep_seq: 0,
+        exclusive: false,
         queued: false,
         next: None,
         slice: 0,
@@ -296,6 +323,7 @@ impl Rq {
         slot.used = true;
         slot.state = TaskState::Running;
         slot.key = WaitKey::NONE;
+        slot.exclusive = false;
         slot.queued = false;
         slot.next = None;
         slot.slice = 0;
@@ -340,11 +368,23 @@ impl Rq {
     }
 
     /// `prepare_to_wait_event` for the current task: it will sleep on `key` in
-    /// `state` once it calls [`Rq::schedule`] (it may still decide not to).
+    /// `state` once it calls [`Rq::schedule`] (it may still decide not to). It
+    /// joins the head of the key's wait queue (`__add_wait_queue`).
     ///
     /// # Panics
     /// For a state that is not a sleeping one, or when the idle task sleeps.
     pub fn prepare_to_wait(&mut self, key: WaitKey, state: TaskState) {
+        self.prepare(key, state, false);
+    }
+
+    /// `prepare_to_wait_exclusive`: as [`Rq::prepare_to_wait`] but at the tail
+    /// of the queue (`__add_wait_queue_entry_tail`), where `nr_exclusive` of a
+    /// wake-up counts it.
+    pub fn prepare_to_wait_exclusive(&mut self, key: WaitKey, state: TaskState) {
+        self.prepare(key, state, true);
+    }
+
+    fn prepare(&mut self, key: WaitKey, state: TaskState, exclusive: bool) {
         assert!(state.sleeping() && self.curr != IDLE, "prepare_to_wait");
         self.sleep_seq += 1;
         let seq = self.sleep_seq;
@@ -352,6 +392,7 @@ impl Rq {
         slot.state = state;
         slot.key = key;
         slot.sleep_seq = seq;
+        slot.exclusive = exclusive;
     }
 
     /// `finish_wait` for the current task: running again, no longer on a key.
@@ -397,28 +438,73 @@ impl Rq {
         }
     }
 
-    /// `wake_up_all(key)` (`__wake_up_common` with `TASK_NORMAL`): every sleeper
-    /// on `key`, longest sleeper first. Returns how many were woken. The empty
-    /// key wakes nobody.
-    /// shortcut: exclusive waiters are all woken (a thundering herd that
-    /// re-checks its condition); upgrade with per-key wait entries.
-    pub fn wake_up_key(&mut self, key: WaitKey) -> usize {
+    /// `__wake_up(key, mode, nr_exclusive)` (`__wake_up_common`): the sleepers
+    /// of `key` whose state `mode` admits, in the order Linux's wait queue
+    /// walks them: every non-exclusive one, newest first (they join the head),
+    /// then exclusive ones, oldest first, stopping after `nr_exclusive` of them
+    /// (`wake_up` is 1; 0, as in `wake_up_all`, wakes them all). Returns how
+    /// many were woken. The empty key wakes nobody.
+    ///
+    /// shortcut: the queue is the slot array scanned by key, not a list, and a
+    /// waiter that loops over several sleeps (Linux's `wait_event` keeps its
+    /// entry queued between iterations) re-joins at the head on each one;
+    /// upgrade with per-key wait entries (plan S5).
+    pub fn wake_up_key(&mut self, key: WaitKey, mode: WakeMode, nr_exclusive: usize) -> usize {
         if key == WaitKey::NONE {
             return 0;
         }
         let mut woken = 0;
+        let mut left = nr_exclusive;
         while let Some(index) = self
             .slots
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.used && s.state.sleeping() && s.key == key)
-            .min_by_key(|(_, s)| s.sleep_seq)
+            .filter(|(_, s)| s.used && s.key == key && mode.wakes(s.state))
+            // List order: non-exclusive first, newest first; then exclusive,
+            // oldest first.
+            .min_by_key(|(_, s)| {
+                (
+                    s.exclusive,
+                    if s.exclusive {
+                        s.sleep_seq
+                    } else {
+                        !s.sleep_seq
+                    },
+                )
+            })
             .and_then(|(index, _)| u32::try_from(index).ok())
         {
+            let exclusive = self.slots[index as usize].exclusive;
             self.wake(index);
             woken += 1;
+            if exclusive && left != 0 {
+                left -= 1;
+                if left == 0 {
+                    break;
+                }
+            }
         }
         woken
+    }
+
+    /// Back to the state [`Rq::new`] made, for the bare-metal suite's group
+    /// boundary: every task but idle is dropped (its slot freed, its handle
+    /// stale), the queue is empty and idle is current. Context: idle is
+    /// current (the caller runs on the boot stack).
+    ///
+    /// # Panics
+    /// If another task is current.
+    pub fn reset(&mut self) {
+        assert!(self.curr == IDLE, "Rq::reset from a task");
+        for slot in self.slots.iter_mut().skip(1) {
+            let generation = slot.generation.wrapping_add(1);
+            *slot = Slot::FREE;
+            slot.generation = generation;
+        }
+        self.head = None;
+        self.tail = None;
+        self.queued = 0;
+        self.need_resched = false;
     }
 
     /// `do_task_dead`'s state change: the current task is dead and must call

@@ -321,17 +321,30 @@ const SUCCESS_MARKERS: &[&str] = &[
 /// unmapped and a read of one faults at the exact instruction.
 const SCHED_SWITCH_RECORD: &str = "CHECK sched-switch ok threads=7 switches=ok regs=callee-saved first_run_abi=aligned fpu=isolated order=fifo timers=ordered wake=keyed,signal,spurious stacks=recycled pool=exhausted,reused guards=unmapped guard_fault=exact";
 
-/// The success markers plus the scheduler record.
-const SCHED_SWITCH_MARKERS: [&str; SUCCESS_MARKERS.len() + 1] = {
+/// Printed by `ktask::selftest::preempt_report` when `/init` dies (`test=sched-preempt` only): a
+/// kernel thread was kept runnable beside `/init`, the tick preempted `/init` at the return to
+/// ring 3 from the timer interrupt (a context switch taken inside the user-interrupt handler)
+/// repeatedly, the thread ran, and `/init` (`-- signals`) was resumed and finished correctly.
+const SCHED_PREEMPT_RECORD: &str =
+    "CHECK sched-preempt ok kthread=ran user_return_preemption=interrupt init=resumed";
+
+/// The success markers plus one extra record marker.
+const fn with_marker(extra: &'static str) -> [&'static str; SUCCESS_MARKERS.len() + 1] {
     let mut markers = [""; SUCCESS_MARKERS.len() + 1];
     let mut index = 0;
     while index < SUCCESS_MARKERS.len() {
         markers[index] = SUCCESS_MARKERS[index];
         index += 1;
     }
-    markers[index] = "CHECK sched-switch ok";
+    markers[index] = extra;
     markers
-};
+}
+
+/// The success markers plus the scheduler record.
+const SCHED_SWITCH_MARKERS: [&str; SUCCESS_MARKERS.len() + 1] =
+    with_marker("CHECK sched-switch ok");
+const SCHED_PREEMPT_MARKERS: [&str; SUCCESS_MARKERS.len() + 1] =
+    with_marker("CHECK sched-preempt ok");
 
 /// One oracle syscall-test group run on this kernel: `-- <group>` on the command line, the normal
 /// success markers, and every `init: test|tests|info` line equal to `xtask/oracle/expected.tsv`
@@ -770,6 +783,25 @@ const DEBUG_CASES: &[DebugCase] = &[
         forbid_success: false,
         modules: ARCHIVE_ONLY,
         user: INIT_OK,
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    // A kernel thread kept runnable beside the signal smoke: the tick preempts `/init` at the
+    // return to ring 3 and the thread and `/init` alternate (`CHECK sched-preempt`, exact).
+    DebugCase {
+        name: "sched-preempt",
+        cmdline: Some("test=sched-preempt -- signals"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: &SCHED_PREEMPT_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some("init: signals ok"),
+            exact_summary: true,
+            protection: (false, false),
+        },
         framebuffers: 1,
         plat: Q35_TCG,
     },
@@ -4128,55 +4160,6 @@ fn validate_platform(lines: &[&str], plat: Platform) -> Result<(), String> {
     Ok(())
 }
 
-/// The checks that belong to one named case beyond its `required` records.
-fn validate_named_case(case: DebugCase, lines: &[&str]) -> Result<(), String> {
-    if case.name == "sched-switch"
-        && !unique_exact_record(lines, "CHECK sched-switch", SCHED_SWITCH_RECORD)
-    {
-        return Err("the scheduler case must report the exact context-switch proof".to_owned());
-    }
-    if case.name == "unmasked-timer" {
-        let observed_irq = lines.iter().any(|line| {
-            let Some(rest) = line.strip_prefix("TIMER mask observation periods=2 irq_delta=")
-            else {
-                return false;
-            };
-            rest.split_ascii_whitespace()
-                .next()
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|delta| delta > 0)
-        });
-        if !observed_irq {
-            return Err("unmasked timer must report periods=2 and nonzero irq_delta".to_owned());
-        }
-    }
-    if case.name == "irq-restore-early"
-        && (!observed_irq_restore(lines, false)
-            || lines
-                .iter()
-                .any(|line| record_matches(line, "CHECK irq-guard")))
-    {
-        return Err(
-            "early IRQ restore must observe two tick periods, delivered IRQs and failed lock acquisition"
-                .to_owned(),
-        );
-    }
-    if case.name == "unexpected-page-fault"
-        && (!unique_exact_record(
-            lines,
-            "TRAP call-abi",
-            "TRAP call-abi vector=14 rsp_mod16=8",
-        ) || lines
-            .iter()
-            .any(|line| record_matches(line, "FAIL trap-call-abi")))
-    {
-        return Err(
-            "fatal page fault must observe the actual ordinary-call entry alignment".to_owned(),
-        );
-    }
-    Ok(())
-}
-
 fn validate_debug_case(
     case: DebugCase,
     process: &ProcessResult,
@@ -4237,8 +4220,8 @@ fn validate_debug_case(
     {
         return (false, diagnostic);
     }
-    if let Err(diagnostic) = validate_named_case(case, &lines) {
-        return (false, diagnostic);
+    if let Some(diagnostic) = named_case_failure(case.name, &lines) {
+        return (false, diagnostic.to_owned());
     }
     if case.forbid_success && lines.iter().any(|line| line.starts_with("RESULT success")) {
         return (false, "negative case emitted RESULT success".to_owned());
@@ -4249,9 +4232,15 @@ fn validate_debug_case(
     )
 }
 
-/// The extra records the three mutation cases must show (the failure text, or `None`).
+/// The extra records the named cases must show (the failure text, or `None`).
 fn named_case_failure(name: &str, lines: &[&str]) -> Option<&'static str> {
     match name {
+        "sched-switch" => (!unique_exact_record(lines, "CHECK sched-switch", SCHED_SWITCH_RECORD))
+            .then_some("the scheduler case must report the exact context-switch proof"),
+        "sched-preempt" => {
+            (!unique_exact_record(lines, "CHECK sched-preempt", SCHED_PREEMPT_RECORD))
+                .then_some("the preemption case must report the exact preemption proof")
+        }
         "unmasked-timer" => {
             let observed_irq = lines.iter().any(|line| {
                 let Some(rest) = line.strip_prefix("TIMER mask observation periods=2 irq_delta=")
@@ -6514,6 +6503,50 @@ mod tests {
 
     fn case(name: &str) -> DebugCase {
         *DEBUG_CASES.iter().find(|case| case.name == name).unwrap()
+    }
+
+    #[test]
+    fn sched_preempt_case_requires_the_one_exact_record_beside_the_signal_smoke() {
+        let process = ProcessResult {
+            timed_out: false,
+            exit_code: Some(33),
+        };
+        let preempt = case("sched-preempt");
+        let with = |record: &str| {
+            success_serial()
+                .replace("argc=1", "argc=2")
+                .replace("\ninit: ok", "\ninit: signals ok\ninit: ok")
+                .replace("\nKernel panic", &format!("\n{record}\nKernel panic"))
+        };
+        assert!(validate(preempt, &process, &with(SCHED_PREEMPT_RECORD)).0);
+        // Absent, altered in any field, or printed twice: rejected.
+        assert!(!validate(preempt, &process, &with("CHECK nothing")).0);
+        for (from, to) in [
+            ("kthread=ran", "kthread=idle"),
+            (
+                "user_return_preemption=interrupt",
+                "user_return_preemption=none",
+            ),
+            ("init=resumed", "init=lost"),
+        ] {
+            assert!(
+                !validate(
+                    preempt,
+                    &process,
+                    &with(&SCHED_PREEMPT_RECORD.replace(from, to))
+                )
+                .0,
+                "{from}"
+            );
+        }
+        assert!(
+            !validate(
+                preempt,
+                &process,
+                &with(&format!("{SCHED_PREEMPT_RECORD}\n{SCHED_PREEMPT_RECORD}"))
+            )
+            .0
+        );
     }
 
     #[test]

@@ -69,7 +69,9 @@ use core::{
     ptr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use kernel::sched::{NoSlot, Rq, SchedId, Switch, TaskState, WaitKey, timerq::TimerQueue};
+use kernel::sched::{
+    NoSlot, Rq, SchedId, Switch, TaskState, WaitKey, WakeMode, timerq::TimerQueue,
+};
 
 /// Scheduler slots: the idle task (slot 0, on the boot stack) and one per pool
 /// stack (slot `n` runs on `KSTACKS[n - 1]`).
@@ -165,13 +167,16 @@ fn stack_top(slot: usize) -> u64 {
 }
 
 /// Reserve the scheduler's storage and make the boot context the idle task.
+/// Once per boot: a second call (the bare-metal suite starts one process per
+/// group) finds the scheduler installed and keeps it; [`reset_group`] returns
+/// it to its initial state between groups.
 ///
 /// # Errors
 /// An allocation failed (the kernel heap is exhausted).
-///
-/// # Panics
-/// If called twice.
 pub fn init() -> Result<(), &'static str> {
+    if READY.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let rq = Rq::new(SLOTS).map_err(|_| "run queue")?;
     // One timed wake-up per task (`sleep_current` re-arms the task's own entry).
     let timers = TimerQueue::new(SLOTS).map_err(|_| "timer queue")?;
@@ -179,6 +184,39 @@ pub fn init() -> Result<(), &'static str> {
     TIMERQ.install(timers);
     READY.store(true, Ordering::Release);
     Ok(())
+}
+
+/// The end of a bare-metal-suite group: forget every task, timed wake-up and
+/// pending switch, so the next group starts on a scheduler as [`init`] left it.
+/// The group's tasks are dead or abandoned (their stacks are pool slots whose
+/// first-run frame the next [`spawn`] rewrites); nothing else refers to them.
+///
+/// Context: BSP, IF=0, the idle task (the boot stack) is current, no `RQ` or
+/// `TIMERQ` guard held. `userspace::teardown` has cleared the clockevent's
+/// wake-up words (`timer::clear_waits`).
+#[cfg(feature = "baremetal-suite")]
+pub fn reset_group() {
+    RQ.lock().reset();
+    TIMERQ.lock().clear();
+    SWITCH_PREV.store(NO_PREV, Ordering::Relaxed);
+    cpu::swap_bad_iret_depth(0);
+}
+
+/// Whether the boot context (the idle task) is current. The suite's group end
+/// uses it to know whether it can switch away (a task) or already is where
+/// teardown runs.
+#[cfg(feature = "baremetal-suite")]
+pub fn in_idle() -> bool {
+    let rq = RQ.lock();
+    rq.curr() == rq.idle()
+}
+
+/// Whether the locks of this module are free (see `Service::is_free`): the
+/// suite ends a stopped group only if the abandoned stack cannot still hold
+/// them.
+#[cfg(feature = "baremetal-suite")]
+pub fn locks_free() -> bool {
+    RQ.is_free() && TIMERQ.is_free()
 }
 
 /// The first-run frame of a task, built at the top of its stack: what
@@ -266,7 +304,10 @@ pub fn spawn_user(regs: PtRegs) -> Result<SchedId, NoSlot> {
 }
 
 /// Start the first user task and become the idle task (`rest_init`'s
-/// `cpu_startup_entry`): never returns.
+/// `cpu_startup_entry`). Returns when that task is gone and nothing else is
+/// runnable: never in a normal boot (the death of init ends it), once per group
+/// in the bare-metal suite, whose group end leaves the CPU for good with
+/// [`exit_current`].
 ///
 /// # Safety
 /// BSP at CPL0, IF clear, after `cpu::install_descriptors`,
@@ -274,7 +315,7 @@ pub fn spawn_user(regs: PtRegs) -> Result<SchedId, NoSlot> {
 /// (executable) and `sp` (writable) for the user; everything the syscall and
 /// fault paths use is in statics (`PROCESS`, `services`); the caller's frame
 /// stays on the boot stack, which only idle uses from here on.
-pub unsafe fn start_init(entry: u64, sp: u64) -> ! {
+pub unsafe fn start_init(entry: u64, sp: u64) {
     // SAFETY: forwarded caller contract (BSP, CPL0, no ring-3 task yet).
     unsafe { cpu::prepare_user_segments() };
     let regs = PtRegs {
@@ -288,10 +329,8 @@ pub unsafe fn start_init(entry: u64, sp: u64) -> ! {
         orig_ax: u64::MAX,
         ..PtRegs::default()
     };
-    crate::unwrap(spawn_user(regs).map_err(|_| "no task slot"), "spawn-init");
-    idle_loop(|| false);
-    // `idle_loop(|| false)` only returns when the closure says so.
-    cpu::halt()
+    let init = crate::unwrap(spawn_user(regs).map_err(|_| "no task slot"), "spawn-init");
+    idle_loop(|| state(init).is_none());
 }
 
 /// `current`, as a handle.
@@ -321,7 +360,8 @@ pub fn state(id: SchedId) -> Option<TaskState> {
     RQ.lock().state(id)
 }
 
-/// `wake_up_all(key)`: every sleeper on `key`; how many woke.
+/// `__wake_up(key, mode, nr_exclusive)`: see [`Rq::wake_up_key`] for the order
+/// and the counting; how many woke.
 #[cfg_attr(
     not(feature = "qemu-self-test"),
     allow(
@@ -329,8 +369,8 @@ pub fn state(id: SchedId) -> Option<TaskState> {
         reason = "seam for the pipe/wait lanes; exercised by the self-test"
     )
 )]
-pub fn wake_up_key(key: WaitKey) -> usize {
-    RQ.lock().wake_up_key(key)
+pub fn wake_up_key(key: WaitKey, mode: WakeMode, nr_exclusive: usize) -> usize {
+    RQ.lock().wake_up_key(key, mode, nr_exclusive)
 }
 
 /// `signal_wake_up`: wake an interruptible sleeper (the signal sender calls it
@@ -370,10 +410,34 @@ pub fn schedule() {
     }
 }
 
-/// Whether the tick asked for a reschedule (`need_resched`): honoured by the
-/// return-to-user path ([`crate::userspace::exit_to_user`]) and idle.
-pub fn resched_pending() -> bool {
+/// Whether the tick asked for a reschedule (`need_resched`).
+fn resched_pending() -> bool {
     RQ.lock().need_resched()
+}
+
+/// `exit_to_user_mode_loop`'s `TIF_NEED_RESCHED` step, at the return to ring 3:
+/// the tick asked for a reschedule because another task is runnable
+/// (`CONFIG_PREEMPT_VOLUNTARY` preempts only here, never in ring 0), so give it
+/// the CPU; this task continues when it is chosen again, with everything
+/// re-examined by the caller's loop. `interrupted`: the return is from an
+/// interrupt or exception (`pt_regs.orig_ax == -1`), not from a system call.
+///
+/// Context: task, IF=0, on this task's own kernel stack, no lock held (an
+/// interrupt handler's frame is fine: the entry stub's frame lives on the
+/// task's stack and the interrupt was acknowledged before this call).
+pub fn preempt_user(interrupted: bool) {
+    if !resched_pending() {
+        return;
+    }
+    #[cfg(feature = "qemu-self-test")]
+    let before = SWITCHES.load(Ordering::Relaxed);
+    schedule();
+    #[cfg(feature = "qemu-self-test")]
+    if interrupted && SWITCHES.load(Ordering::Relaxed) != before {
+        selftest::note_user_preemption();
+    }
+    #[cfg(not(feature = "qemu-self-test"))]
+    let _ = interrupted;
 }
 
 /// `STACK_END_MAGIC` check of a task's stack: a corrupted marker means the
@@ -505,6 +569,10 @@ fn disarm_wake(me: SchedId) {
 /// # Panics
 /// Before [`init`], or from the idle task.
 pub fn sleep_current(key: WaitKey, wake_at_ns: Option<u64>) {
+    debug_assert!(
+        !cpu::interrupts_enabled(),
+        "sleep_current with interrupts on"
+    );
     if wake_at_ns.is_some_and(|at| at <= timer::ktime_get_ns()) {
         return;
     }

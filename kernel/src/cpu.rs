@@ -46,7 +46,7 @@ pub struct Stack {
 impl Stack {
     #[expect(
         clippy::large_stack_arrays,
-        reason = "This constant initializes only the four permanent BSS stacks below; ELF/disassembly inspection checks that no runtime stack temporary or copy exists."
+        reason = "This constant initializes only the permanent BSS stacks below (the boot, double-fault, NMI, machine-check and debug stacks and the `KSTACKS` pool); ELF/disassembly inspection checks that no runtime stack temporary or copy exists."
     )]
     const ZERO: Self = Self {
         guard: [0; 4096],
@@ -70,6 +70,10 @@ pub const KSTACK_SLOTS: usize = 128;
 /// that `Tables::build` leaves unmapped, then 64 KiB of usable stack. An
 /// overflow therefore faults on the guard, and with no stack left for the
 /// exception frame escalates to #DF on its IST stack (`unexpected` names it).
+/// A frame larger than the 4 KiB guard could jump over it unless the compiler
+/// probes each page of the frame as it allocates it; the `x86_64-unknown-none`
+/// target spec asks for inline probes and `kstack-overflow` recurses with 6 KiB
+/// frames to catch a build that does not.
 /// shortcut: a fixed pool in the image (about 8.5 MiB of bss) instead of
 /// Linux's vmalloc'ed `THREAD_SIZE` stacks; upgrade with a stack window when
 /// the task limit must follow `max_threads`.
@@ -1018,10 +1022,13 @@ fn unexpected(frame: &PtRegs, vector: u64, error: u64, address: u64) -> ! {
     // room either) on a task stack's guard page is a kernel stack overflow,
     // Linux's `handle_stack_overflow` ("kernel stack overflow (double-fault)").
     // The boot stack's guard is read on purpose by the `unexpected-page-fault`
-    // case, so it keeps the plain trap line.
-    if let Some(slot) =
-        kstack_slot_of(address).filter(|&slot| address >> 12 == kstack_guard(slot) >> 12)
-    {
+    // case, so it keeps the plain trap line. CR2 at a #DF is the first fault's
+    // address only in practice (the architecture does not specify it), so a
+    // guard-page CR2 counts only with the faulting stack pointer on the same
+    // stack: a stale CR2 or a stray access elsewhere is a plain trap.
+    if let Some(slot) = kstack_slot_of(address).filter(|&slot| {
+        address >> 12 == kstack_guard(slot) >> 12 && kstack_slot_of(frame.sp) == Some(slot)
+    }) {
         crate::log!(
             "FAIL kernel stack overflow slot={} vector={} error={:#x} rip={:#x} cr2={:#x} rsp={:#x}\n",
             slot,

@@ -91,6 +91,11 @@ impl<K: Copy + PartialEq> TimerQueue<K> {
         }
     }
 
+    /// Disarm every owner (a group boundary of the bare-metal suite).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -148,6 +153,18 @@ mod tests {
         assert_eq!(q.insert(2, 2), Err(Full));
         assert_eq!(q.len(), 1);
         assert_eq!(q.next_expiry(), Some(1));
+    }
+
+    #[test]
+    fn clear_disarms_every_owner_and_keeps_the_capacity() {
+        let mut q = queue(2);
+        q.insert(5, 1).unwrap();
+        q.insert(6, 2).unwrap();
+        q.clear();
+        assert!(q.is_empty());
+        assert_eq!(q.next_expiry(), None);
+        q.insert(7, 3).unwrap();
+        q.insert(8, 4).unwrap();
     }
 
     #[test]

@@ -979,6 +979,7 @@ fn init_died(code: u32) -> ! {
             "CHECK user-faults ok handled={}\n",
             USER_FAULTS_HANDLED.load(core::sync::atomic::Ordering::Relaxed)
         );
+        ktask::selftest::preempt_report();
     }
     crate::log!("{}\n", InitDeath(code));
     #[cfg(feature = "qemu-self-test")]
@@ -1044,13 +1045,9 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
 /// returns: init's death panics, as Linux's `do_exit` does for pid 1.
 pub fn exit_to_user(regs: &mut cpu::PtRegs) {
     loop {
-        // `exit_to_user_mode_loop`: `TIF_NEED_RESCHED` first. The tick asked for
-        // a reschedule because another task is runnable (`CONFIG_PREEMPT_VOLUNTARY`
-        // preempts only here, never in ring 0); this task continues, with
-        // everything re-examined, when it is chosen again.
-        if ktask::resched_pending() {
-            ktask::schedule();
-        }
+        // `exit_to_user_mode_loop`: `TIF_NEED_RESCHED` first; this task continues,
+        // with everything re-examined below, when it is chosen again.
+        ktask::preempt_user(regs.orig_ax == u64::MAX);
         let mut process = PROCESS.lock();
         // Nothing to expire or dequeue: skip the clock read (`now_ns` is only
         // used when a pending SIGALRM leaves the queue).
@@ -1692,7 +1689,12 @@ fn run_lines(paths: impl Iterator<Item = &'static str>) {
 const FALLBACK_NAMES: [&str; 4] = ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"];
 
 /// Start init, or end the boot the way Linux does when it cannot.
-pub fn run(user: Result<Loaded, Error>) -> ! {
+///
+/// Returns only when init's task has left the CPU for good and nothing else is
+/// runnable, which in the bare-metal suite is the end of a group (the caller
+/// tears the process down and starts the next); in any other boot init's death
+/// ends the boot, so a return is the caller's failure to report.
+pub fn run(user: Result<Loaded, Error>) {
     match user {
         Ok(init) => start(init),
         Err(Error::NoInit) => {
@@ -1823,12 +1825,13 @@ pub fn teardown() {
 #[cfg(feature = "baremetal-suite")]
 pub fn locks_free() -> bool {
     PROCESS.is_free()
+        && ktask::locks_free()
         && services::TABLES.is_free()
         && services::FRAMES.is_free()
         && crate::kalloc::lock_free()
 }
 
-fn start(mut init: Loaded) -> ! {
+fn start(mut init: Loaded) {
     check_user_image(&init, &mut services::TABLES.lock().user_space());
     crate::log!("Run /init as init process\n");
     // SAFETY: BSP, CPL0, IF clear (nothing since the timer test re-enabled it
@@ -1915,6 +1918,7 @@ fn start(mut init: Loaded) -> ! {
     match crate::services::boot().test {
         kernel::boot::TestMode::SchedSwitch => ktask::selftest::sched_switch(),
         kernel::boot::TestMode::KstackOverflow => ktask::selftest::kstack_overflow(),
+        kernel::boot::TestMode::SchedPreempt => ktask::selftest::start_preempt_hog(),
         _ => {}
     }
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
