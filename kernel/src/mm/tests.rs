@@ -33,17 +33,17 @@ const STACK_PAGES: u64 = 36;
 const STACK_START: u64 = TASK_SIZE - STACK_PAGES * P;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-struct Hw {
-    kind: Pte,
-    prot: PageProt,
+pub(crate) struct Hw {
+    pub(crate) kind: Pte,
+    pub(crate) prot: PageProt,
 }
 
 /// Page tables as a map; `fail_maps` injects `OutOfMemory` after that many
 /// successful `map_*` calls.
 #[derive(Default)]
-struct Fake {
-    pages: BTreeMap<u64, Hw>,
-    fail_maps: Option<u32>,
+pub(crate) struct Fake {
+    pub(crate) pages: BTreeMap<u64, Hw>,
+    pub(crate) fail_maps: Option<u32>,
 }
 
 impl Fake {
@@ -97,21 +97,23 @@ impl UserPages for Fake {
         }
     }
     fn unmap(&mut self, start: u64, pages: u64) -> u64 {
+        // Walk the populated pages only: the ranges can span 2^35 pages.
+        let end = start.saturating_add(pages.saturating_mul(P));
+        let keys: Vec<u64> = self.pages.range(start..end).map(|(k, _)| *k).collect();
         let mut freed = 0;
-        for i in 0..pages {
-            if let Some(h) = self.pages.remove(&(start + i * P)) {
+        for k in keys {
+            if let Some(h) = self.pages.remove(&k) {
                 freed += u64::from(matches!(h.kind, Pte::Anon { .. }));
             }
         }
         freed
     }
     fn protect(&mut self, start: u64, pages: u64, prot: PageProt) {
-        for i in 0..pages {
-            if let Some(h) = self.pages.get_mut(&(start + i * P)) {
-                h.prot = prot;
-                if let Pte::Anon { writable } = &mut h.kind {
-                    *writable &= prot.write;
-                }
+        let end = start.saturating_add(pages.saturating_mul(P));
+        for (_, h) in self.pages.range_mut(start..end) {
+            h.prot = prot;
+            if let Pte::Anon { writable } = &mut h.kind {
+                *writable &= prot.write;
             }
         }
     }
@@ -564,6 +566,35 @@ fn mmap_file_branch_checks_and_typed_outcome() {
         w.fault(m.addr, 0),
         FaultOutcome::NeedsFile { write: false, .. }
     ));
+    // model: a page the loader already installed as a private frame needs no
+    // file; once the VMA is writable the write fault only raises the write bit.
+    w.pt.map_anon_page(m.addr, page_prot(m.vm_flags)).unwrap();
+    assert_eq!(w.fault(m.addr, 0), FaultOutcome::Handled);
+    let Ok(Mmap::NeedsFile(m)) = call(&mut w, &f, PROT_READ | PROT_WRITE, MAP_PRIVATE, 9) else {
+        panic!()
+    };
+    w.mm.mmap_region(
+        &w.env,
+        &mut w.pt,
+        Some(m.file.id),
+        m.addr,
+        m.len,
+        m.vm_flags,
+        m.pgoff,
+    )
+    .unwrap();
+    w.pt.map_anon_page(
+        m.addr,
+        PageProt {
+            accessible: true,
+            write: true,
+            exec: false,
+        },
+    )
+    .unwrap();
+    w.pt.pages.get_mut(&m.addr).unwrap().kind = Pte::Anon { writable: false };
+    assert_eq!(w.fault(m.addr, PF_WRITE | PF_PROT), FaultOutcome::Handled);
+    assert_eq!(w.pt.lookup(m.addr), Pte::Anon { writable: true });
 }
 
 /// src: mm/mmap.c do_mmap: MAP_FIXED_NOREPLACE -> EEXIST is after

@@ -3,10 +3,10 @@
 // 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: arch/x86/entry/syscall_64.c
 // (`do_syscall_x64`: the number is an `int`, compared as `unsigned int`),
 // arch/x86/entry/syscalls/syscall_64.tbl. The per-group files carry their own
-// provenance (`io`: fs/read_write.c, drivers/tty; `process`: kernel/exit.c,
-// kernel/sys.c). All GPL-2.0-only. Syscall names/numbers come from the
-// `syscalls` crate (BSD-2-Clause), whose x86_64 table was compared against the
-// pinned tbl.
+// provenance (`io`: fs/read_write.c, drivers/tty; `memory`: mm/mmap.c,
+// mm/mprotect.c, mm/madvise.c; `process`: kernel/exit.c, kernel/sys.c). All
+// GPL-2.0-only. Syscall names/numbers come from the `syscalls` crate
+// (BSD-2-Clause), whose x86_64 table was compared against the pinned tbl.
 // Transformation: the VFS/tty stack is reduced to the one open file the init
 // process owns (/dev/console on fds 0-2) with its default termios.
 #![forbid(unsafe_code)]
@@ -28,12 +28,18 @@
 
 mod ids;
 mod io;
+mod memory;
 mod process;
 #[cfg(test)]
 mod testing;
 mod time;
 
-use crate::{config, task::Attributes, usercopy::UserPages};
+use crate::{
+    config,
+    mm::{Env, FileInfo, Mm, UserPages as PageTables},
+    task::Attributes,
+    usercopy::UserPages,
+};
 use syscalls::{Errno, Sysno};
 
 pub use io::{MAX_RW_COUNT, TTY_CHUNK};
@@ -82,6 +88,15 @@ pub trait Context: UserPages + Clocks {
     /// known to lack CPUID faulting (`set_cpuid_mode` then returns `-ENODEV`).
     /// False means present or not determinable.
     fn cpuid_fault_absent(&self) -> bool;
+    /// `current->mm`: the VMA set, the rules' limits and the page tables the
+    /// memory syscalls edit.
+    fn address_space(&mut self) -> AddressSpace<'_>;
+    /// `fget(fd)` for `mmap`: the facts `do_mmap` reads from the open file, or
+    /// `None` for a closed descriptor (`-EBADF`). The default is the file table
+    /// of init today: fds 0-2 are `/dev/console`. The VFS owner overrides it.
+    fn mmap_file(&mut self, fd: u32) -> Option<FileInfo> {
+        io::console_file(fd)
+    }
 }
 
 /// What `sysinfo` reads from the machine rather than from the task.
@@ -95,6 +110,15 @@ pub struct Machine {
     pub free_pages: u64,
     /// `get_avenrun(loads, 0, SI_LOAD_SHIFT - FSHIFT)`: see [`crate::loadavg`].
     pub loads: [u64; 3],
+}
+
+/// The calling task's address space for the memory syscalls (`current->mm`).
+pub struct AddressSpace<'a> {
+    pub mm: &'a mut Mm,
+    pub env: &'a Env,
+    /// The page tables behind `mm`; the binary's view locks the frame
+    /// allocator per operation, after the model reserved its heap storage.
+    pub pages: &'a mut dyn PageTables,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +153,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
     }
     // One line per group, in table order of their first number.
     io::dispatch(ctx, sysno, args)
+        .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
         .or_else(|| ids::dispatch(ctx, sysno, args))
         .or_else(|| time::dispatch(ctx, sysno, args))
@@ -186,8 +211,8 @@ mod tests {
             assert_eq!(outcome, neg(Errno::ENOSYS), "{number:?}");
         }
         // Everything else Linux implements still stops loudly.
-        let outcome = dispatch(&mut task, Sysno::mmap as u64, [0; 6]);
-        assert_eq!(outcome, Outcome::Unimplemented(9));
+        let outcome = dispatch(&mut task, Sysno::mremap as u64, [0; 6]);
+        assert_eq!(outcome, Outcome::Unimplemented(25));
     }
 
     #[test]
@@ -195,7 +220,7 @@ mod tests {
         let mut task = task();
         let read = dispatch(&mut task, Sysno::read as u64, [0; 6]);
         assert_eq!(read, Outcome::Unimplemented(0));
-        let brk = dispatch(&mut task, Sysno::brk as u64, [0; 6]);
-        assert_eq!(brk, Outcome::Unimplemented(12));
+        let mremap = dispatch(&mut task, Sysno::mremap as u64, [0; 6]);
+        assert_eq!(mremap, Outcome::Unimplemented(25));
     }
 }

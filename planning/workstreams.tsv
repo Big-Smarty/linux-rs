@@ -2011,7 +2011,7 @@ ws-mm-kmsan	mm/kmsan	docs/verification.md	P0	not_started
 ws-mm-ksm-c	mm/ksm.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-list-lru-c	mm/list_lru.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-maccess-c	mm/maccess.c	docs/subsystems/memory.md	P0	not_started
-ws-mm-madvise-c	mm/madvise.c	docs/subsystems/memory.md	P0	not_started
+ws-mm-madvise-c	mm/madvise.c	docs/subsystems/memory.md	P0	in_progress
 ws-mm-mapping-dirty-helpers-c	mm/mapping_dirty_helpers.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-memblock-c	mm/memblock.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-memcontrol-c	mm/memcontrol.c	docs/subsystems/memory.md	P0	not_started

@@ -24,7 +24,7 @@ use crate::{
     boot::{BootError, BootInfo},
     console, cpu,
     memory::{Allocator, Error as MemoryError, PAGE, PAGE_BYTES, Physical},
-    paging::{self, Tables, UserSpace},
+    paging::{self, LoadSpace, Tables, UserSpace},
     services::{self, Service},
     timer,
 };
@@ -37,17 +37,21 @@ use kernel::{
     exec::{
         args::{ArgsError, InitArgv, Word},
         find::{FindError, InitEntry, Search},
-        plan::{LoadError, LoadPlan, Unsupported, Vmas},
+        load::{exec_file, insert_stack, map_segments},
+        plan::{LoadError, LoadPlan, Unsupported},
         report::{
-            self, ExecFailed, InitDeath, NO_INIT, NO_ROOT, NO_ROOT_PANIC, Segfault, TrapLine,
+            self, ExecFailed, FileRegion, InitDeath, NO_INIT, NO_ROOT, NO_ROOT_PANIC, Segfault,
+            TrapLine,
         },
         script,
-        stack::{self, ARG_PAGES, Aux, ENVP, EXPAND_PAGES, STACK_START, STACK_TOP, StackError},
+        stack::{self, ARG_PAGES, Aux, ENVP, STACK_START, STACK_TOP, StackError},
     },
     image::{cpio::FileType, elf::Elf},
     loadavg::LoadAvg,
+    mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     syscall::{
-        self, ClockState, Clocks, Console, Context, Machine, Outcome, RestartBlock, RestartFn,
+        self, AddressSpace, ClockState, Clocks, Console, Context, Machine, Outcome, RestartBlock,
+        RestartFn,
     },
     task::{self, Attributes},
     usercopy::{self, UserPages},
@@ -138,9 +142,11 @@ pub struct Loaded {
     pub entry: u64,
     pub sp: u64,
     pub loads: usize,
-    pub brk: u64,
     pub argc: u64,
-    pub vmas: Vmas,
+    /// The address space the loader built (VMAs, `start_brk`, data bounds).
+    pub mm: Mm,
+    /// The limits and sysctls its rules read.
+    pub env: Env,
 }
 
 fn weak_random() -> [u8; 16] {
@@ -289,24 +295,19 @@ fn load_init(
         other => other?,
     };
 
-    for segment in plan.segments() {
-        for page in 0..segment.pages() {
-            let prot = segment.page_prot(page);
-            if !prot.accessible() {
-                continue; // PROT_NONE: accounted for, never present.
-            }
-            let mut frame = allocator.allocate()?;
-            segment.fill_page(file, page, frame.bytes());
-            let physical = frame.into_reserved();
-            tables.map_user(
-                allocator,
-                segment.start + page * PAGE,
-                physical,
-                prot.write,
-                prot.exec,
-            )?;
-        }
-    }
+    // The address space is built by the one mapping-rule mechanism (`mm`):
+    // the shared zero page, the stack VMA, then every `PT_LOAD` (the loader
+    // installs the file pages it owns as it goes). The model's vectors come
+    // from the boot arena (`kalloc`): `FRAMES` does not exist yet.
+    tables.init_zero_page(allocator)?;
+    let env = Env::init(allocator.total() as u64, 0);
+    let mut mm = Mm::new(&env);
+    insert_stack(&mut mm, &env, plan.exec_stack)?;
+    let mut space = LoadSpace {
+        tables: &mut *tables,
+        allocator: &mut *allocator,
+    };
+    map_segments(&plan, file, &exec_file(1), &mut mm, &env, &mut space)?;
 
     // The argument block lives in the top ARG_PAGES pages: one contiguous
     // frame so `stack::build` can write it as a single window.
@@ -336,24 +337,16 @@ fn load_init(
         let physical = Physical(top.0 + page * PAGE);
         tables.map_user(allocator, address, physical, true, plan.exec_stack)?;
     }
-    for page in 0..EXPAND_PAGES as u64 {
-        let physical = allocator.allocate()?.into_reserved();
-        tables.map_user(
-            allocator,
-            STACK_START + page * PAGE,
-            physical,
-            true,
-            plan.exec_stack,
-        )?;
-    }
+    // The 32 expansion pages below the arguments are demand-zero (Linux's
+    // `setup_arg_pages` expands the VMA, it does not fault the pages in).
 
     Ok(Loaded {
         entry: plan.entry,
         sp: built.sp,
         loads: plan.segments().len(),
-        brk: plan.brk,
         argc: built.argc,
-        vmas: plan.vmas,
+        mm,
+        env,
     })
 }
 
@@ -373,14 +366,6 @@ pub struct Process {
     pub tgid: u32,
     /// The address space (`mm`): the published page tables.
     pub mm: &'static Service<Tables>,
-    /// File-backed VMAs from the exec plan (segfault report). When this becomes
-    /// a `Vec`, `try_reserve` it BEFORE taking a `FRAMES` guard (`services`).
-    /// shortcut: fixed array, no anonymous VMAs yet; the mm group replaces it
-    /// with a sorted `Vec` grown by `try_reserve`.
-    pub vmas: Vmas,
-    /// `mm->start_brk`, and the initial `mm->brk`.
-    #[allow(dead_code, reason = "read by the brk syscall (mm group)")]
-    pub brk: u64,
     /// Credentials, rlimits, filesystem context, comm, personality and the
     /// user pointers libc registers (`task::Attributes`, the identity group).
     pub attrs: Attributes,
@@ -390,6 +375,14 @@ pub struct Process {
     /// `current->restart_block.nanosleep`, written by the sleeping syscalls.
     #[allow(dead_code, reason = "read by restart_syscall (signal lane)")]
     pub restart: RestartBlock,
+    /// The VMA set, program break and statistics (`mm_struct`); the page
+    /// tables are behind `mm`. It reserves its `Vec` storage (heap) before any
+    /// `FRAMES` guard is taken (`services`).
+    pub space: Mm,
+    /// The rlimits and sysctls the mapping rules read (`Env`).
+    /// shortcut: fixed `INIT_RLIMITS`; `setrlimit`/`prlimit64` must update it
+    /// (or derive it from the credentials group's limits) when they land.
+    pub env: Env,
 }
 
 static PROCESS: Service<Process> = Service::new();
@@ -439,6 +432,12 @@ pub fn account_ticks(user: bool, periods: u64) {
     CPUTIME.tick(user, periods);
 }
 
+/// Ring-3 page faults the address-space model resolved (`page_fault`); the
+/// self-test build reports it when init exits, as evidence that demand paging
+/// of init's own bss/stack through the real tables returned to user mode.
+#[cfg(feature = "qemu-self-test")]
+static USER_FAULTS_HANDLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Syscall context: the process plus its user-memory view (a borrow of the
 /// locked tables, so no map/unmap can run mid-syscall) and the console.
 struct Syscall<'a> {
@@ -447,8 +446,39 @@ struct Syscall<'a> {
     tty: Tty,
 }
 
+/// A kernel access to a user page that is not resident takes the fault Linux
+/// would: `exc_page_fault` -> `do_user_addr_fault` with the kernel-mode error
+/// code (no `X86_PF_USER`) on a user address. A fault the model resolves is
+/// retried (once: it must now succeed); any refusal is the exception-table
+/// fixup, i.e. a short copy and `-EFAULT`, with no signal (`__bad_area_nosemaphore`
+/// only signals in user mode; OOM, SIGBUS and the vsyscall page behave the
+/// same for a kernel-mode access). A file page we cannot supply stops loudly.
+/// No lock is held across the fault that is not already held by the syscall
+/// (`PROCESS`, `TABLES`): the handler takes neither again and only `FRAMES`
+/// (a leaf) below them.
 impl UserPages for Syscall<'_> {
     fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+        if !self.space.resident(page, write) {
+            // Present-but-read-only (write) is `X86_PF_PROT`, an absent page is
+            // not; the model's decision does not depend on it for a write.
+            let error = if write { PF_WRITE } else { 0 };
+            let process = &mut *self.process;
+            match process
+                .space
+                .handle_user_fault(&process.env, &mut self.space, page, error)
+            {
+                FaultOutcome::Handled => {}
+                FaultOutcome::NeedsFile { address, write } => {
+                    crate::log!(
+                        "FAIL mm unimplemented file-backed fault address={:#x} write={} (kernel access)\n",
+                        address,
+                        write
+                    );
+                    crate::fail();
+                }
+                _ => return None,
+            }
+        }
         self.space.page(page, write)
     }
 }
@@ -492,6 +522,13 @@ impl Context for Syscall<'_> {
             total_pages: frames.total() as u64,
             free_pages: frames.available() as u64,
             loads: self.process.load.loads_at(jiffies_of(uptime_ns), NR_ACTIVE),
+        }
+    }
+    fn address_space(&mut self) -> AddressSpace<'_> {
+        AddressSpace {
+            mm: &mut self.process.space,
+            env: &self.process.env,
+            pages: &mut self.space,
         }
     }
 }
@@ -545,6 +582,13 @@ impl Console for Tty {
 /// `kernel/exit.c`: init exiting for any reason panics. In a `qemu-self-test`
 /// build the result mirrors the exit code; the default build halts.
 fn init_died(code: u32) -> ! {
+    #[cfg(feature = "qemu-self-test")]
+    if code == 0 {
+        crate::log!(
+            "CHECK user-faults ok handled={}\n",
+            USER_FAULTS_HANDLED.load(core::sync::atomic::Ordering::Relaxed)
+        );
+    }
     crate::log!("{}\n", InitDeath(code));
     #[cfg(feature = "qemu-self-test")]
     {
@@ -584,22 +628,17 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
     }
 }
 
-/// Called by the IDT entry for an exception raised in ring 3. Fatal to init:
-/// no signal handler can exist yet, so the signal's default action (terminate)
-/// runs, the exit code is the signal number, and init's death panics.
-pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) -> ! {
-    let vmas = PROCESS.lock().vmas;
+/// Called by the IDT entry for an exception raised in ring 3. A page fault
+/// the address-space model resolves returns (the entry code `iretq`s to the
+/// faulting instruction); everything else is fatal to init: no signal handler
+/// can exist yet, so the signal's default action (terminate) runs, the exit
+/// code is the signal number, and init's death panics.
+pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) {
     if vector == 14 {
-        let line = Segfault {
-            address,
-            ip,
-            sp,
-            error,
-            vmas: &vmas,
-        };
-        crate::log!("{}\n", line);
-        init_died(report::signal_exit_code(report::SIGSEGV));
+        page_fault(error, ip, sp, address);
+        return;
     }
+    let region = FileRegion::of(&PROCESS.lock().space, ip);
     let signal = u8::try_from(vector).ok().and_then(report::user_exception);
     let Some(signal) = signal else {
         crate::log!(
@@ -617,11 +656,370 @@ pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) -> ! {
             ip,
             sp,
             error,
-            vmas: &vmas,
+            region,
         };
         crate::log!("{}\n", line);
     }
     init_died(report::signal_exit_code(signal.signal));
+}
+
+/// A page fault taken in ring 3 (`exc_page_fault` -> `do_user_addr_fault`).
+/// Context: the faulting task, interrupts off, no lock held (the fault came
+/// from ring 3). Locks `PROCESS` -> `TABLES` (-> heap, `FRAMES` inside).
+///
+/// Outcomes and what Linux does (6.18.57, arch/x86/mm/fault.c) once signals
+/// exist; until then the default action of the signal is carried out directly:
+/// * `Handled`: return to user, the instruction retries.
+/// * `Segv`: `force_sig_fault(SIGSEGV, SEGV_MAPERR|SEGV_ACCERR, address)` after
+///   `show_signal_msg` (the `init[1]: segfault at ...` line); init has no
+///   handler, so it dies with exit code 11.
+/// * `Bus`: `do_sigbus` -> `SIGBUS` (no console line), exit code 7.
+/// * `Oom`, `PgtableBad`, `Vsyscall`, `NeedsFile`: Linux runs the OOM killer
+///   (which finds init unkillable and panics), oopses and kills the task,
+///   emulates the vsyscall page, or reads the page cache. None is implemented:
+///   a loud `FAIL mm ...` stop, never a signal that did not happen.
+fn page_fault(error: u64, ip: u64, sp: u64, address: u64) {
+    let mut guard = PROCESS.lock();
+    let process = &mut *guard;
+    let mut tables = process.mm.lock();
+    let mut space = tables.user_space();
+    let outcome =
+        process
+            .space
+            .handle_user_fault(&process.env, &mut space, address, error | mm::PF_USER);
+    drop(tables);
+    match outcome {
+        FaultOutcome::Handled => {
+            #[cfg(feature = "qemu-self-test")]
+            USER_FAULTS_HANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        FaultOutcome::Segv { address, .. } => {
+            // Both refusals (MAPERR, ACCERR) print the same line; the code only
+            // reaches siginfo, which no handler can read yet.
+            let line = Segfault {
+                address,
+                ip,
+                sp,
+                error,
+                region: FileRegion::of(&process.space, ip),
+            };
+            drop(guard);
+            crate::log!("{}\n", line);
+            init_died(report::signal_exit_code(report::SIGSEGV));
+        }
+        FaultOutcome::Bus { .. } => {
+            drop(guard);
+            init_died(report::signal_exit_code(report::SIGBUS));
+        }
+        FaultOutcome::Oom => {
+            crate::log!(
+                "FAIL mm out of memory in a user fault (Linux: pagefault_out_of_memory finds no killable task and panics) address={:#x} ip={:#x}\n",
+                address,
+                ip
+            );
+            crate::fail();
+        }
+        FaultOutcome::PgtableBad => {
+            crate::log!(
+                "FAIL mm reserved bit in a user PTE (Linux: pgtable_bad oops, SIGKILL) address={:#x} ip={:#x}\n",
+                address,
+                ip
+            );
+            crate::fail();
+        }
+        FaultOutcome::Vsyscall {
+            address,
+            error_code,
+        } => {
+            crate::log!(
+                "FAIL mm vsyscall page fetch unimplemented (Linux emulates gettimeofday/time/getcpu there) address={:#x} error={:#x} ip={:#x}\n",
+                address,
+                error_code,
+                ip
+            );
+            crate::fail();
+        }
+        FaultOutcome::NeedsFile { address, write } => {
+            crate::log!(
+                "FAIL mm unimplemented file-backed fault address={:#x} write={} ip={:#x}\n",
+                address,
+                write,
+                ip
+            );
+            crate::fail();
+        }
+    }
+}
+
+/// One system call through the dispatcher in the self-test (stops loudly on an
+/// unimplemented number).
+#[cfg(feature = "qemu-self-test")]
+fn call(context: &mut Syscall<'_>, number: syscalls::Sysno, args: [u64; 6]) -> i64 {
+    match syscall::dispatch(context, number as u64, args) {
+        Outcome::Return(value) => value,
+        _ => crate::unwrap(Err::<i64, _>("mm-usercopy-syscall"), "mm-usercopy"),
+    }
+}
+
+/// `PROT_NONE` round trip of [`mm_usercopy_faults`] on pages `a` and `a + P`
+/// (which hold `pattern` across their boundary).
+#[cfg(feature = "qemu-self-test")]
+fn mm_usercopy_protnone(context: &mut Syscall<'_>, a: u64, pattern: [u8; 8]) {
+    use kernel::mm::{PROT_NONE, PROT_READ, PROT_WRITE};
+    use kernel::usercopy::{copy_from_user, copy_to_user};
+    use syscalls::Sysno;
+
+    const P: u64 = PAGE;
+    // PROT_NONE keeps the frame and its data: the entry is not present, holds
+    // the complemented frame bits (Linux's L1TF guard), the kernel is refused,
+    // and protecting back restores the same bytes (the un-inverted frame).
+    let before = context.space.raw_entry(a + P);
+    crate::require(
+        call(context, Sysno::mprotect, [a, 2 * P, PROT_NONE, 0, 0, 0]) == 0,
+        "mm-usercopy-protnone",
+    );
+    crate::require(
+        paging::UserSpace::protnone_guard(before, context.space.raw_entry(a + P)),
+        "mm-usercopy-protnone-inverted",
+    );
+    let mut refused = [0xffu8; 8];
+    crate::require(
+        copy_from_user(context, &mut refused, a + P - 4) == 8 && refused == [0; 8],
+        "mm-usercopy-protnone-refused",
+    );
+    crate::require(
+        copy_to_user(context, a + P, &[1]) == 1,
+        "mm-usercopy-protnone-write-refused",
+    );
+    crate::require(
+        call(
+            context,
+            Sysno::mprotect,
+            [a, 2 * P, PROT_READ | PROT_WRITE, 0, 0, 0],
+        ) == 0,
+        "mm-usercopy-protnone-restore",
+    );
+    let mut kept = [0u8; 8];
+    crate::require(
+        copy_from_user(context, &mut kept, a + P - 4) == 0 && kept == pattern,
+        "mm-usercopy-protnone-data",
+    );
+}
+
+/// `MAP_FIXED` replacement of [`mm_usercopy_faults`] over the two touched pages at `a`.
+#[cfg(feature = "qemu-self-test")]
+fn mm_usercopy_fixed(context: &mut Syscall<'_>, a: u64) {
+    use kernel::mm::{
+        MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE, Pte, UserPages as _,
+    };
+    use kernel::usercopy::copy_from_user;
+    use syscalls::Sysno;
+
+    const P: u64 = PAGE;
+    // `MAP_FIXED` over two touched private pages drops their frames (the final
+    // accounting would show a leak) and leaves demand-zero pages.
+    crate::require(
+        context.space.lookup(a) != Pte::Absent && context.space.lookup(a + P) != Pte::Absent,
+        "mm-usercopy-fixed-before",
+    );
+    crate::require(
+        call(
+            context,
+            Sysno::mmap,
+            [
+                a,
+                2 * P,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                u64::MAX,
+                0,
+            ],
+        )
+        .cast_unsigned()
+            == a,
+        "mm-usercopy-fixed",
+    );
+    crate::require(
+        context.space.lookup(a) == Pte::Absent && context.space.lookup(a + P) == Pte::Absent,
+        "mm-usercopy-fixed-unmapped",
+    );
+    let mut fresh = [0xffu8; 8];
+    crate::require(
+        copy_from_user(context, &mut fresh, a + P - 4) == 0 && fresh == [0; 8],
+        "mm-usercopy-fixed-zero",
+    );
+}
+
+/// The kernel-access cases of [`check_mm_usercopy`]: `a` is three writable
+/// anonymous pages whose last is `PROT_NONE`, `b` one untouched read-only page.
+#[cfg(feature = "qemu-self-test")]
+fn mm_usercopy_faults(context: &mut Syscall<'_>, a: u64, b: u64) {
+    use kernel::mm::{Pte, UserPages as _};
+    use kernel::usercopy::{copy_from_user, copy_to_user};
+
+    const P: u64 = PAGE;
+    // A write across two untouched writable pages faults both in (write fault
+    // on an absent page: a private zeroed frame each), then reads them back.
+    let pattern = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    crate::require(
+        copy_to_user(context, a + P - 4, &pattern) == 0,
+        "mm-usercopy-write",
+    );
+    let mut back = [0u8; 8];
+    crate::require(
+        copy_from_user(context, &mut back, a + P - 4) == 0,
+        "mm-usercopy-read",
+    );
+    crate::require(back == pattern, "mm-usercopy-readback");
+    crate::require(
+        context.space.lookup(a) == Pte::Anon { writable: true }
+            && context.space.lookup(a + P) == Pte::Anon { writable: true },
+        "mm-usercopy-private-frames",
+    );
+    mm_usercopy_protnone(context, a, pattern);
+    // A read of an untouched readable page maps the shared zero page; a write
+    // to that read-only mapping is refused (EFAULT: nothing copied) and keeps it.
+    let mut zeros = [0xffu8; 8];
+    crate::require(
+        copy_from_user(context, &mut zeros, b) == 0,
+        "mm-usercopy-zero-read",
+    );
+    crate::require(
+        zeros == [0; 8] && context.space.lookup(b) == Pte::ZeroPage,
+        "mm-usercopy-zero-page",
+    );
+    crate::require(copy_to_user(context, b, &[1]) == 1, "mm-usercopy-readonly");
+    crate::require(
+        context.space.lookup(b) == Pte::ZeroPage,
+        "mm-usercopy-readonly-kept",
+    );
+    // The PROT_NONE page after the writable ones: the copy stops at the hole
+    // (bytes before it are copied, the rest is reported), and a read of the
+    // hole alone copies nothing and zero-fills the destination.
+    crate::require(
+        copy_to_user(context, a + 2 * P - 2, &[9; 6]) == 4,
+        "mm-usercopy-short-write",
+    );
+    let mut tail = [0xffu8; 6];
+    crate::require(
+        copy_from_user(context, &mut tail, a + 2 * P - 2) == 4,
+        "mm-usercopy-short-read",
+    );
+    crate::require(tail == [9, 9, 0, 0, 0, 0], "mm-usercopy-short-read-bytes");
+    let mut hole = [0xffu8; 8];
+    crate::require(
+        copy_from_user(context, &mut hole, a + 2 * P) == 8,
+        "mm-usercopy-hole",
+    );
+    crate::require(hole == [0; 8], "mm-usercopy-hole-zeroed");
+    crate::require(
+        copy_to_user(context, a + 2 * P, &[1]) == 1,
+        "mm-usercopy-hole-write",
+    );
+    // An address above TASK_SIZE_MAX is refused by the range check, not faulted.
+    crate::require(
+        copy_to_user(context, kernel::usercopy::TASK_SIZE_MAX - 1, &[1, 2]) == 2,
+        "mm-usercopy-range",
+    );
+    mm_usercopy_fixed(context, a);
+}
+
+/// QEMU proof of the kernel-access page-fault path through the real syscall
+/// context, tables and frame allocator, without ring 3: the memory syscalls
+/// create the mappings, then the one user-copy mechanism faults pages in
+/// (`__do_page_fault` of a kernel access to user memory) with Linux's
+/// short-copy results. Context: BSP, IF clear, `PROCESS` installed, no lock held.
+#[cfg(feature = "qemu-self-test")]
+fn check_mm_usercopy() {
+    use kernel::mm::{
+        MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE, Pte, UserPages as _, VmFlags,
+    };
+    use kernel::usercopy::{copy_from_user, copy_to_user};
+    use syscalls::Sysno;
+
+    const P: u64 = PAGE;
+    let mut guard = PROCESS.lock();
+    let mm = guard.mm;
+    let mut tables = mm.lock();
+    let data_frames = |tables: &Tables| services::FRAMES.lock().allocated() - tables.pages;
+    let (frames0, vm0) = (data_frames(&tables), guard.space.total_vm);
+    let mut context = Syscall {
+        space: tables.user_space(),
+        process: &mut guard,
+        tty: Tty,
+    };
+    let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
+    let a = call(
+        &mut context,
+        Sysno::mmap,
+        [0, 3 * P, PROT_READ | PROT_WRITE, anonymous, u64::MAX, 0],
+    )
+    .cast_unsigned();
+    let b = call(
+        &mut context,
+        Sysno::mmap,
+        [0, P, PROT_READ, anonymous, u64::MAX, 0],
+    )
+    .cast_unsigned();
+    crate::require(
+        a.is_multiple_of(P) && b.is_multiple_of(P) && a < kernel::usercopy::TASK_SIZE_MAX,
+        "mm-usercopy-mmap",
+    );
+    crate::require(
+        call(
+            &mut context,
+            Sysno::mprotect,
+            [a + 2 * P, P, PROT_NONE, 0, 0, 0],
+        ) == 0,
+        "mm-usercopy-mprotect",
+    );
+    mm_usercopy_faults(&mut context, a, b);
+    crate::require(
+        call(&mut context, Sysno::munmap, [a, 3 * P, 0, 0, 0, 0]) == 0,
+        "mm-usercopy-munmap-a",
+    );
+    crate::require(
+        call(&mut context, Sysno::munmap, [b, P, 0, 0, 0, 0]) == 0,
+        "mm-usercopy-munmap-b",
+    );
+    // A kernel access one page below the growable stack VMA expands it
+    // (`expand_downwards` through the fault path) and maps a private frame:
+    // the only accounting change left, one frame and one page.
+    let top = context
+        .process
+        .space
+        .vmas()
+        .iter()
+        .find(|vma| vma.flags.intersects(VmFlags::GROWSDOWN))
+        .map(|vma| vma.start);
+    let grown = crate::unwrap(top.ok_or("no stack VMA"), "mm-usercopy-stack-vma") - P;
+    crate::require(
+        copy_to_user(&mut context, grown, &[7]) == 0,
+        "mm-usercopy-stack-grow",
+    );
+    let mut byte = [0u8];
+    crate::require(
+        copy_from_user(&mut context, &mut byte, grown) == 0 && byte == [7],
+        "mm-usercopy-stack-readback",
+    );
+    crate::require(
+        context
+            .process
+            .space
+            .find_vma(grown)
+            .is_some_and(|vma| vma.start == grown && vma.flags.intersects(VmFlags::GROWSDOWN))
+            && context.space.lookup(grown) == (Pte::Anon { writable: true }),
+        "mm-usercopy-stack-vma-grown",
+    );
+    crate::require(
+        data_frames(&tables) == frames0 + 1 && guard.space.total_vm == vm0 + 1,
+        "mm-usercopy-accounting",
+    );
+    drop(tables);
+    drop(guard);
+    crate::log!(
+        "CHECK mm-usercopy ok fault_in=read,write short_write=4 hole=8 readonly=refused zero_page=shared range=refused protnone=inverted,restored fixed=replaced stack=grown unmap=restored\n"
+    );
 }
 
 /// Exercise the one user-copy mechanism on the real owned tables.
@@ -646,7 +1044,7 @@ fn check_user_image(init: &Loaded, space: &mut UserSpace<'_>) {
         "user-range-limit",
     );
     crate::require(
-        init.vmas.find(init.entry).is_some(),
+        FileRegion::of(&init.mm, init.entry).is_some(),
         "user-entry-file-backed",
     );
     let audit = crate::unwrap(space.audit(), "user-isolation-audit");
@@ -661,7 +1059,7 @@ fn check_user_image(init: &Loaded, space: &mut UserSpace<'_>) {
         init.entry,
         init.sp,
         init.loads,
-        init.brk,
+        init.mm.start_brk,
         init.argc
     );
 }
@@ -693,7 +1091,7 @@ const FALLBACK_NAMES: [&str; 4] = ["/sbin/init", "/etc/init", "/bin/init", "/bin
 /// Start init, or end the boot the way Linux does when it cannot.
 pub fn run(user: Result<Loaded, Error>) -> ! {
     match user {
-        Ok(init) => start(&init),
+        Ok(init) => start(init),
         Err(Error::NoInit) => {
             // Linux: `init_eaccess("/init")` fails, `prepare_namespace` finds no
             // root device and panics (init/do_mounts.c:236).
@@ -733,8 +1131,8 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
     }
 }
 
-fn start(init: &Loaded) -> ! {
-    check_user_image(init, &mut services::TABLES.lock().user_space());
+fn start(init: Loaded) -> ! {
+    check_user_image(&init, &mut services::TABLES.lock().user_space());
     crate::log!("Run /init as init process\n");
     // SAFETY: BSP, CPL0, IF clear (nothing since the timer test re-enabled it
     // except the guarded sections, which restore it off), descriptors installed
@@ -773,8 +1171,6 @@ fn start(init: &Loaded) -> ! {
         pid: 1,
         tgid: 1,
         mm: &services::TABLES,
-        vmas: init.vmas,
-        brk: init.brk,
         attrs: Attributes::init(task::max_threads(managed_pages)),
         load,
         restart: RestartBlock {
@@ -783,7 +1179,11 @@ fn start(init: &Loaded) -> ! {
             expires_ns: 0,
             rmtp: 0,
         },
+        space: init.mm,
+        env: init.env,
     });
+    #[cfg(feature = "qemu-self-test")]
+    check_mm_usercopy();
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all
     // state used by the syscall/fault paths is in `PROCESS` and `services`; `kernel_main`'s

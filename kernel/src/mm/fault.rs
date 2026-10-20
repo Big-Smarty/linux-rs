@@ -172,11 +172,15 @@ impl Mm {
         write: bool,
     ) -> Result<(), Step> {
         let v = self.vmas[idx];
-        if !v.is_anonymous() {
-            return Err(Step::NeedsFile);
-        }
         let page = page_floor(address);
         let prot = page_prot(v.flags);
+        // A file VMA has no page cache to fault from yet (`NeedsFile`), but the
+        // loader (and the future page cache) installs the pages it owns as
+        // private frames. A present one is exactly what `wp_page_copy` would
+        // have produced, so only the write-protect upgrade below applies.
+        if !v.is_anonymous() && !matches!(pt.lookup(page), Pte::Anon { .. }) {
+            return Err(Step::NeedsFile);
+        }
         match pt.lookup(page) {
             Pte::Absent => {
                 // do_anonymous_page: File mapping without ->vm_ops?

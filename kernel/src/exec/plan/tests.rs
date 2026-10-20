@@ -8,7 +8,6 @@
 )]
 extern crate std;
 use super::{LoadError, LoadPlan, MAX_LOADS, Unsupported};
-use crate::{exec::stack::STACK_START, usercopy::TASK_SIZE_MAX};
 use std::vec::Vec;
 use syscalls::Errno;
 
@@ -134,14 +133,13 @@ fn oracle_binary_plans_like_linux() {
     assert_eq!(plan.phdr, 0x200040); // AT_PHDR in the oracle's auxv
     assert_eq!(plan.phnum, 7); // AT_PHNUM
     assert!(!plan.exec_stack);
-    assert_eq!(plan.brk, 0x20d000);
     let segments = plan.segments();
     assert_eq!(segments.len(), 4);
     assert_eq!(
         (
             segments[0].start,
             segments[0].file_pages,
-            segments[0].anon_pages
+            segments[0].anon_len
         ),
         (0x200000, 4, 0)
     );
@@ -157,7 +155,7 @@ fn oracle_binary_plans_like_linux() {
         (
             segments[2].start,
             segments[2].file_pages,
-            segments[2].anon_pages
+            segments[2].anon_len
         ),
         (0x20b000, 1, 0)
     );
@@ -169,14 +167,6 @@ fn oracle_binary_plans_like_linux() {
         ),
         (0x20c000, 1, 0x9000)
     );
-    // print_vma_addr in the oracle: init[45b4,204000+7000] for ip 0x2055b4.
-    let vma = plan.vmas.find(0x2055b4).unwrap();
-    assert_eq!(
-        (vma.start, vma.end - vma.start, vma.pgoff),
-        (0x204000, 0x7000, 3)
-    );
-    assert!(plan.vmas.find(0x20d000).is_none());
-    assert!(plan.vmas.find(0x1fffff).is_none());
 }
 
 #[test]
@@ -205,9 +195,12 @@ fn page_contents_come_from_the_file_with_padzero_only_when_writable() {
     // The anonymous bss part is zero, readable and writable even though the
     // segment itself is read-only, and executable only when the segment is.
     let seg = ro_plan.segments()[0];
-    assert_eq!((seg.file_pages, seg.anon_pages), (1, 1));
-    let p = seg.page_prot(1);
-    assert!(p.read && p.write && !p.exec);
+    assert_eq!(
+        (seg.file_pages, seg.anon_start, seg.anon_len),
+        (1, 0x401000, 0x1000)
+    );
+    assert!(seg.prot.read && !seg.prot.write && !seg.prot.exec);
+    // Past the file part there is nothing to fill: the bss is demand-zero.
     ro_plan.segments()[0].fill_page(&ro_file, 1, &mut page);
     assert!(page.iter().all(|&b| b == 0));
 }
@@ -362,126 +355,6 @@ fn rwx_segments_are_allowed_and_prot_none_is_accounted_but_inaccessible() {
 }
 
 #[test]
-fn entry_and_segment_bounds_follow_task_size() {
-    let l = load(R | X, 0, 0x400000, 0x100, 0x100);
-    assert_eq!(
-        errno(LoadPlan::new(&elf(EXEC, TASK_SIZE_MAX, &[l], 0x1000))),
-        Errno::EINVAL
-    );
-    assert!(LoadPlan::new(&elf(EXEC, TASK_SIZE_MAX - 1, &[l], 0x1000)).is_ok());
-    assert!(LoadPlan::new(&elf(EXEC, 0, &[], 0x1000)).is_err()); // no program headers
-    // vaddr + memsz beyond TASK_SIZE_MAX: the mmap/brk layer says ENOMEM first.
-    assert_eq!(
-        errno(plan(&[load(R, 0, 0x400000, 0x10, TASK_SIZE_MAX)], 0x1000)),
-        Errno::ENOMEM
-    );
-    // ... but a first segment whose file page lands on the stack is -EEXIST.
-    assert_eq!(
-        errno(plan(
-            &[load(R, 0, TASK_SIZE_MAX - 0x1000, 0x10, 0x2000)],
-            0x1000
-        )),
-        Errno::EEXIST
-    );
-    assert_eq!(
-        errno(plan(&[load(R, 0, TASK_SIZE_MAX, 0x10, 0x10)], 0x1000)),
-        Errno::ENOMEM
-    );
-    assert_eq!(
-        errno(plan(&[load(R, 0, 0x400000, 0, u64::MAX - 0x1000)], 0x1000)),
-        Errno::ENOMEM
-    );
-    // memsz = u64::MAX: the C arithmetic wraps to an empty brk range, and the
-    // post-mapping `memsz > TASK_SIZE` check answers -EINVAL.
-    assert_eq!(
-        errno(plan(&[load(R, 0, 0x400000, 0, u64::MAX)], 0x1000)),
-        Errno::EINVAL
-    );
-    assert_eq!(
-        errno(plan(&[load(R, 0, 0x400000, 0, TASK_SIZE_MAX + 1)], 0x1000)),
-        Errno::ENOMEM
-    );
-    // Anonymous-only segment ending exactly at TASK_SIZE_MAX is mappable but
-    // overlaps the fixed stack: explicit, not silent.
-    assert_eq!(
-        unsupported(plan(
-            &[load(R | W, 0, TASK_SIZE_MAX - 0x2000, 0, 0x2000)],
-            0x1000
-        )),
-        Unsupported::Overlap
-    );
-    // filesz > memsz is -EINVAL after mapping.
-    assert_eq!(
-        errno(plan(&[load(R, 0, 0x400000, 0x20, 0x10)], 0x1000)),
-        Errno::EINVAL
-    );
-    // Mapped but beyond: p_vaddr at/after TASK_SIZE_MAX with size zero.
-    assert_eq!(
-        errno(plan(&[load(R, 0, u64::MAX, 0, 0)], 0x1000)),
-        Errno::EINVAL
-    );
-}
-
-#[test]
-fn offset_alignment_and_wraparound_follow_vm_mmap() {
-    // vaddr page offset 0x10 but file offset 0: off = -0x10, not page aligned.
-    assert_eq!(
-        errno(plan(&[load(R, 0, 0x400010, 0x10, 0x10)], 0x1000)),
-        Errno::EINVAL
-    );
-    // Congruent offsets work.
-    assert!(plan(&[load(R, 0x10, 0x400010, 0x10, 0x10)], 0x1000).is_ok());
-    // offset + size wraps around 2^64: vm_mmap says -EINVAL.
-    assert_eq!(
-        errno(plan(
-            &[load(R, u64::MAX - 0xfff, 0x400000, 0x2000, 0x2000)],
-            0x1000
-        )),
-        Errno::EINVAL
-    );
-    // Above ramfs MAX_LFS_FILESIZE.
-    assert_eq!(
-        errno(plan(&[load(R, 1 << 63, 0x400000, 0x10, 0x10)], 0x1000)),
-        Errno::EOVERFLOW
-    );
-    // filesz so large that page_align wraps to zero: nothing is mapped and the
-    // post-mapping check rejects it.
-    assert_eq!(
-        errno(plan(
-            &[load(R, 0, 0x400000, u64::MAX - 100, u64::MAX)],
-            0x1000
-        )),
-        Errno::EINVAL
-    );
-}
-
-#[test]
-fn mapping_beyond_end_of_file_and_overlaps_are_explicit() {
-    // The last page of the mapping starts past EOF: Linux would raise SIGBUS.
-    assert_eq!(
-        unsupported(plan(&[load(R, 0, 0x400000, 0x3000, 0x3000)], 0x1000)),
-        Unsupported::BeyondEof
-    );
-    assert!(plan(&[load(R, 0, 0x400000, 0x3000, 0x3000)], 0x2001).is_ok());
-    // First segment on the stack is MAP_FIXED_NOREPLACE: -EEXIST.
-    assert_eq!(
-        errno(plan(&[load(R, 0, STACK_START, 0x10, 0x10)], 0x1000)),
-        Errno::EEXIST
-    );
-    // Later overlap (MAP_FIXED would replace) is unsupported.
-    let a = load(R, 0, 0x400000, 0x1800, 0x1800);
-    let b = load(R | W, 0x1000, 0x401000, 0x10, 0x10);
-    assert_eq!(unsupported(plan(&[a, b], 0x2000)), Unsupported::Overlap);
-    let on_stack = load(R | W, 0, STACK_START, 0, 0x1000);
-    assert_eq!(
-        unsupported(plan(&[a, on_stack], 0x2000)),
-        Unsupported::Overlap
-    );
-    // Touching but disjoint is fine.
-    assert!(plan(&[a, load(R | W, 0x1000, 0x402000, 0x10, 0x10)], 0x2000).is_ok());
-}
-
-#[test]
 fn segment_count_is_bounded() {
     let loads: Vec<Ph> = (0..=MAX_LOADS as u64)
         .map(|i| load(R, 0, 0x400000 + i * 0x2000, 0x10, 0x10))
@@ -500,14 +373,18 @@ fn program_header_address_is_zero_when_unmapped() {
 }
 
 #[test]
-fn bss_only_segment_and_brk() {
+fn bss_only_segment_is_described() {
     let p = plan(&[load(R | W, 0, 0x600123, 0, 0x2000)], 0x1000).unwrap();
     let s = p.segments()[0];
-    assert_eq!((s.start, s.file_pages, s.anon_pages), (0x600000, 0, 3));
-    assert_eq!(p.brk, 0x603000);
-    assert!(p.vmas.find(0x600000).is_none()); // anonymous: no file name
+    assert_eq!(
+        (s.start, s.file_pages, s.anon_start, s.anon_len),
+        (0x600000, 0, 0x600000, 0x3000)
+    );
     let empty = plan(&[load(R, 0, 0x600000, 0, 0)], 0x1000).unwrap();
-    assert_eq!(empty.segments()[0].pages(), 0);
+    assert_eq!(
+        (empty.segments()[0].file_pages, empty.segments()[0].anon_len),
+        (0, 0)
+    );
 }
 
 #[test]

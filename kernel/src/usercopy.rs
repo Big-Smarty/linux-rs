@@ -16,7 +16,11 @@
 //!
 //! # Contract
 //! * Context: task context of the one user task, interrupts in any state; no
-//!   sleeping, no allocation, no locks.
+//!   sleeping and no locks here. The [`UserPages`] implementor may resolve a
+//!   non-resident page by taking the page fault Linux would take for a kernel
+//!   access to user memory (`userspace::Syscall::page`: demand-zero or
+//!   copy-on-write through the address-space model, which can allocate frames
+//!   and heap storage, fallibly); a refused fault is a short copy.
 //! * Why no fault can occur: [`UserPages::page`] resolves a user page to a
 //!   kernel-addressable frame (present, user, and writable when `write`)
 //!   *before* any byte moves. The kernel never touches the user virtual
@@ -26,9 +30,10 @@
 //!   an exception-table fixup instead of this walk.
 //! * TOCTOU: resolution and copy happen under one exclusive borrow. The
 //!   [`UserPages`] implementor (`paging::UserSpace`) holds `&mut Tables`, i.e.
-//!   the `services::TABLES` lock, so `unmap_user`/`protect_user`/`map_user`
-//!   cannot run between the two, and the returned page borrow ends before any
-//!   such edit can start. User code does not run during a syscall (one CPU).
+//!   the `services::TABLES` lock, so no `mm_*` table edit (`mm_unmap`,
+//!   `mm_protect`, ...) can run between the two (the fault-in that
+//!   [`UserPages::page`] itself performs happens before it returns the frame),
+//!   and the returned page borrow ends before any such edit can start. User code does not run during a syscall (one CPU).
 //!   Upgrade path: a second task or CPU needs the address-space lock to cover
 //!   other CPUs' faults and unmaps (it does: the lock is a spinlock), plus a
 //!   TLB shootdown before frames are freed; direct dereference of user
@@ -57,6 +62,10 @@ pub trait UserPages {
     /// The frame backing the 4 KiB page that starts at `page` (page-aligned),
     /// or `None` when the page is not present, not user-accessible, or (when
     /// `write`) not writable. Reads need no readable flag: x86 has none.
+    ///
+    /// The result of a `write == false` request MAY alias a frame shared by
+    /// many mappings (the zero page): the caller MUST only read through it and
+    /// never write. Only a `write == true` result is exclusively writable.
     fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]>;
 }
 

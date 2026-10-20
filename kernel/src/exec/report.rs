@@ -15,8 +15,7 @@
 //! dump of the panic backtrace are not printed; they are diagnostics, not
 //! interface. CPU/core/socket are fixed to the BSP (`0 (core 0, socket 0)`).
 
-use super::plan::Vmas;
-use crate::usercopy::TASK_SIZE_MAX;
+use crate::{mm::Mm, usercopy::TASK_SIZE_MAX};
 use core::fmt;
 
 pub const SIGILL: u8 = 4;
@@ -70,13 +69,36 @@ pub const fn signal_exit_code(signal: u8) -> u32 {
     signal as u32
 }
 
+/// The file-backed VMA that contains an address (`print_vma_addr`'s
+/// `vma_lookup` with `vma->vm_file`). The name printed is the file's basename,
+/// `init` for `/init`, the only file there is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileRegion {
+    pub start: u64,
+    pub end: u64,
+    pub pgoff: u64,
+}
+
+impl FileRegion {
+    /// `vma_lookup(mm, address)` restricted to file-backed VMAs.
+    #[must_use]
+    pub fn of(mm: &Mm, address: u64) -> Option<Self> {
+        mm.find_vma(address)
+            .filter(|v| v.start <= address && v.file.is_some())
+            .map(|v| Self {
+                start: v.start,
+                end: v.end,
+                pgoff: v.pgoff,
+            })
+    }
+}
+
 /// `" in init[offset,start+length]"` when the address lies in a file-backed
-/// region (`print_vma_addr`); nothing otherwise. The name is the file's
-/// basename, `init` for `/init`.
-struct InVma<'a>(&'a Vmas, u64);
-impl fmt::Display for InVma<'_> {
+/// region (`print_vma_addr`); nothing otherwise.
+struct InVma(Option<FileRegion>, u64);
+impl fmt::Display for InVma {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Some(vma) = self.0.find(self.1) else {
+        let Some(vma) = self.0 else {
             return Ok(());
         };
         write!(
@@ -93,14 +115,15 @@ impl fmt::Display for InVma<'_> {
 pub const PF_PROT: u64 = 1;
 
 /// `show_signal_msg`: `init[1]: segfault at ...` (one line, no newline).
-pub struct Segfault<'a> {
+pub struct Segfault {
     pub address: u64,
     pub ip: u64,
     pub sp: u64,
     pub error: u64,
-    pub vmas: &'a Vmas,
+    /// The file-backed VMA containing `ip` (`FileRegion::of`).
+    pub region: Option<FileRegion>,
 }
-impl fmt::Display for Segfault<'_> {
+impl fmt::Display for Segfault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // sanitize_error_code: kernel addresses always look like protection faults.
         let error = if self.address >= TASK_SIZE_MAX {
@@ -115,7 +138,7 @@ impl fmt::Display for Segfault<'_> {
             self.ip,
             self.sp,
             error,
-            InVma(self.vmas, self.ip)
+            InVma(self.region, self.ip)
         )
     }
 }
@@ -156,15 +179,16 @@ pub const fn user_exception(vector: u8) -> Option<UserSignal> {
 }
 
 /// `show_signal`: `init[1] <type><desc> ip:%lx sp:%lx error:%lx[ in init[...]]`.
-pub struct TrapLine<'a> {
+pub struct TrapLine {
     pub kind: &'static str,
     pub desc: &'static str,
     pub ip: u64,
     pub sp: u64,
     pub error: u64,
-    pub vmas: &'a Vmas,
+    /// The file-backed VMA containing `ip` (`FileRegion::of`).
+    pub region: Option<FileRegion>,
 }
-impl fmt::Display for TrapLine<'_> {
+impl fmt::Display for TrapLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -174,7 +198,7 @@ impl fmt::Display for TrapLine<'_> {
             self.ip,
             self.sp,
             self.error,
-            InVma(self.vmas, self.ip)
+            InVma(self.region, self.ip)
         )
     }
 }
