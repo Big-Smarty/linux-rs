@@ -19,7 +19,7 @@ mod pt;
 mod space;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use env::{Env, FileInfo, Overcommit, RLIM_INFINITY, STK_LIM};
 pub use fault::{
