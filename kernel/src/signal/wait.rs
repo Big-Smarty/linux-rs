@@ -45,6 +45,36 @@ fn synced<T: Task>(task: &mut T) -> &mut State {
     state
 }
 
+/// `-ERESTARTSYS` (512): what an interruptible wait returns when a signal is
+/// pending; the return path turns it into `-EINTR` (handler without
+/// `SA_RESTART`) or restarts the call.
+pub const ERESTARTSYS: i64 = super::deliver::ERESTARTSYS;
+
+/// `wait_event_interruptible(cond)`: sleep until `ready` holds (`Ok`) or a
+/// signal is pending (`Err(-ERESTARTSYS)`), whichever comes first. This is the
+/// primitive a blocking read or write (pipe, tty, socket) waits with: `ready`
+/// examines whatever the other side changes, with interrupts masked, so the
+/// check and the halt cannot lose a wake-up. The condition is tested before the
+/// signals, as the macro does, so ready data wins over a pending signal.
+///
+/// # Errors
+/// `-ERESTARTSYS` as an `i64` in `Err`, ready to be the syscall's result.
+pub fn wait_event_interruptible<T: Task>(
+    task: &mut T,
+    mut ready: impl FnMut(&mut T) -> bool,
+) -> Result<(), i64> {
+    loop {
+        synced(task);
+        if ready(task) {
+            return Ok(());
+        }
+        if task.state().signal_pending() {
+            return Err(-ERESTARTSYS);
+        }
+        task.wait(None);
+    }
+}
+
 /// `do_nanosleep`'s wait: sleep until `CLOCK_MONOTONIC` reaches `deadline_ns`
 /// or a signal is pending. `None` when the deadline was reached, `Some(left)`
 /// with the nanoseconds remaining when a signal interrupted it (the caller then

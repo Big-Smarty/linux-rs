@@ -235,6 +235,43 @@ mod tests {
     }
 
     #[test]
+    fn wait_event_interruptible_prefers_the_condition_then_a_signal() {
+        use crate::signal::wait::{ERESTARTSYS, wait_event_interruptible};
+        let mut t = mapped();
+        // Ready at once: no wait at all.
+        assert_eq!(wait_event_interruptible(&mut t, |_| true), Ok(()));
+        assert_eq!(t.waits, 0);
+        // The "other side" makes it ready at the third look.
+        let mut looks = 0;
+        let r = wait_event_interruptible(&mut t, |t| {
+            looks += 1;
+            if looks == 3 {
+                return true;
+            }
+            t.script_signal(t.now + 1, SIGUSR1); // a signal arrives, but...
+            t.state.set_blocked(SigSet(SigSet::bit(SIGUSR1))); // ...stays blocked
+            false
+        });
+        assert_eq!(r, Ok(()));
+        // An unblocked signal ends the wait with -ERESTARTSYS.
+        let mut t = mapped();
+        t.script_signal(10, SIGUSR1);
+        assert_eq!(
+            wait_event_interruptible(&mut t, |_| false),
+            Err(-ERESTARTSYS)
+        );
+        assert_eq!(t.now, 10);
+        // Ready data wins over a pending signal.
+        assert_eq!(wait_event_interruptible(&mut t, |_| true), Ok(()));
+        // send_sig is the kernel's SI_USER from this process (SIGPIPE).
+        let mut t = mapped();
+        t.state.actions[12].handler = 0x4000;
+        t.state.send_sig(13);
+        let (sig, info) = t.state.dequeue_signal().unwrap();
+        assert_eq!((sig, info), (13, SigInfo::kill(13, 0, 1, 0)));
+    }
+
+    #[test]
     fn sleep_until_reports_the_time_left_when_a_signal_interrupts() {
         use crate::signal::wait::sleep_until;
         let mut t = mapped();

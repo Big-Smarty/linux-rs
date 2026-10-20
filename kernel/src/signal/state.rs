@@ -386,6 +386,16 @@ impl State {
         Ok(())
     }
 
+    /// `send_sig(sig, current, 0)`: the kernel sending `sig` to this thread on
+    /// behalf of the current task (`SIGPIPE` from a pipe or socket write, `SIGXFSZ`,
+    /// ...). The siginfo is `SEND_SIG_NOINFO`: `SI_USER` with this process's pid
+    /// and uid. `sig` is `1..=64`.
+    pub fn send_sig(&mut self, sig: u8) {
+        let info = SigInfo::kill(sig, SI_USER, self.tgid, self.uid);
+        // Only a real-time signal sent with `si_code < 0` can fail; `SI_USER` is >= 0.
+        let _ = self.send_signal(sig, info, Target::Thread);
+    }
+
     /// `force_sig_info_to_task` on the current task.
     pub fn force_sig_info(&mut self, info: SigInfo, handler: Handler) {
         let Ok(sig) = u8::try_from(info.signo) else {
