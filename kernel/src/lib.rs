@@ -21,6 +21,7 @@ extern crate alloc;
 pub mod mm;
 pub mod ratelimit;
 pub mod signal;
+pub mod suite;
 pub mod sync;
 pub mod syscall;
 pub mod task;

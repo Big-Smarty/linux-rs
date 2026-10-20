@@ -95,6 +95,19 @@ static ROWS: AtomicUsize = AtomicUsize::new(0);
 /// Next cell, `0..=COLS*ROWS` (see `fbtext::step`).
 static CURSOR: AtomicUsize = AtomicUsize::new(0);
 static SCROLLS: AtomicUsize = AtomicUsize::new(0);
+/// Bare-metal suite pager: milliseconds a full screen stays up before the next
+/// page replaces it (0 = ordinary scrolling). Set only after the clock runs.
+#[cfg(feature = "baremetal-suite")]
+static PAGER_MS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "baremetal-suite")]
+static PAGES: AtomicUsize = AtomicUsize::new(0);
+/// Identifies the run on every replay page header (build id and log digest).
+#[cfg(feature = "baremetal-suite")]
+const TAG_MAX: usize = 48;
+#[cfg(feature = "baremetal-suite")]
+static TAG: [AtomicU8; TAG_MAX] = [const { AtomicU8::new(0) }; TAG_MAX];
+#[cfg(feature = "baremetal-suite")]
+static TAG_LEN: AtomicUsize = AtomicUsize::new(0);
 /// Glyph index per cell (`0` = blank), row-major with stride `COLS`.
 static SHADOW: [AtomicU8; MAX_COLS * MAX_ROWS] = [const { AtomicU8::new(0) }; MAX_COLS * MAX_ROWS];
 
@@ -331,8 +344,13 @@ impl Write for Console {
 /// Raw bytes to the same sinks as `log!` (the init task's /dev/console).
 pub fn write_bytes(bytes: &[u8]) {
     for &byte in bytes {
+        #[cfg(feature = "baremetal-suite")]
+        crate::baremetal::capture_byte(byte);
         #[cfg(feature = "qemu-self-test")]
         crate::cpu::serial_byte(byte);
+        #[cfg(feature = "baremetal-suite")]
+        crate::baremetal::screen_byte(byte, pixel_byte);
+        #[cfg(not(feature = "baremetal-suite"))]
         pixel_byte(byte);
     }
     // One drain per call: the chunk just written must be visible before a caller
@@ -358,6 +376,12 @@ fn pixel_byte(byte: u8) {
         }
         return;
     }
+    #[cfg(feature = "baremetal-suite")]
+    if PAGER_MS.load(Ordering::Relaxed) != 0
+        && fbtext::step(CURSOR.load(Ordering::Relaxed), cols, rows, byte == b'\n').scroll
+    {
+        page_break();
+    }
     // Atomically take the next cell even if an exception interrupted output;
     // the winner of the exchange owns any scroll this character implies.
     let mut old = CURSOR.load(Ordering::Relaxed);
@@ -381,8 +405,125 @@ fn pixel_byte(byte: u8) {
     }
 }
 
+/// Blank every framebuffer and the text grid and put the cursor at the top
+/// left. Writes only (no framebuffer read); the shadow text is reset first so a
+/// reentrant writer cannot resurrect old cells.
+#[cfg(feature = "baremetal-suite")]
+pub fn clear_screen() {
+    let count = COUNT.load(Ordering::Acquire);
+    for cell in &SHADOW {
+        cell.store(0, Ordering::Relaxed);
+    }
+    CURSOR.store(0, Ordering::Relaxed);
+    for slot in &SLOTS[..count] {
+        clear(&slot.load());
+    }
+    drain();
+}
+
+/// Turn the pager on (`milliseconds != 0`) or off. While on, a screen that
+/// fills up stays visible for that long and is then replaced by a fresh page
+/// instead of scrolling, so each page can be photographed (the machine has no
+/// keyboard driver and no serial console). `tag` (cut to [`TAG_MAX`] bytes)
+/// is printed on every page header so photographs of two runs cannot be mixed
+/// up. The wait is a raw-TSC spin (`timer::spin_ms`): it needs no clock.
+#[cfg(feature = "baremetal-suite")]
+pub fn set_pager(milliseconds: usize, tag: &[u8]) {
+    let tag = &tag[..tag.len().min(TAG_MAX)];
+    for (slot, &byte) in TAG.iter().zip(tag) {
+        slot.store(byte, Ordering::Relaxed);
+    }
+    TAG_LEN.store(tag.len(), Ordering::Relaxed);
+    PAGER_MS.store(milliseconds, Ordering::Relaxed);
+}
+
+/// Hold the current page, then start an empty one with a page header.
+#[cfg(feature = "baremetal-suite")]
+pub fn page_hold() {
+    page_break();
+}
+
+/// Text to the framebuffers only: not serial and not the suite's capture. The
+/// suite replays its captured log with this (the log must not capture itself).
+#[cfg(feature = "baremetal-suite")]
+pub fn write_screen(bytes: &[u8]) {
+    for &byte in bytes {
+        pixel_byte(byte);
+    }
+}
+
+#[cfg(feature = "baremetal-suite")]
+fn page_break() {
+    drain();
+    crate::timer::spin_ms(PAGER_MS.load(Ordering::Relaxed) as u64);
+    clear_screen();
+    let page = PAGES.fetch_add(1, Ordering::Relaxed) + 2;
+    // Header cells only: not captured and not on serial (it is not log text).
+    for byte in header_bytes(page) {
+        pixel_byte(byte);
+    }
+}
+
+/// `-- linux-rs suite <tag> replay page <number>` and a newline, byte by byte.
+#[cfg(feature = "baremetal-suite")]
+fn header_bytes(number: usize) -> impl Iterator<Item = u8> {
+    let mut digits = [0u8; 20];
+    let mut length = 0;
+    let mut rest = number;
+    loop {
+        digits[length] = b'0' + u8::try_from(rest % 10).unwrap_or(0);
+        length += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let tag =
+        (0..TAG_LEN.load(Ordering::Relaxed).min(TAG_MAX)).map(|i| TAG[i].load(Ordering::Relaxed));
+    b"-- linux-rs suite "
+        .iter()
+        .copied()
+        .chain(tag)
+        .chain(b" replay page ".iter().copied())
+        .chain((0..length).rev().map(move |i| digits[i]))
+        .chain(core::iter::once(b'\n'))
+}
+
+/// Layout facts of every drawn framebuffer, in slot order:
+/// `(width, height, bits per pixel, columns, rows)`.
+#[cfg(feature = "baremetal-suite")]
+pub fn for_each_framebuffer(mut visit: impl FnMut(usize, usize, usize, usize, usize)) {
+    let count = COUNT.load(Ordering::Acquire);
+    let (cols, rows) = (COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed));
+    for slot in &SLOTS[..count] {
+        let l = slot.load();
+        visit(l.width, l.height, l.bytes * 8, cols, rows);
+    }
+}
+
+/// Text rows still free below the cursor (a pending scroll counts as none);
+/// `usize::MAX` without a framebuffer, where nothing can scroll off.
+#[cfg(feature = "baremetal-suite")]
+pub fn rows_free() -> usize {
+    let (cols, rows) = grid();
+    if cols == 0 {
+        return usize::MAX;
+    }
+    // `CURSOR` is `fbtext`'s state: the cell number shifted left, plus a wrap bit.
+    rows.saturating_sub((CURSOR.load(Ordering::Relaxed) >> 1).div_ceil(cols))
+}
+
+/// The shared text grid `(columns, rows)`, `(0, 0)` without a framebuffer.
+#[cfg(feature = "baremetal-suite")]
+pub fn grid() -> (usize, usize) {
+    if COUNT.load(Ordering::Acquire) == 0 {
+        return (0, 0);
+    }
+    (COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed))
+}
+
 /// Read one pixel back (self-test only; framebuffer reads can be very slow).
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "boot-proofs")]
 fn get(l: &Layout, x: usize, y: usize) -> u32 {
     let address = l.address + y * l.pitch + x * l.bytes;
     let mut b = [0u8; 4];
@@ -396,7 +537,7 @@ fn get(l: &Layout, x: usize, y: usize) -> u32 {
 
 /// Whether the pixels of a cell on this framebuffer equal what its shadow
 /// glyph must render (stale pixels or a failed scroll redraw differ).
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "boot-proofs")]
 fn cell_matches(l: &Layout, col: usize, row: usize) -> bool {
     let cols = COLS.load(Ordering::Relaxed);
     let glyph = SHADOW[row * cols + col].load(Ordering::Relaxed);
@@ -418,7 +559,7 @@ fn cell_matches(l: &Layout, col: usize, row: usize) -> bool {
 /// that no stale cell survives, and that the pixels on every framebuffer match.
 /// Output goes to the framebuffer only (not serial), then a CHECK record is
 /// logged. Returns whether all checks held.
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "boot-proofs")]
 pub fn self_test() -> bool {
     let count = COUNT.load(Ordering::Acquire);
     let (cols, rows) = (COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed));

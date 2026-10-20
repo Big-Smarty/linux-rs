@@ -928,7 +928,7 @@ extern "C" fn interrupt_handler(regs: &mut PtRegs, vector: u64, error: u64) {
         _ => unexpected(regs, vector, error, 0),
     }
 }
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "boot-proofs")]
 #[unsafe(naked)]
 unsafe extern "C" fn ordinary_call_stack_residue() -> u64 {
     // Observe the actual ordinary SysV callee-entry stack before any prologue.
@@ -939,7 +939,7 @@ unsafe extern "C" fn ordinary_call_stack_residue() -> u64 {
 }
 
 fn unexpected(frame: &PtRegs, vector: u64, error: u64, address: u64) -> ! {
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     {
         // SAFETY: ordinary scalar C-ABI CALL into the naked entry witness.
         // Deliberately observe, rather than normalize, a broken interrupt caller.

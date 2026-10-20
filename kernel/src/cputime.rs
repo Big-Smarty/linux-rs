@@ -72,8 +72,20 @@ impl CpuAccount {
     }
 
     /// The task starts running at monotonic time `now_ns`; ticks before this
-    /// belong to nobody.
+    /// belong to nobody. A new task (the bare-metal suite starts one fresh
+    /// `/init` per group) begins with no accumulated time, as a new
+    /// `task_struct` does; for the first task every field is already zero.
     pub fn start(&self, now_ns: u64) {
+        for field in [
+            &self.slept_ns,
+            &self.user_ns,
+            &self.system_ns,
+            &self.prev_user_ns,
+            &self.prev_system_ns,
+        ] {
+            field.store(0, Ordering::Relaxed);
+        }
+        self.sleep_since_ns.store(NEVER, Ordering::Relaxed);
         self.start_ns.store(now_ns, Ordering::Relaxed);
     }
 

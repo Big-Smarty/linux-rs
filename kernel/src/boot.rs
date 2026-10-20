@@ -449,6 +449,13 @@ impl BootInfo {
         command_line_has_word(self.command_line(), word)
     }
 
+    /// The value of the `name=value` word in the kernel part of the command
+    /// line (before `--`), like [`BootInfo::has_option`].
+    #[must_use]
+    pub fn option_value(&self, name: &[u8]) -> Option<&[u8]> {
+        command_line_value(self.command_line(), name)
+    }
+
     /// Consume the one bootstrap handoff. No other constructor exists.
     ///
     /// # Errors
@@ -738,6 +745,22 @@ pub fn command_line_has_word(line: &[u8], word: &[u8]) -> bool {
     false
 }
 
+/// Value of the first `name=value` word before the first `--` word.
+#[must_use]
+pub fn command_line_value<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    for candidate in line.split(|&b| b == b' ').filter(|w| !w.is_empty()) {
+        if candidate == b"--" {
+            return None;
+        }
+        if let Some(rest) = candidate.strip_prefix(name)
+            && let Some(value) = rest.strip_prefix(b"=")
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// Validate one production memory-map extent in ascending order.
 ///
 /// # Errors
@@ -759,7 +782,7 @@ pub fn checked_region(region: Region, previous_end: u64) -> Result<u64, BootErro
     Ok(end)
 }
 
-#[cfg(any(test, feature = "qemu-self-test"))]
+#[cfg(any(test, feature = "boot-proofs"))]
 #[must_use]
 pub fn regression_checks() -> bool {
     let valid = Region {
@@ -841,6 +864,10 @@ mod tests {
         assert!(!command_line_has_word(b"a -- nolapic", b"nolapic"));
         assert!(!command_line_has_word(b"nolapic2 xnolapic", b"nolapic"));
         assert!(!command_line_has_word(b"", b"nolapic"));
+        assert_eq!(command_line_value(b"a x=1 -- x=2", b"x"), Some(&b"1"[..]));
+        assert_eq!(command_line_value(b"a -- x=2", b"x"), None);
+        assert_eq!(command_line_value(b"xy=3 x", b"x"), None);
+        assert_eq!(command_line_value(b"x=", b"x"), Some(&b""[..]));
     }
 
     #[test]

@@ -394,7 +394,30 @@ fn run(stack: &Stack) {
         }
     }
 
+    if let Some(word) = stack.argv.iter().nth(2) {
+        tests::set_suite_args(word, stack.argv.iter().nth(3));
+    }
     match stack.argv.iter().nth(1) {
+        // A group that never ends: only the bare-metal suite's time bound stops it.
+        // It leaves an `ITIMER_REAL` armed (2 ms interval; SIGALRM is dropped for
+        // init), which the suite's group teardown must not carry into the next group.
+        Some(b"spin") => {
+            out!("init: spinning on purpose");
+            let itimerval: [i64; 4] = [0, 2000, 0, 2000];
+            // SAFETY: `itimerval` is a live 32-byte `struct itimerval`; a null old value.
+            let armed = unsafe {
+                syscalls::syscall3(
+                    Sysno::setitimer,
+                    0,
+                    ptr::from_ref(&itimerval).expose_provenance(),
+                    0,
+                )
+            };
+            expect("spin-itimer", armed, Ok(0));
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         Some(b"fault") => {
             out!("init: faulting on purpose");
             // SAFETY: not sound, deliberately: the read of address 0 must raise SIGSEGV.

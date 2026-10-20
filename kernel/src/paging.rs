@@ -296,7 +296,7 @@ impl Tables {
         Ok(())
     }
 
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     pub fn failure_tests(
         boot: &BootInfo,
         allocator: &mut Allocator<'_>,
@@ -487,7 +487,7 @@ impl Tables {
     ///
     /// # Errors
     /// As [`Tables::mm_map_anon`], plus `Overflow`.
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     fn map_anon_range(
         &mut self,
         allocator: &mut Allocator<'_>,
@@ -529,7 +529,7 @@ impl Tables {
     /// removing the `invlpg` from `mm_unmap` or from `mm_protect` makes this
     /// fail with `FAIL user-mm error=Conflict`. That is evidence for TCG's TLB
     /// model on this cell, not for real hardware.
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     pub fn user_mm_tests(&mut self, allocator: &mut Allocator<'_>) -> Result<(), Error> {
         use kernel::mm::{PageProt, Pte};
         use kernel::{
@@ -732,6 +732,12 @@ impl Tables {
         // writable and never written through the direct map.
         self.zero = Some(allocator.allocate()?.into_reserved());
         Ok(())
+    }
+
+    /// Whether [`Tables::init_zero_page`] already ran.
+    #[must_use]
+    pub fn has_zero_page(&self) -> bool {
+        self.zero.is_some()
     }
 
     /// Visit the leaf slots of `[start, start + pages * 4096)` (clamped to the
@@ -1086,7 +1092,7 @@ impl UserSpace<'_> {
 
     /// The raw leaf entry of the user page at page-aligned `page`, or 0 (self-test
     /// evidence of the `PROT_NONE` frame inversion).
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
     #[must_use]
     pub fn raw_entry(&self, page: u64) -> u64 {
         match self.tables.user_slot(page) {
@@ -1099,7 +1105,7 @@ impl UserSpace<'_> {
 
     /// Whether `after` is `before` (a present leaf) turned `PROT_NONE`: P clear,
     /// `PROTNONE` set and exactly the frame bits complemented (self-test).
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
     #[must_use]
     pub fn protnone_guard(before: u64, after: u64) -> bool {
         before & PRESENT != 0

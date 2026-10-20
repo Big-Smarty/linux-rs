@@ -5,7 +5,7 @@
 // infallible one does not exist in target builds, see `kalloc`. The process's
 // signal state uses `Box::try_new`; only the self-test uses the `Vec` form.
 #![feature(allocator_ext)]
-#![cfg_attr(feature = "qemu-self-test", feature(vec_push_within_capacity))]
+#![cfg_attr(feature = "boot-proofs", feature(vec_push_within_capacity))]
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 compile_error!(
@@ -19,11 +19,15 @@ use kernel::{boot, firmware, image, memory};
 use linux_rs_runtime as _;
 
 mod apic;
+#[cfg(feature = "baremetal-suite")]
+mod baremetal;
 mod console;
 mod cpu;
 mod kalloc;
 mod mmio;
 mod paging;
+#[cfg(feature = "baremetal-suite")]
+mod pci;
 mod services;
 mod timer;
 mod userspace;
@@ -118,6 +122,48 @@ fn unwrap<T, E: core::fmt::Debug>(result: Result<T, E>, label: &str) -> T {
     }
 }
 
+/// A boot proof's verdict. Everywhere but the bare-metal suite a failed proof
+/// stops the boot (`require`); the suite records it for the summary screen and
+/// goes on, so one run on real hardware shows every failure.
+fn proof(label: &'static str, ok: bool) -> bool {
+    #[cfg(feature = "baremetal-suite")]
+    {
+        baremetal::record_proof(label, ok)
+    }
+    #[cfg(not(feature = "baremetal-suite"))]
+    {
+        require(ok, label);
+        true
+    }
+}
+
+/// [`proof`] for a step that yields a value: the value of a passing proof, and
+/// `None` after a recorded failure (the stop is `unwrap`'s outside the suite).
+#[cfg_attr(
+    not(feature = "baremetal-suite"),
+    allow(clippy::unnecessary_wraps, reason = "only the suite records a failure")
+)]
+fn proof_result<T, E: core::fmt::Debug>(label: &'static str, result: Result<T, E>) -> Option<T> {
+    #[cfg(feature = "baremetal-suite")]
+    {
+        match result {
+            Ok(value) => {
+                baremetal::record_proof(label, true);
+                Some(value)
+            }
+            Err(error) => {
+                log!("FAIL {} error={:?}\n", label, error);
+                baremetal::record_proof(label, false);
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "baremetal-suite"))]
+    {
+        Some(unwrap(result, label))
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
     #[cfg(feature = "qemu-self-test")]
@@ -130,17 +176,17 @@ extern "C" fn kernel_main() -> ! {
     // references to it are created.
     let framebuffer = unsafe { console::init(&boot::BootInfo::take_framebuffers()) } > 0;
     log!("linux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
-    #[cfg(feature = "qemu-self-test")]
-    require(console::self_test(), "console-scroll");
-    #[cfg(feature = "qemu-self-test")]
-    require(
-        linux_rs_runtime::self_test(),
+    #[cfg(feature = "boot-proofs")]
+    proof("console-scroll", console::self_test());
+    #[cfg(feature = "boot-proofs")]
+    if proof(
         "scalar-rust-memory-boundaries",
-    );
-    #[cfg(feature = "qemu-self-test")]
-    log!(
-        "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true\n"
-    );
+        linux_rs_runtime::self_test(),
+    ) {
+        log!(
+            "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true\n"
+        );
+    }
     unwrap(cpu::validate(), "cpu");
     // SAFETY: BSP IF clear, no descriptor references/APs; image and all stacks
     // stay reserved for the complete lifetime of this execution.
@@ -153,18 +199,21 @@ extern "C" fn kernel_main() -> ! {
     // The handoff is immutable from here on; `'static` lets the allocator
     // borrow it and keeps it reachable after this frame is abandoned.
     let boot = services::BOOT.init(boot);
+    #[cfg(feature = "baremetal-suite")]
+    baremetal::begin(boot);
     inspect_boot_images(boot);
     // SAFETY: one constructor call consumes usable RAM ownership from the
     // trusted handoff, no DMA/AP/firmware mutation or competing allocator.
     let mut allocator = unwrap(unsafe { Allocator::new(boot) }, "allocator");
     check_frame_ownership(&mut allocator);
     let mut tables = unwrap(paging::Tables::build(boot, &mut allocator), "tables-build");
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
+    if proof_result(
+        "table-allocation-rollback",
+        paging::Tables::failure_tests(boot, &mut allocator, tables.pages),
+    )
+    .is_some()
     {
-        unwrap(
-            paging::Tables::failure_tests(boot, &mut allocator, tables.pages),
-            "table-allocation-rollback",
-        );
         log!(
             "CHECK table-oom ok failure_points={} accounting=restored\n",
             tables.pages
@@ -181,7 +230,17 @@ extern "C" fn kernel_main() -> ! {
     // unpacked with the kernel heap before the module payloads disappear. From
     // here on `FRAMES` is locked per use, never across a heap allocation.
     services::FRAMES.install(allocator);
+    #[cfg(not(feature = "baremetal-suite"))]
     let user = userspace::load(boot, &mut tables);
+    // The suite starts one fresh /init per group after the tables are active,
+    // when the loader's module copies are gone: keep its own copies.
+    #[cfg(feature = "baremetal-suite")]
+    {
+        // SAFETY: the loader CR3 is still active (the owned tables are
+        // activated below); module storage is initialized and immutable.
+        let kept = unsafe { baremetal::retain_archives(boot) };
+        proof("retain-initramfs", kept);
+    }
     // Interrupt-controller and time device pages (LAPIC, IOAPICs, HPET) are
     // mapped uncached into the same unpublished tree; the APIC mode decision
     // reads only CPUID/IA32_APIC_BASE.
@@ -217,11 +276,14 @@ extern "C" fn kernel_main() -> ! {
         table_pages
     );
     check_exceptions(boot, &mut services::FRAMES.lock());
-    #[cfg(feature = "qemu-self-test")]
+    // The suite runs the exhaustion walk after the groups (`baremetal`).
+    #[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
     check_allocator_recovery(&mut services::FRAMES.lock());
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "boot-proofs")]
     check_user_mm(&mut tables, &mut services::FRAMES.lock());
     clock_and_irq_checks(boot, &prepared, &acpi, &device_pages, options);
+    #[cfg(feature = "baremetal-suite")]
+    baremetal::inventory(boot, &acpi);
     log!(
         "CHECKPOINT bootstrap-complete free_pages={} owned_tables={}\n",
         services::FRAMES.lock().available(),
@@ -229,6 +291,10 @@ extern "C" fn kernel_main() -> ! {
     );
     publish_services(tables);
     // Diverges: init runs and its death ends the boot, or Linux's failure text.
+    // The suite instead runs every group, then its summary.
+    #[cfg(feature = "baremetal-suite")]
+    baremetal::run();
+    #[cfg(not(feature = "baremetal-suite"))]
     userspace::run(user)
 }
 
@@ -238,9 +304,8 @@ extern "C" fn kernel_main() -> ! {
 fn publish_services(tables: paging::Tables) {
     services::TABLES.install(tables);
     // The heap is usable from here on (it grows from `FRAMES`).
-    #[cfg(feature = "qemu-self-test")]
-    {
-        unwrap(kalloc::self_test(), "heap");
+    #[cfg(feature = "boot-proofs")]
+    if proof_result("heap", kalloc::self_test()).is_some() {
         log!(
             "CHECK heap ok vec=1000 box=4096 align=4096 growth=buddy-frames oom=failed-cleanly recovered=true over_cap=rejected accounting=restored\n"
         );
@@ -263,6 +328,8 @@ fn clock_and_irq_checks(
     let clock = unsafe { timer::init(prepared, acpi, device_pages, options) };
     let tick_ok = match clock {
         Ok(report) => {
+            #[cfg(feature = "baremetal-suite")]
+            baremetal::note_apic_mode(report.apic_mode);
             log!(
                 "CHECK interrupt-controllers ok mode={} event={} ioapic_timer={}\n",
                 match report.apic_mode {
@@ -280,16 +347,19 @@ fn clock_and_irq_checks(
         Err(error) => {
             // A physical diagnostic boot reports and continues so one boot
             // shows everything else; the QEMU suite treats it as a failure.
+            // The bare-metal suite records it and continues as well.
+            let stop = cfg!(all(
+                feature = "qemu-self-test",
+                not(feature = "baremetal-suite")
+            ));
             log!(
                 "{} timer-init error={:?}\n",
-                if cfg!(feature = "qemu-self-test") {
-                    "FAIL"
-                } else {
-                    "WARN"
-                },
+                if stop { "FAIL" } else { "WARN" },
                 error
             );
-            if cfg!(feature = "qemu-self-test") {
+            #[cfg(feature = "baremetal-suite")]
+            baremetal::record_proof("timer-init", false);
+            if stop {
                 fail();
             }
             timer::mask_timer();
@@ -297,19 +367,24 @@ fn clock_and_irq_checks(
         }
     };
     if tick_ok {
-        unwrap(
+        #[cfg(feature = "baremetal-suite")]
+        baremetal::record_proof("timer-init", true);
+        if proof_result(
+            "irq-guard",
             cpu::irq_guard_test(
                 cfg!(feature = "qemu-self-test") && boot.test == TestMode::IrqRestoreEarly,
             ),
-            "irq-guard",
-        );
-        log!(
-            "CHECK irq-guard ok nested=2 out_of_order=true saved_on=true saved_off=true exclusive=true blocked_periods=2 blocked_delta=0 resumed=true\n"
-        );
-        require(cpu::irq_register_test(), "irq-all-gpr-preservation");
+        )
+        .is_some()
+        {
+            log!(
+                "CHECK irq-guard ok nested=2 out_of_order=true saved_on=true saved_off=true exclusive=true blocked_periods=2 blocked_delta=0 resumed=true\n"
+            );
+        }
+        proof("irq-all-gpr-preservation", cpu::irq_register_test());
         let tick_start = timer::ticks();
         let wall_start = timer::ktime_get_ns();
-        require(timer::wait_for_ticks(16, 500), "timer-delivery");
+        let delivered = proof("timer-delivery", timer::wait_for_ticks(16, 500));
         let tick_ns = timer::ktime_get_ns() - wall_start;
         // The mutation case deliberately leaves the tick unmasked: the same
         // assertion must fail after real tick progression, not return an
@@ -318,34 +393,38 @@ fn clock_and_irq_checks(
             timer::mask_timer();
         }
         let tick_end = timer::ticks();
-        let delta = unwrap(timer::observe_periods(2), "timer-period-observation");
-        log!("TIMER mask observation periods=2 irq_delta={}\n", delta);
-        require(delta == 0, "timer-mask");
-        require(tick_end >= tick_start + 16, "timer-delivery");
-        // 16 ticks counted from an arbitrary phase span between 15 and 16
-        // periods of HZ=1000; the bounds absorb host scheduling noise only.
-        require(
-            (14_000_000..=60_000_000).contains(&tick_ns),
-            "timer-period-vs-tsc",
-        );
-        log!(
-            "CHECK timer ok delivered={} masked_count={} gprs=15 periods=2 hz=1000 tick16_ns={} tsc_khz={}\n",
-            tick_end - tick_start,
-            timer::ticks(),
-            tick_ns,
-            timer::tsc_khz()
-        );
-        let proof = unwrap(
-            timer::timekeeping_selftest().ok_or("timekeeping"),
+        if let Some(delta) = proof_result("timer-period-observation", timer::observe_periods(2)) {
+            log!("TIMER mask observation periods=2 irq_delta={}\n", delta);
+            let masked = proof("timer-mask", delta == 0);
+            let counted = proof("timer-tick-count", tick_end >= tick_start + 16);
+            // 16 ticks counted from an arbitrary phase span between 15 and 16
+            // periods of HZ=1000; the bounds absorb host scheduling noise only.
+            let period = proof(
+                "timer-period-vs-tsc",
+                (14_000_000..=60_000_000).contains(&tick_ns),
+            );
+            if delivered && masked && counted && period {
+                log!(
+                    "CHECK timer ok delivered={} masked_count={} gprs=15 periods=2 hz=1000 tick16_ns={} tsc_khz={}\n",
+                    tick_end - tick_start,
+                    timer::ticks(),
+                    tick_ns,
+                    timer::tsc_khz()
+                );
+            }
+        }
+        if let Some(sample) = proof_result(
             "timekeeping",
-        );
-        log!(
-            "CHECK timekeeping ok slept_ns={} realtime_skew_ns={} boottime_lag_ns={} monotonic_steps={}\n",
-            proof.waited_ns,
-            proof.real_minus_mono_ns,
-            proof.boot_minus_mono_ns,
-            proof.monotonic_steps
-        );
+            timer::timekeeping_selftest().ok_or("timekeeping"),
+        ) {
+            log!(
+                "CHECK timekeeping ok slept_ns={} realtime_skew_ns={} boottime_lag_ns={} monotonic_steps={}\n",
+                sample.waited_ns,
+                sample.real_minus_mono_ns,
+                sample.boot_minus_mono_ns,
+                sample.monotonic_steps
+            );
+        }
     } else {
         log!("WARN timer tick not delivered: interrupt-dependent checks skipped\n");
     }
@@ -472,39 +551,40 @@ fn check_frame_ownership(allocator: &mut Allocator<'_>) {
 }
 
 fn check_exceptions(boot: &boot::BootInfo, allocator: &mut Allocator<'_>) {
-    require(cpu::breakpoint_test(), "breakpoint-return");
+    let mut all = proof("breakpoint-return", cpu::breakpoint_test());
     // SAFETY: controlled fault probes with exact page/error/RIP matching. The
     // readonly probe has a mutable Rust type and no live reference, so an
     // accidentally writable mapping is a detected failure, not a const alias.
     let readonly = ptr::addr_of_mut!(READONLY_PROBE) as u64;
     let sentinel = unsafe { ptr::read_volatile(ptr::addr_of!(READONLY_PROBE)) };
     // SAFETY: IF0, owned IDT/CR3, and the unmapped BSP guard were checked above.
-    require(
-        unsafe { cpu::page_fault_register_test() },
-        "page-fault-all-gpr-preservation",
-    );
-    log!("CHECK page-fault-gprs ok gprs=15\n");
-    require(
-        unsafe { cpu::fault_test(cpu::guards()[0], 0) },
-        "guard-page-fault",
-    );
-    require(
-        unsafe { cpu::fault_test(readonly, 1) },
-        "readonly-page-fault",
-    );
-    require(
-        unsafe { ptr::read_volatile(ptr::addr_of!(READONLY_PROBE)) } == sentinel,
+    let gprs = proof("page-fault-all-gpr-preservation", unsafe {
+        cpu::page_fault_register_test()
+    });
+    all &= gprs;
+    if gprs {
+        log!("CHECK page-fault-gprs ok gprs=15\n");
+    }
+    all &= proof("guard-page-fault", unsafe {
+        cpu::fault_test(cpu::guards()[0], 0)
+    });
+    all &= proof("readonly-page-fault", unsafe {
+        cpu::fault_test(readonly, 1)
+    });
+    all &= proof(
         "readonly-value-preserved",
+        unsafe { ptr::read_volatile(ptr::addr_of!(READONLY_PROBE)) } == sentinel,
     );
     let mut nx = unwrap(allocator.allocate(), "nx-frame");
     nx.bytes()[0] = 0xc3; // RET if executable: a missing NX check must fail test.
     let nx_address = boot.direct_map + nx.physical().0;
-    require(
-        unsafe { cpu::fault_test(nx_address, 2) },
-        "nx-execution-fault",
-    );
+    all &= proof("nx-execution-fault", unsafe {
+        cpu::fault_test(nx_address, 2)
+    });
     unwrap(allocator.release(nx), "nx-release");
-    log!("CHECK exception ok breakpoint=returned gprs=15 guard=0 readonly=3 nx=17\n");
+    if all {
+        log!("CHECK exception ok breakpoint=returned gprs=15 guard=0 readonly=3 nx=17\n");
+    }
     if boot.test == TestMode::UnexpectedFault {
         cpu::unexpected_fault();
     }
@@ -520,18 +600,24 @@ fn check_exceptions(boot: &boot::BootInfo, allocator: &mut Allocator<'_>) {
     assert!(boot.test != TestMode::Panic, "controlled panic case");
 }
 
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "boot-proofs")]
 fn check_user_mm(tables: &mut paging::Tables, allocator: &mut Allocator<'_>) {
-    unwrap(tables.user_mm_tests(allocator), "user-mm");
-    log!(
-        "CHECK user-mm ok pages=3 rollback_points=3 tlb=invlpg protect=ro unmap=3 conflict=rolled-back accounting=restored\n"
-    );
+    if proof_result("user-mm", tables.user_mm_tests(allocator)).is_some() {
+        log!(
+            "CHECK user-mm ok pages=3 rollback_points=3 tlb=invlpg protect=ro unmap=3 conflict=rolled-back accounting=restored\n"
+        );
+    }
 }
 
+/// The end of a boot that cannot continue. The bare-metal suite instead ends
+/// the running group (or, outside a group, shows its summary): the stop is
+/// already in the captured log.
 fn fail() -> ! {
-    #[cfg(feature = "qemu-self-test")]
+    #[cfg(feature = "baremetal-suite")]
+    baremetal::fatal();
+    #[cfg(all(feature = "qemu-self-test", not(feature = "baremetal-suite")))]
     cpu::exit(false);
-    #[cfg(not(feature = "qemu-self-test"))]
+    #[cfg(not(any(feature = "qemu-self-test", feature = "baremetal-suite")))]
     cpu::halt()
 }
 #[panic_handler]
@@ -540,10 +626,14 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     fail()
 }
 
-#[cfg(feature = "qemu-self-test")]
+#[cfg(feature = "boot-proofs")]
 fn check_allocator_recovery(allocator: &mut Allocator<'_>) {
-    let max_order = unwrap(allocator.test_orders(), "buddy-orders");
-    let exhausted = unwrap(allocator.test_exhaustion(), "exhaustion");
+    let Some(max_order) = proof_result("buddy-orders", allocator.test_orders()) else {
+        return;
+    };
+    let Some(exhausted) = proof_result("exhaustion", allocator.test_exhaustion()) else {
+        return;
+    };
     log!(
         "CHECK exhaustion ok frames={} recovered={}\n",
         exhausted,

@@ -17,6 +17,10 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod suite;
+
+pub use suite::create as baremetal_suite;
+
 const TARGET: &str = "x86_64-unknown-none";
 // Reviewed host-build source replacement; kernel builds accept the checked-in file only if identical.
 const PROJECT_CARGO_CONFIG: &str = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"\n";
@@ -50,7 +54,12 @@ const NO_GLOBAL_OOM_HANDLING: &str = "--cfg=no_global_oom_handling";
 /// What the isolated Cargo build compiles: the kernel (two feature profiles) or the user `/init`.
 #[derive(Clone, Copy)]
 enum Target {
-    Kernel { qemu_self_test: bool },
+    /// `suite` is the `baremetal-suite` feature (decision A21); with
+    /// `qemu_self_test` it is the composed build the harness validates.
+    Kernel {
+        qemu_self_test: bool,
+        suite: bool,
+    },
     Init,
 }
 
@@ -95,7 +104,16 @@ impl Target {
         match self {
             Self::Kernel {
                 qemu_self_test: true,
+                suite: true,
+            } => "qemu-self-test,baremetal-suite",
+            Self::Kernel {
+                qemu_self_test: true,
+                suite: false,
             } => "qemu-self-test",
+            Self::Kernel {
+                qemu_self_test: false,
+                suite: true,
+            } => "baremetal-suite",
             _ => "freestanding",
         }
     }
@@ -191,6 +209,9 @@ enum User {
     Oracle(&'static str),
     /// No `/init` in any archive: Linux's `prepare_namespace` failure text.
     NoRoot,
+    /// The kernel-run bare-metal suite (`suite`): the groups it runs, each with whether it must
+    /// pass, in run order.
+    Suite(&'static [(&'static str, bool)]),
 }
 
 #[derive(Clone, Copy)]
@@ -773,6 +794,71 @@ const DEBUG_CASES: &[DebugCase] = &[
             tsc_sources: &["pit", "hpet"],
             ..Q35_TCG
         },
+    },
+];
+
+/// Cases of the kernel-run bare-metal suite (`suite`, decision A21), run with the composed
+/// `qemu-self-test` + `baremetal-suite` build after [`DEBUG_CASES`]. They are not in
+/// [`debug_case_catalog`]: `kernel-package` stages exactly that catalog from the self-test build.
+const SUITE_CASES: &[DebugCase] = &[
+    DebugCase {
+        name: "baremetal-suite",
+        cmdline: Some("suite_pause_ms=50"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Suite(suite::ALL_PASS),
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    // The same on two displays: the machine the suite is for has two GPUs.
+    DebugCase {
+        name: "baremetal-suite-two-displays",
+        cmdline: Some("suite_pause_ms=50"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Suite(suite::ALL_PASS),
+        framebuffers: 2,
+        plat: Q35_TCG,
+    },
+    DebugCase {
+        name: "baremetal-suite-kvm",
+        cmdline: Some("suite_pause_ms=50"),
+        cpu: "host",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Suite(suite::ALL_PASS),
+        framebuffers: 1,
+        plat: Platform {
+            kvm: true,
+            mode: "x2apic",
+            reason: "hypervisor",
+            event: "lapic-deadline",
+            tsc_sources: &["pit", "hpet"],
+            ..Q35_TCG
+        },
+    },
+    // A segfaulting /init, a syscall Linux has and this kernel does not, and an /init that
+    // loops forever (ended by the one-second group bound) end only their own group runs; the
+    // group after them still runs and passes, and the suite reports failure.
+    DebugCase {
+        name: "baremetal-suite-stops",
+        cmdline: Some("suite_pause_ms=50 suite_timeout_s=1 suite_groups=fault,io_uring,spin,ids"),
+        cpu: "qemu64",
+        expected_exit: 35,
+        required: &["CHECKPOINT bootstrap-complete"],
+        forbid_success: true,
+        modules: ARCHIVE_ONLY,
+        user: User::Suite(suite::STOPS),
+        framebuffers: 1,
+        plat: Q35_TCG,
     },
 ];
 
@@ -2618,6 +2704,11 @@ fn build_command(
             "-Clink-arg=-Map={}",
             display_path(&output.join(format!("{}.map", target.prefix())))?
         ));
+    if matches!(target, Target::Kernel { suite: true, .. }) {
+        // The summary screen names the build (`baremetal.rs` BUILD_ID): the
+        // source commit, marked when the tree had uncommitted changes.
+        command.env("LINUX_RS_BUILD_ID", suite::build_id(root));
+    }
     match target {
         Target::Kernel { .. } => command.arg("-Clink-arg=-Tkernel/linker.ld"),
         // The init only needs line tables off: the kernel never debugs it.
@@ -2662,10 +2753,13 @@ fn build_profile_manifest(target: Target) -> BTreeMap<String, String> {
         ("build_profile", target.features()),
         (
             "feature_set",
-            if target.features() == "qemu-self-test" {
-                "qemu-self-test (includes freestanding)"
-            } else {
-                "freestanding"
+            match target.features() {
+                "qemu-self-test" => "qemu-self-test (includes freestanding)",
+                "baremetal-suite" => "baremetal-suite (includes freestanding; no qemu-self-test)",
+                "qemu-self-test,baremetal-suite" => {
+                    "qemu-self-test + baremetal-suite (includes freestanding)"
+                }
+                _ => "freestanding",
             },
         ),
         ("qualified_rustc_commit", REQUIRED_RUSTC_COMMIT),
@@ -3053,7 +3147,8 @@ fn finish_build(
         qemu_self_test: matches!(
             target,
             Target::Kernel {
-                qemu_self_test: true
+                qemu_self_test: true,
+                ..
             }
         ),
     })
@@ -3084,6 +3179,7 @@ pub fn build(root: &Path, requested: &Path) -> io::Result<()> {
         &output.path,
         Target::Kernel {
             qemu_self_test: false,
+            suite: false,
         },
     ) {
         Ok(build) => build,
@@ -4040,49 +4136,13 @@ fn validate_debug_case(
     if let Err(diagnostic) = validate_userspace(&lines, case.user, &expected.init) {
         return (false, diagnostic);
     }
-    if case.name == "unmasked-timer" {
-        let observed_irq = lines.iter().any(|line| {
-            let Some(rest) = line.strip_prefix("TIMER mask observation periods=2 irq_delta=")
-            else {
-                return false;
-            };
-            rest.split_ascii_whitespace()
-                .next()
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|delta| delta > 0)
-        });
-        if !observed_irq {
-            return (
-                false,
-                "unmasked timer must report periods=2 and nonzero irq_delta".to_owned(),
-            );
-        }
-    }
-    if case.name == "irq-restore-early"
-        && (!observed_irq_restore(&lines, false)
-            || lines
-                .iter()
-                .any(|line| record_matches(line, "CHECK irq-guard")))
+    if let User::Suite(groups) = case.user
+        && let Err(diagnostic) = suite::validate(serial, &lines, groups)
     {
-        return (
-            false,
-            "early IRQ restore must observe two tick periods, delivered IRQs and failed lock acquisition"
-                .to_owned(),
-        );
+        return (false, diagnostic);
     }
-    if case.name == "unexpected-page-fault"
-        && (!unique_exact_record(
-            &lines,
-            "TRAP call-abi",
-            "TRAP call-abi vector=14 rsp_mod16=8",
-        ) || lines
-            .iter()
-            .any(|line| record_matches(line, "FAIL trap-call-abi")))
-    {
-        return (
-            false,
-            "fatal page fault must observe the actual ordinary-call entry alignment".to_owned(),
-        );
+    if let Some(diagnostic) = named_case_failure(case.name, &lines) {
+        return (false, diagnostic.to_owned());
     }
     if case.forbid_success && lines.iter().any(|line| line.starts_with("RESULT success")) {
         return (false, "negative case emitted RESULT success".to_owned());
@@ -4091,6 +4151,42 @@ fn validate_debug_case(
         true,
         "expected QEMU exit and serial assertions matched".to_owned(),
     )
+}
+
+/// The extra records the three mutation cases must show (the failure text, or `None`).
+fn named_case_failure(name: &str, lines: &[&str]) -> Option<&'static str> {
+    match name {
+        "unmasked-timer" => {
+            let observed_irq = lines.iter().any(|line| {
+                let Some(rest) = line.strip_prefix("TIMER mask observation periods=2 irq_delta=")
+                else {
+                    return false;
+                };
+                rest.split_ascii_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|delta| delta > 0)
+            });
+            (!observed_irq)
+                .then_some("unmasked timer must report periods=2 and nonzero irq_delta")
+        }
+        "irq-restore-early" => (!observed_irq_restore(lines, false)
+            || lines
+                .iter()
+                .any(|line| record_matches(line, "CHECK irq-guard")))
+        .then_some(
+            "early IRQ restore must observe two tick periods, delivered IRQs and failed lock acquisition",
+        ),
+        "unexpected-page-fault" => (!unique_exact_record(
+            lines,
+            "TRAP call-abi",
+            "TRAP call-abi vector=14 rsp_mod16=8",
+        ) || lines
+            .iter()
+            .any(|line| record_matches(line, "FAIL trap-call-abi")))
+        .then_some("fatal page fault must observe the actual ordinary-call entry alignment"),
+        _ => None,
+    }
 }
 
 /// Linux 6.18.57 with no `/init` and no root device (observed on the pinned reference kernel).
@@ -4163,7 +4259,8 @@ impl Finder<'_> {
 fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> Result<(), String> {
     let find = Finder { lines };
     let (argc, mode_line, exact_summary, (execute_protection, access_protection)) = match user {
-        User::None => return Ok(()),
+        // The suite's own validator (`suite::validate`) judges the whole serial log.
+        User::None | User::Suite(_) => return Ok(()),
         User::NoRoot => return validate_no_root(lines),
         User::Ok {
             argc,
@@ -4387,7 +4484,7 @@ fn user_tail(
                 "unimplemented-syscall stop",
             )?,
         ],
-        User::None | User::NoRoot => Vec::new(),
+        User::None | User::NoRoot | User::Suite(_) => Vec::new(),
     })
 }
 
@@ -4722,9 +4819,12 @@ fn record_fixtures(
 struct TestRun {
     self_build: Build,
     default_build: Build,
+    suite_build: Build,
     init_build: Build,
     fixtures: Fixtures,
     cases: Vec<CaseResult>,
+    /// The [`SUITE_CASES`] results, counted apart from `cases` (see there).
+    suite_cases: Vec<CaseResult>,
     screenshot: PathBuf,
     screenshot_format: String,
     cpu_state: String,
@@ -4734,9 +4834,11 @@ fn write_top_manifest(output: &Output, run: &TestRun) -> io::Result<()> {
     let TestRun {
         self_build,
         default_build,
+        suite_build,
         init_build,
         fixtures,
         cases,
+        suite_cases,
         screenshot,
         screenshot_format,
         cpu_state,
@@ -4777,6 +4879,7 @@ fn write_top_manifest(output: &Output, run: &TestRun) -> io::Result<()> {
     for case in cases {
         record_case(&mut values, output, case)?;
     }
+    suite::record(&mut values, output, suite_cases, suite_build)?;
     manifest_value(
         &mut values,
         "default_boot_state",
@@ -4829,18 +4932,21 @@ pub fn test(root: &Path, requested: &Path, timeout: Duration) -> io::Result<()> 
         Ok(run) => {
             write_top_manifest(&output, &run)?;
             let (cases, screenshot) = (&run.cases, &run.screenshot);
-            let failures = cases
-                .iter()
+            let all = cases.iter().chain(&run.suite_cases);
+            let failures = all
+                .clone()
                 .filter(|case| !case.passed && !case.unavailable)
                 .collect::<Vec<_>>();
-            let unavailable = cases
-                .iter()
-                .filter(|case| case.unavailable)
-                .collect::<Vec<_>>();
+            let unavailable = all.filter(|case| case.unavailable).collect::<Vec<_>>();
             println!(
                 "kernel-test: {}/{} debug-exit cases matched; default framebuffer capture requires human review",
                 cases.iter().filter(|case| case.passed).count(),
                 cases.len()
+            );
+            println!(
+                "kernel-test: {}/{} baremetal-suite cases matched",
+                run.suite_cases.iter().filter(|case| case.passed).count(),
+                run.suite_cases.len()
             );
             for case in &unavailable {
                 println!(
@@ -4883,6 +4989,7 @@ fn run_kernel_test(output: &Output, timeout: Duration) -> io::Result<TestRun> {
         &qemu_dir,
         Target::Kernel {
             qemu_self_test: true,
+            suite: false,
         },
     )?;
     let default_dir = output.path.join("freestanding-build");
@@ -4892,12 +4999,23 @@ fn run_kernel_test(output: &Output, timeout: Duration) -> io::Result<TestRun> {
         &default_dir,
         Target::Kernel {
             qemu_self_test: false,
+            suite: false,
         },
     )?;
     let init_dir = output.path.join("init-build");
     create_directory(&init_dir)?;
     let init_build = build_target(&output.root, &init_dir, Target::Init)?;
-    for dir in [&default_dir, &init_dir] {
+    let suite_dir = output.path.join("baremetal-suite-build");
+    create_directory(&suite_dir)?;
+    let suite_build = build_target(
+        &output.root,
+        &suite_dir,
+        Target::Kernel {
+            qemu_self_test: true,
+            suite: true,
+        },
+    )?;
+    for dir in [&default_dir, &init_dir, &suite_dir] {
         if fs::read(qemu_dir.join("source-inputs-before.tsv"))?
             != fs::read(dir.join("source-inputs-before.tsv"))?
         {
@@ -4919,14 +5037,27 @@ fn run_kernel_test(output: &Output, timeout: Duration) -> io::Result<TestRun> {
             timeout,
         )?);
     }
+    let mut suite_cases = Vec::with_capacity(SUITE_CASES.len());
+    for case in SUITE_CASES.iter().copied() {
+        suite_cases.push(run_debug_case(
+            &output.root,
+            &output.path,
+            &suite_build,
+            case,
+            &tools,
+            timeout.max(suite::TIMEOUT),
+        )?);
+    }
     let (screenshot, screenshot_format, cpu_state) =
         capture_default_framebuffer(&output.root, &output.path, &default_build, &tools, timeout)?;
     Ok(TestRun {
         self_build,
         default_build,
+        suite_build,
         init_build,
         fixtures: tools.fixtures,
         cases,
+        suite_cases,
         screenshot,
         screenshot_format,
         cpu_state,
@@ -5675,6 +5806,7 @@ mod tests {
         };
         let kernel = Target::Kernel {
             qemu_self_test: false,
+            suite: false,
         };
         let flags = remap_flags(
             Path::new("/work/root"),

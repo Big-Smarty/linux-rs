@@ -8,7 +8,7 @@
 
 use syscalls::{Errno, Sysno};
 
-use super::{R, T, addr, addr_mut, sys};
+use super::{R, T, addr, addr_mut, suite_start, sys};
 
 const BAD: usize = 0xdead_0000_0000;
 const ABSTIME: usize = 1;
@@ -141,13 +141,11 @@ fn clocks(t: &mut T) {
         last = n;
     }
     t.eq("monotonic-never-goes-back", monotonic_ok, true);
+    // The coarse clock is read first: read after `mono`, a tick between the two
+    // reads (likely on a slow emulated CPU) puts it ahead of `mono` on Linux too.
+    let coarse = now(MONOTONIC_COARSE);
     let (mono, raw, boot) = (now(MONOTONIC), now(MONOTONIC_RAW), now(BOOTTIME));
-    let (coarse, rt, rt_coarse, tai) = (
-        now(MONOTONIC_COARSE),
-        now(REALTIME),
-        now(REALTIME_COARSE),
-        now(TAI),
-    );
+    let (rt, rt_coarse, tai) = (now(REALTIME), now(REALTIME_COARSE), now(TAI));
     t.holds(
         "boottime-ge-monotonic",
         boot >= mono - 1_000_000,
@@ -172,11 +170,13 @@ fn clocks(t: &mut T) {
         mono - coarse,
         "within one tick of monotonic, never ahead",
     );
+    // The suite starts each group long after boot: the bound counts from there.
+    let from = suite_start().unwrap_or(0) as i64 * 1_000_000_000;
     t.holds(
         "monotonic-since-boot",
-        mono > 0 && mono < 120_000_000_000,
+        mono > from.max(0) && mono < from + 120_000_000_000,
         mono,
-        "0 < up < 120 s",
+        "0 < up < 120 s (counted from the group's start in the suite)",
     );
     t.holds(
         "realtime-plausible",

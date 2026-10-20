@@ -16,6 +16,7 @@ const USAGE: &str = "Usage: xtask <check|status> [--root PATH]
        xtask kernel-build --output target/kernel-tooling/<new-directory> [--root PATH]
        xtask kernel-test --output target/kernel-tooling/<new-directory> [--root PATH] [--timeout-seconds N]
        xtask kernel-package --build-output PATH --output target/kernel-tooling/<new-directory> [--root PATH]
+       xtask baremetal-suite --output target/kernel-tooling/<new-directory> [--root PATH]
        xtask --help
 
 Offline structural audit plus bounded x86_64 QEMU tooling; kernel test results do not establish physical Linux parity or performance.
@@ -69,6 +70,7 @@ enum Command {
     KernelBuild,
     KernelTest,
     KernelPackage,
+    BaremetalSuite,
 }
 
 struct Options {
@@ -151,6 +153,8 @@ fn arguments_from(
                 Command::KernelTest
             } else if arg == "kernel-package" {
                 Command::KernelPackage
+            } else if arg == "baremetal-suite" {
+                Command::BaremetalSuite
             } else {
                 // Preserve escaped raw OS bytes instead of emitting terminal
                 // controls or replacing invalid UTF-8 in an unknown argument.
@@ -192,7 +196,10 @@ fn validate_command_options(
     timeout_seconds: Option<u64>,
 ) -> std::result::Result<(), String> {
     match command {
-        Command::KernelBuild | Command::KernelTest | Command::KernelPackage => {
+        Command::KernelBuild
+        | Command::KernelTest
+        | Command::KernelPackage
+        | Command::BaremetalSuite => {
             if output.is_none() {
                 return Err(
                     "kernel commands require --output target/kernel-tooling/<new-directory>".into(),
@@ -242,6 +249,11 @@ fn main() -> ExitCode {
         Command::KernelPackage => {
             package::create(&options.root, &options.build_output, &options.output)
         }
+        Command::BaremetalSuite => kernel::baremetal_suite(
+            &options.root,
+            &options.output,
+            std::time::Duration::from_secs(options.timeout_seconds.max(240)),
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

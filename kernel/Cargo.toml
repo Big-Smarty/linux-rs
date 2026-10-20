@@ -16,7 +16,13 @@ required-features = ["freestanding"]
 [features]
 default = []
 freestanding = ["dep:x86_64", "dep:raw-cpuid", "dep:linux-rs-runtime", "dep:font8x8"]
-qemu-self-test = ["freestanding", "linux-rs-runtime?/self-test"]
+# Proofs that run at boot on any machine: no port or MMIO access beyond what the
+# kernel itself needs. `qemu-self-test` adds the QEMU-only COM1 and debug-exit
+# I/O; `baremetal-suite` adds the user-run hardware suite (decision A21) and
+# stays free of both (docs/bare-metal-suite.md, "Kernel-run suite").
+boot-proofs = []
+qemu-self-test = ["freestanding", "boot-proofs", "linux-rs-runtime?/self-test"]
+baremetal-suite = ["freestanding", "boot-proofs", "linux-rs-runtime?/self-test"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -27,6 +27,8 @@
 //! carry `vfs::tmpfs::UNSET_TIME` until `start` fixes them with the running
 //! clock.
 
+// The suite loads from retained archives, not from `BootInfo` modules.
+#[cfg_attr(feature = "baremetal-suite", allow(unused_imports))]
 use crate::{
     boot::{BootError, BootInfo},
     console, cpu,
@@ -211,10 +213,22 @@ fn random_bytes() -> [u8; 16] {
 /// # Errors
 /// [`Error::NoInit`] when absent (the caller reproduces Linux's panic), the
 /// Linux `execve` errno or an explicit unsupported case otherwise.
+#[cfg(not(feature = "baremetal-suite"))]
 pub fn load(boot: &BootInfo, tables: &mut Tables) -> Result<Loaded, Error> {
     let (vfs, compressed) = build_rootfs(boot)?;
+    load_rootfs(boot.command_line(), vfs, compressed, tables)
+}
+
+/// [`load`] after the rootfs exists: the shared tail of the boot path and of
+/// the bare-metal suite's per-group loads.
+fn load_rootfs(
+    command_line: &[u8],
+    vfs: Vfs,
+    compressed: Option<usize>,
+    tables: &mut Tables,
+) -> Result<Loaded, Error> {
     let fallback = first_fallback(&vfs);
-    match load_init(boot, vfs, tables) {
+    match load_init(command_line, vfs, tables) {
         Ok(loaded) => Ok(loaded),
         Err(Error::NoInit) if compressed.is_some() => {
             Err(Error::CompressedModule(compressed.unwrap_or_default()))
@@ -243,14 +257,9 @@ fn early_clock() -> Timespec {
 /// boot module unpacked in order (`populate_rootfs`). A module the unpacker
 /// stops on keeps the entries before the stop, as in Linux; compressed modules
 /// are skipped (decompression is not ported; the boot log already warned).
+#[cfg(not(feature = "baremetal-suite"))]
 fn build_rootfs(boot: &BootInfo) -> Result<(Vfs, Option<usize>), Error> {
-    // shmem_default_max_blocks / _max_inodes: both half the RAM's pages
-    // (`min3(nr_pages - totalhigh, nr_pages / 2, ...)` for the inodes).
-    let pages = services::FRAMES.lock().total() as u64;
-    let mut vfs = Vfs::new(pages / 2, pages / 2, early_clock).map_err(Error::Vfs)?;
-    let mut compressed = None;
-    vfs.default_rootfs().map_err(Error::Vfs)?;
-    let mut unpacker = Unpacker::new();
+    let mut rootfs = new_rootfs()?;
     for index in 0..boot.module_count() {
         let span = boot.module_span(index)?;
         // SAFETY: trusted initialized immutable file storage, BSP only, no
@@ -258,18 +267,45 @@ fn build_rootfs(boot: &BootInfo) -> Result<(Vfs, Option<usize>), Error> {
         // runs before the owned tables are activated). The borrow ends within
         // this iteration; the unpacker copies what it keeps.
         let bytes = unsafe { boot.module_bytes(span) }?;
-        if let Some(message) = unpacker.unpack(&mut vfs, bytes) {
+        rootfs.unpack(index, bytes);
+    }
+    Ok((rootfs.vfs, rootfs.compressed))
+}
+
+/// A rootfs under construction: the `rootfs_initcall` state between modules.
+struct Rootfs {
+    vfs: Vfs,
+    unpacker: Unpacker,
+    compressed: Option<usize>,
+}
+
+fn new_rootfs() -> Result<Rootfs, Error> {
+    // shmem_default_max_blocks / _max_inodes: both half the RAM's pages
+    // (`min3(nr_pages - totalhigh, nr_pages / 2, ...)` for the inodes).
+    let pages = services::FRAMES.lock().total() as u64;
+    let mut vfs = Vfs::new(pages / 2, pages / 2, early_clock).map_err(Error::Vfs)?;
+    vfs.default_rootfs().map_err(Error::Vfs)?;
+    Ok(Rootfs {
+        vfs,
+        unpacker: Unpacker::new(),
+        compressed: None,
+    })
+}
+
+impl Rootfs {
+    /// `unpack_to_rootfs` of boot module `index`.
+    fn unpack(&mut self, index: usize, bytes: &[u8]) {
+        if let Some(message) = self.unpacker.unpack(&mut self.vfs, bytes) {
             // CONFIG_BLK_DEV_RAM=n (`do_populate_rootfs`): the unpacker's own
             // message; the entries before the failure stay in the tree.
             if message == vfs::initramfs::NOT_PORTED {
-                compressed.get_or_insert(index);
+                self.compressed.get_or_insert(index);
                 crate::log!("WARN module={}: {}\n", index, message);
             } else {
                 crate::log!("Initramfs unpacking failed: {}\n", message);
             }
         }
     }
-    Ok((vfs, compressed))
 }
 
 /// The kernel thread's view of the rootfs for `init_*` and `kernel_execve`.
@@ -339,7 +375,7 @@ fn interpreter_failure(vfs: &mut Vfs, interpreter: &[u8], unsupported: Unsupport
     }
 }
 
-fn load_init(boot: &BootInfo, mut vfs: Vfs, tables: &mut Tables) -> Result<Loaded, Error> {
+fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<Loaded, Error> {
     // kernel_init_freeable: `init_eaccess(ramdisk_execute_command)` failing sends
     // Linux to `prepare_namespace`; any lookup failure counts.
     let env = vfs.kernel_env();
@@ -376,7 +412,10 @@ fn load_init(boot: &BootInfo, mut vfs: Vfs, tables: &mut Tables) -> Result<Loade
     // reserved from the heap before each `FRAMES` guard, which the table view
     // takes per operation (`services`).
     let total_pages = services::FRAMES.lock().total() as u64;
-    tables.init_zero_page(&mut services::FRAMES.lock())?;
+    // The suite loads one init per group into the same tables (`teardown`).
+    if !tables.has_zero_page() {
+        tables.init_zero_page(&mut services::FRAMES.lock())?;
+    }
     let env = Env::init(total_pages, 0);
     let mut mm = Mm::new(&env);
     insert_stack(&mut mm, &env, plan.exec_stack)?;
@@ -396,7 +435,7 @@ fn load_init(boot: &BootInfo, mut vfs: Vfs, tables: &mut Tables) -> Result<Loade
     // The argument block lives in the top ARG_PAGES pages: one contiguous
     // frame so `stack::build` can write it as a single window.
     let mut top = allocator.allocate_order(2)?;
-    let argv = InitArgv::parse(boot.command_line())?;
+    let argv = InitArgv::parse(command_line)?;
     let aux = Aux {
         hwcap: __cpuid(1).edx,
         phdr: plan.phdr,
@@ -536,7 +575,7 @@ pub fn account_ticks(user: bool, periods: u64) {
 /// Ring-3 page faults the address-space model resolved (`page_fault`); the
 /// self-test build reports it when init exits, as evidence that demand paging
 /// of init's own bss/stack through the real tables returned to user mode.
-#[cfg(feature = "qemu-self-test")]
+#[cfg(all(feature = "qemu-self-test", not(feature = "baremetal-suite")))]
 static USER_FAULTS_HANDLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Syscall context: the process plus its user-memory view (a borrow of the
@@ -822,6 +861,17 @@ impl Console for Tty {
 
 /// `kernel/exit.c`: init exiting for any reason panics. In a `qemu-self-test`
 /// build the result mirrors the exit code; the default build halts.
+///
+/// The bare-metal suite deviates deliberately (test profile only, decision
+/// A21): Linux's panic line is still printed for the record, but the death
+/// only ends the group's run and the next group starts on a fresh rootfs.
+#[cfg(feature = "baremetal-suite")]
+fn init_died(code: u32) -> ! {
+    crate::log!("{}\n", InitDeath(code));
+    crate::baremetal::init_exited(code)
+}
+
+#[cfg(not(feature = "baremetal-suite"))]
 fn init_died(code: u32) -> ! {
     #[cfg(feature = "qemu-self-test")]
     if code == 0 {
@@ -1130,7 +1180,7 @@ fn page_fault(process: &mut Process, regs: &cpu::PtRegs, error: u64, address: u6
     drop(tables);
     let kind = match outcome {
         FaultOutcome::Handled => {
-            #[cfg(feature = "qemu-self-test")]
+            #[cfg(all(feature = "qemu-self-test", not(feature = "baremetal-suite")))]
             USER_FAULTS_HANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return true;
         }
@@ -1172,7 +1222,7 @@ fn page_fault(process: &mut Process, regs: &cpu::PtRegs, error: u64, address: u6
 
 /// One system call through the dispatcher in the self-test (stops loudly on an
 /// unimplemented number).
-#[cfg(feature = "qemu-self-test")]
+#[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
 fn call(context: &mut Syscall<'_>, number: syscalls::Sysno, args: [u64; 6]) -> i64 {
     match syscall::dispatch(context, number as u64, args) {
         Outcome::Return(value) => value,
@@ -1182,7 +1232,7 @@ fn call(context: &mut Syscall<'_>, number: syscalls::Sysno, args: [u64; 6]) -> i
 
 /// `PROT_NONE` round trip of [`mm_usercopy_faults`] on pages `a` and `a + P`
 /// (which hold `pattern` across their boundary).
-#[cfg(feature = "qemu-self-test")]
+#[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
 fn mm_usercopy_protnone(context: &mut Syscall<'_>, a: u64, pattern: [u8; 8]) {
     use kernel::mm::{PROT_NONE, PROT_READ, PROT_WRITE};
     use kernel::usercopy::{copy_from_user, copy_to_user};
@@ -1226,7 +1276,7 @@ fn mm_usercopy_protnone(context: &mut Syscall<'_>, a: u64, pattern: [u8; 8]) {
 }
 
 /// `MAP_FIXED` replacement of [`mm_usercopy_faults`] over the two touched pages at `a`.
-#[cfg(feature = "qemu-self-test")]
+#[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
 fn mm_usercopy_fixed(context: &mut Syscall<'_>, a: u64) {
     use kernel::mm::{
         MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE, Pte, UserPages as _,
@@ -1271,7 +1321,7 @@ fn mm_usercopy_fixed(context: &mut Syscall<'_>, a: u64) {
 
 /// The kernel-access cases of [`check_mm_usercopy`]: `a` is three writable
 /// anonymous pages whose last is `PROT_NONE`, `b` one untouched read-only page.
-#[cfg(feature = "qemu-self-test")]
+#[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
 fn mm_usercopy_faults(context: &mut Syscall<'_>, a: u64, b: u64) {
     use kernel::mm::{Pte, UserPages as _};
     use kernel::usercopy::{copy_from_user, copy_to_user};
@@ -1348,7 +1398,7 @@ fn mm_usercopy_faults(context: &mut Syscall<'_>, a: u64, b: u64) {
 /// create the mappings, then the one user-copy mechanism faults pages in
 /// (`__do_page_fault` of a kernel access to user memory) with Linux's
 /// short-copy results. Context: BSP, IF clear, `PROCESS` installed, no lock held.
-#[cfg(feature = "qemu-self-test")]
+#[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
 fn check_mm_usercopy() {
     use kernel::mm::{
         MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE, Pte, UserPages as _, VmFlags,
@@ -1489,12 +1539,18 @@ fn check_user_image(init: &Loaded, space: &mut UserSpace<'_>) {
 /// End of the boot after a failed init: in a `qemu-self-test` build a failing
 /// result with the harness's debug-exit, otherwise halt.
 fn stop(label: &str) -> ! {
-    #[cfg(feature = "qemu-self-test")]
+    // The suite ends only the group's run (`baremetal::fatal`).
+    #[cfg(feature = "baremetal-suite")]
+    {
+        crate::log!("FAIL {}\n", label);
+        crate::fail()
+    }
+    #[cfg(all(feature = "qemu-self-test", not(feature = "baremetal-suite")))]
     {
         crate::log!("FAIL {}\n", label);
         cpu::exit(false);
     }
-    #[cfg(not(feature = "qemu-self-test"))]
+    #[cfg(not(any(feature = "qemu-self-test", feature = "baremetal-suite")))]
     {
         let _ = label;
         cpu::halt()
@@ -1558,6 +1614,93 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
             crate::fail();
         }
     }
+}
+
+/// The bare-metal suite's group load (decision A21): a fresh rootfs from the
+/// retained archive copies, then `/init` with `-- <group> <uptime_s> <ram>` as
+/// its arguments (`uptime_s`: whole seconds of boot time at the group's start,
+/// so the group's uptime bounds count from there; `ram`: bytes of RAM the
+/// memory map declares, the ceiling of `ids.sysinfo-ram` on any machine).
+/// The module payloads are unreadable once the owned tables are active, so the
+/// suite keeps heap copies (`baremetal::retain_archives`).
+///
+/// Context: BSP, IF clear, no group running, no lock held. Locks `TABLES`
+/// for the load (`TABLES` -> heap -> `FRAMES`, the documented order).
+#[cfg(feature = "baremetal-suite")]
+pub fn load_group(
+    archives: &[Vec<u8>],
+    group: &str,
+    uptime_s: u64,
+    ram_bytes: u64,
+) -> Result<Loaded, Error> {
+    /// Decimal digits of `value` right-aligned in `digits`; the start index.
+    fn decimal(digits: &mut [u8; 20], mut value: u64) -> usize {
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+            value /= 10;
+            if value == 0 {
+                return start;
+            }
+        }
+    }
+    let mut rootfs = new_rootfs()?;
+    for (index, bytes) in archives.iter().enumerate() {
+        rootfs.unpack(index, bytes);
+    }
+    // "-- <group> <decimal uptime> <decimal ram>", at most 20 digits each.
+    let (mut up, mut ram) = ([0u8; 20], [0u8; 20]);
+    let (up_start, ram_start) = (decimal(&mut up, uptime_s), decimal(&mut ram, ram_bytes));
+    let (up, ram) = (&up[up_start..], &ram[ram_start..]);
+    let mut line = Vec::new();
+    line.try_reserve_exact(5 + group.len() + up.len() + ram.len())
+        .map_err(|_| Error::Vfs(Errno::ENOMEM))?;
+    for &byte in b"-- "
+        .iter()
+        .chain(group.as_bytes())
+        .chain(b" ")
+        .chain(up)
+        .chain(b" ")
+        .chain(ram)
+    {
+        let _ = line.push_within_capacity(byte);
+    }
+    let mut tables = services::TABLES.lock();
+    load_rootfs(&line, rootfs.vfs, rootfs.compressed, &mut tables)
+}
+
+/// End of a group's process: unmap and free every user page, then drop the
+/// process (rootfs, open files, address-space model).
+///
+/// shortcut: the intermediate user page tables stay (they are never freed
+/// before address-space teardown, see `paging`) and are reused by the next
+/// group's identical layout; a real `exit_mmap` replaces this with `execve`/
+/// `exit`. Everything else returns to the allocator.
+///
+/// Context: BSP, IF clear, `PROCESS`, `TABLES` and `FRAMES` free (the suite
+/// checks [`locks_free`] after a kernel stop).
+#[cfg(feature = "baremetal-suite")]
+pub fn teardown() {
+    let process = PROCESS.take();
+    {
+        let mut tables = services::TABLES.lock();
+        let mut frames = services::FRAMES.lock();
+        tables.mm_unmap(&mut frames, 0, usercopy::TASK_SIZE_MAX / PAGE);
+    }
+    drop(process);
+    // The process's signal state (handlers, queues, `ITIMER_REAL`) died with it;
+    // its clockevent wake-ups must not outlive it.
+    timer::clear_waits();
+}
+
+/// Whether every lock a group's teardown takes is free (see `Service::is_free`).
+#[cfg(feature = "baremetal-suite")]
+pub fn locks_free() -> bool {
+    PROCESS.is_free()
+        && services::TABLES.is_free()
+        && services::FRAMES.is_free()
+        && crate::kalloc::lock_free()
 }
 
 fn start(mut init: Loaded) -> ! {
@@ -1632,7 +1775,9 @@ fn start(mut init: Loaded) -> ! {
         signal,
         printk_ratelimit: RateLimit::printk(kernel::time::HZ),
     });
-    #[cfg(feature = "qemu-self-test")]
+    // Not in the suite: it runs once per group and the `mm` group covers the
+    // user-copy faults from ring 3.
+    #[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
     check_mm_usercopy();
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all
