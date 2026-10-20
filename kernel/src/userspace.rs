@@ -1317,11 +1317,11 @@ fn start(mut init: Loaded) -> ! {
     // then follow the real wall clock.
     init.vfs
         .start_timekeeping(timer::ktime_get_real, timer::ktime_get_real());
-    // The segments' VMAs hold /init (`vm_file`); the loader's own reference
-    // (`bprm->file`) goes.
+    // The segments' VMAs hold /init (`vm_file`). The loader's reference
+    // (`bprm->file`) stays as `mm->exe_file` for the life of the process, so
+    // `Process::exec` can never name a recycled description.
     crate::unwrap(init.vfs.reserve_pin(), "exec-pin");
     init.vfs.pin(u64::from(init.exec.index()));
-    init.vfs.fput(init.exec);
     let mut fdt = FdTable::default();
     // console_on_rootfs: descriptors 0-2 are one /dev/console open file.
     if init.vfs.console_on_rootfs(&mut fdt).is_err() {

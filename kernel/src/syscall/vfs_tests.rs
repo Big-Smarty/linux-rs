@@ -1158,7 +1158,7 @@ fn file_mmap_checks_come_from_the_descriptor() {
     let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
     let ro = fd(open(&mut t, "/f", O_RDONLY, 0));
     let wo = fd(open(&mut t, "/f", O_WRONLY, 0));
-    let mut map =
+    let map =
         |t: &mut Task, prot, flags, fd: u64| call(t, Sysno::mmap, &[0, 4096, prot, flags, fd, 0]);
     // fget first; then the model's order (write-only: EACCES; shared writable
     // on a read-only description: EACCES).

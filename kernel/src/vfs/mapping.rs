@@ -127,7 +127,7 @@ impl Vfs {
     /// If `id` is not an open description (a kernel bug) or no room was
     /// reserved.
     pub fn pin(&mut self, id: u64) {
-        let file = self.file_of(id);
+        let file = file_of(id);
         if self.pins.iter().any(|pin| pin.file == file) {
             return;
         }
@@ -161,10 +161,6 @@ impl Vfs {
         self.fput(pin.file);
     }
 
-    fn file_of(&self, id: u64) -> FileId {
-        FileId(u32::try_from(id).expect("mapped file id is a file handle"))
-    }
-
     /// The page of the file behind a private mapping that `shmem_fault` would
     /// supply for page index `pgoff`, copied into `bytes` (the part past
     /// `i_size` and holes are zero).
@@ -181,7 +177,7 @@ impl Vfs {
         pgoff: u64,
         bytes: &mut [u8; PAGE_SIZE],
     ) -> Result<(), FileFault> {
-        let file = self.file_of(id);
+        let file = file_of(id);
         let slot = self
             .pins
             .iter()
@@ -218,4 +214,9 @@ impl Vfs {
     pub fn take_coherence_loss(&mut self) -> bool {
         core::mem::take(&mut self.coherence_lost)
     }
+}
+
+/// The description behind a `FileInfo::id` of this module.
+fn file_of(id: u64) -> FileId {
+    FileId(u32::try_from(id).expect("mapped file id is a file handle"))
 }
