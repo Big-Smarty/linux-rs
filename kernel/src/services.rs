@@ -11,7 +11,9 @@
 //! | [`TABLES`] | the published page tables (the one address space) | task context | task context |
 //!
 //! # Lock order (the shared DAG; acquire left to right, never the reverse)
-//! `userspace::PROCESS` -> [`TABLES`] -> `heap` -> [`FRAMES`]. [`FRAMES`] is a
+//! `userspace::PROCESS` -> [`TABLES`] -> `heap` -> [`FRAMES`], and `PROCESS` ->
+//! `TIMER_HW` (a leaf: the clockevent programming of `timer::set_itimer_ns` /
+//! `wait_event`, called with `PROCESS` held). [`FRAMES`] is a
 //! leaf: it calls nothing that locks. A table operation takes the frame
 //! allocator as an argument, so callers lock [`TABLES`] first and pass the
 //! [`FRAMES`] guard. `PROCESS` and [`TABLES`] ARE held across a user-memory
