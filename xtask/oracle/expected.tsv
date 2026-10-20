@@ -1,6 +1,6 @@
-# Expected output lines of the oracle syscall suite (user/init modes mm ids time signal fs proc fork) on the pinned
+# Expected output lines of the oracle syscall suite (user/init modes mm ids time signal fs proc fork jobctl) on the pinned
 # Linux 6.18.57 reference kernel: QEMU q35, -cpu qemu64 (TCG), -smp 1 -m 512M, "console=ttyS0 panic=-1 vdso=0 norandmaps -- <mode>",
-# the harness-built /init and generated initramfs (target/linux-reference/init-reference-006; docs/implementation.md#oracle-syscall-test-suite).
+# the harness-built /init and generated initramfs (target/linux-reference/init-reference-006 for mm ids time signal fs proc, -009/-010 for fork, -011 for jobctl; docs/implementation.md#oracle-syscall-test-suite).
 # Columns: group, kind (check|info|summary), name, line (the exact stdout line without the newline).
 # A consumer matches "check" and "summary" rows exactly; "info" rows are recorded observations (tmpfs d_off cookies), not requirements.
 # Kernel printk lines may interleave with console output and must be filtered by the consumer (keep lines that start with
@@ -1194,3 +1194,74 @@ fork	check	clone3-child-cleartid	init: test fork.clone3-child-cleartid ok
 fork	check	execve-in-child-exit-status	init: test fork.execve-in-child-exit-status ok
 fork	check	exec-resets-the-clone-exit-signal	init: test fork.exec-resets-the-clone-exit-signal ok
 fork	summary	-	init: tests fork passed=164 failed=0
+jobctl	check	sigstop-stops	init: test jobctl.sigstop-stops ok
+jobctl	check	sigstop-stop-reported-once	init: test jobctl.sigstop-stop-reported-once ok
+jobctl	check	sigstop-continues	init: test jobctl.sigstop-continues ok
+jobctl	check	sigtstp-stops	init: test jobctl.sigtstp-stops ok
+jobctl	check	sigtstp-stop-reported-once	init: test jobctl.sigtstp-stop-reported-once ok
+jobctl	check	sigtstp-continues	init: test jobctl.sigtstp-continues ok
+jobctl	check	sigttin-stops	init: test jobctl.sigttin-stops ok
+jobctl	check	sigttin-stop-reported-once	init: test jobctl.sigttin-stop-reported-once ok
+jobctl	check	sigttin-continues	init: test jobctl.sigttin-continues ok
+jobctl	check	sigttou-stops	init: test jobctl.sigttou-stops ok
+jobctl	check	sigttou-stop-reported-once	init: test jobctl.sigttou-stop-reported-once ok
+jobctl	check	sigttou-continues	init: test jobctl.sigttou-continues ok
+jobctl	check	sigterm-waits-for-the-continue	init: test jobctl.sigterm-waits-for-the-continue ok
+jobctl	check	sigcont-delivers-the-pending-sigterm	init: test jobctl.sigcont-delivers-the-pending-sigterm ok
+jobctl	check	sigkill-kills-a-stopped-child	init: test jobctl.sigkill-kills-a-stopped-child ok
+jobctl	check	wnowait-stop-info	init: test jobctl.wnowait-stop-info ok
+jobctl	check	wnowait-stop-repeats	init: test jobctl.wnowait-stop-repeats ok
+jobctl	check	wnowait-then-wait-consumes	init: test jobctl.wnowait-then-wait-consumes ok
+jobctl	check	continue-cancels-the-unreported-stop	init: test jobctl.continue-cancels-the-unreported-stop ok
+jobctl	check	continue-is-reported	init: test jobctl.continue-is-reported ok
+jobctl	check	continue-reported-once	init: test jobctl.continue-reported-once ok
+jobctl	check	second-stop-replaces-the-unreported-continue	init: test jobctl.second-stop-replaces-the-unreported-continue ok
+jobctl	check	stop-continue-stop-then-exit	init: test jobctl.stop-continue-stop-then-exit ok
+jobctl	check	sigcont-on-a-running-child-reports-nothing	init: test jobctl.sigcont-on-a-running-child-reports-nothing ok
+jobctl	check	running-child-unharmed	init: test jobctl.running-child-unharmed ok
+jobctl	check	handled-stop-signal-does-not-stop	init: test jobctl.handled-stop-signal-does-not-stop ok
+jobctl	check	stop-and-continue-discard-each-other	init: test jobctl.stop-and-continue-discard-each-other ok
+jobctl	check	setpgid-joins-a-sibling-group	init: test jobctl.setpgid-joins-a-sibling-group ok
+jobctl	check	kill-group-stop	init: test jobctl.kill-group-stop ok
+jobctl	check	kill-group-stops-every-member	init: test jobctl.kill-group-stops-every-member ok
+jobctl	check	kill-group-continue	init: test jobctl.kill-group-continue ok
+jobctl	check	kill-group-continues-every-member	init: test jobctl.kill-group-continues-every-member ok
+jobctl	check	group-members-exit-after-continue	init: test jobctl.group-members-exit-after-continue ok
+jobctl	check	wait-sleeps-until-a-child-stops	init: test jobctl.wait-sleeps-until-a-child-stops ok
+jobctl	check	the-others-exit-normally	init: test jobctl.the-others-exit-normally ok
+jobctl	check	stops-ran-to-the-end	init: test jobctl.stops-ran-to-the-end ok
+jobctl	check	sigchld-for-a-stop	init: test jobctl.sigchld-for-a-stop ok
+jobctl	check	sigchld-for-a-continue	init: test jobctl.sigchld-for-a-continue ok
+jobctl	check	nocldstop-reports-without-a-signal	init: test jobctl.nocldstop-reports-without-a-signal ok
+jobctl	check	nocldstop-still-announces-the-exit	init: test jobctl.nocldstop-still-announces-the-exit ok
+jobctl	check	notifications-ran-to-the-end	init: test jobctl.notifications-ran-to-the-end ok
+jobctl	check	orphaned-sigtstp-is-dropped	init: test jobctl.orphaned-sigtstp-is-dropped ok
+jobctl	check	orphaned-sigttin-is-dropped	init: test jobctl.orphaned-sigttin-is-dropped ok
+jobctl	check	orphaned-sigttou-is-dropped	init: test jobctl.orphaned-sigttou-is-dropped ok
+jobctl	check	orphaned-sigstop-still-stops	init: test jobctl.orphaned-sigstop-still-stops ok
+jobctl	check	orphaned-sigstop-continues	init: test jobctl.orphaned-sigstop-continues ok
+jobctl	check	orphaned-handled-sigtstp-runs-its-handler	init: test jobctl.orphaned-handled-sigtstp-runs-its-handler ok
+jobctl	check	orphaned-handled-parent-exits	init: test jobctl.orphaned-handled-parent-exits ok
+jobctl	check	orphaned-handled-what-the-member-saw	init: test jobctl.orphaned-handled-what-the-member-saw ok
+jobctl	check	orphaned-handled-member-status	init: test jobctl.orphaned-handled-member-status ok
+jobctl	check	orphaned-default-action-parent-exits	init: test jobctl.orphaned-default-action-parent-exits ok
+jobctl	check	orphaned-default-action-what-the-member-saw	init: test jobctl.orphaned-default-action-what-the-member-saw ok
+jobctl	check	orphaned-default-action-member-status	init: test jobctl.orphaned-default-action-member-status ok
+jobctl	check	orphaned-blocked-parent-exits	init: test jobctl.orphaned-blocked-parent-exits ok
+jobctl	check	orphaned-blocked-what-the-member-saw	init: test jobctl.orphaned-blocked-what-the-member-saw ok
+jobctl	check	orphaned-blocked-member-status	init: test jobctl.orphaned-blocked-member-status ok
+jobctl	check	orphaned-no-stopped-member-parent-exits	init: test jobctl.orphaned-no-stopped-member-parent-exits ok
+jobctl	check	orphaned-no-stopped-member-what-the-member-saw	init: test jobctl.orphaned-no-stopped-member-what-the-member-saw ok
+jobctl	check	orphaned-no-stopped-member-member-status	init: test jobctl.orphaned-no-stopped-member-member-status ok
+jobctl	check	child-became-a-session-leader	init: test jobctl.child-became-a-session-leader ok
+jobctl	check	getsid-of-a-child-in-another-session	init: test jobctl.getsid-of-a-child-in-another-session ok
+jobctl	check	setpgid-of-a-child-in-another-session	init: test jobctl.setpgid-of-a-child-in-another-session ok
+jobctl	check	setpgid-into-a-group-of-another-session	init: test jobctl.setpgid-into-a-group-of-another-session ok
+jobctl	check	setpgid-into-a-group-that-does-not-exist	init: test jobctl.setpgid-into-a-group-that-does-not-exist ok
+jobctl	check	kill-probes-a-group-of-another-session	init: test jobctl.kill-probes-a-group-of-another-session ok
+jobctl	check	session-leader-exits	init: test jobctl.session-leader-exits ok
+jobctl	check	exec-image-is-running	init: test jobctl.exec-image-is-running ok
+jobctl	check	setpgid-after-execve	init: test jobctl.setpgid-after-execve ok
+jobctl	check	getpgid-unchanged	init: test jobctl.getpgid-unchanged ok
+jobctl	check	exec-image-exits	init: test jobctl.exec-image-exits ok
+jobctl	summary	-	init: tests jobctl passed=70 failed=0

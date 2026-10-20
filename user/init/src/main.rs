@@ -322,6 +322,10 @@ fn run(stack: &Stack) {
     if stack.argv.iter().nth(1) == Some(b"execsig".as_slice()) {
         tests::fork::execsig(stack.argv);
     }
+    // The image of the `jobctl` group's `setpgid`-after-`execve` check: silent too.
+    if stack.argv.iter().nth(1) == Some(b"jobwait".as_slice()) {
+        tests::jobctl::jobwait();
+    }
     out!("init: {stack:?}");
 
     expect("rsp_mod16", stack.sp % 16, 0);
