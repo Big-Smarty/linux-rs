@@ -19,6 +19,7 @@ use crate::{
     vfs::{FdTable, FileId, Timespec, Vfs},
 };
 extern crate std;
+use crate::sched::WaitKey;
 use std::{boxed::Box, collections::BTreeMap, vec::Vec};
 
 #[derive(Default)]
@@ -335,7 +336,7 @@ impl<P: UserPages, C> signal::Task for Task<P, C> {
     }
     /// Advance the clock to the earliest of the deadline, the interval timer
     /// and the scripted signals, then deliver the scripted ones that are due.
-    fn wait(&mut self, deadline_ns: Option<u64>) {
+    fn wait(&mut self, _key: WaitKey, deadline_ns: Option<u64>) {
         self.waits += 1;
         let next = deadline_ns
             .into_iter()

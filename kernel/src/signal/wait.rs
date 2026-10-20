@@ -13,11 +13,12 @@
 //!
 //! # Contract
 //! * Context: task context, interrupts masked; sleeping is [`Task::wait`],
-//!   which halts the CPU until an interrupt or a deadline. Every iteration
+//!   which leaves the CPU until a wake-up of its key, a signal or a deadline. Every iteration
 //!   first brings the timers up to date ([`State::sync_timers`]) so an
 //!   `ITIMER_REAL` expiry that woke the CPU has become a pending `SIGALRM`
 //!   before the condition is examined, and no wake-up can be lost: the check
-//!   and the halt both run with interrupts masked (`sti; hlt`).
+//!   and the state change that puts the task to sleep both run with interrupts
+//!   masked, and the idle task's halt is `sti; hlt`.
 //! * `pause` and `rt_sigsuspend` return `-ERESTARTNOHAND` with the wake-up
 //!   signal still pending; the return path (`deliver`) turns that into
 //!   `-EINTR` when a handler runs and restarts the call when the signal
@@ -30,6 +31,7 @@ use super::{
     state::State,
     syscalls::{get_user, put_user},
 };
+use crate::sched::WaitKey;
 use syscalls::Errno;
 
 fn err(errno: Errno) -> i64 {
@@ -49,17 +51,21 @@ fn synced<T: Task>(task: &mut T) -> State<'_> {
 /// `SA_RESTART`) or restarts the call.
 pub const ERESTARTSYS: i64 = super::deliver::ERESTARTSYS;
 
-/// `wait_event_interruptible(cond)`: sleep until `ready` holds (`Ok`) or a
-/// signal is pending (`Err(-ERESTARTSYS)`), whichever comes first. This is the
-/// primitive a blocking read or write (pipe, tty, socket) waits with: `ready`
-/// examines whatever the other side changes, with interrupts masked, so the
-/// check and the halt cannot lose a wake-up. The condition is tested before the
-/// signals, as the macro does, so ready data wins over a pending signal.
+/// `wait_event_interruptible(wq, cond)`: sleep on `key` (the wait queue) until
+/// `ready` holds (`Ok`) or a signal is pending (`Err(-ERESTARTSYS)`), whichever
+/// comes first. This is the primitive a blocking read or write (pipe, tty,
+/// socket) waits with: `ready` examines whatever the other side changes, with
+/// interrupts masked, so the check and the sleep cannot lose a wake-up; the
+/// other side wakes `key` (`sched::Rq::wake_up_key`) after changing it. The
+/// condition is tested before the signals, as the macro does, so ready data
+/// wins over a pending signal. [`WaitKey::NONE`] is for a condition no one wakes
+/// by key (only a signal or the interval timer ends the wait).
 ///
 /// # Errors
 /// `-ERESTARTSYS` as an `i64` in `Err`, ready to be the syscall's result.
 pub fn wait_event_interruptible<T: Task>(
     task: &mut T,
+    key: WaitKey,
     mut ready: impl FnMut(&mut T) -> bool,
 ) -> Result<(), i64> {
     loop {
@@ -70,7 +76,7 @@ pub fn wait_event_interruptible<T: Task>(
         if task.state().signal_pending() {
             return Err(-ERESTARTSYS);
         }
-        task.wait(None);
+        task.wait(key, None);
     }
 }
 
@@ -89,14 +95,14 @@ pub fn sleep_until<T: Task>(task: &mut T, deadline_ns: u64) -> Option<u64> {
         if signalled {
             return Some(deadline_ns - now);
         }
-        task.wait(Some(deadline_ns));
+        task.wait(WaitKey::NONE, Some(deadline_ns));
     }
 }
 
 /// `pause()`: sleep until a signal is pending.
 pub fn sys_pause<T: Task>(task: &mut T) -> i64 {
     while !synced(task).signal_pending() {
-        task.wait(None);
+        task.wait(WaitKey::NONE, None);
     }
     -ERESTARTNOHAND
 }
@@ -119,7 +125,7 @@ pub fn sys_rt_sigsuspend<T: Task>(task: &mut T, unewset: u64, sigsetsize: u64) -
     state.me.saved_sigmask = Some(state.me.blocked);
     state.set_blocked(SigSet(u64::from_le_bytes(bytes)));
     while !synced(task).signal_pending() {
-        task.wait(None);
+        task.wait(WaitKey::NONE, None);
     }
     -ERESTARTNOHAND
 }
@@ -204,7 +210,7 @@ pub fn sys_rt_sigtimedwait<T: Task>(
             if deadline.is_some_and(|d| task.now_ns() >= d) {
                 break;
             }
-            task.wait(deadline);
+            task.wait(WaitKey::NONE, deadline);
         }
         let mut state = task.state();
         // __set_task_blocked(real_blocked), then collect.

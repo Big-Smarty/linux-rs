@@ -340,6 +340,7 @@ pub trait Cpu {
     fn ss_is_valid_user_data(&self, ss: u16) -> bool;
 }
 
+pub use crate::sched::WaitKey;
 pub use state::{Ids, State, TaskSignals};
 
 /// The task the signal syscalls and the blocking waits run for: the binary's
@@ -359,12 +360,14 @@ pub trait Task {
     fn parts(&mut self) -> (State<'_>, Self::Pages<'_>);
     /// `CLOCK_MONOTONIC` in nanoseconds (`ktime_get`).
     fn now_ns(&self) -> u64;
-    /// `schedule()` for one wake-up: halt until an interrupt arrives or the
-    /// monotonic clock reaches `deadline_ns` (`None`: no deadline), then
-    /// return; the caller re-checks its condition. The implementation arms the
+    /// `schedule()` for one wake-up: sleep (interruptibly) on `key` until a
+    /// wake-up of that key, a signal, the monotonic clock reaching `deadline_ns`
+    /// (`None`: no deadline) or any other wake-up, then return; the caller
+    /// re-checks its condition, so a spurious return is harmless. A deadline
+    /// already reached returns at once. The implementation arms the
     /// `ITIMER_REAL` expiry of `State::itimer` as a wake-up source too. Context:
     /// task, interrupts masked on entry and exit.
-    fn wait(&mut self, deadline_ns: Option<u64>);
+    fn wait(&mut self, key: WaitKey, deadline_ns: Option<u64>);
     /// `regs->sp` at syscall entry (`sigaltstack`'s `on_sig_stack` argument).
     fn user_sp(&self) -> u64;
     /// `frame::rt_sigreturn` on the entry registers, the state and user memory

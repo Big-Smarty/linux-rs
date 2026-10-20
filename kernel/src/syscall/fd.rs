@@ -39,6 +39,7 @@ use syscalls::{Errno, Sysno};
 
 use super::{Context, MAX_RW_COUNT, Outcome, Stop, Sys, io, outcome};
 use crate::{
+    sched::WaitKey,
     signal::{SIGPIPE, SIGXFSZ, wait::ERESTARTSYS},
     task::RLIM_INFINITY,
     usercopy::{access_ok, copy_from_user, copy_to_user},
@@ -459,7 +460,7 @@ fn interruptible_wait<C: Context>(ctx: &mut C) -> Result<(), Stop> {
     // `ITIMER_REAL` that expired into an ignored or blocked `SIGALRM` leaves
     // nothing that could end the wait.
     let mut dead = false;
-    let _ = crate::signal::wait::wait_event_interruptible(ctx, |c| {
+    let _ = crate::signal::wait::wait_event_interruptible(ctx, WaitKey::NONE, |c| {
         let state = c.state();
         dead = !state.signal_pending() && state.sig.itimer.next_event().is_none();
         dead

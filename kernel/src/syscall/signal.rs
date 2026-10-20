@@ -235,14 +235,18 @@ mod tests {
 
     #[test]
     fn wait_event_interruptible_prefers_the_condition_then_a_signal() {
+        use crate::sched::WaitKey;
         use crate::signal::wait::{ERESTARTSYS, wait_event_interruptible};
         let mut t = mapped();
         // Ready at once: no wait at all.
-        assert_eq!(wait_event_interruptible(&mut t, |_| true), Ok(()));
+        assert_eq!(
+            wait_event_interruptible(&mut t, WaitKey::NONE, |_| true),
+            Ok(())
+        );
         assert_eq!(t.waits, 0);
         // The "other side" makes it ready at the third look.
         let mut looks = 0;
-        let r = wait_event_interruptible(&mut t, |t| {
+        let r = wait_event_interruptible(&mut t, WaitKey::NONE, |t| {
             looks += 1;
             if looks == 3 {
                 return true;
@@ -256,12 +260,15 @@ mod tests {
         let mut t = mapped();
         t.script_signal(10, SIGUSR1);
         assert_eq!(
-            wait_event_interruptible(&mut t, |_| false),
+            wait_event_interruptible(&mut t, WaitKey::NONE, |_| false),
             Err(-ERESTARTSYS)
         );
         assert_eq!(t.now, 10);
         // Ready data wins over a pending signal.
-        assert_eq!(wait_event_interruptible(&mut t, |_| true), Ok(()));
+        assert_eq!(
+            wait_event_interruptible(&mut t, WaitKey::NONE, |_| true),
+            Ok(())
+        );
         // send_sig is the kernel's SI_USER from this process (SIGPIPE).
         let mut t = mapped();
         t.state.hand.actions[12].handler = 0x4000;
