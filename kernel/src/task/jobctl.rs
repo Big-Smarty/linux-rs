@@ -21,7 +21,7 @@ use super::{
     pid::PidType,
     tasklist::{PF_FORKNOEXEC, TaskId, Tasklist},
 };
-use crate::signal::jobctl::SignalStop;
+use crate::signal::jobctl::{SIGNAL_CLD_MASK, SignalStop};
 use syscalls::Errno;
 
 /// What [`Tasklist::signal_stop`] decided for the running task.
@@ -181,6 +181,13 @@ impl Tasklist {
     /// parent the `CLD_CONTINUED` (or `CLD_STOPPED`) notification; the bits are
     /// cleared first. A no-op when nothing is owed.
     pub fn notify_job_control(&mut self, task: TaskId, w: &mut dyn Waker) {
+        // Every return to user mode asks: look at the flags before building a view.
+        if self
+            .task(task)
+            .is_none_or(|t| t.signals.signal.job_flags & SIGNAL_CLD_MASK == 0)
+        {
+            return;
+        }
         let why = self
             .signal_state_as(task, true)
             .and_then(|mut state| state.take_cld_notification());
