@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use syscalls::{Errno, Sysno};
 
-use super::proc::{BAD, SIGPIPE, SIGUSR1, nap, reap_all, sigaction, spawn, wait4};
+use super::proc::{BAD, SIGCHLD, SIGPIPE, SIGUSR1, nap, reap_all, sigaction, spawn, wait4};
 use super::{R, T, addr, addr_mut, fn_addr, sys};
 
 const POLLIN: i16 = 1;
@@ -279,6 +279,23 @@ fn blocking_reads(t: &mut T) {
         (Ok(5), b"hello".as_slice(), true),
     );
     let _ = wait4(c as isize, 0);
+    // The sleeping reader does not wait for the writer to sleep or exit: the write itself
+    // wakes it, while the writer goes on running (a busy loop of 300 ms, no wait of its own).
+    let c = spawn(|| {
+        close(r);
+        nap(25);
+        let _ = write(w, b"!");
+        let until = now_ms() + 300;
+        while now_ms() < until {}
+        0
+    });
+    let start = now_ms();
+    t.eq(
+        "write-wakes-the-reader-while-the-writer-keeps-running",
+        (read(r, &mut buf), waited(start, 25), within(start, 200)),
+        (Ok(1), true, true),
+    );
+    let _ = wait4(c as isize, 0);
     // The last writer leaving ends the sleep with end of file; a writer that is still there
     // (a child holding its copy of the write end) keeps the read waiting.
     let c = spawn(|| {
@@ -295,6 +312,63 @@ fn blocking_reads(t: &mut T) {
     );
     let _ = wait4(c as isize, 0);
     close(r);
+    // End of file reaches a reader that is not the parent of the writer that left.
+    let (r, w) = pipe();
+    let reader = spawn(|| {
+        close(w);
+        usize::from(read(r, &mut [0u8; 8]) == Ok(0))
+    });
+    let writer = spawn(|| {
+        close(r);
+        nap(30);
+        0
+    });
+    close(r);
+    close(w);
+    let start = now_ms();
+    t.eq(
+        "eof-reaches-a-reader-that-is-a-sibling-of-the-writer",
+        (wait4(reader as isize, 0), waited(start, 25)),
+        ((Ok(reader), 1 << 8), true),
+    );
+    let _ = wait4(writer as isize, 0);
+    // ... even when no task is left that the exit would wake otherwise: with `SIGCHLD` ignored
+    // the exits are reaped at once and wake nobody, and the parent sleeps through all of it; the
+    // writer's exit alone wakes the reader, which has answered in a second pipe by the time the
+    // parent looks.
+    let (r, w) = pipe();
+    let (done_r, done_w) = pipe();
+    let _ = sys(Sysno::fcntl, &[done_r, 4, 0o4000]);
+    let _ = sigaction(SIGCHLD, SIG_IGN, 0);
+    let _ = spawn(|| {
+        close(w);
+        close(done_r);
+        let answer = if read(r, &mut [0u8; 8]) == Ok(0) {
+            b'D'
+        } else {
+            b'x'
+        };
+        let _ = write(done_w, &[answer]);
+        0
+    });
+    let _ = spawn(|| {
+        close(r);
+        close(done_r);
+        nap(25);
+        0
+    });
+    close(r);
+    close(w);
+    close(done_w);
+    nap(300);
+    let mut answer = [0u8; 1];
+    t.eq(
+        "exit-of-the-last-writer-wakes-a-reader-nobody-else-wakes",
+        (read(done_r, &mut answer), answer),
+        (Ok(1), *b"D"),
+    );
+    let _ = sigaction(SIGCHLD, 0, 0);
+    close(done_r);
     // Closing one of two descriptors of the write end is not the end of the writers.
     let (r, w) = pipe();
     let dup = sys(Sysno::dup, &[w]).unwrap_or(usize::MAX);

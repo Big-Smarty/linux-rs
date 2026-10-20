@@ -510,7 +510,7 @@ fn run(stack: &Stack) {
             demand_paging();
             out!("init: demand ok");
         }
-        // Oracle syscall suite groups (`user/init/src/tests`): `mm ids time signal fs proc`.
+        // Oracle syscall suite groups (`user/init/src/tests`): `mm ids time signal fs proc fork jobctl pipe`.
         Some(mode) if tests::run_mode(mode) => {}
         _ => {}
     }

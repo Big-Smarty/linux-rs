@@ -1001,7 +1001,8 @@ const SUITE_CASES: &[DebugCase] = &[
 ];
 
 /// Expected stdout lines of the oracle syscall suite (`user/init` modes `mm ids time signal fs
-/// proc`) as observed on the pinned Linux 6.18.57 (`target/linux-reference/init-reference-006`).
+/// proc fork jobctl pipe`) as observed on the pinned Linux 6.18.57 (`target/linux-reference`:
+/// `init-reference-006` for the first six, `-009`/`-010` for `fork`, `-011` for `jobctl` and `pipe`).
 /// Tab-separated `group kind name line`, `#` comments and a header row; see the file header.
 /// [`oracle_rows`] reads it; the `kernel-test` cases made by `oracle_case!` compare a run of the
 /// mode on this kernel against it.

@@ -1277,7 +1277,10 @@ pipe	check	poll-without-descriptors-sleeps	init: test pipe.poll-without-descript
 pipe	check	poll-times-out-after-the-whole-time	init: test pipe.poll-times-out-after-the-whole-time ok
 pipe	check	poll-zero-timeout-does-not-wait	init: test pipe.poll-zero-timeout-does-not-wait ok
 pipe	check	read-wakes-when-another-task-writes	init: test pipe.read-wakes-when-another-task-writes ok
+pipe	check	write-wakes-the-reader-while-the-writer-keeps-running	init: test pipe.write-wakes-the-reader-while-the-writer-keeps-running ok
 pipe	check	read-waits-for-the-last-writer-and-then-sees-eof	init: test pipe.read-waits-for-the-last-writer-and-then-sees-eof ok
+pipe	check	eof-reaches-a-reader-that-is-a-sibling-of-the-writer	init: test pipe.eof-reaches-a-reader-that-is-a-sibling-of-the-writer ok
+pipe	check	exit-of-the-last-writer-wakes-a-reader-nobody-else-wakes	init: test pipe.exit-of-the-last-writer-wakes-a-reader-nobody-else-wakes ok
 pipe	check	pipe-with-a-duplicate-writer-is-not-at-eof	init: test pipe.pipe-with-a-duplicate-writer-is-not-at-eof ok
 pipe	check	pipe-without-writers-is-at-eof	init: test pipe.pipe-without-writers-is-at-eof ok
 pipe	check	blocked-write-completes-when-the-reader-drains	init: test pipe.blocked-write-completes-when-the-reader-drains ok
@@ -1300,4 +1303,4 @@ pipe	check	poll-reports-the-pipe-that-got-the-data	init: test pipe.poll-reports-
 pipe	check	poll-resumes-until-its-original-end	init: test pipe.poll-resumes-until-its-original-end ok
 pipe	check	poll-interrupted-by-a-handler-is-eintr	init: test pipe.poll-interrupted-by-a-handler-is-eintr ok
 pipe	check	poll-without-timeout-resumes-and-finds-the-data	init: test pipe.poll-without-timeout-resumes-and-finds-the-data ok
-pipe	summary	-	init: tests pipe passed=35 failed=0
+pipe	summary	-	init: tests pipe passed=38 failed=0
