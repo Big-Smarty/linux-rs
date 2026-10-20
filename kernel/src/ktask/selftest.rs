@@ -412,7 +412,8 @@ pub fn start_preempt_hog() {
 /// The `sched-preempt` check, at `/init`'s death: the thread ran, the tick
 /// preempted `/init` from the user-interrupt path more than once, and `/init`
 /// came back every time (the harness checks its output). A no-op in the other
-/// cases.
+/// cases. (The suite's `init_died` is not a boot end and does not call it.)
+#[cfg(not(feature = "baremetal-suite"))]
 pub fn preempt_report() {
     if services::boot().test != kernel::boot::TestMode::SchedPreempt {
         return;
