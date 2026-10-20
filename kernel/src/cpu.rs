@@ -271,7 +271,7 @@ impl IrqSpinLock {
         }
     }
 
-    fn try_lock(&self) -> Option<IrqSpinGuard<'_>> {
+    pub(crate) fn try_lock(&self) -> Option<IrqSpinGuard<'_>> {
         let irq = LocalInterruptGuard::disable();
         Some(IrqSpinGuard {
             raw: self.0.try_lock()?,

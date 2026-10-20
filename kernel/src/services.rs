@@ -18,6 +18,19 @@
 //! fault (the kernel never touches user addresses, see `usercopy`), a callback
 //! or a blocking operation; nothing here sleeps.
 //!
+//! # The rule that is easy to break
+//! [`FRAMES`] is a leaf, and the heap takes it to grow. So **never allocate
+//! from the heap (`Vec::try_reserve`, `Box::try_new`, ...) while holding a
+//! [`FRAMES`] guard**: the heap lock is held first by the allocation, the
+//! grow path then needs `FRAMES`, which the caller holds, and a spinlock with
+//! interrupts masked would spin forever. Reserve heap memory first, then lock
+//! `FRAMES` (e.g. `try_reserve` the VMA `Vec`, then call `map_user_anon`). The
+//! grow path does not spin: it uses [`Service::try_lock`] and panics (a
+//! `FAIL panic` line, then the boot stops) when `FRAMES` is held, which on
+//! one CPU can only be this violation.
+//! shortcut: with SMP a held `FRAMES` may belong to another CPU and the grow
+//! path must spin unless the owner is the current CPU (record the owner CPU).
+//!
 //! # Contexts
 //! Every lock is [`IrqMutex`]: it disables local interrupts for the critical
 //! section, so a handler can never deadlock against an interrupted holder on
@@ -60,7 +73,8 @@ impl<T> IrqMutex<T> {
     }
 
     /// Mask local interrupts and take the lock. Must not be called again by the
-    /// holder (not reentrant: the second call would spin forever).
+    /// holder (not reentrant: the second call would spin forever; use
+    /// [`IrqMutex::try_lock`] where a bug could make that happen).
     pub fn lock(&self) -> IrqMutexGuard<'_, T> {
         let guard = self.lock.lock();
         // SAFETY: the lock is held for the guard's whole lifetime, so this is
@@ -71,6 +85,19 @@ impl<T> IrqMutex<T> {
             value,
             _held: guard,
         }
+    }
+}
+
+impl<T> IrqMutex<T> {
+    /// Take the lock if it is free; interrupts are restored on failure.
+    pub fn try_lock(&self) -> Option<IrqMutexGuard<'_, T>> {
+        let guard = self.lock.try_lock()?;
+        // SAFETY: as in `lock`.
+        let value = unsafe { &mut *self.value.get() };
+        Some(IrqMutexGuard {
+            value,
+            _held: guard,
+        })
     }
 }
 
@@ -116,6 +143,18 @@ impl<T: Send> Service<T> {
         let guard = self.0.lock();
         assert!(guard.is_some(), "kernel service used before install");
         ServiceGuard(guard)
+    }
+
+    /// Like [`Service::lock`] but `None` when the service is locked. On this
+    /// single-CPU cell, with interrupts masked inside every critical section,
+    /// `None` can only mean the caller already holds it: a lock-order bug.
+    ///
+    /// # Panics
+    /// If nothing was installed yet.
+    pub fn try_lock(&self) -> Option<ServiceGuard<'_, T>> {
+        let guard = self.0.try_lock()?;
+        assert!(guard.is_some(), "kernel service used before install");
+        Some(ServiceGuard(guard))
     }
 }
 

@@ -405,16 +405,21 @@ impl Tables {
         // (`entry_pointer`); `&mut self` excludes software writers, and
         // `AtomicU64` makes the swap race-free against the hardware's own
         // accessed/dirty updates of this entry.
-        let old = unsafe { AtomicU64::from_ptr(slot) }.swap(0, Ordering::AcqRel);
-        if old & PRESENT == 0 {
+        let entry = unsafe { AtomicU64::from_ptr(slot) };
+        // Check before clearing: a non-user entry in the user half is an
+        // isolation bug that must not also lose the entry (and its frame).
+        // Hardware only changes A/D bits between this load and the swap.
+        let seen = entry.load(Ordering::Acquire);
+        if seen & PRESENT == 0 {
             return Ok(None);
         }
+        if seen & USER == 0 {
+            return Err(Error::Audit);
+        }
+        let old = entry.swap(0, Ordering::AcqRel);
         // Single CPU: `invlpg` retires every cached translation of the page
         // (and covering paging-structure entries). SMP needs a shootdown here.
         tlb::flush(VirtAddr::new(address));
-        if old & USER == 0 {
-            return Err(Error::Audit);
-        }
         Ok(Some(Physical(old & ADDRESS)))
     }
 
@@ -466,6 +471,10 @@ impl Tables {
     /// on any failure every page mapped so far is unmapped and freed again, so
     /// allocator accounting returns to its entry value (except for empty
     /// intermediate tables, which stay).
+    ///
+    /// The caller holds the `FRAMES` guard that `allocator` came from: it must
+    /// not allocate from the heap meanwhile (heap growth needs `FRAMES`; see
+    /// the rule in `services`). Reserve heap memory (VMA `Vec`s) first.
     ///
     /// # Errors
     /// As [`Tables::map_user`], plus frame exhaustion.
@@ -551,9 +560,15 @@ impl Tables {
 
     /// Executed post-activation user-half checks: rollback at every allocation
     /// point, copy through a fresh anonymous mapping, `invlpg` after
-    /// tightening and after unmapping (proved by faults a stale TLB entry
-    /// would hide), conflict rollback, frame accounting. Uses unmapped pages
-    /// inside init's existing stack page table, so no table is added.
+    /// tightening and after unmapping (a write fault after `protect_user` and a
+    /// read fault after unmap, both of which a stale TLB entry would hide),
+    /// conflict rollback, frame accounting. Uses unmapped pages inside init's
+    /// existing stack page table, so no table is added.
+    ///
+    /// Negative control (QEMU TCG, recorded in `docs/implementation.md`):
+    /// removing the `invlpg` from `unmap_user` or from `protect_user` makes
+    /// this fail with `FAIL user-mm error=Conflict`. That is evidence for TCG's
+    /// TLB model on this cell, not for real hardware.
     #[cfg(feature = "qemu-self-test")]
     pub fn user_mm_tests(&mut self, allocator: &mut Allocator<'_>) -> Result<(), Error> {
         use kernel::{
@@ -601,12 +616,16 @@ impl Tables {
                 return Err(fail());
             }
         }
-        // SAFETY (all raw accesses below): `base` is a mapped, writable user
-        // page of the active tree; SMAP is not enabled yet (it is turned on in
-        // `userspace::start`), so ring 0 may touch it. This also loads the
-        // writable translation into the TLB.
+        // Deliberate, test-only ring-0 access to a user address (the kernel
+        // otherwise never dereferences one, see `usercopy`): it loads the
+        // writable translation into the TLB so a missing `invlpg` is visible.
         let pointer =
             ptr::with_exposed_provenance_mut::<u8>(usize::try_from(base).map_err(|_| fail())?);
+        // SAFETY: `base` is a mapped, writable, user-accessible page of the
+        // active tree (just mapped by `map_user_anon`); one byte, naturally
+        // aligned, no Rust reference to it exists (the `UserSpace` views above
+        // ended). SMAP is not enabled yet (`userspace::start` turns it on after
+        // this runs), so ring 0 may touch user pages.
         unsafe { pointer.write_volatile(0x5a) };
         if self.protect_user(base, false, false)? != Some((true, false))
             // SAFETY: IF clear, test recovery installed, readonly user page.

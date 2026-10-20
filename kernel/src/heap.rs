@@ -17,7 +17,7 @@
 //!   GFP-style atomic reserve exists; NMI/#DF/#MC never may.
 //! * Failure: every path that cannot be satisfied returns `None` with no
 //!   state change visible to the caller: an oversized request (more than the
-//!   largest block, `2^(ORDERS-1)` bytes, which is also the largest chunk the
+//!   largest block, `2^(ORDERS-1)` = 4 MiB, which is also the largest chunk the
 //!   frame allocator can supply, Linux's `KMALLOC_MAX_SIZE` analogue) or a
 //!   source that has no memory. There is no panic and no abort on any layout.
 //! * Rounding: a request occupies the next power of two of `max(size, align,
@@ -30,9 +30,10 @@
 use buddy_system_allocator::Heap;
 use core::{alloc::Layout, mem::size_of, ptr::NonNull};
 
-/// Largest block is `2^(ORDERS - 1)` bytes: 8 MiB, above the 4 MiB chunk the
-/// frame allocator can produce, so a chunk is never split by the cap.
-pub const ORDERS: usize = 24;
+/// Largest block is `2^(ORDERS - 1)` bytes: 4 MiB, exactly the largest chunk
+/// the frame allocator can produce (`MAX_ORDER` 10), so a request the cap
+/// accepts can in principle be served and one above it never asks the source.
+pub const ORDERS: usize = 23;
 /// Smallest chunk requested from a source: 64 KiB amortizes growth.
 pub const MIN_CHUNK: usize = 64 * 1024;
 
@@ -69,13 +70,6 @@ pub struct KernelHeap<S> {
     chunks: usize,
     refused: usize,
 }
-
-// SAFETY: the heap exclusively owns every block on its free lists (permanent
-// regions handed over by `ChunkSource`, never aliased) and has no thread
-// affinity; the raw pointers inside the free lists are plain addresses into
-// that owned memory. Moving the heap (with its source) between CPUs is
-// therefore sound whenever the source itself is `Send`.
-unsafe impl<S: Send> Send for KernelHeap<S> {}
 
 impl<S: ChunkSource> KernelHeap<S> {
     #[must_use]

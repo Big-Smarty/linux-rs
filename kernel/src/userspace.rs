@@ -4,7 +4,7 @@
 //! then runs init: ring-3 entry, the syscall and exception handlers called by
 //! `cpu.rs`, and init's death.
 //!
-//! State used after ring 3 starts lives in statics (`STATE` here, `BOOT`,
+//! State used after ring 3 starts lives in statics (`PROCESS` here, `BOOT`,
 //! `FRAMES` and `TABLES` in `services`), never in `kernel_main`'s frame, whose
 //! stack is reused as init's kernel stack.
 //!
@@ -367,7 +367,8 @@ pub struct Process {
     pub tgid: u32,
     /// The address space (`mm`): the published page tables.
     pub mm: &'static Service<Tables>,
-    /// File-backed VMAs from the exec plan (segfault report).
+    /// File-backed VMAs from the exec plan (segfault report). When this becomes
+    /// a `Vec`, `try_reserve` it BEFORE taking a `FRAMES` guard (`services`).
     /// shortcut: fixed array, no anonymous VMAs yet; the mm group replaces it
     /// with a sorted `Vec` grown by `try_reserve`.
     pub vmas: Vmas,
@@ -632,7 +633,7 @@ fn start(init: &Loaded) -> ! {
     });
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all
-    // state used by the syscall/fault paths is in `STATE`; `kernel_main`'s
+    // state used by the syscall/fault paths is in `PROCESS` and `services`; `kernel_main`'s
     // frame is abandoned, its stack top is TSS.RSP0.
     unsafe { cpu::enter_user(entry, sp) }
 }

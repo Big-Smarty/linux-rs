@@ -19,6 +19,12 @@
 //! `FRAMES`, and `FRAMES` never calls the heap. Interrupt handlers and the
 //! panic/fault paths MUST NOT allocate (they only `log!`).
 //!
+//! Latency: growth zero-fills a whole frame block (up to 4 MiB) and `dealloc`
+//! scans free lists, both with the heap lock held and interrupts masked, so a
+//! large growth delays timer interrupts by that much. Acceptable for the
+//! current single task; revisit (smaller chunks, zero-on-demand) before
+//! latency-sensitive work or when interrupts start to allocate-adjacent work.
+//!
 //! shortcut: heap memory comes from order-0..10 frame blocks that are never
 //! returned (no chunk reclaim yet); allocations are bounded by the largest
 //! free frame block (4 MiB), Linux's `KMALLOC_MAX_SIZE` analogue.
@@ -46,8 +52,15 @@ unsafe impl ChunkSource for FrameChunks {
         if order > MAX_ORDER {
             return None;
         }
-        // Lock order: heap (held by the caller) -> FRAMES.
-        let mut frames = FRAMES.lock();
+        // Lock order: heap (held by the caller) -> FRAMES. One CPU, IF masked
+        // in every critical section: a held FRAMES is held by our own caller
+        // (a heap allocation made while holding a FRAMES guard), which would
+        // otherwise spin forever. Fail loudly instead (`services` rule).
+        let Some(mut frames) = FRAMES.try_lock() else {
+            panic!(
+                "heap growth needs FRAMES, which the allocating caller holds: lock-order violation"
+            );
+        };
         let frame = frames.allocate_order(order).ok()?;
         let start = services::boot()
             .direct_map
@@ -168,7 +181,11 @@ pub fn self_test() -> Result<(), &'static str> {
     drop(huge);
     let mut over: Vec<u8> = Vec::new();
     let tried = stats().refused;
-    if over.try_reserve_exact(16 << 20).is_ok() || stats().refused != tried {
+    // 8 MiB and 16 MiB exceed the 4 MiB cap: rejected before the source.
+    if over.try_reserve_exact(8 << 20).is_ok()
+        || over.try_reserve_exact(16 << 20).is_ok()
+        || stats().refused != tried
+    {
         return Err("over-cap");
     }
     let end = stats();
