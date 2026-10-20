@@ -673,6 +673,7 @@ const DEBUG_CASES: &[DebugCase] = &[
         },
     },
     oracle_case!(ids),
+    oracle_case!(time),
 ];
 
 /// Expected stdout lines of the oracle syscall suite (`user/init` modes `mm ids time signal fs

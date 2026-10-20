@@ -397,8 +397,10 @@ static PROCESS: Service<Process> = Service::new();
 /// `nr_running + nr_uninterruptible` of the one CPU: init is always runnable
 /// (running or preempted by the tick) because no syscall blocks yet and the
 /// kernel never halts while init exists.
-/// shortcut: a constant; replace with the runqueue's counters when a syscall
-/// can sleep (nanosleep, futex, wait4, blocking I/O) or a second task exists.
+/// shortcut: a constant, though `nanosleep`/`clock_nanosleep` now sleep (Linux
+/// counts a sleeping task in neither `nr_running` nor `nr_uninterruptible`, so
+/// `sysinfo` loads over-count while init sleeps); replace with the runqueue's
+/// counters when a second task or a blocking syscall (futex, wait4, I/O) exists.
 const NR_ACTIVE: i64 = 1;
 
 /// The boot clock in jiffies, the unit of the load-average windows. The
