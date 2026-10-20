@@ -438,11 +438,8 @@ fn stat_family(t: &mut T) {
     );
     t.eq("stat-hello-blksize", hello.blksize, 4096);
     t.eq("stat-hello-blocks", hello.blocks, 8);
-    t.eq(
-        "stat-hello-mtime-from-archive",
-        (hello.mtime, hello.atime),
-        ([0, 0], [0, 0]),
-    );
+    // The archive header's mtime (0) is applied; atime and ctime are the unpack time.
+    t.eq("stat-hello-mtime-from-archive", hello.mtime, [0, 0]);
     t.eq("stat-hello-rdev", hello.rdev, 0);
     let (_, init) = stat_path(b"/init\0");
     t.eq(
