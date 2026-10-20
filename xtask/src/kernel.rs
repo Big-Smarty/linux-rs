@@ -319,7 +319,7 @@ const SUCCESS_MARKERS: &[&str] = &[
 /// canaries; keyed, signal and spurious wake-ups; the timer queue wakes in expiry order; the stack
 /// pool is exhausted, refused, recycled and its handles go stale; every pool guard page is
 /// unmapped and a read of one faults at the exact instruction.
-const SCHED_SWITCH_RECORD: &str = "CHECK sched-switch ok threads=7 switches=ok regs=callee-saved fpu=isolated order=fifo timers=ordered wake=keyed,signal,spurious stacks=recycled pool=exhausted,reused guards=unmapped guard_fault=exact";
+const SCHED_SWITCH_RECORD: &str = "CHECK sched-switch ok threads=7 switches=ok regs=callee-saved first_run_abi=aligned fpu=isolated order=fifo timers=ordered wake=keyed,signal,spurious stacks=recycled pool=exhausted,reused guards=unmapped guard_fault=exact";
 
 /// The success markers plus the scheduler record.
 const SCHED_SWITCH_MARKERS: [&str; SUCCESS_MARKERS.len() + 1] = {
@@ -6535,6 +6535,7 @@ mod tests {
         for (from, to) in [
             ("threads=7", "threads=6"),
             ("regs=callee-saved", "regs=none"),
+            ("first_run_abi=aligned", "first_run_abi=skewed"),
             ("fpu=isolated", "fpu=shared"),
             ("timers=ordered", "timers=unordered"),
             ("guard_fault=exact", "guard_fault=none"),

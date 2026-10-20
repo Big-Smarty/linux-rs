@@ -28,6 +28,7 @@ const THREADS: u64 = 7;
 static TURN: AtomicU64 = AtomicU64::new(0);
 static ORDER_BAD: AtomicU64 = AtomicU64::new(0);
 static REG_BAD: AtomicU64 = AtomicU64::new(0);
+static ABI_BAD: AtomicU64 = AtomicU64::new(0);
 static FPU_BAD: AtomicU64 = AtomicU64::new(0);
 static CTRL_BAD: AtomicU64 = AtomicU64::new(0);
 static TIME_BAD: AtomicU64 = AtomicU64::new(0);
@@ -125,6 +126,13 @@ unsafe extern "C" fn callee_saved_probe(_seed: u64, _switch: extern "C" fn()) ->
 /// One half of the ping-pong: strict alternation through `schedule()`, with
 /// register and FP canaries that differ per thread.
 extern "C" fn pingpong(me: usize) {
+    // The first run of a task enters Rust through `ret_from_fork_asm`'s CALL:
+    // an ordinary call from here must see the SysV entry alignment (8 mod 16),
+    // which holds only if the whole chain from the hand-built frame was aligned.
+    // SAFETY: scalar C-ABI call into the naked witness, no state touched.
+    if unsafe { cpu::ordinary_call_stack_residue() } != 8 {
+        ABI_BAD.fetch_add(1, Ordering::Relaxed);
+    }
     let seed = 0x0123_4567_89ab_0000u64 | ((me as u64 + 1) << 12);
     for round in 0..ROUNDS {
         if TURN.load(Ordering::Relaxed) != me as u64 {
@@ -298,6 +306,7 @@ pub fn sched_switch() {
         REG_BAD.load(Ordering::Relaxed) != 0,
         "callee-saved-registers",
     );
+    fail_if(ABI_BAD.load(Ordering::Relaxed) != 0, "first-run-alignment");
     fail_if(FPU_BAD.load(Ordering::Relaxed) != 0, "fpu-isolation");
     fail_if(TIME_BAD.load(Ordering::Relaxed) != 0, "sleep-short");
     fail_if(
@@ -331,7 +340,7 @@ pub fn sched_switch() {
     );
     fail_if(current() != RQ.lock().idle(), "idle-not-current");
     crate::log!(
-        "CHECK sched-switch ok threads=7 switches=ok regs=callee-saved fpu=isolated order=fifo timers=ordered wake=keyed,signal,spurious stacks=recycled pool=exhausted,reused guards=unmapped guard_fault=exact\n"
+        "CHECK sched-switch ok threads=7 switches=ok regs=callee-saved first_run_abi=aligned fpu=isolated order=fifo timers=ordered wake=keyed,signal,spurious stacks=recycled pool=exhausted,reused guards=unmapped guard_fault=exact\n"
     );
 }
 

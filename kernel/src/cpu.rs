@@ -994,7 +994,7 @@ extern "C" fn interrupt_handler(regs: &mut PtRegs, vector: u64, error: u64) {
 }
 #[cfg(feature = "boot-proofs")]
 #[unsafe(naked)]
-unsafe extern "C" fn ordinary_call_stack_residue() -> u64 {
+pub(crate) unsafe extern "C" fn ordinary_call_stack_residue() -> u64 {
     // Observe the actual ordinary SysV callee-entry stack before any prologue.
     // Rust/intrinsics cannot expose that point. CALL/RET own one stack word;
     // RAX and arithmetic flags are caller-clobbered, memory is not accessed.
