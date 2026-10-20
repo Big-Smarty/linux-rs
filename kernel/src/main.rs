@@ -21,11 +21,14 @@ extern crate alloc;
 use kernel::{boot, firmware, image, memory};
 use linux_rs_runtime as _;
 
+mod apic;
 mod console;
 mod cpu;
 mod kalloc;
+mod mmio;
 mod paging;
 mod services;
+mod timer;
 mod userspace;
 
 use boot::TestMode;
@@ -178,6 +181,24 @@ extern "C" fn kernel_main() -> ! {
     // which `paging`'s update rules allow but no longer require.
     let table_pages = tables.pages;
     let user = userspace::load(boot, &mut allocator, &mut tables);
+    // Interrupt-controller and time device pages (LAPIC, IOAPICs, HPET) are
+    // mapped uncached into the same unpublished tree; the APIC mode decision
+    // reads only CPUID/IA32_APIC_BASE.
+    let options = timer::Options::from_boot(boot);
+    let prepared = apic::prepare(
+        acpi.madt.as_ref(),
+        options.nolapic,
+        options.nox2apic,
+        boot.test,
+    );
+    let device_pages = timer::map_mmio(
+        boot,
+        &mut allocator,
+        &mut tables,
+        &prepared,
+        &acpi,
+        options.noapic,
+    );
     // SAFETY: the fully constructed tree covers current image/stack, descriptor,
     // loader/firmware/metadata and framebuffer resources at unchanged addresses;
     // guard/image-alias holes are intentional; no SMP/PCID/global translations.
@@ -199,41 +220,7 @@ extern "C" fn kernel_main() -> ! {
     check_allocator_recovery(&mut allocator);
     #[cfg(feature = "qemu-self-test")]
     check_user_mm(&mut tables, &mut allocator);
-    unwrap(cpu::start_timer(acpi.legacy_pic), "timer-init");
-    unwrap(
-        cpu::irq_guard_test(
-            cfg!(feature = "qemu-self-test") && boot.test == TestMode::IrqRestoreEarly,
-        ),
-        "irq-guard",
-    );
-    log!(
-        "CHECK irq-guard ok nested=2 out_of_order=true saved_on=true saved_off=true exclusive=true blocked_wraps=2 blocked_delta=0 resumed=true\n"
-    );
-    require(cpu::irq_register_test(), "irq-all-gpr-preservation");
-    let tick_start = cpu::ticks();
-    while cpu::ticks() - tick_start < 16 {
-        cpu::wait_tick();
-    }
-    // The mutation case deliberately leaves IRQ0 unmasked: the same assertion
-    // must fail after real PIT progression, not return an injected failure.
-    if boot.test != TestMode::UnmaskedTimer {
-        cpu::mask_timer();
-    }
-    let tick_end = cpu::ticks();
-    let observation = unwrap(cpu::observe_timer_periods(), "timer-period-observation");
-    log!(
-        "TIMER mask observation pit_wraps={} irq_delta={}\n",
-        observation.wraps,
-        observation.irq_delta
-    );
-    require(observation.irq_delta == 0, "timer-mask");
-    require(tick_end >= tick_start + 16, "timer-delivery");
-    log!(
-        "CHECK timer ok delivered={} masked_count={} gprs=15 pit_wraps={}\n",
-        tick_end - tick_start,
-        cpu::ticks(),
-        observation.wraps
-    );
+    clock_and_irq_checks(boot, &prepared, &acpi, &device_pages, options);
     log!(
         "CHECKPOINT bootstrap-complete free_pages={} owned_tables={}\n",
         allocator.available(),
@@ -257,6 +244,110 @@ fn publish_services(allocator: Allocator<'static>, tables: paging::Tables) {
         log!(
             "CHECK heap ok vec=1000 box=4096 align=4096 growth=buddy-frames oom=failed-cleanly recovered=true over_cap=rejected accounting=restored\n"
         );
+    }
+}
+
+/// Interrupt controllers, clock and tick bring-up plus the proofs that depend
+/// on a delivered tick. A failed bring-up is fatal in the QEMU suite; the
+/// physical diagnostic profile reports it and continues without the
+/// interrupt-dependent checks.
+fn clock_and_irq_checks(
+    boot: &boot::BootInfo,
+    prepared: &apic::Prepared,
+    acpi: &firmware::Acpi,
+    device_pages: &timer::Mmio,
+    options: timer::Options,
+) {
+    // SAFETY: BSP, IF clear, CR3 published with the device pages mapped, IDT
+    // installed above; the only call, before any AP or DMA.
+    let clock = unsafe { timer::init(prepared, acpi, device_pages, options) };
+    let tick_ok = match clock {
+        Ok(report) => {
+            log!(
+                "CHECK interrupt-controllers ok mode={} event={} ioapic_timer={}\n",
+                match report.apic_mode {
+                    kernel::intc::ApicMode::Disabled => "legacy-pic",
+                    kernel::intc::ApicMode::Xapic => "xapic",
+                    kernel::intc::ApicMode::X2apic => "x2apic",
+                },
+                report.event,
+                report
+                    .ioapic_timer
+                    .map_or("n/a", |ok| if ok { "true" } else { "false" })
+            );
+            true
+        }
+        Err(error) => {
+            // A physical diagnostic boot reports and continues so one boot
+            // shows everything else; the QEMU suite treats it as a failure.
+            log!(
+                "{} timer-init error={:?}\n",
+                if cfg!(feature = "qemu-self-test") {
+                    "FAIL"
+                } else {
+                    "WARN"
+                },
+                error
+            );
+            if cfg!(feature = "qemu-self-test") {
+                fail();
+            }
+            timer::mask_timer();
+            false
+        }
+    };
+    if tick_ok {
+        unwrap(
+            cpu::irq_guard_test(
+                cfg!(feature = "qemu-self-test") && boot.test == TestMode::IrqRestoreEarly,
+            ),
+            "irq-guard",
+        );
+        log!(
+            "CHECK irq-guard ok nested=2 out_of_order=true saved_on=true saved_off=true exclusive=true blocked_periods=2 blocked_delta=0 resumed=true\n"
+        );
+        require(cpu::irq_register_test(), "irq-all-gpr-preservation");
+        let tick_start = timer::ticks();
+        let wall_start = timer::ktime_get_ns();
+        require(timer::wait_for_ticks(16, 500), "timer-delivery");
+        let tick_ns = timer::ktime_get_ns() - wall_start;
+        // The mutation case deliberately leaves the tick unmasked: the same
+        // assertion must fail after real tick progression, not return an
+        // injected failure.
+        if boot.test != TestMode::UnmaskedTimer {
+            timer::mask_timer();
+        }
+        let tick_end = timer::ticks();
+        let delta = unwrap(timer::observe_periods(2), "timer-period-observation");
+        log!("TIMER mask observation periods=2 irq_delta={}\n", delta);
+        require(delta == 0, "timer-mask");
+        require(tick_end >= tick_start + 16, "timer-delivery");
+        // 16 ticks counted from an arbitrary phase span between 15 and 16
+        // periods of HZ=1000; the bounds absorb host scheduling noise only.
+        require(
+            (14_000_000..=60_000_000).contains(&tick_ns),
+            "timer-period-vs-tsc",
+        );
+        log!(
+            "CHECK timer ok delivered={} masked_count={} gprs=15 periods=2 hz=1000 tick16_ns={} tsc_khz={}\n",
+            tick_end - tick_start,
+            timer::ticks(),
+            tick_ns,
+            timer::tsc_khz()
+        );
+        let proof = unwrap(
+            timer::timekeeping_selftest().ok_or("timekeeping"),
+            "timekeeping",
+        );
+        log!(
+            "CHECK timekeeping ok slept_ns={} realtime_skew_ns={} boottime_lag_ns={} monotonic_steps={}\n",
+            proof.waited_ns,
+            proof.real_minus_mono_ns,
+            proof.boot_minus_mono_ns,
+            proof.monotonic_steps
+        );
+    } else {
+        log!("WARN timer tick not delivered: interrupt-dependent checks skipped\n");
     }
 }
 
@@ -289,9 +380,41 @@ fn loader_handoff(framebuffer: bool) -> (boot::BootInfo, firmware::Acpi) {
         "production-parser-regressions",
     );
     log!(
-        "CHECK handoff ok acpi_tables={} legacy_pic={}\n",
+        "CHECK handoff ok acpi_tables={} legacy_pic={} warnings={}\n",
         acpi.tables,
-        acpi.legacy_pic
+        acpi.legacy_pic,
+        acpi.warnings().len() + acpi.warnings_dropped
+    );
+    for warning in acpi.warnings() {
+        log!(
+            "WARN acpi table {} {:?}\n",
+            core::str::from_utf8(&warning.signature).unwrap_or("????"),
+            warning.problem
+        );
+    }
+    match &acpi.madt {
+        Some(madt) => log!(
+            "CHECK madt ok lapic={:#x} cpus={} lapics={} x2apics={} max_apic_id={} ioapics={} overrides={} nmi_sources={} lapic_nmis={} dropped={} pcat_compat={} irq0_gsi={}\n",
+            madt.lapic_address,
+            madt.cpus_usable,
+            madt.lapic_entries,
+            madt.x2apic_entries,
+            madt.max_apic_id,
+            madt.ioapics().len(),
+            madt.overrides().len(),
+            madt.nmi_sources().len(),
+            madt.lapic_nmis().len(),
+            madt.dropped,
+            madt.pcat_compat,
+            madt.isa_route(0).map_or(-1, |route| i64::from(route.gsi))
+        ),
+        None => log!("WARN madt absent: local APIC and IOAPIC topology unknown\n"),
+    }
+    log!(
+        "CHECK time-tables hpet={:#x} pm_timer={:#x} century={:#x}\n",
+        acpi.hpet.map_or(0, |h| h.address),
+        acpi.fadt.map_or(0, |f| f.pm_timer_port),
+        acpi.fadt.map_or(0, |f| f.century)
     );
     if boot.test == TestMode::BadMap {
         let invalid = boot::Region {

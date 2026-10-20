@@ -239,6 +239,12 @@ pub enum TestMode {
     UnmaskedTimer,
     IrqRestoreEarly,
     BadMap,
+    /// QEMU self-test only: set `IA32_APIC_BASE.EXTD` before the kernel looks,
+    /// simulating firmware that hands over with x2APIC enabled.
+    FirmwareX2apic,
+    /// QEMU self-test only: treat the machine as a hypervisor with x2APIC so
+    /// the x2APIC register backend runs under TCG (no KVM signature there).
+    ForceX2apic,
 }
 
 #[repr(C)]
@@ -435,6 +441,14 @@ impl BootInfo {
         &self.command_line[..self.command_line_length]
     }
 
+    /// Whether `word` is a whole word of the kernel part of the command line,
+    /// i.e. before a `--` separator (the init arguments follow it), as for
+    /// Linux early parameters such as `nolapic`.
+    #[must_use]
+    pub fn has_option(&self, word: &[u8]) -> bool {
+        command_line_has_word(self.command_line(), word)
+    }
+
     /// Consume the one bootstrap handoff. No other constructor exists.
     ///
     /// # Errors
@@ -502,6 +516,8 @@ impl BootInfo {
                     b"test=unmasked-timer" => TestMode::UnmaskedTimer,
                     b"test=irq-restore-early" => TestMode::IrqRestoreEarly,
                     b"test=bad-map" => TestMode::BadMap,
+                    b"test=firmware-x2apic" => TestMode::FirmwareX2apic,
+                    b"test=force-x2apic" => TestMode::ForceX2apic,
                     _ => TestMode::Normal,
                 };
             }
@@ -708,6 +724,20 @@ impl BootInfo {
     }
 }
 
+/// Whole-word match in the part of `line` before the first `--` word.
+#[must_use]
+pub fn command_line_has_word(line: &[u8], word: &[u8]) -> bool {
+    for candidate in line.split(|&b| b == b' ').filter(|w| !w.is_empty()) {
+        if candidate == b"--" {
+            return false;
+        }
+        if candidate == word {
+            return true;
+        }
+    }
+    false
+}
+
 /// Validate one production memory-map extent in ascending order.
 ///
 /// # Errors
@@ -802,6 +832,15 @@ mod tests {
             previous = checked_region(region, previous).expect("valid adjacent map");
         }
         assert_eq!(previous, 8209);
+    }
+
+    #[test]
+    fn option_words_stop_at_the_init_separator() {
+        assert!(command_line_has_word(b"nolapic", b"nolapic"));
+        assert!(command_line_has_word(b"a  nolapic b -- c", b"nolapic"));
+        assert!(!command_line_has_word(b"a -- nolapic", b"nolapic"));
+        assert!(!command_line_has_word(b"nolapic2 xnolapic", b"nolapic"));
+        assert!(!command_line_has_word(b"", b"nolapic"));
     }
 
     #[test]

@@ -8,24 +8,25 @@ use core::{
     arch::{asm, naked_asm},
     marker::PhantomData,
     ptr,
-    sync::atomic::{AtomicU64, Ordering, compiler_fence},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering, compiler_fence},
 };
-use kernel::sync::{RawSpinGuard, RawSpinLock};
+use kernel::{
+    intc::{ERROR_VECTOR, ISA_IRQ_VECTOR_BASE, LOCAL_TIMER_VECTOR, SPURIOUS_VECTOR},
+    sync::{RawSpinGuard, RawSpinLock},
+};
 use raw_cpuid::CpuId;
 use x86_64::{
     PhysAddr, PrivilegeLevel, VirtAddr,
     instructions::{
         interrupts,
+        port::Port,
         segmentation::{CS, DS, ES, FS, GS, SS, Segment},
         tables::{DescriptorTablePointer, lidt, load_tss},
     },
     registers::{
         control::{Cr0, Cr0Flags, Cr2, Cr3, Cr4, Cr4Flags},
         debug::{DebugAddressRegister, Dr0, Dr1, Dr2, Dr3, Dr7},
-        model_specific::{
-            ApicBase, ApicBaseFlags, Efer, EferFlags, FsBase, GsBase, KernelGsBase, LStar, Msr,
-            SFMask, Star,
-        },
+        model_specific::{Efer, EferFlags, FsBase, GsBase, KernelGsBase, LStar, Msr, SFMask, Star},
         rflags::RFlags,
     },
     structures::{
@@ -97,9 +98,6 @@ pub enum Error {
     Paging,
     Stack,
     Cpu,
-    Apic,
-    TimerCounter,
-    TimerStalled,
     InterruptGuard,
 }
 
@@ -124,6 +122,13 @@ pub fn validate() -> Result<(), Error> {
     if pat & 0xff != 6 || (pat >> 40) & 0xff != 1 {
         return Err(Error::Pat);
     }
+    // Device pages (LAPIC/IOAPIC/HPET) are mapped through a UC entry; require one
+    // and remember its index (PAT<<2 | PCD<<1 | PWT). Reset value: entry 3.
+    let uc = (0..8u8).find(|&index| pat.to_le_bytes()[usize::from(index)] == 0x00);
+    let Some(uc) = uc else {
+        return Err(Error::Pat);
+    };
+    MMIO_PAT_INDEX.store(uc, Ordering::Relaxed);
     let cr0 = Cr0::read();
     let cr4 = Cr4::read();
     // The address of a live local lies in the current stack frame; this replaces
@@ -179,6 +184,14 @@ const INTERRUPT_FLAG: u64 = 1 << 9;
 // releasing any AP. NMI/fault paths do not participate in this ownership domain.
 // Pack depth<<1 and the first owner's IF in one word: the last removal captures
 // the restoration flag atomically, without a separate reset/publication race.
+/// PAT index of an uncached entry, set by `validate`.
+static MMIO_PAT_INDEX: AtomicU8 = AtomicU8::new(3);
+
+/// PAT index (`PAT<<2 | PCD<<1 | PWT`) of the uncached entry `validate` found.
+pub fn mmio_pat_index() -> u8 {
+    MMIO_PAT_INDEX.load(Ordering::Relaxed)
+}
+
 static IRQ_NESTING: AtomicU64 = AtomicU64::new(0);
 
 fn interrupts_enabled() -> bool {
@@ -287,7 +300,7 @@ pub(crate) struct IrqSpinGuard<'a> {
     irq: LocalInterruptGuard,
 }
 
-static LEGACY_TIMER: IrqSpinLock = IrqSpinLock::new();
+static TIMER_HW: IrqSpinLock = IrqSpinLock::new();
 // BSP-only bootstrap probe, disabled outside irq_guard_test. Before AP release
 // these exception/test fields must move into explicit per-CPU ownership.
 static IRQ_LOCK_PROBE: AtomicU64 = AtomicU64::new(0);
@@ -309,11 +322,9 @@ pub fn exit(success: bool) -> ! {
     interrupts_off();
     // Only compiled into explicitly opted-in QEMU self-test artifacts. The
     // external runner must attach isa-debug-exit at f4, width4. Not physical I/O.
-    // SAFETY: controlled virtual device, CPL0, scalar EAX/DX, no stack/flags
-    // effects; omit nomem for device ordering. OUT has no supported intrinsic.
-    unsafe {
-        asm!("out dx, eax", in("dx") 0xf4u16, in("eax") if success { 0x10u32 } else { 0x11u32 }, options(nostack, preserves_flags));
-    }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: controlled virtual device, CPL0, one 32-bit OUT.
+    unsafe { Port::<u32>::new(0xf4).write(if success { 0x10 } else { 0x11 }) };
     halt()
 }
 
@@ -340,25 +351,58 @@ pub fn active_tables() -> u64 {
     Cr3::read_raw().0.start_address().as_u64()
 }
 
-fn out_byte(port: u16, value: u8) {
-    // SAFETY: all callers name owned early PC devices in an explicitly validated
-    // legacy-PIC configuration, or feature-gated emulated UART. No general port
-    // API is exported. OUT only uses AL/DX, preserves flags/stack; memory barrier
-    // prevents compiler reordering across device configuration and acknowledgment.
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") value, options(nostack, preserves_flags));
-    }
+// Port I/O and IF control use the vendored `x86_64` crate (`Port`, `interrupts`),
+// whose asm is `nomem`. This kernel's device sequences (configuration, EOI,
+// mask) must stay ordered against ordinary memory work, so each access is
+// bracketed by compiler fences; the processor keeps the I/O instructions
+// themselves in order. No flags or stack are used.
+pub(crate) fn out_byte(port: u16, value: u8) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: all callers name owned early PC devices (8259, 8254, CMOS index,
+    // speaker gate 0x61, delay port 0x80) or the feature-gated emulated UART; the
+    // ports are those of Linux's i8259.c/tsc.c/rtc.c for the same devices. No
+    // general port API is exported; CPL0 (IOPL irrelevant).
+    unsafe { Port::<u8>::new(port).write(value) };
+    compiler_fence(Ordering::SeqCst);
 }
-fn in_byte(port: u16) -> u8 {
-    let value: u8;
-    // SAFETY: same device ownership as out_byte; IN returns initialized scalar.
-    unsafe {
-        asm!("in al, dx", in("dx") port, out("al") value, options(nostack, preserves_flags));
-    }
+pub(crate) fn in_byte(port: u16) -> u8 {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: same device ownership as `out_byte`; IN returns an initialized scalar.
+    let value = unsafe { Port::<u8>::new(port).read() };
+    compiler_fence(Ordering::SeqCst);
     value
 }
-fn io_wait() {
+pub(crate) fn io_wait() {
     out_byte(0x80, 0);
+}
+/// 32-bit port read for the ACPI PM timer.
+pub(crate) fn in_dword(port: u16) -> u32 {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: the only caller reads the ACPI PM timer I/O port named by the
+    // checked FADT (a 4-byte, read-only counter block); IN has no side effect there.
+    let value = unsafe { Port::<u32>::new(port).read() };
+    compiler_fence(Ordering::SeqCst);
+    value
+}
+/// Enable maskable interrupts. Callers poll a bounded condition and restore
+/// IF=0 with [`interrupts_off`] before returning.
+pub(crate) fn interrupts_on() {
+    compiler_fence(Ordering::SeqCst);
+    // The IDT, controller and every handler reachable with IF=1 are installed by
+    // the caller; BSP, CPL0.
+    interrupts::enable();
+    compiler_fence(Ordering::SeqCst);
+}
+/// Halt until an interrupt, then mask again. The crate's `enable_and_hlt` is the
+/// adjacent `sti; hlt` pair: STI's one-instruction shadow makes it race-free
+/// against an already pending interrupt. Needs an installed IDT and an armed
+/// interrupt source that is known to work (a dead source halts forever; see
+/// `timer::wait_until_ns`). IF is 0 on return.
+pub(crate) fn wait_for_interrupt() {
+    compiler_fence(Ordering::SeqCst);
+    interrupts::enable_and_hlt();
+    interrupts::disable();
+    compiler_fence(Ordering::SeqCst);
 }
 
 #[cfg(feature = "qemu-self-test")]
@@ -541,8 +585,15 @@ unsafe fn install_idt() {
     for (index, gate) in idt.iter_mut().enumerate() {
         let handler = match handlers.get(index) {
             Some(&handler) => handler,
-            None if index == 32 => timer_entry as *const (),
-            None => unexpected_entry as *const (),
+            None => match index {
+                0x30 => irq0_entry as *const (),
+                0x37 => pic_spurious7_entry as *const (),
+                0x3f => pic_spurious15_entry as *const (),
+                0xec => lapic_timer_entry as *const (),
+                0xfe => apic_error_entry as *const (),
+                0xff => apic_spurious_entry as *const (),
+                _ => unexpected_entry as *const (),
+            },
         };
         // Zero-based IST slots (the crate adds the hardware +1): #DF 1, NMI 2,
         // #MC 3, #DB 4 (Linux idt.c `ISTG` list).
@@ -647,7 +698,12 @@ entry!(v28, 28);
 entry!(v29, 29, error);
 entry!(v30, 30, error);
 entry!(v31, 31);
-entry!(timer_entry, 32);
+entry!(irq0_entry, 0x30);
+entry!(pic_spurious7_entry, 0x37);
+entry!(pic_spurious15_entry, 0x3f);
+entry!(lapic_timer_entry, 0xec);
+entry!(apic_error_entry, 0xfe);
+entry!(apic_spurious_entry, 0xff);
 // The CPU does not push the vector number. Unassigned external slots share one
 // compiler entry; its private sentinel is NEVER reported as a real vector.
 const UNKNOWN_EXTERNAL_VECTOR: u64 = 256;
@@ -661,7 +717,6 @@ struct InterruptFrame {
     rsp: u64,
     ss: u64,
 }
-static TICKS: AtomicU64 = AtomicU64::new(0);
 static BREAKPOINTS: AtomicU64 = AtomicU64::new(0);
 static BREAKPOINT_ARMED: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -670,7 +725,31 @@ static FAULT_RIP: AtomicU64 = AtomicU64::new(0);
 static FAULT_ERROR: AtomicU64 = AtomicU64::new(0);
 static FAULT_ARMED: AtomicU64 = AtomicU64::new(0);
 
+/// Hardware interrupt vectors this kernel owns. Like Linux's `common_interrupt`
+/// they are served identically at any CPL (`/init` runs with IF=1, so a timer or
+/// spurious vector that was latched across the shutdown can arrive in ring 3):
+/// they are not task exceptions. Returns false for everything else, including a
+/// *real* 8259 IRQ7/15, which stays an unexpected vector.
+fn external_interrupt(vector: u64) -> bool {
+    let base = u64::from(ISA_IRQ_VECTOR_BASE);
+    match vector {
+        v if v == u64::from(SPURIOUS_VECTOR) => crate::apic::spurious_interrupt(),
+        v if v == u64::from(ERROR_VECTOR) => crate::apic::error_interrupt(),
+        v if v == base => crate::timer::isa_irq0_interrupt(),
+        v if v == u64::from(LOCAL_TIMER_VECTOR) => crate::timer::lapic_timer_interrupt(),
+        // 8259 lines 7 and 15 raise a spurious vector when a request vanishes
+        // between INTR and acknowledge (Linux spurious_8259A_irq): ignore only
+        // when the in-service bit is clear.
+        v if v == base + 7 || v == base + 15 => return crate::apic::pic_spurious(v != base + 7),
+        _ => return false,
+    }
+    true
+}
+
 extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: u64) {
+    if external_interrupt(vector) {
+        return;
+    }
     // Any ring-3 CS (64-bit 0x33 or compatibility 0x23, RPL 3).
     if frame.cs & 3 == 3 {
         // Any exception raised by init is fatal to it (no signal handlers exist
@@ -706,18 +785,6 @@ extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: 
                 FAULTS.fetch_add(1, Ordering::Relaxed);
             } else {
                 unexpected(frame, vector, error, address);
-            }
-        }
-        32 => {
-            TICKS.fetch_add(1, Ordering::Relaxed);
-            out_byte(0x20, 0x20);
-            if IRQ_LOCK_PROBE.load(Ordering::Acquire) == IRQ_LOCK_ARMED {
-                let result = if LEGACY_TIMER.try_lock().is_some() {
-                    IRQ_LOCK_PASSED
-                } else {
-                    IRQ_LOCK_FAILED
-                };
-                IRQ_LOCK_PROBE.store(result, Ordering::Release);
             }
         }
         _ => unexpected(frame, vector, error, 0),
@@ -862,10 +929,10 @@ pub unsafe fn page_fault_register_test() -> bool {
 }
 
 pub fn irq_register_test() -> bool {
-    let before = ticks();
-    // SAFETY: only called after PIT/PIC/IDT initialization, on BSP with IF=0.
+    let before = crate::timer::ticks();
+    // SAFETY: only called after tick/IDT initialization, on BSP with IF=0.
     let preserved = unsafe { irq_register_probe() };
-    preserved == 1 && ticks() > before
+    preserved == 1 && crate::timer::ticks() > before
 }
 
 pub fn unexpected_breakpoint() -> ! {
@@ -946,135 +1013,31 @@ pub fn unexpected_page_fault() -> ! {
     crate::fail()
 }
 
-pub fn start_timer(legacy_pic: bool) -> Result<(), Error> {
-    // Initialization remains BSP-only before AP release. This lock also makes
-    // the port transaction indivisible with respect to later counter readers.
-    let _owner = LEGACY_TIMER.lock();
-    if !legacy_pic {
-        return Err(Error::Cpu);
-    }
-    // IA32_APIC_BASE only exists when CPUID reports a local APIC.
-    if CpuId::new()
-        .get_feature_info()
-        .is_some_and(|features| features.has_apic())
-    {
-        let mut msr = ApicBase::MSR;
-        // SAFETY: CPL0 BSP; the MSR exists per the CPUID check above.
-        let apic = unsafe { msr.read() };
-        if apic & ApicBaseFlags::X2APIC_ENABLE.bits() != 0 {
-            return Err(Error::Apic);
-        }
-        // Disable the local APIC for this explicit legacy-PIC UP test cell.
-        // This is not APIC initialization or a permanent Linux policy choice.
-        // SAFETY: only the enable bit changes; every other bit (including the
-        // base address and reserved bits) is written back as read.
-        unsafe { msr.write(apic & !ApicBaseFlags::LAPIC_ENABLE.bits()) };
-    }
-    out_byte(0x20, 0x11);
-    io_wait();
-    out_byte(0xa0, 0x11);
-    io_wait();
-    out_byte(0x21, 0x20);
-    io_wait();
-    out_byte(0xa1, 0x28);
-    io_wait();
-    out_byte(0x21, 4);
-    io_wait();
-    out_byte(0xa1, 2);
-    io_wait();
-    out_byte(0x21, 1);
-    io_wait();
-    out_byte(0xa1, 1);
-    io_wait();
-    out_byte(0x21, 0xfe);
-    out_byte(0xa1, 0xff);
-    // 8254 input 1,193,182Hz, mode2, divisor11932 (~100Hz), channel0 only.
-    out_byte(0x43, 0x34);
-    out_byte(0x40, 0x9c);
-    out_byte(0x40, 0x2e);
-    Ok(())
-}
-pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
-}
-pub fn wait_tick() {
-    // SAFETY: fully installed descriptors and armed PIT/PIC; BSP executes alone,
-    // STI's one-instruction inhibition makes HLT race-free with pending IRQ;
-    // handler preserves every scalar register. CLI restores early context.
-    // HLT/IF control cannot be expressed with normal Rust/intrinsics. No unwind.
-    unsafe {
-        asm!("sti", "hlt", "cli");
-    }
-}
-pub fn mask_timer() {
-    let _owner = LEGACY_TIMER.lock();
-    out_byte(0x21, 0xff);
+/// Run `f` as one timer-hardware programming transaction: local interrupts off
+/// and the timer lock held, so the tick IRQ cannot interleave with a
+/// multi-register sequence. `f` must not sleep, allocate or take another lock.
+pub(crate) fn timer_transaction<R>(f: impl FnOnce() -> R) -> R {
+    let _owner = TIMER_HW.lock();
+    f()
 }
 
-pub struct TimerObservation {
-    pub wraps: u8,
-    pub irq_delta: u64,
-}
-
-fn pit_counter_locked(_owner: &RawSpinGuard<'_>) -> u16 {
-    // One owner latches channel0 then consumes low/high once. IRQ EOI accesses
-    // only PIC command20; NMI/fault handlers never access PIT or this lock.
-    out_byte(0x43, 0);
-    u16::from_le_bytes([in_byte(0x40), in_byte(0x40)])
-}
-
-fn pit_counter() -> u16 {
-    pit_counter_locked(&LEGACY_TIMER.lock().raw)
-}
-
-/// Observe >=2 actual mode2 down-counter reloads while IF=1. The finite polling
-/// bound is a failure limit, NOT a calibrated CPU delay or elapsed-time oracle.
-/// Caller initialized PIT/PIC/IDT; return always restores IF=0.
-pub fn observe_timer_periods() -> Result<TimerObservation, Error> {
-    // SAFETY: installed IDT and owned initialized PIT/PIC, one BSP, bounded
-    // non-sleeping sampling; compiler boundary permits all IRQ memory effects.
-    unsafe {
-        asm!("sti", options(nostack));
+/// The tick handlers' nonblocking probe of the timer lock, active only inside
+/// `irq_guard_test`: a held lock must make this fail, never deadlock.
+pub(crate) fn irq_lock_probe() {
+    if IRQ_LOCK_PROBE.load(Ordering::Acquire) == IRQ_LOCK_ARMED {
+        let result = if TIMER_HW.try_lock().is_some() {
+            IRQ_LOCK_PASSED
+        } else {
+            IRQ_LOCK_FAILED
+        };
+        IRQ_LOCK_PROBE.store(result, Ordering::Release);
     }
-    let observation = poll_timer_periods(pit_counter);
-    interrupts_off();
-    observation
 }
 
-fn poll_timer_periods(mut counter: impl FnMut() -> u16) -> Result<TimerObservation, Error> {
-    let before = ticks();
-    let mut previous = counter();
-    let mut wraps = 0u8;
-    let mut invalid_counter = previous > 11932;
-    for _ in 0..2_000_000 {
-        let current = counter();
-        if current > 11932 {
-            invalid_counter = true;
-            break;
-        }
-        if current > previous {
-            wraps += 1;
-            if wraps == 2 {
-                break;
-            }
-        }
-        previous = current;
-    }
-    if invalid_counter {
-        return Err(Error::TimerCounter);
-    }
-    if wraps < 2 {
-        return Err(Error::TimerStalled);
-    }
-    Ok(TimerObservation {
-        wraps,
-        irq_delta: ticks() - before,
-    })
-}
-
-/// Execute nested saved-IF and lock/IRQ ownership checks against the real PIT.
-/// Called on the BSP after timer setup, before any AP or scheduler execution.
-/// Every returning path has IF=0; no emulator delay substitutes for PIT wraps.
+/// Execute nested saved-IF and lock/IRQ ownership checks against the real tick
+/// interrupt (LAPIC timer or PIT). Called on the BSP after timer setup, before
+/// any AP or scheduler execution. Every returning path has IF=0; intervals are
+/// measured on the calibrated TSC, not by a loop count.
 pub fn irq_guard_test(restore_early: bool) -> Result<(), Error> {
     if interrupts_enabled() || IRQ_NESTING.load(Ordering::Relaxed) != 0 {
         interrupts_off();
@@ -1098,11 +1061,9 @@ pub fn irq_guard_test(restore_early: bool) -> Result<(), Error> {
     if !out_of_order_irq_guards(false) {
         return Err(Error::InterruptGuard);
     }
-    // SAFETY: the caller initialized descriptors and PIC/PIT. No lock is held,
+    // The caller initialized descriptors and the tick source. No lock is held,
     // no AP runs, and the bounded inner test never schedules or allocates.
-    unsafe {
-        asm!("sti", options(nostack));
-    }
+    interrupts_on();
     let result = irq_guard_enabled_test(restore_early);
     interrupts_off();
     IRQ_LOCK_PROBE.store(0, Ordering::Release);
@@ -1129,40 +1090,40 @@ fn irq_guard_enabled_test(restore_early: bool) -> Result<(), Error> {
     if !out_of_order_irq_guards(true) {
         return Err(Error::InterruptGuard);
     }
-    let owner = LEGACY_TIMER.lock();
-    if interrupts_enabled() || LEGACY_TIMER.try_lock().is_some() || interrupts_enabled() {
+    let owner = TIMER_HW.lock();
+    if interrupts_enabled() || TIMER_HW.try_lock().is_some() || interrupts_enabled() {
         return Err(Error::InterruptGuard);
     }
-    let blocked = poll_timer_periods(|| pit_counter_locked(&owner.raw))?;
-    if blocked.wraps != 2 || blocked.irq_delta != 0 {
+    let blocked = crate::timer::poll_periods(2).map_err(|_| Error::InterruptGuard)?;
+    if blocked != 0 {
         return Err(Error::InterruptGuard);
     }
     IRQ_LOCK_PROBE.store(IRQ_LOCK_ARMED, Ordering::Release);
     let resumed = if restore_early {
         // QEMU-only mutation selected by main: really restore IF while retaining
-        // the raw lock, then observe actual IRQs over two PIT wraps. The IRQ
+        // the raw lock, then observe actual IRQs over two tick periods. The IRQ
         // handler must fail its nonblocking acquisition, never deadlock.
         let IrqSpinGuard { raw, irq } = owner;
         drop(irq);
-        let observation = poll_timer_periods(|| pit_counter_locked(&raw));
+        let observation = crate::timer::poll_periods(2);
         drop(raw);
-        observation?
+        observation
     } else {
         // Correct field destruction publishes unlock before restoring IF.
         drop(owner);
         if !interrupts_enabled() {
             return Err(Error::InterruptGuard);
         }
-        poll_timer_periods(pit_counter)?
-    };
+        crate::timer::poll_periods(2)
+    }
+    .map_err(|_| Error::InterruptGuard)?;
     let acquired = IRQ_LOCK_PROBE.load(Ordering::Acquire) == IRQ_LOCK_PASSED;
     crate::log!(
-        "IRQ restore observation pit_wraps={} irq_delta={} lock_acquired={}\n",
-        resumed.wraps,
-        resumed.irq_delta,
+        "IRQ restore observation periods=2 irq_delta={} lock_acquired={}\n",
+        resumed,
         acquired
     );
-    if resumed.wraps != 2 || resumed.irq_delta == 0 || !acquired {
+    if resumed == 0 || !acquired {
         return Err(Error::InterruptGuard);
     }
     Ok(())
