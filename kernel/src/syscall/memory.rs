@@ -83,7 +83,7 @@ fn mmap<C: Context>(ctx: &mut C, [addr, len, prot, flags, fd, off]: [u64; 6]) ->
 /// `MADV_*` values `madvise_behavior_valid` accepts under the declared
 /// configuration (`CONFIG_KSM`, `CONFIG_TRANSPARENT_HUGEPAGE` and
 /// `CONFIG_MEMORY_FAILURE` are off, so MERGEABLE/UNMERGEABLE, HUGEPAGE/
-/// NOHUGEPAGE/COLLAPSE and HWPOISON/SOFT_OFFLINE are `-EINVAL`).
+/// NOHUGEPAGE/COLLAPSE and `HWPOISON`/`SOFT_OFFLINE` are `-EINVAL`).
 const fn madvise_behavior_valid(behavior: i32) -> bool {
     matches!(
         behavior,
@@ -100,7 +100,7 @@ const MADV_NORMAL: i32 = 0;
 fn madvise<C: Context>(ctx: &mut C, [start, len_in, behavior, ..]: [u64; 6]) -> Outcome {
     // `int behavior`.
     #[allow(clippy::cast_possible_truncation)]
-    let behavior = behavior as u32 as i32;
+    let behavior = (behavior as u32).cast_signed();
     if !madvise_behavior_valid(behavior) || start & (PAGE_SIZE - 1) != 0 {
         return Outcome::Return(error(Errno::EINVAL));
     }

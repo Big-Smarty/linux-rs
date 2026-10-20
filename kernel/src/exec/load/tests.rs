@@ -59,18 +59,18 @@ fn load_phs(phs: &[Ph], len: usize) -> Result<(Mm, Fake), LoadError> {
 }
 
 fn errno(result: Result<(Mm, Fake), LoadError>) -> Errno {
-    match result {
+    match result.map(|_| ()) {
         Err(LoadError::Errno(errno)) => errno,
         Err(other) => panic!("expected an errno, got {other:?}"),
-        Ok(_) => panic!("expected an errno, got success"),
+        Ok(()) => panic!("expected an errno, got success"),
     }
 }
 
 fn unsupported(result: Result<(Mm, Fake), LoadError>) -> Unsupported {
-    match result {
+    match result.map(|_| ()) {
         Err(LoadError::Unsupported(kind)) => kind,
         Err(other) => panic!("expected unsupported, got {other:?}"),
-        Ok(_) => panic!("expected unsupported, got success"),
+        Ok(()) => panic!("expected unsupported, got success"),
     }
 }
 
@@ -265,7 +265,7 @@ fn segments_past_eof_and_replacement_follow_the_model() {
 fn prot_none_segment_keeps_its_page_behind_a_none_pte() {
     let (mm, pt) = load_phs(&[load(0, 0x1000, 0x500000, 0x10, 0x10)], 0x2000).unwrap();
     assert!(mm.find_vma(0x500000).is_some_and(|v| !v.is_accessible()));
-    assert_eq!(pt.pages[&0x500000].prot.accessible, false);
+    assert!(!pt.pages[&0x500000].prot.accessible);
 }
 
 #[test]
