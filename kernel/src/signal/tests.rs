@@ -1492,6 +1492,47 @@ fn altstack_overflow_with_mapped_memory_below_fails_the_frame() {
 }
 
 #[test]
+fn sigreturn_rejects_a_valid_fpstate_image_at_an_unaligned_address() {
+    // restore_fpregs_from_user requires a 16-byte aligned FXSAVE area
+    // (signal_64.c:92); the image itself is valid (default MXCSR).
+    let mut cpu = FakeCpu::new();
+    let mut st = handler_state();
+    let mut space = user_space();
+    let (mut ret, frame) = frame_for_return(&mut st, &mut cpu, &mut space);
+    let mut img = [0u8; 512];
+    img[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+    let at = STACK_LO + 0x1001;
+    assert_eq!(copy_to_user(&mut space, at, &img), 0);
+    assert_eq!(
+        copy_to_user(&mut space, frame + 48 + 184, &at.to_le_bytes()),
+        0
+    );
+    assert!(rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu).bad_frame);
+    assert!(cpu.restored.is_empty());
+}
+
+#[test]
+fn sigreturn_with_a_non_64bit_cs_keeps_an_invalid_ss() {
+    // force_valid_ss only applies in 64-bit mode (cs == USER_CS): with cs=0x23
+    // an invalid, non-USER_DS ss stays as given (0x18|3).
+    let mut cpu = FakeCpu::new();
+    let mut st = handler_state();
+    let mut space = user_space();
+    let (mut ret, frame) = frame_for_return(&mut st, &mut cpu, &mut space);
+    assert_eq!(copy_to_user(&mut space, frame + 8, &2u64.to_le_bytes()), 0); // no STRICT
+    assert_eq!(
+        copy_to_user(&mut space, frame + 48 + 144, &0x23u16.to_le_bytes()),
+        0
+    );
+    assert_eq!(
+        copy_to_user(&mut space, frame + 48 + 150, &0x18u16.to_le_bytes()),
+        0
+    );
+    rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu);
+    assert_eq!((ret.cs, ret.ss), (0x23, 0x1b));
+}
+
+#[test]
 fn handle_pending_signals_loops_after_a_failed_frame() {
     // A handler without a restorer fails its frame (SIGSEGV forced); the loop
     // must continue and take the fatal SIGSEGV instead of resuming user mode.
@@ -1522,4 +1563,24 @@ fn a_default_stop_signal_stops_the_task() {
         do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu),
         Outcome::Stop(SIGTSTP)
     );
+}
+
+#[test]
+fn force_fault_records_trap_error_and_keeps_cr2_for_non_page_faults() {
+    // do_general_protection: trap 13, error 0x18; cr2 is not touched (Linux
+    // keeps the last page-fault address in `thread.cr2`).
+    let mut st = State::new(5, 0, 100);
+    st.actions[usize::from(SIGSEGV) - 1] = segv_handler_state().actions[usize::from(SIGSEGV) - 1];
+    st.arch.cr2 = 0x1234;
+    st.force_fault(&crate::signal::info::exception(13, 0x18, 5, 0, 0).unwrap());
+    assert_eq!(
+        (st.arch.trap_nr, st.arch.error_code, st.arch.cr2),
+        (13, 0x18, 0x1234)
+    );
+    let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
+    do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu);
+    let sc = r.sp + 48;
+    assert_eq!(read(&mut space, sc + 160, 8), 13u64.to_le_bytes()); // trapno
+    assert_eq!(read(&mut space, sc + 152, 8), 0x18u64.to_le_bytes()); // err
+    assert_eq!(read(&mut space, sc + 176, 8), 0x1234u64.to_le_bytes()); // cr2
 }
