@@ -164,11 +164,12 @@ fn getgroups<C: Context>(ctx: &mut C, size: i32, list: u64) -> Res {
 ///
 /// Exact for `PRIO_PROCESS`. For `PRIO_PGRP` (own group) and `PRIO_USER`
 /// (own uid) Linux returns the maximum of `20 - nice` over *every* task in the
-/// group or of that uid, and a booted 6.18 has kernel threads of uid 0 and of
-/// the idle/init group with nice -20 (the high-priority `kworker/*H`), so it
-/// reports 40 there. This kernel has no kernel threads, so 20 is the answer
-/// for this kernel's task set, not the value a stock Linux would print; the
-/// two cases become exact when scheduler state and kernel threads exist.
+/// group or of that uid (kernel/sys.c getpriority), and a booted 6.18 has
+/// kernel threads of uid 0 and of init's group with nice -20 (the
+/// high-priority `kworker/*H`), so it reports 40 there. This kernel has no
+/// kernel threads, so it would print 20: a different value than the pin. Those
+/// two successful cases therefore stop the kernel loudly (`Unimplemented`)
+/// until kernel threads exist; the error cases (`ESRCH`, `EINVAL`) are exact.
 const NICE_TO_RLIMIT_DEFAULT: i64 = 20;
 
 fn getpriority<C: Context>(ctx: &mut C, which: i32, who: i32) -> Res {
@@ -177,12 +178,10 @@ fn getpriority<C: Context>(ctx: &mut C, which: i32, who: i32) -> Res {
         0 => find_task(ctx, who).map(|()| NICE_TO_RLIMIT_DEFAULT),
         // PRIO_PGRP: init's group is `init_struct_pid`, which has no number, so
         // only "my group" (0) names it; any other number has no tasks.
-        1 if who == 0 => Ok(NICE_TO_RLIMIT_DEFAULT),
+        1 if who == 0 => Err(Stop::Unimplemented),
         // PRIO_USER: `who == 0` means the caller's uid; a uid other than the
         // caller's (the only uid with tasks) has no `user_struct`.
-        2 if who == 0 || u32::try_from(who) == Ok(ctx.attrs().cred.uid) => {
-            Ok(NICE_TO_RLIMIT_DEFAULT)
-        }
+        2 if who == 0 || u32::try_from(who) == Ok(ctx.attrs().cred.uid) => Err(Stop::Unimplemented),
         1 | 2 => Err(Errno::ESRCH.into()),
         _ => Err(Errno::EINVAL.into()),
     }
@@ -739,9 +738,16 @@ mod tests {
         assert_eq!(call(&mut t, Sysno::getpriority, &[0, 0]), ok(20));
         assert_eq!(call(&mut t, Sysno::getpriority, &[0, 1]), ok(20));
         assert_eq!(call(&mut t, Sysno::getpriority, &[0, 2]), err(Errno::ESRCH));
-        assert_eq!(call(&mut t, Sysno::getpriority, &[1, 0]), ok(20));
+        // Linux answers 40 here (nice -20 kernel threads); we have none, so stop.
+        assert_eq!(
+            call(&mut t, Sysno::getpriority, &[1, 0]),
+            Outcome::Unimplemented(140)
+        );
         assert_eq!(call(&mut t, Sysno::getpriority, &[1, 1]), err(Errno::ESRCH));
-        assert_eq!(call(&mut t, Sysno::getpriority, &[2, 0]), ok(20));
+        assert_eq!(
+            call(&mut t, Sysno::getpriority, &[2, 0]),
+            Outcome::Unimplemented(140)
+        );
         assert_eq!(call(&mut t, Sysno::getpriority, &[2, 1]), err(Errno::ESRCH));
         assert_eq!(
             call(&mut t, Sysno::getpriority, &[2, u64::from(u32::MAX)]),

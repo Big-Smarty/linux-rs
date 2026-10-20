@@ -4112,7 +4112,11 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     }
     if let User::Oracle(group) = user {
         let (first, last) = validate_oracle(lines, group)?;
-        positions.extend([first, last]);
+        positions.push(first);
+        // A one-line group has first == last; strict ordering must not reject it.
+        if last != first {
+            positions.push(last);
+        }
     }
     positions.extend(user_tail(&find, user, init)?);
     if positions.windows(2).all(|pair| pair[0] < pair[1]) {

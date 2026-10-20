@@ -58,8 +58,10 @@ const THREAD_SIZE: u64 = 4096 << 2;
 /// `free_pages` free 4 KiB pages: the thread structures may use 1/8 of memory.
 #[must_use]
 pub fn max_threads(free_pages: u64) -> u64 {
-    // `fls64(nr_pages) + fls64(PAGE_SIZE) > 64` selects MAX_THREADS; it is the
-    // same as the product overflowing 64 bits.
+    // Linux selects MAX_THREADS when `fls64(nr_pages) + fls64(PAGE_SIZE) > 64`
+    // (nr_pages >= 2^51). `checked_mul` overflows only from 2^52, but between
+    // the two the quotient (nr_pages / 32) is far above MAX_THREADS and the
+    // clamp gives the same result.
     let threads = free_pages
         .checked_mul(4096)
         .map_or(MAX_THREADS, |bytes| bytes / (THREAD_SIZE * 8));
@@ -106,6 +108,11 @@ impl Rlimits {
     /// `Invalid` for a resource `>= RLIM_NLIMITS` or `cur > max`; `Permission`
     /// for an `RLIMIT_NOFILE` hard limit above `sysctl_nr_open`.
     pub fn prlimit(&mut self, resource: u32, new: Option<Rlimit>) -> Result<Rlimit, LimitError> {
+        // shortcut: Linux clamps this user index with `array_index_nospec`
+        // (kernel/sys.c do_prlimit, Spectre v1); there is no nospec primitive
+        // in the tree yet (a branchless mask the optimiser cannot undo needs a
+        // reviewed asm site), so only the architectural bounds check exists.
+        // Upgrade with one shared `array_index_nospec` for every user-indexed table.
         let index = usize::try_from(resource)
             .ok()
             .filter(|&index| index < RLIM_NLIMITS)

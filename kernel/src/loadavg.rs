@@ -10,10 +10,12 @@
 // (idle CPUs folding their deltas) is absent because the CPU never enters the
 // dynamic-idle path while a task is runnable.
 #![forbid(unsafe_code)]
-//! The load averages `sysinfo(2)` reports, advanced by the periodic tick.
+//! The load averages `sysinfo(2)` reports.
 //!
-//! Context: called from the timer interrupt on the boot CPU, one tick at a time
-//! (the owner serialises it with the reader). No allocation, no sleeping.
+//! The state is a pure function of the jiffies count: [`LoadAvg::loads_at`]
+//! replays every sampling window up to `jiffies` on a copy, so no interrupt
+//! hook or lock is needed and the result is identical to ticking each jiffy.
+//! No allocation, no sleeping; any context.
 
 /// `FSHIFT`: bits of fixed-point precision.
 pub const FSHIFT: u32 = 11;
@@ -65,26 +67,46 @@ impl LoadAvg {
         }
     }
 
-    /// One timer tick at `jiffies` with `nr_active` = `nr_running +
-    /// nr_uninterruptible` of the CPU. Order as in `tick_periodic`: the global
-    /// update (`calc_global_load`, 10 ticks after the window) first, then this
-    /// CPU's sample (`calc_global_load_tick`).
-    pub fn tick(&mut self, jiffies: u64, nr_active: i64) {
-        if jiffies >= self.global_update + 10 {
-            let active = u64::try_from(self.tasks).map_or(0, |tasks| tasks * FIXED_1);
-            for (load, exp) in self.avenrun.iter_mut().zip(EXP) {
-                *load = calc_load(*load, exp, active);
+    /// Replay the sampling events due by `jiffies`, with `nr_active` =
+    /// `nr_running + nr_uninterruptible` of the CPU at each of them. Events run
+    /// in time order and, when simultaneous, as in `tick_periodic`: the global
+    /// update (`calc_global_load`, 10 ticks after the window) before this CPU's
+    /// sample (`calc_global_load_tick`). Several windows missed at once are
+    /// replayed one by one, which is what the per-tick path would have done.
+    pub fn advance(&mut self, jiffies: u64, nr_active: i64) {
+        loop {
+            let global = self.global_update + 10;
+            if global <= self.cpu_update {
+                if jiffies < global {
+                    break;
+                }
+                let active = u64::try_from(self.tasks).map_or(0, |tasks| tasks * FIXED_1);
+                for (load, exp) in self.avenrun.iter_mut().zip(EXP) {
+                    *load = calc_load(*load, exp, active);
+                }
+                self.global_update += LOAD_FREQ;
+            } else {
+                if jiffies < self.cpu_update {
+                    break;
+                }
+                self.tasks += nr_active - self.cpu_active;
+                self.cpu_active = nr_active;
+                self.cpu_update += LOAD_FREQ;
             }
-            self.global_update += LOAD_FREQ;
-        }
-        if jiffies >= self.cpu_update {
-            self.tasks += nr_active - self.cpu_active;
-            self.cpu_active = nr_active;
-            self.cpu_update += LOAD_FREQ;
         }
     }
 
-    /// `get_avenrun(loads, 0, SI_LOAD_SHIFT - FSHIFT)`: the values `sysinfo` stores.
+    /// `get_avenrun(loads, 0, SI_LOAD_SHIFT - FSHIFT)` as of `jiffies`: the
+    /// values `sysinfo` stores. Works on a copy; `self` stays the state at the
+    /// start of the replay (cost is one step per elapsed 5 s window).
+    #[must_use]
+    pub fn loads_at(&self, jiffies: u64, nr_active: i64) -> [u64; 3] {
+        let mut now = *self;
+        now.advance(jiffies, nr_active);
+        now.sysinfo_loads()
+    }
+
+    /// `get_avenrun(loads, 0, SI_LOAD_SHIFT - FSHIFT)` of the current state.
     #[must_use]
     pub fn sysinfo_loads(&self) -> [u64; 3] {
         self.avenrun.map(|load| load << (SI_LOAD_SHIFT - FSHIFT))
@@ -111,18 +133,18 @@ mod tests {
         let mut load = LoadAvg::new(0);
         assert_eq!(LOAD_FREQ, 5001);
         for jiffies in 1..=5010 {
-            load.tick(jiffies, 1);
+            load.advance(jiffies, 1);
             assert_eq!(load.sysinfo_loads(), [0; 3], "{jiffies}");
         }
         // The CPU sampled at 5001; the global update waits for 5001 + 10.
-        load.tick(5011, 1);
+        load.advance(5011, 1);
         assert_eq!(load.sysinfo_loads(), [164 << 5, 34 << 5, 11 << 5]);
         // The next window: CPU at 10002, global at 10012.
         for jiffies in 5012..=10011 {
-            load.tick(jiffies, 1);
+            load.advance(jiffies, 1);
         }
         assert_eq!(load.sysinfo_loads()[0], 164 << 5);
-        load.tick(10012, 1);
+        load.advance(10012, 1);
         let second = calc_load(164, 1884, 2048);
         assert_eq!(load.sysinfo_loads()[0], second << 5);
         assert_eq!(second, 315);
@@ -131,17 +153,33 @@ mod tests {
     #[test]
     fn an_idle_cpu_decays_and_never_goes_negative() {
         let mut load = LoadAvg::new(100);
-        load.tick(100 + 5001, 1);
-        load.tick(100 + 5011, 1);
+        load.advance(100 + 5001, 1);
+        load.advance(100 + 5011, 1);
         let busy = load.sysinfo_loads()[0];
         assert!(busy > 0);
         // The task stops counting at the next sample: the contribution is removed.
-        load.tick(100 + 10002, 0);
-        load.tick(100 + 10012, 0);
+        load.advance(100 + 10002, 0);
+        load.advance(100 + 10012, 0);
         assert!(load.sysinfo_loads()[0] < busy);
         let mut load = LoadAvg::new(0);
-        load.tick(5001, -3);
-        load.tick(5011, -3);
+        load.advance(5001, -3);
+        load.advance(5011, -3);
         assert_eq!(load.sysinfo_loads(), [0; 3]);
+    }
+
+    #[test]
+    fn a_late_replay_equals_ticking_every_jiffy() {
+        let start = 123;
+        let mut each = LoadAvg::new(start);
+        for jiffies in start..=start + 40_000 {
+            each.advance(jiffies, 1);
+        }
+        let once = LoadAvg::new(start);
+        assert_eq!(once.loads_at(start + 40_000, 1), each.sysinfo_loads());
+        assert_ne!(each.sysinfo_loads(), [0; 3]);
+        // Not yet at the first global update: still zero, and `loads_at` leaves
+        // the receiver untouched.
+        assert_eq!(once.loads_at(start + 5010, 1), [0; 3]);
+        assert_eq!(once, LoadAvg::new(start));
     }
 }

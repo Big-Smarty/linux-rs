@@ -25,7 +25,7 @@ use crate::{
     console, cpu,
     memory::{Allocator, Error as MemoryError, PAGE, PAGE_BYTES, Physical},
     paging::{self, Tables, UserSpace},
-    services::{self, IrqMutex, Service},
+    services::{self, Service},
 };
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
@@ -379,14 +379,12 @@ pub struct Process {
     /// Credentials, rlimits, filesystem context, comm, personality and the
     /// user pointers libc registers (`task::Attributes`, the identity group).
     pub attrs: Attributes,
+    /// Load-average state at init start; `sysinfo` replays it to the boot
+    /// clock ([`LoadAvg::loads_at`]), so there is no tick hook and no lock.
+    pub load: LoadAvg,
 }
 
 static PROCESS: Service<Process> = Service::new();
-
-/// The load averages `sysinfo` reports, advanced by the timer interrupt
-/// ([`loadavg_tick`]) once init runs. Lock order: a leaf below everything; it is
-/// an `IrqMutex`, so the handler cannot meet an interrupted holder.
-static LOADAVG: IrqMutex<Option<LoadAvg>> = IrqMutex::new(None);
 
 /// `nr_running + nr_uninterruptible` of the one CPU: init is always runnable
 /// (running or preempted by the tick) because no syscall blocks yet and the
@@ -395,13 +393,11 @@ static LOADAVG: IrqMutex<Option<LoadAvg>> = IrqMutex::new(None);
 /// can sleep (nanosleep, futex, wait4, blocking I/O) or a second task exists.
 const NR_ACTIVE: i64 = 1;
 
-/// `calc_global_load` and `calc_global_load_tick` on the timer interrupt.
-/// `jiffies` is the tick count after this tick. Context: hardirq on the boot
-/// CPU; takes only `LOADAVG`.
-pub fn loadavg_tick(jiffies: u64) {
-    if let Some(load) = LOADAVG.lock().as_mut() {
-        load.tick(jiffies, NR_ACTIVE);
-    }
+/// The boot clock in jiffies, the unit of the load-average windows. The
+/// periodic tick is masked before init starts, so `timer::ticks()` does not
+/// advance; the boot clock (`ktime_get_boottime_ns`) does.
+fn jiffies_of(boot_ns: u64) -> u64 {
+    boot_ns / crate::time::TICK_NSEC
 }
 
 /// `!X86_FEATURE_CPUID_FAULT`, decided only where CPUID can prove it. AMD sets
@@ -467,15 +463,13 @@ impl Context for Syscall<'_> {
         // `ktime_get_boottime_ns` is the boot clock `do_sysinfo` reads.
         let uptime_ns = crate::timer::ktime_get_boottime_ns();
         // Lock order: `FRAMES` is the leaf below `PROCESS` -> `TABLES` -> heap.
+        // The load averages take no lock: they are replayed from `Process::load`.
         let frames = services::FRAMES.lock();
         Machine {
             uptime_ns,
             total_pages: frames.total() as u64,
             free_pages: frames.available() as u64,
-            loads: LOADAVG
-                .lock()
-                .as_ref()
-                .map_or([0; 3], LoadAvg::sysinfo_loads),
+            loads: self.process.load.loads_at(jiffies_of(uptime_ns), NR_ACTIVE),
         }
     }
 }
@@ -710,7 +704,7 @@ fn start(init: &Loaded) -> ! {
     let managed_pages = services::FRAMES.lock().total() as u64;
     // `sched_init`: the first load window starts when the scheduler does.
     // shortcut: that is when init starts here, not at kernel entry.
-    *LOADAVG.lock() = Some(LoadAvg::new(crate::timer::ticks()));
+    let load = LoadAvg::new(jiffies_of(crate::timer::ktime_get_boottime_ns()));
     PROCESS.install(Process {
         pid: 1,
         tgid: 1,
@@ -718,6 +712,7 @@ fn start(init: &Loaded) -> ! {
         vmas: init.vmas,
         brk: init.brk,
         attrs: Attributes::init(task::max_threads(managed_pages)),
+        load,
     });
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all
