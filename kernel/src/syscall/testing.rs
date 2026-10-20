@@ -3,11 +3,12 @@
 //! `usercopy::fake::Space` and whose console collects bytes.
 
 use super::{
-    Console, Context, Machine,
+    AddressSpace, Console, Context, Machine,
     time::{ClockState, Clocks, RestartBlock},
 };
 use crate::{
     cputime::CpuSample,
+    mm::{Env, Mm, tests::Fake},
     task::Attributes,
     usercopy::{UserPages, fake::Space},
 };
@@ -74,10 +75,15 @@ pub struct Task<P = Space, C = Sink> {
     pub machine: Machine,
     pub cpuid_fault_absent: bool,
     pub clocks: FakeClocks,
+    /// The address space the memory syscalls edit, over the model's fake tables.
+    pub mm: Mm,
+    pub env: Env,
+    pub tables: Fake,
 }
 
 impl<P, C> Task<P, C> {
     pub fn new(pages: P, sink: C) -> Self {
+        let env = Env::init(1 << 17, 0);
         Self {
             pages,
             sink,
@@ -93,6 +99,9 @@ impl<P, C> Task<P, C> {
             },
             cpuid_fault_absent: false,
             clocks: FakeClocks::default(),
+            mm: Mm::new(&env),
+            env,
+            tables: Fake::default(),
         }
     }
 }
@@ -138,6 +147,13 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
     fn cpuid_fault_absent(&self) -> bool {
         self.cpuid_fault_absent
     }
+    fn address_space(&mut self) -> AddressSpace<'_> {
+        AddressSpace {
+            mm: &mut self.mm,
+            env: &self.env,
+            pages: &mut self.tables,
+        }
+    }
 }
 
 impl<P, C> Clocks for Task<P, C> {
@@ -172,3 +188,4 @@ impl<P, C> Clocks for Task<P, C> {
         self.clocks.rtc
     }
 }
+

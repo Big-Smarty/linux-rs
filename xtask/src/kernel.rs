@@ -184,7 +184,7 @@ enum User {
     },
     /// Reads address 0 (`-- fault`): SIGSEGV kills init, exit code 0xb.
     Segfault,
-    /// Calls `mmap`, which Linux implements and this slice does not: the kernel stops.
+    /// Calls `io_uring_setup`, which Linux implements and this kernel does not: it stops.
     Unimplemented,
     /// Runs one oracle syscall-test group (`-- <group>`, `user/init/src/tests`) to `init: ok`;
     /// every `init: test|tests|info` line equals the pinned Linux's ([`validate_oracle`]).
@@ -255,6 +255,9 @@ const BUDDY_ORDER_RECORD: &str = "CHECK buddy-orders ok max_order=10 contiguous=
 const USER_MM_RECORD: &str = "CHECK user-mm ok pages=3 rollback_points=3 tlb=invlpg protect=ro unmap=3 conflict=rolled-back accounting=restored";
 const HEAP_RECORD: &str = "CHECK heap ok vec=1000 box=4096 align=4096 growth=buddy-frames oom=failed-cleanly recovered=true over_cap=rejected accounting=restored";
 const IRQ_GUARD_RECORD: &str = "CHECK irq-guard ok nested=2 out_of_order=true saved_on=true saved_off=true exclusive=true blocked_periods=2 blocked_delta=0 resumed=true";
+/// Printed by `userspace::start` before ring 3 (self-test builds): the memory syscalls and the
+/// one user-copy mechanism on the real tables, faulting pages in with Linux's short-copy results.
+const MM_USERCOPY_RECORD: &str = "CHECK mm-usercopy ok fault_in=read,write short_write=4 hole=8 readonly=refused zero_page=shared range=refused unmap=restored";
 const PF_GPR_RECORD: &str = "CHECK page-fault-gprs ok gprs=15";
 const MEMORY_RUNTIME_RECORD: &str = "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true";
 
@@ -487,10 +490,13 @@ const DEBUG_CASES: &[DebugCase] = &[
     },
     DebugCase {
         name: "unimplemented-syscall",
-        cmdline: Some("-- mmap"),
+        cmdline: Some("-- io_uring"),
         cpu: "qemu64",
         expected_exit: 35,
-        required: &["init: calling mmap", "FAIL syscall unimplemented nr=9"],
+        required: &[
+            "init: calling io_uring_setup",
+            "FAIL syscall unimplemented nr=425",
+        ],
         forbid_success: true,
         modules: ARCHIVE_ONLY,
         user: User::Unimplemented,
@@ -4096,6 +4102,7 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
             &|line| line.starts_with(&exec_prefix) && line.ends_with(&exec_suffix),
             "userspace exec record",
         )?,
+        find.exact(MM_USERCOPY_RECORD, "mm-usercopy record")?,
         find.exact("init: hello from userspace", "init's first line")?,
         find.at(
             &|line| {
@@ -4257,9 +4264,12 @@ fn user_tail(
             find.exact("FAIL init exitcode=0x0000000b", "failure marker")?,
         ],
         User::Unimplemented => vec![
-            find.exact("init: calling mmap", "mmap announcement")?,
             find.exact(
-                "FAIL syscall unimplemented nr=9",
+                "init: calling io_uring_setup",
+                "io_uring_setup announcement",
+            )?,
+            find.exact(
+                "FAIL syscall unimplemented nr=425",
                 "unimplemented-syscall stop",
             )?,
         ],
@@ -6317,6 +6327,18 @@ mod tests {
                 serial.replace("kernel_user_bits=0", "kernel_user_bits=3"),
             ),
             ("no hello", serial.replace("init: hello from userspace", "")),
+            ("no mm-usercopy", serial.replace(MM_USERCOPY_RECORD, "")),
+            (
+                "changed mm-usercopy",
+                serial.replace("short_write=4", "short_write=0"),
+            ),
+            (
+                "duplicate mm-usercopy",
+                serial.replace(
+                    MM_USERCOPY_RECORD,
+                    &format!("{MM_USERCOPY_RECORD}\n{MM_USERCOPY_RECORD}"),
+                ),
+            ),
             (
                 "Run line after the exec record",
                 serial.replace("Run /init as init process\n", "").replace(
@@ -6425,13 +6447,13 @@ mod tests {
         );
 
         let unimplemented =
-            format!("{prefix}\ninit: calling mmap\nFAIL syscall unimplemented nr=9");
+            format!("{prefix}\ninit: calling io_uring_setup\nFAIL syscall unimplemented nr=425");
         assert!(validate(case("unimplemented-syscall"), &exit(35), &unimplemented).0);
         assert!(
             !validate(
                 case("unimplemented-syscall"),
                 &exit(35),
-                &unimplemented.replace("nr=9", "nr=0")
+                &unimplemented.replace("nr=425", "nr=0")
             )
             .0
         );
@@ -6531,6 +6553,7 @@ mod tests {
             "CHECK userspace-image ok entry=0x204800 sp=0x7fffffffee40 loads=2 brk=0x20d000 argc=1",
             "Run /init as init process",
             "CHECK userspace exec path=/init entry=0x204800 loads=2 sp=0x7fffffffee40 smep=false smap=false",
+            MM_USERCOPY_RECORD,
             "init: hello from userspace",
             &fixture::init_summary(&expected().init, 1),
             "init: ok",

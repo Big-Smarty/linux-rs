@@ -23,6 +23,26 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
     }
 }
 
+/// What `do_mmap` reads from the open file behind `fd` (`fget(fd)`): fds 0-2
+/// are init's `/dev/console` (`console_fops`, opened `O_RDWR`), which has no
+/// `->mmap` (so `do_mmap` answers `-ENODEV` after its argument checks), is a
+/// character device (`file_mmap_size_max` is `ULONG_MAX`) and is not a regular
+/// file; every other descriptor is closed.
+pub(super) fn console_file(fd: u32) -> Option<crate::mm::FileInfo> {
+    matches!(fd, 0..=2).then_some(crate::mm::FileInfo {
+        id: 2,
+        readable: true,
+        writable: true,
+        noexec: false,
+        swapfile: false,
+        append_only: false,
+        can_mmap: false,
+        mmap_size_max: u64::MAX,
+        mmap_sync: false,
+        hugepages: false,
+    })
+}
+
 /// `write(2)` on the console. fds 0, 1 and 2 are init's `/dev/console`
 /// (opened `O_RDWR`, then duplicated); every other fd is closed.
 ///

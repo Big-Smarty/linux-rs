@@ -403,7 +403,8 @@ fn run(stack: &Stack) {
         }
         // A syscall inside Linux's table that the first kernel slice does not
         // implement: the candidate kernel stops with `FAIL syscall unimplemented
-        // nr=9`. Real Linux returns EINVAL for this zero-length mmap.
+        // nr=9`. Real Linux returns EINVAL for this zero-length mmap (the memory
+        // syscalls are implemented now: the kernel-test case uses `io_uring`).
         Some(b"mmap") => {
             out!("init: calling mmap");
             // SAFETY: length 0 maps nothing; the call takes no pointers.
@@ -411,6 +412,18 @@ fn run(stack: &Stack) {
                 raw::syscall6(Sysno::mmap as usize, 0, 0, 3, 0x22, usize::MAX, 0)
             });
             fail("mmap", result);
+        }
+        // io_uring_setup(2) is in Linux's table (`CONFIG_IO_URING=y` in the reference
+        // configuration) and far from anything this kernel implements: the
+        // candidate stops with `FAIL syscall unimplemented nr=425`. Real Linux
+        // answers EFAULT for the null `io_uring_params` pointer.
+        Some(b"io_uring") => {
+            out!("init: calling io_uring_setup");
+            // SAFETY: entries 0 and a null params pointer; the call touches no memory
+            // of this process (Linux rejects the null pointer, never dereferencing it).
+            let result =
+                Errno::from_ret(unsafe { raw::syscall2(Sysno::io_uring_setup as usize, 0, 0) });
+            fail("io_uring_setup", result);
         }
         // rseq(2) is -ENOSYS in the candidate's declared configuration
         // (CONFIG_RSEQ=n); a Linux with RSEQ=y answers EINVAL for these arguments.

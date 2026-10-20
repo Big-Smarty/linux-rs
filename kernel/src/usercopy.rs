@@ -16,7 +16,11 @@
 //!
 //! # Contract
 //! * Context: task context of the one user task, interrupts in any state; no
-//!   sleeping, no allocation, no locks.
+//!   sleeping and no locks here. The [`UserPages`] implementor may resolve a
+//!   non-resident page by taking the page fault Linux would take for a kernel
+//!   access to user memory (`userspace::Syscall::page`: demand-zero or
+//!   copy-on-write through the address-space model, which can allocate frames
+//!   and heap storage, fallibly); a refused fault is a short copy.
 //! * Why no fault can occur: [`UserPages::page`] resolves a user page to a
 //!   kernel-addressable frame (present, user, and writable when `write`)
 //!   *before* any byte moves. The kernel never touches the user virtual

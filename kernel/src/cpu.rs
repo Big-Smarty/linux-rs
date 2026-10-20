@@ -755,9 +755,13 @@ extern "C" fn interrupt_handler(frame: &mut InterruptFrame, vector: u64, error: 
     // Any ring-3 CS (64-bit 0x33 or compatibility 0x23, RPL 3).
     if frame.cs & 3 == 3 {
         // Any exception raised by init is fatal to it (no signal handlers exist
-        // yet). CR2 is read first, before anything that could fault.
+        // yet) except a page fault the address-space model resolves, which
+        // returns here and `iretq`s to the faulting instruction (the error-code
+        // entry preserves all fifteen GPRs across a returning #PF, see `entry!`).
+        // CR2 is read first, before anything that could fault.
         let address = if vector == 14 { Cr2::read_raw() } else { 0 };
         crate::userspace::exception(vector, error, frame.rip, frame.rsp, address);
+        return;
     }
     if frame.cs != u64::from(KERNEL_CS.0) {
         unexpected(frame, vector, error, 0);
