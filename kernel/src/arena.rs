@@ -296,7 +296,7 @@ mod tests {
         arena.try_reserve(3).unwrap();
         assert!(arena.spare() >= 3);
         let capacity = arena.spare();
-        let ids: alloc::vec::Vec<_> = (0..capacity as u8)
+        let ids: alloc::vec::Vec<_> = (0..u8::try_from(capacity).unwrap())
             .map(|i| arena.insert_reserved(i).unwrap())
             .collect();
         assert_eq!(arena.spare(), 0);

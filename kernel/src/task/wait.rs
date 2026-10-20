@@ -315,7 +315,8 @@ impl Tasklist {
             self.release_task(p);
         }
         if wo.with_info {
-            if status & 0x7f == 0 {
+            // `(status & 0x7f) == 0`: exited normally.
+            if status.trailing_zeros() >= 7 {
                 wo.info.cause = CLD_EXITED;
                 wo.info.status = i32::try_from(status >> 8).unwrap_or(0);
             } else {

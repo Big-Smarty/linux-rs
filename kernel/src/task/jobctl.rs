@@ -25,14 +25,14 @@ impl Tasklist {
     ///
     /// # Errors
     /// `EINVAL`, `ESRCH`, `EPERM`, `EACCES` (target already exec'd), `ENOMEM`.
-    pub fn setpgid(&mut self, current: TaskId, pid: i32, pgid: i32) -> Result<(), Errno> {
+    pub fn setpgid(&mut self, current: TaskId, pid: i32, group: i32) -> Result<(), Errno> {
         let pid = if pid == 0 {
             self.task_pid_vnr(current)
         } else {
             pid
         };
-        let pgid = if pgid == 0 { pid } else { pgid };
-        if pgid < 0 {
+        let group = if group == 0 { pid } else { group };
+        if group < 0 {
             return Err(Errno::EINVAL);
         }
         let p = self.find_task_by_vpid(pid).ok_or(Errno::ESRCH)?;
@@ -53,10 +53,10 @@ impl Tasklist {
             return Err(Errno::EPERM);
         }
         let own = self.task_pid_type(p, PidType::Pid).ok_or(Errno::ESRCH)?;
-        let pgrp = if pgid == pid {
+        let pgrp = if group == pid {
             own
         } else {
-            let pgrp = self.find_vpid(pgid).ok_or(Errno::EPERM)?;
+            let pgrp = self.find_vpid(group).ok_or(Errno::EPERM)?;
             let member = self.pid_task(pgrp, PidType::Pgid).ok_or(Errno::EPERM)?;
             if self.task_pid_type(member, PidType::Sid) != self.task_pid_type(current, PidType::Sid)
             {

@@ -212,10 +212,11 @@ impl Tasklist {
         // "We don't want people slaying init."
         t.exit_signal = SIGCHLD;
         // If it has exited notify the new parent about this child's death.
-        if t.exit_state == ExitState::Zombie && self.do_notify_parent(child, SIGCHLD, w) {
-            if let Some(t) = self.task_mut(child) {
-                t.exit_state = ExitState::Dead;
-            }
+        if t.exit_state == ExitState::Zombie
+            && self.do_notify_parent(child, SIGCHLD, w)
+            && let Some(t) = self.task_mut(child)
+        {
+            t.exit_state = ExitState::Dead;
         }
         self.kill_orphaned_pgrp(child, Some(father), w);
     }

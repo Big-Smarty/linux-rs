@@ -121,6 +121,10 @@ impl Tasklist {
     /// `__kill_pgrp_info`: success if any member accepted the signal, else
     /// the last error, `ESRCH` for an empty group. Members are visited newest
     /// first (`do_each_pid_task`).
+    ///
+    /// # Errors
+    /// The last member's error when no member accepted the signal, `ESRCH`
+    /// for an empty or missing group.
     pub fn kill_pgrp_info(
         &mut self,
         sender: Option<TaskId>,

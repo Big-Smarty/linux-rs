@@ -5,7 +5,7 @@
 //! descriptors 0-2 on the console, as `console_on_rootfs` leaves init.
 
 use super::{
-    AddressSpace, Console, Context, Files, Machine,
+    AddressSpace, Console, Context, ExecAux, Files, Machine, Tasks,
     time::{ClockState, Clocks, RestartBlock},
 };
 use crate::{
@@ -14,9 +14,9 @@ use crate::{
     signal::{
         self, SIGALRM, SIGUSR1, SIGUSR2, State, frame::Sigreturn, info::SigInfo, state::Target,
     },
-    task::Attributes,
+    task::{Attributes, TaskId, Tasklist, exit::NoWake},
     usercopy::{UserPages, fake::Space},
-    vfs::{FdTable, Timespec, Vfs},
+    vfs::{FdTable, FileId, Timespec, Vfs},
 };
 extern crate std;
 use std::{boxed::Box, collections::BTreeMap, vec::Vec};
@@ -94,6 +94,14 @@ pub struct Task<P = Space, C = Sink> {
     /// Private copies of file pages a kernel access faulted in (the binary's
     /// `user_fault` for `NeedsFile`: `Vfs::fault_page`, then a private frame).
     pub file_pages: BTreeMap<u64, Box<[u8; 4096]>>,
+    /// The task list; `current` is its init (pid 1).
+    pub tasks: Tasklist,
+    pub current: TaskId,
+    pub wake: NoWake,
+    /// `mm->exe_file` as `replace_exe_file` last set it.
+    pub exe: Option<FileId>,
+    /// `(ip, sp)` of the last `start_thread`.
+    pub started: Option<(u64, u64)>,
     /// The signal state: a non-init process whose `SIGUSR1`, `SIGUSR2` and
     /// `SIGALRM` have handlers, so sending them queues rather than kills.
     pub state: State<'static>,
@@ -120,6 +128,7 @@ impl<P, C> Task<P, C> {
         vfs.console_on_rootfs(&mut fdt).expect("console");
         let mut attrs = Attributes::init(1000);
         attrs.fs = vfs.new_fs_struct(0o022);
+        let (tasks, current) = Tasklist::new(1000, &attrs.cred, 1000).expect("task list");
         let state = State::standalone(1, 0, 1000);
         for sig in [SIGUSR1, SIGUSR2, SIGALRM] {
             state.hand.actions[usize::from(sig) - 1].handler = 0x4000;
@@ -145,6 +154,11 @@ impl<P, C> Task<P, C> {
             vfs,
             fdt,
             file_pages: BTreeMap::new(),
+            tasks,
+            current,
+            wake: NoWake,
+            exe: None,
+            started: None,
             state,
             now: 0,
             waits: 0,
@@ -216,6 +230,27 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
     }
     fn cpuid_fault_absent(&self) -> bool {
         self.cpuid_fault_absent
+    }
+    fn tasks(&mut self) -> Tasks<'_> {
+        Tasks {
+            list: &mut self.tasks,
+            current: self.current,
+            wake: &mut self.wake,
+        }
+    }
+    fn replace_exe_file(&mut self, file: FileId) -> Option<FileId> {
+        self.exe.replace(file)
+    }
+    fn exec_aux(&mut self) -> ExecAux {
+        ExecAux {
+            hwcap: 0x0183_fbff,
+            random: *b"0123456789abcdef",
+        }
+    }
+    fn start_thread(&mut self, ip: u64, sp: u64) {
+        self.started = Some((ip, sp));
+        self.fs_base = 0;
+        self.gs_base = 0;
     }
     fn address_space(&mut self) -> AddressSpace<'_> {
         AddressSpace {

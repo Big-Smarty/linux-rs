@@ -2,7 +2,15 @@
 // Host tests of the task list model. Expected values are derived from the
 // pinned Linux sources named at each test (kernel/exit.c, kernel/sys.c,
 // kernel/signal.c, kernel/pid.c), not from the code under test.
-#![allow(clippy::too_many_lines, clippy::similar_names)]
+#![allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::many_single_char_names,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::assert_is_empty,
+    clippy::manual_assert_eq
+)]
 extern crate std;
 
 use super::{
@@ -404,7 +412,6 @@ fn reparented_zombie_is_reaped_at_once_when_init_ignores_sigchld() {
 fn wait4_argument_matrix() {
     // kernel_wait4: option mask, INT_MIN, pid / pgrp selection.
     let (mut l, init) = list();
-    let bad = [0x10, WEXITED, 0x8000_0000 >> 1 & 0, 0x40];
     for options in [0x10, WEXITED, 0x100, WNOWAIT, 0x1000_0000] {
         assert_eq!(
             l.prepare_wait4(init, -1, options).err(),
@@ -412,7 +419,6 @@ fn wait4_argument_matrix() {
             "{options:#x}"
         );
     }
-    let _ = bad;
     for options in [0, WNOHANG, WUNTRACED, WCONTINUED, WALL, WCLONE, 0x2000_0000] {
         assert!(l.prepare_wait4(init, -1, options).is_ok(), "{options:#x}");
     }

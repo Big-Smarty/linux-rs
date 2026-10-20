@@ -169,7 +169,7 @@ fn file_mapping<C: Context>(ctx: &mut C, m: &FileMapping, zero: bool) -> Outcome
 /// `fput(vma->vm_file)` for every file no VMA maps any more.
 /// shortcut: O(pins x VMAs) per call (skipped when nothing is pinned); keep a
 /// per-description VMA count when programs hold many file mappings.
-fn unpin_unmapped<C: Context>(ctx: &mut C) {
+pub(super) fn unpin_unmapped<C: Context>(ctx: &mut C) {
     let mut index = ctx.files().vfs.pin_count();
     while index > 0 {
         index -= 1;

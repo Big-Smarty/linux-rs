@@ -27,6 +27,7 @@
 //! [`Context`] offers by adding methods to the trait (the binary's `Process`
 //! implements it; tests use `testing::Task`), never by reaching for globals.
 
+mod exec;
 mod fd;
 mod fs;
 mod ids;
@@ -42,10 +43,11 @@ mod vfs_tests;
 
 use crate::{
     config,
-    mm::{Env, Mm, UserPages as PageTables},
-    task::{Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE},
+    exec::load::Pager,
+    mm::{Env, Mm},
+    task::{Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE, TaskId, Tasklist, exit::Waker},
     usercopy::UserPages,
-    vfs::{Cred, FdTable, FsStruct, Vfs, mapping::Mappable},
+    vfs::{Cred, FdTable, FileId, FsStruct, Vfs, mapping::Mappable},
 };
 use syscalls::{Errno, Sysno};
 
@@ -74,6 +76,22 @@ pub struct Files<'a> {
     pub vfs: &'a mut Vfs,
     pub fdt: &'a mut FdTable,
     pub fs: &'a mut FsStruct,
+}
+
+/// The task list and the caller's place in it (`current`), with the way to
+/// wake other tasks' sleepers.
+pub struct Tasks<'a> {
+    pub list: &'a mut Tasklist,
+    pub current: TaskId,
+    pub wake: &'a mut dyn Waker,
+}
+
+/// What `create_elf_tables` takes from the machine: `ELF_HWCAP` and the 16
+/// `AT_RANDOM` bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecAux {
+    pub hwcap: u32,
+    pub random: [u8; 16],
 }
 
 /// Everything a syscall may touch: the calling task's user memory (the one
@@ -114,6 +132,18 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
         let Files { vfs, fdt, .. } = self.files();
         vfs.mmap_info(fdt, fd)
     }
+    /// The task list, `current` and the wake-up path.
+    fn tasks(&mut self) -> Tasks<'_>;
+    /// `set_mm_exe_file`: the open description the new image was loaded from
+    /// becomes `mm->exe_file`; the previous one is returned for `fput`. The
+    /// binary also keeps the id the fault report names the program by.
+    fn replace_exe_file(&mut self, file: FileId) -> Option<FileId>;
+    /// `ELF_HWCAP` and fresh random bytes for the auxiliary vector.
+    fn exec_aux(&mut self) -> ExecAux;
+    /// `flush_thread` + `start_thread`: the FPU and the segment bases are reset
+    /// and the registers become the initial user state at `ip`/`sp` (all other
+    /// general registers zero), as `load_elf_binary` leaves them.
+    fn start_thread(&mut self, ip: u64, sp: u64);
     /// `current->files`, `current->fs` (the same value as `attrs().fs`) and the
     /// mounted rootfs.
     fn files(&mut self) -> Files<'_>;
@@ -150,15 +180,20 @@ pub struct AddressSpace<'a> {
     pub env: &'a Env,
     /// The page tables behind `mm`; the binary's view locks the frame
     /// allocator per operation, after the model reserved its heap storage.
-    pub pages: &'a mut dyn PageTables,
+    /// `Pager` adds installing a frame with given contents (exec's page-cache
+    /// stand-in).
+    pub pages: &'a mut dyn Pager,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Value for `rax`: the result, or `-errno`.
     Return(i64),
-    /// The init task exits with this `exit_code` (`(status & 0xff) << 8`).
-    Exit(u32),
+    /// The task exits with this `exit_code` (`(status & 0xff) << 8`): `exit`
+    /// ends the calling thread (`do_exit`), `exit_group` the whole group
+    /// (`do_group_exit`); with one thread they differ only in who sets the
+    /// group exit code.
+    Exit { code: u32, group: bool },
     /// A syscall inside Linux's table that this slice does not implement.
     Unimplemented(u32),
     /// The single task would sleep (an empty pipe, a full pipe, console input)
@@ -221,6 +256,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         .or_else(|| fs::dispatch(ctx, sysno, args))
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
+        .or_else(|| exec::dispatch(ctx, sysno, args))
         .or_else(|| ids::dispatch(ctx, sysno, args))
         .or_else(|| time::dispatch(ctx, sysno, args))
         .or_else(|| signal::dispatch(ctx, sysno, args));

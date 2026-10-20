@@ -37,7 +37,7 @@ use crate::{
     services::{self, Service},
     timer,
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
     iter,
@@ -60,16 +60,19 @@ use kernel::{
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     ratelimit::RateLimit,
     signal::{
-        self, Ids, State, TaskSignals,
+        self, State,
         deliver::{self, Outcome as SignalOutcome},
         frame::Sigreturn,
         info,
     },
     syscall::{
-        self, AddressSpace, ClockState, Clocks, Console, Context, Files, Machine, Outcome,
-        RestartBlock,
+        self, AddressSpace, ClockState, Clocks, Console, Context, ExecAux, Files, Machine, Outcome,
+        RestartBlock, Tasks,
     },
-    task::{self, Attributes},
+    task::{
+        self, Attributes, TaskId, Tasklist,
+        exit::{ExitPrep, NoWake},
+    },
     usercopy::{self, UserPages},
     vfs::{
         self, FdTable, FileId, MAY_EXEC, O_LARGEFILE, O_RDONLY, Timespec, Vfs, initramfs::Unpacker,
@@ -485,10 +488,17 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
 /// handler holds `PROCESS` for the whole syscall (a single task cannot
 /// re-enter), so a field needs no lock of its own.
 pub struct Process {
-    /// Task id; `pid == tgid` for the single-threaded init.
-    pub pid: u32,
-    /// Thread-group id: what `getpid` reports.
-    pub tgid: u32,
+    /// The task list (parentage, pids, groups, sessions, credential
+    /// snapshots) and the signal objects of its tasks. Inside `PROCESS` until
+    /// the `TASKLIST` lock class exists (`services`).
+    pub tasks: Tasklist,
+    /// `current`: init, the only task.
+    pub current: TaskId,
+    /// Wake-ups of other tasks' sleepers: there are none yet.
+    wake: NoWake,
+    /// `mm->exe_file`: the open description the image was loaded from (its
+    /// `FileInfo::id` is `exec`).
+    exe_file: FileId,
     /// The address space (`mm`): the published page tables.
     pub mm: &'static Service<Tables>,
     /// Credentials, rlimits, filesystem context, comm, personality and the
@@ -517,9 +527,6 @@ pub struct Process {
     pub vfs: Vfs,
     /// `current->files`.
     pub fdt: FdTable,
-    /// `sighand` + `signal_struct` + the task's signal fields (the pure model
-    /// in `kernel::signal`), boxed because the two pending queues are ~16 KiB.
-    pub signal: Box<TaskSignals>,
     /// `printk_ratelimit_state`: the limiter of the `show_unhandled_signals`
     /// lines (global in Linux; one process here).
     printk_ratelimit: RateLimit,
@@ -644,7 +651,7 @@ fn user_fault(
 ///
 /// It borrows the fields of [`Process`] the fault needs, so the signal code
 /// (frame writes, `rt_sigreturn`, the signal syscalls) can hold it next to
-/// `&mut process.signal`; [`Syscall`]'s own [`UserPages`] is the same view.
+/// `&mut process.tasks`; [`Syscall`]'s own [`UserPages`] is the same view.
 struct FaultPages<'a, 'b> {
     mm: &'a mut Mm,
     env: &'a Env,
@@ -652,28 +659,26 @@ struct FaultPages<'a, 'b> {
     space: &'a mut UserSpace<'b>,
 }
 
-/// The `State` view of the one process's signal objects.
+/// The `State` view of the current task's signal objects (`current` is in the
+/// task list for as long as it runs).
 fn signal_state(process: &mut Process) -> State<'_> {
-    let ids = signal_ids(process);
-    process.signal.view(ids)
+    current_signals(&mut process.tasks, process.current)
 }
 
-/// What the signal view derives from the process (not stored twice).
-fn signal_ids(process: &Process) -> Ids {
-    Ids {
-        // Pids are below `pid_max` (32768), far inside `i32`.
-        pid: process.pid.cast_signed(),
-        tgid: process.tgid.cast_signed(),
-        uid: process.attrs.cred.uid,
-        global_init: process.tgid == 1,
+fn current_signals(tasks: &mut Tasklist, current: TaskId) -> State<'_> {
+    match tasks.signal_state(current) {
+        Some(state) => state,
+        None => {
+            crate::log!("FAIL current task is not in the task list\n");
+            crate::fail();
+        }
     }
 }
 
 impl<'a, 'b> FaultPages<'a, 'b> {
     fn of(process: &'a mut Process, space: &'a mut UserSpace<'b>) -> (State<'a>, Self) {
-        let ids = signal_ids(process);
         (
-            process.signal.view(ids),
+            current_signals(&mut process.tasks, process.current),
             Self {
                 mm: &mut process.space,
                 env: &process.env,
@@ -727,10 +732,52 @@ impl Context for Syscall<'_> {
         &mut self.tty
     }
     fn tgid(&self) -> u32 {
-        self.process.tgid
+        self.process
+            .tasks
+            .task_tgid_vnr(self.process.current)
+            .cast_unsigned()
     }
     fn tid(&self) -> u32 {
-        self.process.pid
+        self.process
+            .tasks
+            .task_pid_vnr(self.process.current)
+            .cast_unsigned()
+    }
+    fn tasks(&mut self) -> Tasks<'_> {
+        let process = &mut *self.process;
+        Tasks {
+            list: &mut process.tasks,
+            current: process.current,
+            wake: &mut process.wake,
+        }
+    }
+    fn replace_exe_file(&mut self, file: FileId) -> Option<FileId> {
+        self.process.exec = u64::from(file.index());
+        Some(core::mem::replace(&mut self.process.exe_file, file))
+    }
+    fn exec_aux(&mut self) -> ExecAux {
+        ExecAux {
+            hwcap: __cpuid(1).edx,
+            random: random_bytes(),
+        }
+    }
+    fn start_thread(&mut self, ip: u64, sp: u64) {
+        // flush_thread: the FPU returns to its initial state, TLS bases to 0.
+        signal::Cpu::fpu_reset(&mut cpu::UserCpu::new());
+        cpu::set_user_fs_base(0);
+        cpu::set_user_gs_base(0);
+        // start_thread: the same initial user state `enter_user` builds (every
+        // general register zero, `ELF_PLAT_INIT`); `orig_ax` keeps the number
+        // of the system call that is returning.
+        *self.regs = cpu::PtRegs {
+            ip,
+            sp,
+            cs: signal::USER_CS,
+            ss: signal::USER_DS,
+            flags: 0x202,
+            orig_ax: self.regs.orig_ax,
+            ..cpu::PtRegs::default()
+        };
     }
     fn attrs(&mut self) -> &mut Attributes {
         &mut self.process.attrs
@@ -836,7 +883,7 @@ impl<'a> signal::Task for Syscall<'a> {
         // idle time, not the task's.
         CPUTIME.sleep_begin(timer::ktime_get_ns());
         // The interval timer is a wake-up source of every sleep.
-        timer::set_itimer_ns(self.process.signal.signal.itimer.next_event());
+        timer::set_itimer_ns(self.state().sig.itimer.next_event());
         timer::wait_event(deadline_ns);
         CPUTIME.sleep_end(timer::ktime_get_ns());
     }
@@ -878,6 +925,32 @@ struct Tty;
 impl Console for Tty {
     fn write(&mut self, bytes: &[u8]) {
         console::write_bytes(bytes);
+    }
+}
+
+/// `do_exit` of the calling task: `exit` (`group` false) or `do_group_exit`
+/// (`exit_group`, a fatal signal). The last thread of global init panics
+/// (`init_died`). No other task exists yet to take the rest of the path
+/// (`exit_mm`, `exit_files`, `exit_notify`, `do_task_dead`), so a task that
+/// is not init stops the kernel loudly.
+fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
+    let mut process = PROCESS.lock();
+    let current = process.current;
+    let code = if group {
+        process.tasks.do_group_exit(current, code)
+    } else {
+        code
+    };
+    match process.tasks.exit_prepare(current, code, signaled) {
+        ExitPrep::InitDied { exitcode } => {
+            drop(process);
+            init_died(exitcode)
+        }
+        ExitPrep::Proceed { .. } => {
+            drop(process);
+            crate::log!("FAIL exit of a task other than init: no scheduler to leave\n");
+            crate::fail()
+        }
     }
 }
 
@@ -936,7 +1009,7 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
     };
     match outcome {
         Outcome::Return(value) => regs.ax = value.cast_unsigned(),
-        Outcome::Exit(code) => init_died(code),
+        Outcome::Exit { code, group } => do_exit(code, group, false),
         Outcome::Unimplemented(number) => {
             crate::log!("FAIL syscall unimplemented nr={}\n", number);
             crate::fail();
@@ -993,7 +1066,8 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
                 SignalOutcome::Resume | SignalOutcome::Handled | SignalOutcome::FrameFailed => {}
                 SignalOutcome::Exit { exit_code, .. } => {
                     drop(process);
-                    init_died(exit_code);
+                    // get_signal: PF_SIGNALED, then do_group_exit(signr).
+                    do_exit(exit_code, true, true);
                 }
                 SignalOutcome::Stop(sig) => {
                     crate::log!("FAIL signal stop unimplemented sig={}\n", sig);
@@ -1002,7 +1076,7 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
             }
         }
         // Wake the CPU for the next interval-timer expiry while ring 3 runs.
-        let expiry = process.signal.signal.itimer.next_event();
+        let expiry = signal_state(&mut process).sig.itimer.next_event();
         timer::set_itimer_ns(expiry);
         // `rearm` drops an expiry that fell between the `sync_timers` above and
         // its own clock read (or while a frame was built): nothing would wake
@@ -1017,6 +1091,15 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
 /// `printk_ratelimit()` called from `func`: ten lines per five seconds, and the
 /// "callbacks suppressed" line (named after the caller) when it re-opens.
 fn printk_ratelimit(process: &mut Process, func: &str) -> bool {
+    // The lines this limiter guards name the program `init` (`report`); after
+    // an `execve` of another program they would be wrong, so stop instead.
+    if process.attrs.comm[..5] != *b"init\0" {
+        crate::log!(
+            "FAIL fault report names only init (comm of the faulting program differs) func={}\n",
+            func
+        );
+        crate::fail();
+    }
     let jiffies = timer::ktime_get_ns() / kernel::time::TICK_NSEC;
     let verdict = process.printk_ratelimit.check(jiffies);
     if verdict.suppressed > 0 {
@@ -1785,14 +1868,21 @@ fn start(mut init: Loaded) -> ! {
     }
     let mut attrs = Attributes::init(task::max_threads(managed_pages));
     attrs.fs = init.vfs.new_fs_struct(0o022);
-    let signal = crate::unwrap(
-        Box::try_new(TaskSignals::new_init(task::max_threads(managed_pages) / 2))
-            .map_err(|_| "out of memory"),
-        "signal-state",
+    let max_threads = task::max_threads(managed_pages);
+    let (tasks, current) = crate::unwrap(
+        Tasklist::new(
+            u32::try_from(max_threads).unwrap_or(u32::MAX),
+            &attrs.cred,
+            max_threads / 2,
+        )
+        .map_err(|_| "out of memory"),
+        "task-list",
     );
     PROCESS.install(Process {
-        pid: 1,
-        tgid: 1,
+        tasks,
+        current,
+        wake: NoWake,
+        exe_file: init.exec,
         mm: &services::TABLES,
         attrs,
         load,
@@ -1802,7 +1892,6 @@ fn start(mut init: Loaded) -> ! {
         exec: u64::from(init.exec.index()),
         vfs: init.vfs,
         fdt,
-        signal,
         printk_ratelimit: RateLimit::printk(kernel::time::HZ),
     });
     // Not in the suite: it runs once per group and the `mm` group covers the

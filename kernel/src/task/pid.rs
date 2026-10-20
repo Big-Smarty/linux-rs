@@ -208,7 +208,7 @@ impl PidTable {
         }
         self.entries[nr as usize] = Some(pid);
         self.allocated += 1;
-        Ok(i32::try_from(nr).map_err(|_| Errno::EAGAIN)?)
+        i32::try_from(nr).map_err(|_| Errno::EAGAIN)
     }
 
     /// `free_pid`: the number may be allocated again (after the cursor wraps).

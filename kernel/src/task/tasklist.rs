@@ -364,10 +364,10 @@ impl Tasklist {
         if id == self.init_pid {
             return;
         }
-        if self.pids.get(id).is_some_and(Pid::unused) {
-            if let Some(pid) = self.pids.remove(id) {
-                self.table.free(pid.nr);
-            }
+        if self.pids.get(id).is_some_and(Pid::unused)
+            && let Some(pid) = self.pids.remove(id)
+        {
+            self.table.free(pid.nr);
         }
     }
 

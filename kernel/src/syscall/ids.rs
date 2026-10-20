@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Selected semantics from Linux 6.18.57, commit
 // 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: kernel/sys.c (`getpriority`,
-// `getresuid`, `getresgid`, `gettid`, `getppid`, `getuid`..`getegid`,
-// `getpgid`, `getpgrp`, `getsid`, `newuname` with `override_release` and
+// `getresuid`, `getresgid`, `gettid`, `getuid`..`getegid`, `newuname` with `override_release` and
 // `override_architecture`, `do_prlimit`, `getrlimit`, `prlimit64`,
 // `setrlimit`, `umask`, `prctl`, `do_sysinfo`), kernel/groups.c (`getgroups`),
 // kernel/exec_domain.c (`personality`), kernel/fork.c (`set_tid_address`),
@@ -15,7 +14,7 @@
 // pid succeed only for the caller, credentials never change, and `prctl`
 // options Linux implements but this slice does not stop the kernel instead of
 // answering.
-//! Identity and process-attribute syscalls: ids, process-tree ids, `uname`,
+//! Identity and process-attribute syscalls: ids, `uname`,
 //! `arch_prctl`, resource limits, `umask`, CPU affinity, `sysinfo`,
 //! `personality`, the `prctl` options init uses and the pointers libc registers
 //! at startup (`set_tid_address`, `set_robust_list`).
@@ -67,15 +66,11 @@ fn uint(arg: u64) -> u32 {
 pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) -> Option<Outcome> {
     let [a0, a1, a2, a3, a4, _] = args;
     let result: Res = match sysno {
-        Sysno::getppid => Ok(i64::from(ctx.attrs().ppid)),
         Sysno::getuid => Ok(i64::from(ctx.attrs().cred.uid)),
         Sysno::geteuid => Ok(i64::from(ctx.attrs().cred.euid)),
         Sysno::getgid => Ok(i64::from(ctx.attrs().cred.gid)),
         Sysno::getegid => Ok(i64::from(ctx.attrs().cred.egid)),
         Sysno::gettid => Ok(i64::from(ctx.tid())),
-        Sysno::getpgrp => Ok(i64::from(ctx.attrs().pgid)),
-        Sysno::getpgid => find_task(ctx, int(a0)).map(|()| i64::from(ctx.attrs().pgid)),
-        Sysno::getsid => find_task(ctx, int(a0)).map(|()| i64::from(ctx.attrs().sid)),
         Sysno::getresuid => {
             let cred = ctx.attrs().cred;
             put_ids(ctx, [a0, a1, a2], [cred.uid, cred.euid, cred.suid])
@@ -118,13 +113,19 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
     }
 }
 
-/// `find_task_by_vpid`: with one task only the caller exists (`pid` is a
-/// `pid_t`; `0` callers handle themselves).
-fn find_task<C: Context>(ctx: &C, pid: i32) -> Result<(), Stop> {
-    if pid == 0 || u32::try_from(pid) == Ok(ctx.tid()) {
-        Ok(())
-    } else {
-        Err(Errno::ESRCH.into())
+/// `find_task_by_vpid`: `pid` is a `pid_t`, `0` callers handle themselves. The
+/// per-task attributes of any other task belong to that task, so a target
+/// other than the caller stops the kernel loudly instead of answering with the
+/// caller's.
+fn find_task<C: Context>(ctx: &mut C, pid: i32) -> Result<(), Stop> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let tasks = ctx.tasks();
+    match tasks.list.find_task_by_vpid(pid) {
+        None => Err(Errno::ESRCH.into()),
+        Some(task) if task == tasks.current => Ok(()),
+        Some(_) => Err(Stop::Unimplemented),
     }
 }
 
