@@ -723,6 +723,7 @@ const DEBUG_CASES: &[DebugCase] = &[
     oracle_case!(ids),
     oracle_case!(time),
     oracle_case!(fs),
+    oracle_case!(signal),
     // The signal smoke run on the other two clockevent paths: the PIT-only periodic timer (an
     // `ITIMER_REAL` wake-up served at tick granularity) and the KVM TSC-deadline timer.
     DebugCase {

@@ -65,7 +65,7 @@ use kernel::{
     },
     syscall::{
         self, AddressSpace, ClockState, Clocks, Console, Context, Files, Machine, Outcome,
-        RestartBlock, RestartFn,
+        RestartBlock,
     },
     task::{self, Attributes},
     usercopy::{self, UserPages},
@@ -458,8 +458,8 @@ pub struct Process {
     /// Load-average state at init start; `sysinfo` replays it to the boot
     /// clock ([`LoadAvg::loads_at`]), so there is no tick hook and no lock.
     pub load: LoadAvg,
-    /// `current->restart_block.nanosleep`, written by the sleeping syscalls.
-    #[allow(dead_code, reason = "read by restart_syscall (signal lane)")]
+    /// `current->restart_block.nanosleep`, written by the sleeping syscalls and
+    /// run by `restart_syscall`.
     pub restart: RestartBlock,
     /// The VMA set, program break and statistics (`mm_struct`); the page
     /// tables are behind `mm`. It reserves its `Vec` storage (heap) before any
@@ -554,20 +554,20 @@ struct Syscall<'a> {
 /// a private frame holding the file page ([`Vfs::fault_page`]; `SIGBUS` past
 /// `i_size`), mapped with the VMA's protection.
 fn user_fault(
-    process: &mut Process,
+    mm: &mut Mm,
+    env: &Env,
+    vfs: &mut Vfs,
     space: &mut UserSpace<'_>,
     address: u64,
     error: u64,
 ) -> FaultOutcome {
-    let outcome = process
-        .space
-        .handle_user_fault(&process.env, space, address, error);
+    let outcome = mm.handle_user_fault(env, space, address, error);
     let FaultOutcome::NeedsFile { address, .. } = outcome else {
         return outcome;
     };
     let page = address & !(PAGE - 1);
     // The model only reports `NeedsFile` for an address inside a file VMA.
-    let Some(vma) = process.space.find_vma(page).copied() else {
+    let Some(vma) = mm.find_vma(page).copied() else {
         crate::log!(
             "FAIL mm file fault outside any VMA address={:#x}\n",
             address
@@ -583,7 +583,7 @@ fn user_fault(
     };
     let mut bytes = [0u8; PAGE_BYTES];
     let pgoff = vma.pgoff + ((page - vma.start) >> 12);
-    match process.vfs.fault_page(file, pgoff, &mut bytes) {
+    match vfs.fault_page(file, pgoff, &mut bytes) {
         Err(FileFault::Bus) => FaultOutcome::Bus { address },
         Ok(()) => match space.install(page, mm::page_prot(vma.flags), &bytes) {
             Ok(()) => FaultOutcome::Handled,
@@ -592,28 +592,76 @@ fn user_fault(
     }
 }
 
-/// A kernel access to a user page that is not resident takes the fault Linux
-/// would: `exc_page_fault` -> `do_user_addr_fault` with the kernel-mode error
-/// code (no `X86_PF_USER`) on a user address. A fault the model resolves is
-/// retried (once: it must now succeed); any refusal is the exception-table
-/// fixup, i.e. a short copy and `-EFAULT`, with no signal (`__bad_area_nosemaphore`
-/// only signals in user mode; OOM, SIGBUS and the vsyscall page behave the
-/// same for a kernel-mode access).
-/// No lock is held across the fault that is not already held by the syscall
-/// (`PROCESS`, `TABLES`): the handler takes neither again and only `FRAMES`
-/// (a leaf) below them.
-impl UserPages for Syscall<'_> {
-    fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+/// The user-memory view of the kernel: a kernel access to a user page that is
+/// not resident takes the fault Linux would, `exc_page_fault` ->
+/// `do_user_addr_fault` with the kernel-mode error code (no `X86_PF_USER`) on a
+/// user address. A fault the model resolves is retried (once: it must now
+/// succeed); any refusal is the exception-table fixup, i.e. a short copy and
+/// `-EFAULT`, with no signal (`__bad_area_nosemaphore` only signals in user
+/// mode; OOM, SIGBUS and the vsyscall page behave the same for a kernel-mode
+/// access). No lock is held across the fault that is not already held by the
+/// syscall (`PROCESS`, `TABLES`): the handler takes neither again and only
+/// `FRAMES` (a leaf) below them.
+///
+/// It borrows the fields of [`Process`] the fault needs, so the signal code
+/// (frame writes, `rt_sigreturn`, the signal syscalls) can hold it next to
+/// `&mut process.signal`; [`Syscall`]'s own [`UserPages`] is the same view.
+struct FaultPages<'a, 'b> {
+    mm: &'a mut Mm,
+    env: &'a Env,
+    vfs: &'a mut Vfs,
+    space: &'a mut UserSpace<'b>,
+}
+
+impl<'a, 'b> FaultPages<'a, 'b> {
+    fn of(process: &'a mut Process, space: &'a mut UserSpace<'b>) -> (&'a mut State, Self) {
+        (
+            &mut *process.signal,
+            Self {
+                mm: &mut process.space,
+                env: &process.env,
+                vfs: &mut process.vfs,
+                space,
+            },
+        )
+    }
+
+    /// `page` by value: the returned borrow lives as long as the view's.
+    fn into_page(self, page: u64, write: bool) -> Option<&'a mut [u8; PAGE_BYTES]> {
         if !self.space.resident(page, write) {
             // Present-but-read-only (write) is `X86_PF_PROT`, an absent page is
             // not; the model's decision does not depend on it for a write.
             let error = if write { PF_WRITE } else { 0 };
-            match user_fault(&mut *self.process, &mut self.space, page, error) {
+            match user_fault(self.mm, self.env, self.vfs, self.space, page, error) {
                 FaultOutcome::Handled => {}
                 _ => return None,
             }
         }
         self.space.page(page, write)
+    }
+}
+
+impl UserPages for FaultPages<'_, '_> {
+    fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+        FaultPages {
+            mm: &mut *self.mm,
+            env: self.env,
+            vfs: &mut *self.vfs,
+            space: &mut *self.space,
+        }
+        .into_page(page, write)
+    }
+}
+
+impl UserPages for Syscall<'_> {
+    fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+        FaultPages {
+            mm: &mut self.process.space,
+            env: &self.process.env,
+            vfs: &mut self.process.vfs,
+            space: &mut self.space,
+        }
+        .into_page(page, write)
     }
 }
 
@@ -686,6 +734,9 @@ impl Clocks for Syscall<'_> {
     fn set_restart_block(&mut self, block: RestartBlock) {
         self.process.restart = block;
     }
+    fn restart_block(&self) -> RestartBlock {
+        self.process.restart
+    }
     fn cpu_sample(&self) -> CpuSample {
         CPUTIME.sample(timer::ktime_get_ns())
     }
@@ -693,12 +744,8 @@ impl Clocks for Syscall<'_> {
         CPUTIME.adjusted(timer::ktime_get_ns())
     }
     fn sleep_until(&mut self, deadline_ns: u64) -> Option<u64> {
-        // The task leaves the CPU for the wait (`schedule()`): the halted CPU is
-        // idle time, not the task's. Nothing can interrupt the wait yet (no signals).
-        CPUTIME.sleep_begin(timer::ktime_get_ns());
-        timer::wait_until_ns(deadline_ns);
-        CPUTIME.sleep_end(timer::ktime_get_ns());
-        None
+        // `do_nanosleep`: asleep until the deadline or a pending signal.
+        signal::wait::sleep_until(self, deadline_ns)
     }
     // shortcut: init is root with every capability; credentials come with the
     // ids/capability work, which replaces these two with `capable(...)`.
@@ -715,33 +762,39 @@ impl Clocks for Syscall<'_> {
 
 impl<'a> signal::Task for Syscall<'a> {
     type Pages<'b>
-        = &'b mut UserSpace<'a>
+        = FaultPages<'b, 'a>
     where
         Self: 'b;
     fn state(&mut self) -> &mut State {
         &mut self.process.signal
     }
-    fn parts(&mut self) -> (&mut State, &mut UserSpace<'a>) {
-        (&mut self.process.signal, &mut self.space)
+    fn parts(&mut self) -> (&mut State, FaultPages<'_, 'a>) {
+        FaultPages::of(self.process, &mut self.space)
     }
     fn now_ns(&self) -> u64 {
         timer::ktime_get_ns()
     }
     fn wait(&mut self, deadline_ns: Option<u64>) {
+        // The task leaves the CPU for the wait (`schedule()`): the halted CPU is
+        // idle time, not the task's.
+        CPUTIME.sleep_begin(timer::ktime_get_ns());
         // The interval timer is a wake-up source of every sleep.
         timer::set_itimer_ns(self.process.signal.itimer.next_event());
         timer::wait_event(deadline_ns);
+        CPUTIME.sleep_end(timer::ktime_get_ns());
     }
     fn user_sp(&self) -> u64 {
         self.regs.sp
     }
     fn rt_sigreturn(&mut self) -> Sigreturn {
-        let result = signal::frame::rt_sigreturn(
-            &mut self.process.signal,
-            self.regs,
-            &mut self.space,
-            &mut cpu::UserCpu::new(),
-        );
+        let (state, mut pages) = FaultPages::of(self.process, &mut self.space);
+        let result =
+            signal::frame::rt_sigreturn(state, self.regs, &mut pages, &mut cpu::UserCpu::new());
+        // `restore_sigcontext`: a pending restarted system call now returns -EINTR.
+        // shortcut: reset even when the frame was unreadable before that point
+        // (Linux then resets nothing); only a hand-made `restart_syscall` after
+        // a refused frame can tell.
+        self.process.restart = RestartBlock::NONE;
         if result.bad_frame {
             // `signal_fault`: printed before the SIGSEGV is forced; `regs` are
             // whatever the failed `restore_sigcontext` left, as in Linux.
@@ -851,12 +904,9 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
             let mm = process.mm;
             let mut tables = mm.lock();
             let mut space = tables.user_space();
-            let outcome = deliver::handle_pending_signals(
-                &mut process.signal,
-                regs,
-                &mut space,
-                &mut cpu::UserCpu::new(),
-            );
+            let (state, mut pages) = FaultPages::of(&mut process, &mut space);
+            let outcome =
+                deliver::handle_pending_signals(state, regs, &mut pages, &mut cpu::UserCpu::new());
             drop(tables);
             match outcome {
                 // `handle_pending_signals` loops while a forced SIGSEGV is pending.
@@ -870,13 +920,6 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
                     crate::fail();
                 }
             }
-        }
-        // A return frame the CPU would refuse in ring 0 (a hostile `rt_sigreturn`
-        // frame or handler address): Linux's `.Lbad_iret` turns that into a user
-        // #GP, and so does this.
-        if let Some(error) = bad_iret_error(regs) {
-            raise_fault(&mut process, regs, 13, error);
-            continue;
         }
         // Wake the CPU for the next interval-timer expiry while ring 3 runs.
         let expiry = process.signal.itimer.next_event();
@@ -1076,7 +1119,14 @@ fn page_fault(process: &mut Process, regs: &cpu::PtRegs, error: u64, address: u6
     let (ip, mm) = (regs.ip, process.mm);
     let mut tables = mm.lock();
     let mut space = tables.user_space();
-    let outcome = user_fault(process, &mut space, address, error | mm::PF_USER);
+    let outcome = user_fault(
+        &mut process.space,
+        &process.env,
+        &mut process.vfs,
+        &mut space,
+        address,
+        error | mm::PF_USER,
+    );
     drop(tables);
     let kind = match outcome {
         FaultOutcome::Handled => {
@@ -1312,9 +1362,12 @@ fn check_mm_usercopy() {
     let mut tables = mm.lock();
     let data_frames = |tables: &Tables| services::FRAMES.lock().allocated() - tables.pages;
     let (frames0, vm0) = (data_frames(&tables), guard.space.total_vm);
+    // The self-test makes its calls from the kernel: no entry registers.
+    let mut regs = cpu::PtRegs::default();
     let mut context = Syscall {
         space: tables.user_space(),
         process: &mut guard,
+        regs: &mut regs,
         tty: Tty,
     };
     let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -1570,12 +1623,7 @@ fn start(mut init: Loaded) -> ! {
         mm: &services::TABLES,
         attrs,
         load,
-        restart: RestartBlock {
-            func: RestartFn::None,
-            clockid: 0,
-            expires_ns: 0,
-            rmtp: 0,
-        },
+        restart: RestartBlock::NONE,
         space: init.mm,
         env: init.env,
         exec: u64::from(init.exec.index()),
