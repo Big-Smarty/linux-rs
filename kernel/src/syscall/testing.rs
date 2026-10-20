@@ -4,7 +4,7 @@
 
 use super::{
     Console, Context, Machine,
-    time::{ClockState, Clocks},
+    time::{ClockState, Clocks, RestartBlock},
 };
 use crate::{
     cputime::CpuSample,
@@ -33,8 +33,10 @@ pub struct FakeClocks {
     pub interrupt: Option<u64>,
     /// Deadlines passed to `sleep_until`.
     pub slept: Vec<u64>,
-    /// Offsets passed to `set_real_offset_ns`.
+    /// Offsets passed to `set_realtime`.
     pub set: Vec<i64>,
+    /// Every `restart_block` store, in order.
+    pub restarts: Vec<RestartBlock>,
 }
 
 impl Default for FakeClocks {
@@ -44,6 +46,7 @@ impl Default for FakeClocks {
                 mono_ns: 5_123_456_789,
                 boot_offset_ns: 0,
                 real_offset_ns: 1_800_000_000_000_000_000,
+                settod_real_ns: 0,
             },
             sample: CpuSample {
                 runtime_ns: 3_000_000,
@@ -56,6 +59,7 @@ impl Default for FakeClocks {
             interrupt: None,
             slept: Vec::new(),
             set: Vec::new(),
+            restarts: Vec::new(),
         }
     }
 }
@@ -140,9 +144,13 @@ impl<P, C> Clocks for Task<P, C> {
     fn clock_state(&self) -> ClockState {
         self.clocks.state
     }
-    fn set_real_offset_ns(&mut self, offset: i64) {
+    fn set_realtime(&mut self, offset: i64, real_ns: i64) {
         self.clocks.set.push(offset);
         self.clocks.state.real_offset_ns = offset;
+        self.clocks.state.settod_real_ns = real_ns;
+    }
+    fn set_restart_block(&mut self, block: RestartBlock) {
+        self.clocks.restarts.push(block);
     }
     fn cpu_sample(&self) -> CpuSample {
         self.clocks.sample

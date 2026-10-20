@@ -118,6 +118,7 @@ static CLOCK_MUL: AtomicU64 = AtomicU64::new(0);
 static CLOCK_SHIFT: AtomicU64 = AtomicU64::new(0);
 static CLOCK_OFFSET: AtomicU64 = AtomicU64::new(0);
 static CLOCK_REAL_OFFSET: AtomicI64 = AtomicI64::new(0);
+static CLOCK_SETTOD_REAL: AtomicI64 = AtomicI64::new(0);
 
 fn clock_publish(clock: &Clock) {
     let scale = clock.scale();
@@ -126,6 +127,7 @@ fn clock_publish(clock: &Clock) {
     CLOCK_SHIFT.store(u64::from(scale.shift), Ordering::Relaxed);
     CLOCK_OFFSET.store(scale.offset, Ordering::Relaxed);
     CLOCK_REAL_OFFSET.store(clock.real_offset_ns(), Ordering::Relaxed);
+    CLOCK_SETTOD_REAL.store(clock.settod_real_ns(), Ordering::Relaxed);
     CLOCK_SEQ.fetch_add(1, Ordering::Release);
 }
 fn clock_load() -> Clock {
@@ -141,9 +143,10 @@ fn clock_load() -> Clock {
             offset: CLOCK_OFFSET.load(Ordering::Relaxed),
         };
         let real_offset = CLOCK_REAL_OFFSET.load(Ordering::Relaxed);
+        let settod = CLOCK_SETTOD_REAL.load(Ordering::Relaxed);
         fence(Ordering::Acquire);
         if CLOCK_SEQ.load(Ordering::Relaxed) == before {
-            return Clock::from_parts(scale, real_offset);
+            return Clock::from_parts(scale, real_offset, settod);
         }
     }
 }
@@ -173,16 +176,20 @@ pub fn clock_state() -> kernel::syscall::ClockState {
         // No suspend: `CLOCK_BOOTTIME` is `CLOCK_MONOTONIC`.
         boot_offset_ns: 0,
         real_offset_ns: clock.real_offset_ns(),
+        settod_real_ns: clock.settod_real_ns(),
     }
 }
-/// `do_settimeofday64`'s store: replace the realtime offset.
+/// `do_settimeofday64`'s store: replace the realtime offset and record the
+/// value that was set (`xtime`, which the coarse readers return until a tick).
 ///
 /// Context: task context with IF clear (the syscall entry masks it), BSP. The
 /// sequence-counted clock has one writer; an interrupt arriving mid-write on
 /// this CPU would spin on the odd sequence forever, hence IF must be clear.
-pub fn set_real_offset_ns(offset: i64) {
+/// Takes no lock itself; it runs under the `PROCESS` lock like the syscall.
+pub fn set_realtime(offset: i64, real_ns: i64) {
+    debug_assert!(!cpu::interrupts_enabled(), "clock writer needs IF clear");
     let mut clock = clock_load();
-    clock.set_real_offset_ns(offset);
+    clock.set_realtime(offset, real_ns);
     clock_publish(&clock);
 }
 /// Whether the CMOS RTC answered at boot: the wakeup-capable RTC that

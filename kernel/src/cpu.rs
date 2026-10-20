@@ -194,7 +194,8 @@ pub fn mmio_pat_index() -> u8 {
 
 static IRQ_NESTING: AtomicU64 = AtomicU64::new(0);
 
-fn interrupts_enabled() -> bool {
+/// `RFLAGS.IF` of the calling CPU (`irqs_disabled()` is its negation).
+pub fn interrupts_enabled() -> bool {
     let flags: u64;
     // SAFETY: CPL0, owned mapped stack with no red zone. PUSHFQ/POP balance the
     // stack and only read flags. Omit nomem to retain the compiler boundary.

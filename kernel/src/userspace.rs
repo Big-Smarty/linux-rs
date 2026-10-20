@@ -46,7 +46,9 @@ use kernel::{
     },
     image::{cpio::FileType, elf::Elf},
     loadavg::LoadAvg,
-    syscall::{self, ClockState, Clocks, Console, Context, Machine, Outcome},
+    syscall::{
+        self, ClockState, Clocks, Console, Context, Machine, Outcome, RestartBlock, RestartFn,
+    },
     task::{self, Attributes},
     usercopy::{self, UserPages},
 };
@@ -360,7 +362,8 @@ fn load_init(
 /// groups extend it (file table, credentials, signals, ...); exactly one is
 /// reachable until tasks exist.
 ///
-/// Lock order: `PROCESS` -> `TABLES` -> heap -> `FRAMES` (`services`). The
+/// Lock order: `PROCESS` -> `TABLES` -> heap -> `FRAMES` (`services`), and
+/// `PROCESS` -> `TIMER_HW` (a leaf, taken by `sleep_until`'s timer wait). The
 /// handler holds `PROCESS` for the whole syscall (a single task cannot
 /// re-enter), so a field needs no lock of its own.
 pub struct Process {
@@ -384,6 +387,9 @@ pub struct Process {
     /// Load-average state at init start; `sysinfo` replays it to the boot
     /// clock ([`LoadAvg::loads_at`]), so there is no tick hook and no lock.
     pub load: LoadAvg,
+    /// `current->restart_block.nanosleep`, written by the sleeping syscalls.
+    #[allow(dead_code, reason = "read by restart_syscall (signal lane)")]
+    pub restart: RestartBlock,
 }
 
 static PROCESS: Service<Process> = Service::new();
@@ -492,9 +498,12 @@ impl Clocks for Syscall<'_> {
     fn clock_state(&self) -> ClockState {
         timer::clock_state()
     }
-    fn set_real_offset_ns(&mut self, offset: i64) {
+    fn set_realtime(&mut self, offset: i64, real_ns: i64) {
         // IF is clear for the whole syscall (SYSCALL_MASK), the clock's writer rule.
-        timer::set_real_offset_ns(offset);
+        timer::set_realtime(offset, real_ns);
+    }
+    fn set_restart_block(&mut self, block: RestartBlock) {
+        self.process.restart = block;
     }
     fn cpu_sample(&self) -> CpuSample {
         CPUTIME.sample(timer::ktime_get_ns())
@@ -766,6 +775,12 @@ fn start(init: &Loaded) -> ! {
         brk: init.brk,
         attrs: Attributes::init(task::max_threads(managed_pages)),
         load,
+        restart: RestartBlock {
+            func: RestartFn::None,
+            clockid: 0,
+            expires_ns: 0,
+            rmtp: 0,
+        },
     });
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all

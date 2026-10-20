@@ -388,11 +388,15 @@ impl Timespec {
 /// Linux before the first suspend. `real_offset_ns` is `CLOCK_REALTIME` minus
 /// `CLOCK_MONOTONIC` (Linux's negated `wall_to_monotonic`): the CMOS time at
 /// the instant monotonic time was zero (`timekeeping_init`), changed only by
-/// `clock_settime(CLOCK_REALTIME)` (`do_settimeofday64`).
+/// `clock_settime(CLOCK_REALTIME)` (`do_settimeofday64`). `settod_real_ns` is the
+/// time that last call stored (0 before any): `xtime` is exactly that value
+/// until the next tick republishes it, so the coarse realtime view never reads
+/// below it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clock {
     scale: Cyc2Ns,
     real_offset_ns: i64,
+    settod_real_ns: i64,
 }
 
 impl Clock {
@@ -402,23 +406,31 @@ impl Clock {
         Self {
             scale: Cyc2Ns::new(tsc_khz, tsc_now, 0),
             real_offset_ns: epoch_real_sec.saturating_mul(NSEC_PER_SEC as i64),
+            settod_real_ns: 0,
         }
     }
     /// Rebuild a clock from stored parts.
     #[must_use]
-    pub fn from_parts(scale: Cyc2Ns, real_offset_ns: i64) -> Self {
+    pub fn from_parts(scale: Cyc2Ns, real_offset_ns: i64, settod_real_ns: i64) -> Self {
         Self {
             scale,
             real_offset_ns,
+            settod_real_ns,
         }
     }
     #[must_use]
     pub fn real_offset_ns(&self) -> i64 {
         self.real_offset_ns
     }
-    /// Replace the realtime offset (`tk_set_wall_to_mono` + `tk_set_xtime`).
-    pub fn set_real_offset_ns(&mut self, real_offset_ns: i64) {
+    #[must_use]
+    pub fn settod_real_ns(&self) -> i64 {
+        self.settod_real_ns
+    }
+    /// `do_settimeofday64`'s store (`tk_set_wall_to_mono` + `tk_set_xtime`):
+    /// the new offset and the realtime value (`xtime`) that was set.
+    pub fn set_realtime(&mut self, real_offset_ns: i64, settod_real_ns: i64) {
         self.real_offset_ns = real_offset_ns;
+        self.settod_real_ns = settod_real_ns;
     }
     /// Change the TSC frequency without a discontinuity at `tsc_now`.
     pub fn rescale(&mut self, tsc_khz: u32, tsc_now: u64) {
@@ -485,8 +497,9 @@ mod tests {
     fn set_real_offset_moves_realtime_only() {
         let mut c = Clock::new(2_000_000, 500, 1_000);
         let mono = c.monotonic_ns(500 + 4_000_000_000);
-        c.set_real_offset_ns(-5 + 7_000_000_000);
+        c.set_realtime(-5 + 7_000_000_000, 11_000_000_000);
         assert_eq!(c.real_offset_ns(), 6_999_999_995);
+        assert_eq!(c.settod_real_ns(), 11_000_000_000);
         assert_eq!(c.monotonic_ns(500 + 4_000_000_000), mono);
         assert_eq!(c.boottime_ns(500 + 4_000_000_000), mono);
         assert_eq!(

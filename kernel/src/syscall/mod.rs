@@ -38,7 +38,7 @@ use syscalls::{Errno, Sysno};
 
 pub use io::{MAX_RW_COUNT, TTY_CHUNK};
 pub use process::exit_code;
-pub use time::{ClockState, Clocks, Kclock, clockid_to_kclock};
+pub use time::{ClockState, Clocks, Kclock, RestartBlock, RestartFn, clockid_to_kclock};
 
 /// `Sysno` values the `syscalls` crate lists for `x86_64` that the pinned
 /// 6.18.57 `syscall_64.tbl` leaves without an entry point or maps to

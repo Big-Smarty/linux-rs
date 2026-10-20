@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Selected semantics from Linux 6.18.57, commit
 // 2ff600d29ee478d0a8d46ef8a58afb5e038fe692 (all GPL-2.0-only):
-// kernel/time/posix-timers.c (`clockid_to_kclock` l.1519-1532, the `k_clock`
-// tables l.1424-1517, `clock_settime`/`clock_gettime`/`clock_getres`/
+// kernel/time/posix-timers.c (`clockid_to_kclock` l.1535-1547, the `k_clock`
+// tables l.1433-1531, `clock_settime`/`clock_gettime`/`clock_getres`/
 // `clock_nanosleep` l.1117-1273 and l.1377-1403, `common_nsleep*`),
-// kernel/time/posix-cpu-timers.c (`pid_for_clock` l.55-93,
+// kernel/time/posix-cpu-timers.c (`pid_for_clock` l.57-95,
 // `posix_cpu_clock_getres/_set/_get`, `posix_cpu_nsleep`, `clock_process`,
 // `clock_thread`), kernel/time/posix-clock.c (`clock_posix_dynamic`),
 // kernel/time/alarmtimer.c (`alarm_clock`, `alarm_timer_nsleep`,
@@ -41,9 +41,13 @@ every range is bounded by `timespec64_valid*` or `KTIME_MAX` at the call site"
 //! sleep. This file then follows `do_nanosleep`/`hrtimer_nanosleep`: it writes
 //! the remaining time to `rem_out` (relative sleeps only) and returns
 //! `-ERESTART_RESTARTBLOCK` (516) or, for absolute sleeps, `-ERESTARTNOHAND`
-//! (514). The signal lane must (a) make `sleep_until` return `Some`, (b) store
-//! the `restart_block` (`clockid`, absolute `expires`) so `restart_syscall`
-//! (219) can resume with `deadline = expires`, and (c) translate 514/516 into
+//! (514). The `restart_block` is recorded through [`Clocks::set_restart_block`]:
+//! `do_no_restart_syscall` with the `rmtp` pointer when a sleep starts, and the
+//! restart function, `clockid` and absolute `expires` (the hard expiry, i.e.
+//! including `timer_slack_ns` for hrtimer sleeps) when it is interrupted, so
+//! `restart_syscall` (219) can resume with `deadline = expires`. The signal lane
+//! must (a) make `sleep_until` return `Some(expires - now)`, (b) implement
+//! `restart_syscall` over the stored block, and (c) translate 514/516 into
 //! `EINTR`/restart at signal delivery. Today nothing interrupts a sleep, so no
 //! check depends on it.
 
@@ -69,6 +73,8 @@ const ERESTARTNOHAND: i64 = 514;
 const ERESTART_RESTARTBLOCK: i64 = 516;
 /// `USER_HZ`: the unit of `times(2)`.
 const USER_HZ: u64 = 100;
+/// `init_task.timer_slack_ns`: the hrtimer range of a normal task.
+const TIMER_SLACK_NS: i128 = 50_000;
 /// `INITIAL_JIFFIES = (unsigned long)(unsigned int)(-300 * HZ)`.
 const INITIAL_JIFFIES: u64 = (-300i64 * HZ as i64) as u32 as u64;
 
@@ -81,6 +87,34 @@ pub struct ClockState {
     pub boot_offset_ns: u64,
     /// `CLOCK_REALTIME - CLOCK_MONOTONIC` (`-wall_to_monotonic`).
     pub real_offset_ns: i64,
+    /// The realtime that the last `clock_settime(CLOCK_REALTIME)` stored, 0
+    /// before any: `xtime` equals it until the next tick, so the coarse
+    /// realtime readers (`time`, `CLOCK_REALTIME_COARSE`) never read below it.
+    pub settod_real_ns: i64,
+}
+
+/// Which `restart_block.fn` is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartFn {
+    /// `do_no_restart_syscall`: `restart_syscall` fails with `EINTR`.
+    None,
+    /// `hrtimer_nanosleep_restart`.
+    Hrtimer,
+    /// `alarm_timer_nsleep_restart`.
+    Alarm,
+}
+
+/// The `restart_block.nanosleep` fields `nanosleep`/`clock_nanosleep` fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestartBlock {
+    pub func: RestartFn,
+    /// `hrtimer` base clock id (a relative `CLOCK_REALTIME` sleep is on
+    /// `CLOCK_MONOTONIC`), or the `alarmtimer_type` for [`RestartFn::Alarm`].
+    pub clockid: i32,
+    /// Absolute expiry on that base, in ns.
+    pub expires_ns: i64,
+    /// `rmtp` user pointer, 0 for `TT_NONE`.
+    pub rmtp: u64,
 }
 
 /// What the time syscalls need beyond user memory; the binary implements it
@@ -88,7 +122,10 @@ pub struct ClockState {
 pub trait Clocks {
     fn clock_state(&self) -> ClockState;
     /// Install a new realtime offset (`do_settimeofday64`). Interrupts are off.
-    fn set_real_offset_ns(&mut self, offset: i64);
+    /// `real_ns` is the time that was set (`tk_set_xtime`).
+    fn set_realtime(&mut self, offset: i64, real_ns: i64);
+    /// Store `current->restart_block` for `restart_syscall` (see the seam notes).
+    fn set_restart_block(&mut self, block: RestartBlock);
     /// `CPUCLOCK_SCHED`/`VIRT`/`PROF` inputs of the (only) task.
     fn cpu_sample(&self) -> crate::cputime::CpuSample;
     /// `thread_group_cputime_adjusted`: `(utime, stime)` in ns for `times(2)`.
@@ -261,6 +298,13 @@ impl Now {
     fn coarse_mono(&self) -> i128 {
         self.mono() - self.mono() % i128::from(TICK_NSEC)
     }
+    /// `ktime_get_coarse_real_ts64`: the tick view plus the offset, but right
+    /// after `clock_settime` the exact value that was set (`xtime`) until the
+    /// next tick passes it; later ticks are always above it.
+    fn coarse_real(&self) -> i128 {
+        (self.coarse_mono() + i128::from(self.state.real_offset_ns))
+            .max(i128::from(self.state.settod_real_ns))
+    }
 }
 
 /// The `clock_get_timespec` method, as nanoseconds.
@@ -272,7 +316,7 @@ fn clock_get<C: Context>(ctx: &C, kclock: Kclock, id: i32) -> Result<i128, Errno
         Kclock::Realtime | Kclock::Tai => now.real(), // tai_offset is 0
         Kclock::Monotonic | Kclock::MonotonicRaw => now.mono(),
         Kclock::Boottime => now.boot(),
-        Kclock::RealtimeCoarse => now.coarse_mono() + i128::from(now.state.real_offset_ns),
+        Kclock::RealtimeCoarse => now.coarse_real(),
         Kclock::MonotonicCoarse => now.coarse_mono(),
         Kclock::RealtimeAlarm | Kclock::BoottimeAlarm => {
             if !ctx.alarm_rtc() {
@@ -366,7 +410,10 @@ fn set_realtime<C: Context>(ctx: &mut C, ts: Ts) -> i64 {
         return error(Errno::EINVAL);
     }
     // `valid_settod` bounds `new` below 8.3e18 < i64::MAX.
-    ctx.set_real_offset_ns(i64::try_from(new).unwrap_or(i64::MAX));
+    ctx.set_realtime(
+        i64::try_from(new).unwrap_or(i64::MAX),
+        i64::try_from(to_ktime(ts)).unwrap_or(i64::MAX),
+    );
     0
 }
 
@@ -416,27 +463,63 @@ fn sleeper(kclock: Kclock) -> Option<Sleeper> {
     }
 }
 
+/// `ktime_add_safe`: saturates at `KTIME_MAX`.
+fn add_safe(a: i128, b: i128) -> i128 {
+    (a + b).min(KTIME_MAX)
+}
+
+/// How an interrupted relative sleep is resumed: `restart_block` minus `rmtp`.
+#[derive(Clone, Copy)]
+struct Resume {
+    func: RestartFn,
+    clockid: i32,
+    expires_ns: i128,
+}
+
 /// `do_nanosleep`'s tail: sleep to `deadline_ns` (monotonic), report the
 /// remaining time through `rem_out` and the restart code on interruption.
-fn sleep_to<C: Context>(ctx: &mut C, deadline_ns: i128, rem_out: Option<u64>, abs: bool) -> i64 {
+fn sleep_to<C: Context>(
+    ctx: &mut C,
+    deadline_ns: i128,
+    rem_out: Option<u64>,
+    abs: bool,
+    resume: Resume,
+) -> i64 {
     let deadline = u64::try_from(deadline_ns.clamp(0, KTIME_MAX)).unwrap_or(0);
     let Some(remaining) = ctx.sleep_until(deadline) else {
         return 0;
     };
-    let code = if let Some(rem_out) = rem_out {
+    if let Some(rem_out) = rem_out {
         if remaining == 0 {
             return 0;
         }
         if let Err(errno) = write_timespec(ctx, rem_out, i128::from(remaining)) {
             return error(errno);
         }
-        -ERESTART_RESTARTBLOCK
-    } else {
-        -ERESTART_RESTARTBLOCK
-    };
+    }
     // `hrtimer_nanosleep`/`alarm_timer_nsleep`: absolute sleeps neither report
-    // the remaining time nor restart.
-    if abs { -ERESTARTNOHAND } else { code }
+    // the remaining time nor restart; relative ones install the restart block.
+    if abs {
+        return -ERESTARTNOHAND;
+    }
+    ctx.set_restart_block(RestartBlock {
+        func: resume.func,
+        clockid: resume.clockid,
+        expires_ns: i64::try_from(resume.expires_ns.clamp(0, KTIME_MAX)).unwrap_or(i64::MAX),
+        rmtp: rem_out.unwrap_or(0),
+    });
+    -ERESTART_RESTARTBLOCK
+}
+
+/// `current->restart_block.fn = do_no_restart_syscall` plus the `rmtp` fields,
+/// as `nanosleep` and `clock_nanosleep` do before sleeping.
+fn begin_sleep<C: Context>(ctx: &mut C, rem_out: Option<u64>) {
+    ctx.set_restart_block(RestartBlock {
+        func: RestartFn::None,
+        clockid: 0,
+        expires_ns: 0,
+        rmtp: rem_out.unwrap_or(0),
+    });
 }
 
 /// `sys_clock_nanosleep`. `Err(Never)` marks the CPU-clock wait this slice does
@@ -464,21 +547,39 @@ fn clock_nanosleep<C: Context>(
     let abs = flags & TIMER_ABSTIME != 0;
     // `if (flags & TIMER_ABSTIME) rem_out = NULL;`
     let rem_out = (!abs && rem_out != 0).then_some(rem_out);
+    begin_sleep(ctx, rem_out);
     let now = Now {
         state: ctx.clock_state(),
     };
     let request = to_ktime(ts);
+    // Absolute: translate the clock's time to monotonic (`timens_ktime_to_host`
+    // is the identity); relative: `now + request` on the clock's base is the
+    // same monotonic distance.
+    let deadline = if abs {
+        request - (now.clock_of(kclock) - now.mono())
+    } else {
+        add_safe(now.mono(), request)
+    };
     match sleeper {
         Sleeper::Hrtimer => {
-            // Relative: `now + request` on the clock's base is the same
-            // monotonic distance; absolute: translate the clock's time to
-            // monotonic (`timens_ktime_to_host` is the identity).
-            let deadline = if abs {
-                request - (now.clock_of(kclock) - now.mono())
+            // `hrtimer_nanosleep`: a relative `CLOCK_REALTIME` timer is moved
+            // to the monotonic base; the restart expiry is the hard expiry,
+            // `now + request + timer_slack_ns` on the timer's base.
+            let base = if kclock == Kclock::Realtime {
+                Kclock::Monotonic
             } else {
-                now.mono().saturating_add(request)
+                kclock
             };
-            Ok(sleep_to(ctx, deadline, rem_out, abs))
+            let resume = Resume {
+                func: RestartFn::Hrtimer,
+                clockid: match base {
+                    Kclock::Monotonic => 1,
+                    Kclock::Boottime => 7,
+                    _ => 11,
+                },
+                expires_ns: add_safe(add_safe(now.clock_of(base), request), TIMER_SLACK_NS),
+            };
+            Ok(sleep_to(ctx, deadline, rem_out, abs, resume))
         }
         Sleeper::Alarm => {
             if !ctx.alarm_rtc() {
@@ -493,12 +594,12 @@ fn clock_nanosleep<C: Context>(
             // shortcut: without suspend an alarm timer fires exactly when the
             // hrtimer on the same base would; the RTC wakeup is never armed.
             // Replace with a real `alarm_start` when suspend-to-RAM exists.
-            let deadline = if abs {
-                request - (now.clock_of(kclock) - now.mono())
-            } else {
-                now.mono().saturating_add(request)
+            let resume = Resume {
+                func: RestartFn::Alarm,
+                clockid: i32::from(kclock == Kclock::BoottimeAlarm),
+                expires_ns: add_safe(now.clock_of(kclock), request),
             };
-            Ok(sleep_to(ctx, deadline, rem_out, abs))
+            Ok(sleep_to(ctx, deadline, rem_out, abs, resume))
         }
         Sleeper::Cpu => {
             // `posix_cpu_nsleep`: a per-thread clock naming the caller's own
@@ -514,6 +615,13 @@ fn clock_nanosleep<C: Context>(
                 if let Err(errno) = cpu_clock_valid(ctx, id) {
                     return Ok(error(errno));
                 }
+            }
+            // `posix_cpu_timer_set` arms nothing for a zero expiry and fires at
+            // once for an absolute one that is not in the future, so
+            // `do_cpu_nanosleep` returns 0 without waiting.
+            let cpu_now = clock_get(ctx, kclock, id).unwrap_or(0);
+            if request == 0 || (abs && request <= cpu_now) {
+                return Ok(0);
             }
             // The wait itself (a timer on the caller's own CPU time can only
             // fire while it runs) needs signals/threads to be observable; it is
@@ -542,8 +650,16 @@ fn nanosleep<C: Context>(ctx: &mut C, sleep_req: u64, rem_out: u64) -> i64 {
     if !valid(ts) {
         return error(Errno::EINVAL);
     }
-    let deadline = i128::from(ctx.clock_state().mono_ns).saturating_add(to_ktime(ts));
-    sleep_to(ctx, deadline, (rem_out != 0).then_some(rem_out), false)
+    let rem_out = (rem_out != 0).then_some(rem_out);
+    begin_sleep(ctx, rem_out);
+    let mono = i128::from(ctx.clock_state().mono_ns);
+    let request = to_ktime(ts);
+    let resume = Resume {
+        func: RestartFn::Hrtimer,
+        clockid: 1,
+        expires_ns: add_safe(add_safe(mono, request), TIMER_SLACK_NS),
+    };
+    sleep_to(ctx, add_safe(mono, request), rem_out, false, resume)
 }
 
 fn gettimeofday<C: Context>(ctx: &mut C, tv: u64, tz: u64) -> i64 {
@@ -567,10 +683,11 @@ fn gettimeofday<C: Context>(ctx: &mut C, tv: u64, tz: u64) -> i64 {
 }
 
 fn time<C: Context>(ctx: &mut C, tloc: u64) -> i64 {
-    let state = ctx.clock_state();
-    let now = Now { state };
+    let now = Now {
+        state: ctx.clock_state(),
+    };
     // `ktime_get_real_seconds` is the tick-published `xtime_sec`.
-    let seconds = (now.coarse_mono() + i128::from(state.real_offset_ns)).div_euclid(NS) as i64;
+    let seconds = now.coarse_real().div_euclid(NS) as i64;
     if tloc != 0
         && let Err(errno) = put_i64(ctx, tloc, seconds)
     {
@@ -957,6 +1074,40 @@ mod tests {
             call(&mut t, Sysno::clock_nanosleep, [other, 0, BUF, 0]),
             Outcome::Unimplemented(number)
         );
+        // Requests Linux answers at once: a zero expiry arms nothing, and an
+        // absolute one that is not in the future fires immediately
+        // (`posix_cpu_timer_set`). The fake process clock reads 3_000_000 ns,
+        // the virtual clock (`which` 1) 2_000_000 ns.
+        let virt = arg(cpu_clock(1, 1, false));
+        for (clock, flags, ts) in [
+            (2, 0, (0, 0)),
+            (other, 0, (0, 0)),
+            (2, 1, (0, 0)),
+            (2, 1, (0, 3_000_000)),
+            (2, 1, (0, 1)),
+            (virt, 1, (0, 2_000_000)),
+        ] {
+            put(&mut t, BUF, ts.0, ts.1);
+            assert_eq!(
+                ret(&mut t, Sysno::clock_nanosleep, [clock, flags, BUF, 0]),
+                0,
+                "{clock} {flags} {ts:?}"
+            );
+        }
+        // ... while a future expiry is the genuine wait that stops loudly.
+        for (clock, flags, ts) in [
+            (2, 1, (0, 3_000_001)),
+            (2, 0, (0, 1)),
+            (virt, 1, (0, 2_000_001)),
+        ] {
+            put(&mut t, BUF, ts.0, ts.1);
+            assert_eq!(
+                call(&mut t, Sysno::clock_nanosleep, [clock, flags, BUF, 0]),
+                Outcome::Unimplemented(number),
+                "{clock} {flags} {ts:?}"
+            );
+        }
+        put(&mut t, BUF, 0, 1);
         // Own thread's clock cannot be slept on; unknown targets are invalid.
         let own = arg(cpu_clock(1, 2, true));
         let zero = arg(cpu_clock(0, 2, true));
@@ -1004,6 +1155,138 @@ mod tests {
             -ERESTARTNOHAND
         );
         assert_eq!(get(&mut t, BUF + 48), (0, 0));
+    }
+
+    #[test]
+    fn interrupted_sleep_records_the_restart_block() {
+        let mut t = user_task();
+        let mono = MONO as i64;
+        let real = (MONO + OFFSET) as i64;
+        let block = |func, clockid, expires_ns, rmtp| RestartBlock {
+            func,
+            clockid,
+            expires_ns,
+            rmtp,
+        };
+        let none = |rmtp| block(RestartFn::None, 0, 0, rmtp);
+        t.clocks.state.boot_offset_ns = 1_000;
+        put(&mut t, BUF, 1, 0);
+        // (clock id, flags, expected restart block after the entry reset).
+        // Hard expiry = now on the timer's base + 1 s + 50 us of slack; a relative
+        // CLOCK_REALTIME sleep runs on the monotonic base.
+        for (clock, flags, want) in [
+            (
+                1,
+                0,
+                block(RestartFn::Hrtimer, 1, mono + 1_000_050_000, BUF + 16),
+            ),
+            (
+                0,
+                0,
+                block(RestartFn::Hrtimer, 1, mono + 1_000_050_000, BUF + 16),
+            ),
+            (
+                7,
+                0,
+                block(
+                    RestartFn::Hrtimer,
+                    7,
+                    mono + 1_000 + 1_000_050_000,
+                    BUF + 16,
+                ),
+            ),
+            (
+                11,
+                0,
+                block(RestartFn::Hrtimer, 11, real + 1_000_050_000, BUF + 16),
+            ),
+            // Alarm sleeps have no slack and use the alarm type as the clock id.
+            (
+                8,
+                0,
+                block(RestartFn::Alarm, 0, real + 1_000_000_000, BUF + 16),
+            ),
+            (
+                9,
+                0,
+                block(RestartFn::Alarm, 1, mono + 1_000 + 1_000_000_000, BUF + 16),
+            ),
+        ] {
+            t.clocks.restarts.clear();
+            t.clocks.interrupt = Some(5);
+            assert_eq!(
+                ret(
+                    &mut t,
+                    Sysno::clock_nanosleep,
+                    [clock, flags, BUF, BUF + 16]
+                ),
+                -ERESTART_RESTARTBLOCK,
+                "{clock}"
+            );
+            assert_eq!(t.clocks.restarts, [none(BUF + 16), want], "{clock}");
+        }
+        // nanosleep is CLOCK_MONOTONIC; without rmtp the pointer field is 0.
+        t.clocks.restarts.clear();
+        t.clocks.interrupt = Some(5);
+        assert_eq!(
+            ret(&mut t, Sysno::nanosleep, [BUF, 0, 0, 0]),
+            -ERESTART_RESTARTBLOCK
+        );
+        assert_eq!(
+            t.clocks.restarts,
+            [
+                none(0),
+                block(RestartFn::Hrtimer, 1, mono + 1_000_050_000, 0)
+            ]
+        );
+        // Absolute sleeps and completed sleeps leave `do_no_restart_syscall`.
+        t.clocks.restarts.clear();
+        t.clocks.interrupt = Some(5);
+        assert_eq!(
+            ret(&mut t, Sysno::clock_nanosleep, [1, 1, BUF, BUF + 16]),
+            -ERESTARTNOHAND
+        );
+        assert_eq!(ret(&mut t, Sysno::clock_nanosleep, [1, 0, BUF, 0]), 0);
+        assert_eq!(t.clocks.restarts, [none(0), none(0)]);
+        // A huge relative request saturates at KTIME_MAX.
+        put(&mut t, BUF, KTIME_SEC_MAX, 0);
+        t.clocks.restarts.clear();
+        t.clocks.interrupt = Some(5);
+        assert_eq!(
+            ret(&mut t, Sysno::nanosleep, [BUF, 0, 0, 0]),
+            -ERESTART_RESTARTBLOCK
+        );
+        assert_eq!(
+            t.clocks.restarts[1],
+            block(RestartFn::Hrtimer, 1, i64::MAX, 0)
+        );
+    }
+
+    #[test]
+    fn coarse_realtime_reads_the_value_just_set() {
+        let mut t = user_task();
+        let coarse = |t: &mut Task| (gettime(t, 5).1, ret(t, Sysno::time, [0, 0, 0, 0]));
+        // Before any set the tick view is floor(mono) + offset.
+        assert_eq!(
+            coarse(&mut t),
+            ((1_800_000_005, 123_000_000), 1_800_000_005)
+        );
+        // `do_settimeofday64` stores xtime exactly: time() is T at once, not T-1.
+        put(&mut t, BUF, 1_000_000, 0);
+        assert_eq!(ret(&mut t, Sysno::clock_settime, [0, BUF, 0, 0]), 0);
+        assert_eq!(coarse(&mut t), ((1_000_000, 0), 1_000_000));
+        assert_eq!(gettime(&mut t, 0).1, (1_000_000, 0));
+        // The next tick publishes real time again, which is above the set value.
+        t.clocks.state.mono_ns = 5_124_000_000;
+        assert_eq!(coarse(&mut t), ((1_000_000, 543_211), 1_000_000));
+        t.clocks.state.mono_ns = 5_999_999_999;
+        assert_eq!(coarse(&mut t), ((1_000_000, 875_543_211), 1_000_000));
+        t.clocks.state.mono_ns = 6_000_000_000;
+        assert_eq!(coarse(&mut t), ((1_000_000, 876_543_211), 1_000_000));
+        // Setting the clock backwards lowers the floor with it.
+        put(&mut t, BUF, 999_000, 7);
+        assert_eq!(ret(&mut t, Sysno::clock_settime, [0, BUF, 0, 0]), 0);
+        assert_eq!(coarse(&mut t), ((999_000, 7), 999_000));
     }
 
     #[test]
