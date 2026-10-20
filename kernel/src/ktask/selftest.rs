@@ -446,8 +446,16 @@ pub fn preempt_report() {
 // depth is measured per entry from ring 3: every system call and exception
 // starts on an empty stack, so the lowest overwritten word after it is the
 // depth of that path, and the stack is painted again before the next one.
-// Test profile only: the paint and the scans cost a few thousand word
-// accesses per entry and the production kernels do not carry them.
+// Test profile only: a scan walks the painted part of the stack from its
+// bottom, (65,536 - depth) / 8 volatile loads (about 7-8 thousand on a shallow
+// path), and an entry scans twice (`entry_begin`, `entry_end`) and repaints
+// the dirty part; the production kernels do not carry any of it.
+//
+// Every figure is an upper bound with a floor. A repaint stops `PAINT_MARGIN`
+// below the frame of `measure`, so the words from there up to the entry's own
+// frame (the dead frames of `entry_begin`/`entry_end`/`measure`, the margin)
+// stay dirty and every later reading includes them: about 880 bytes, the
+// smallest `between` ever recorded, is the shallowest depth a path can show.
 
 /// The fill of an untouched stack word.
 const STACK_PAINT: u64 = 0x5AFE_57AC_0DD5_C0DE;
@@ -499,8 +507,17 @@ static MAX_SLOT: AtomicU64 = AtomicU64::new(0);
 static MAX_NR: AtomicI64 = AtomicI64::new(-1);
 /// Measured stretches.
 static MEASURED: AtomicU64 = AtomicU64::new(0);
-/// Handler frames built since boot (an entry that saw it grow is a signal path).
-static SIGNAL_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Handler frames built per pool stack (an entry that saw its own stack's
+/// counter grow is a signal path; another task's frame does not count).
+static SIGNAL_FRAMES: [AtomicU64; cpu::KSTACK_SLOTS] =
+    [const { AtomicU64::new(0) }; cpu::KSTACK_SLOTS];
+
+/// What [`entry_begin`] hands to [`entry_end`].
+#[derive(Clone, Copy)]
+pub struct Entry {
+    pool: usize,
+    frames: u64,
+}
 
 /// Fill pool stack `pool` below its first live address `frame` with
 /// [`STACK_PAINT`], keeping the end-marker word at its lowest address.
@@ -555,10 +572,12 @@ fn record(pool: usize, path: Path, used: u64, nr: Option<u64>) {
     }
 }
 
-/// Measure the current task's stack since it was last painted, count it as
-/// `path`, and paint the unused part below the caller's frame again.
-fn measure(pool: usize, path: Path, nr: Option<u64>) {
-    let low = lowest_dirty(pool);
+/// Count the current task's stack use since it was last painted (`low` is its
+/// [`lowest_dirty`]) as `path`, and paint the unused part below this frame
+/// again. Never inlined: the repaint's safety argument needs `here` to sit in
+/// this function's own small frame, not in a caller's large one.
+#[inline(never)]
+fn measure(pool: usize, low: u64, path: Path, nr: Option<u64>) {
     record(pool, path, cpu::kstack_top(pool) - low, nr);
     let here = 0u64;
     let live = (ptr::addr_of!(here) as u64 & !7).saturating_sub(PAINT_MARGIN);
@@ -579,18 +598,25 @@ fn current_pool() -> Option<usize> {
 /// A system call or exception from ring 3 starts: count what ran since the
 /// last entry ended (interrupts, a child's first return) and paint again.
 /// Returns the pool slot to give [`entry_end`].
-pub fn entry_begin() -> Option<usize> {
+#[inline(never)]
+pub fn entry_begin() -> Option<Entry> {
     let pool = current_pool()?;
-    measure(pool, Path::Between, None);
-    Some(pool)
+    measure(pool, lowest_dirty(pool), Path::Between, None);
+    Some(Entry {
+        pool,
+        frames: SIGNAL_FRAMES[pool].load(Ordering::Relaxed),
+    })
 }
 
 /// The entry ends, back at its outermost frame: count its depth.
 /// `syscall` is the system call number, `None` for an exception, whose vector
 /// is `vector`.
-pub fn entry_end(pool: Option<usize>, signals_before: u64, syscall: Option<u64>, vector: u64) {
-    let Some(pool) = pool else { return };
-    let signalled = SIGNAL_FRAMES.load(Ordering::Relaxed) != signals_before;
+#[inline(never)]
+pub fn entry_end(entry: Option<Entry>, syscall: Option<u64>, vector: u64) {
+    let Some(Entry { pool, frames }) = entry else {
+        return;
+    };
+    let signalled = SIGNAL_FRAMES[pool].load(Ordering::Relaxed) != frames;
     let path = match (syscall, vector) {
         (Some(59 | 322), _) => Path::Exec,
         (Some(15), _) => Path::Signal,
@@ -603,17 +629,14 @@ pub fn entry_end(pool: Option<usize>, signals_before: u64, syscall: Option<u64>,
     if signalled {
         record(pool, Path::Signal, cpu::kstack_top(pool) - low, syscall);
     }
-    measure(pool, path, syscall);
-}
-
-/// The handler frame counter read before an entry.
-pub fn signal_frames() -> u64 {
-    SIGNAL_FRAMES.load(Ordering::Relaxed)
+    measure(pool, low, path, syscall);
 }
 
 /// A signal handler frame was just built for the running task.
 pub fn note_signal_frame() {
-    SIGNAL_FRAMES.fetch_add(1, Ordering::Relaxed);
+    if let Some(pool) = current_pool() {
+        SIGNAL_FRAMES[pool].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A task is exiting on its own stack: count its depth.

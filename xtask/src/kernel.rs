@@ -4700,10 +4700,11 @@ fn kstack_usage_ok(line: &str) -> bool {
         return false;
     };
     let (usable, _) = rest.split_once(' ').unwrap_or((rest, ""));
-    matches!(
-        (used.parse::<u64>(), usable.parse::<u64>()),
-        (Ok(used), Ok(usable)) if used > 0 && used * 2 <= usable
-    )
+    // The pool stacks are 64 KiB usable; a record that claims another size is not this kernel's.
+    usable == "65536"
+        && used
+            .parse::<u64>()
+            .is_ok_and(|used| used > 0 && used <= 65536 / 2)
 }
 
 /// The records after the summary line, by what init did.
@@ -6977,6 +6978,14 @@ mod tests {
             (
                 "kernel stack use of zero",
                 serial.replace("max_used=7432", "max_used=0"),
+            ),
+            (
+                "kernel stack use that would overflow when doubled",
+                serial.replace("max_used=7432", "max_used=9223372036854775808"),
+            ),
+            (
+                "kernel stack record claiming another stack size",
+                serial.replace("usable=65536", "usable=999999"),
             ),
             (
                 "duplicate init: ok",

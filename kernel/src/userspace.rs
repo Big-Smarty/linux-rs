@@ -1472,10 +1472,7 @@ fn init_died(code: u32) -> ! {
 /// off and the CPU is on the running task's kernel stack.
 pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
     #[cfg(feature = "qemu-self-test")]
-    let (stack, frames) = (
-        ktask::selftest::entry_begin(),
-        ktask::selftest::signal_frames(),
-    );
+    let entry = ktask::selftest::entry_begin();
     let args = [regs.di, regs.si, regs.dx, regs.r10, regs.r8, regs.r9];
     let number = regs.orig_ax;
     let outcome = {
@@ -1504,7 +1501,7 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
     }
     exit_to_user(regs);
     #[cfg(feature = "qemu-self-test")]
-    ktask::selftest::entry_end(stack, frames, Some(number), 0);
+    ktask::selftest::entry_end(entry, Some(number), 0);
 }
 
 /// `exit_to_user_mode_loop` + `arch_do_signal_or_restart`: before every return
@@ -1762,10 +1759,7 @@ fn raise_fault(
 /// (NMI, #DF, #MC, #NM, ...) is a kernel failure, never a user death.
 pub fn exception(regs: &mut cpu::PtRegs, vector: u64, error: u64, address: u64) {
     #[cfg(feature = "qemu-self-test")]
-    let (stack, frames) = (
-        ktask::selftest::entry_begin(),
-        ktask::selftest::signal_frames(),
-    );
+    let entry = ktask::selftest::entry_begin();
     let raised = {
         let mut local = current_local();
         let TaskLocal { tables, own } = &mut *local;
@@ -1787,7 +1781,7 @@ pub fn exception(regs: &mut cpu::PtRegs, vector: u64, error: u64, address: u64) 
     }
     exit_to_user(regs);
     #[cfg(feature = "qemu-self-test")]
-    ktask::selftest::entry_end(stack, frames, None, vector);
+    ktask::selftest::entry_end(entry, None, vector);
 }
 
 /// `print_vma_addr`'s file part for `ip`: Linux prints the basename of the
