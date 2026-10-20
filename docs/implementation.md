@@ -41,7 +41,7 @@ cargo +nightly clippy --workspace --all-targets --locked --offline -- -D warning
 cargo +nightly test --workspace --locked --offline                  # kernel 121, xtask 70, baremetal 10, 2 doc tests
 env PATH="/bin:$PATH" cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/final-001 --timeout-seconds 60
 cargo +1.88.0 run -p xtask --locked --offline -- check            # 22 vendored packages verified
-cargo +1.88.0 run -p xtask --locked --offline -- status           # 24 in_progress, 2599 not_started of 2623
+cargo +1.88.0 run -p xtask --locked --offline -- status           # 25 in_progress, 2598 not_started of 2623
 ```
 
 Both target strict Clippy profiles (`qemu-self-test`, `freestanding`) also passed, run with `--config target/kernel-tooling/final-001/freestanding-build/cargo-home/config.toml` (the per-run merged vendor source; see [kernel tooling](kernel-tooling.md#vendored-dependencies-and-the-fresh-clone-build)). `final-001` matched **18/18** cases: bad-map, bad-module, cpu-max, cpu-without-pat, empty-module, init-segfault, irq-restore-early, no-init, panic, rseq, sse, success, unexpected-breakpoint, unexpected-fault, unexpected-interrupt, unexpected-page-fault, unimplemented-syscall, unmasked-timer.
