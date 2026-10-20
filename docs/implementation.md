@@ -895,13 +895,13 @@ Differences from the earlier cell: vectors moved from 0x20 to Linux's `ISA_IRQ_V
 
 | Site | Why asm | Contract |
 |---|---|---|
-| `timer::rdtsc` (`lfence; rdtsc`) | `_rdtsc` is not serialising; `_mm_lfence` needs SSE2, which the soft-float target lacks | CPUID.1:EDX.TSC checked in `init`; outputs EAX/EDX; flags clobbered; `nomem, nostack`; any context |
+| `timer::rdtsc` (`lfence; rdtsc`) | **no hand asm**: `core::arch::x86_64::{_mm_lfence, _rdtsc}`; `_mm_lfence` is an out-of-line call (its `sse2` target feature cannot be enabled on this soft-float target's own functions), executing only `lfence` | CPUID.1:EDX.TSC checked in `init`; LFENCE raises only #UD without SSE2 (every x86-64 CPU has it) and is not gated by CR0.EM/TS or CR4.OSFXSR; the intrinsics have side effects, so the fence stays before the read as in Linux's `rdtsc_ordered()`; any context |
 | `cpu::{out_byte,in_byte,in_dword,exit}` | **no hand asm**: vendored `x86_64` `instructions::port::Port` | the crate's asm is `nomem`; each access is bracketed by `compiler_fence(SeqCst)` so device sequences stay ordered against memory work as the earlier hand asm (not `nomem`) was; CPL0, ports are the owned PC devices / the FADT-named PM-timer block |
 | `cpu::interrupts_on`, `cpu::wait_for_interrupt` | **no hand asm**: `interrupts::{enable, enable_and_hlt, disable}` | same fences; the crate emits `sti; hlt` adjacent, race-free through STI's shadow; BSP, IDT and a *verified* interrupt source installed (`timer::idle` spins instead of halting until ticks were seen) |
 | `Msr` reads/writes (`apic.rs`, `timer.rs`) | the `x86_64` crate's wrappers | `apic::{rdmsr,wrmsr}` are now `unsafe fn`s whose call sites state the CPUID guard (`IA32_APIC_BASE`: APIC; ARCH_CAPABILITIES: CPUID.7); x2APIC registers are reachable only through `intc::LapicReg` (private field, so safe code cannot name an out-of-page offset or an arbitrary MSR; host test over every constant); `TSC_DEADLINE`: CPUID.1:ECX[24] |
 | `mmio::{read32,write32}` | volatile access | only addresses returned by `Tables::map_mmio` (UC, supervisor-only, mapped for the life of the kernel) |
 
-The only remaining hand asm of this slice is `rdtsc` (LFENCE needs SSE2, absent on this soft-float target). No disassembly review of these sites is claimed beyond the compiler. The IDT entries reuse the audited `entry!` macro; no new naked function.
+This slice adds no hand asm (the review showed `_mm_lfence` compiles on this target as an out-of-line `lfence; ret`, replacing the earlier `rdtsc` asm). No disassembly review of these sites is claimed beyond the compiler. The IDT entries reuse the audited `entry!` macro; no new naked function.
 
 ### Five design questions
 

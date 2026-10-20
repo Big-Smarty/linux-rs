@@ -18,7 +18,7 @@
 //!   (kernel/time/tick-sched.c, no idle tick stop yet).
 
 use core::{
-    arch::asm,
+    arch::x86_64::{_mm_lfence, _rdtsc},
     sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering, fence},
 };
 use kernel::{
@@ -61,19 +61,19 @@ pub enum Error {
 /// does for every clock read.
 #[must_use]
 pub fn rdtsc() -> u64 {
-    let (low, high): (u64, u64);
-    // Why asm: the supported `_rdtsc` intrinsic has no serialising form and
-    // `_mm_lfence` needs SSE2, which this soft-float target does not enable.
-    // Prerequisites: CPUID.1:EDX.TSC (checked in `init`), CR4.TSD is irrelevant at
-    // CPL0. Registers: EAX/EDX outputs (RAX/RDX), no inputs. Clobbers: none other
-    // than flags (not claimed preserved). No stack use (nostack), no memory
-    // access (nomem: the instruction reads only the TSC and fences by itself
-    // against earlier loads, which are compiler-ordered by program order of the
-    // reading code). Any context incl. IRQ/NMI; no control-flow effect.
+    // SAFETY: `_mm_lfence` is declared `#[target_feature(enable = "sse2")]`;
+    // this soft-float target cannot enable SSE2 on our own functions, so it is
+    // an out-of-line call that executes only `lfence` (no XMM/MMX state, no
+    // memory, no stack effect). LFENCE's only exception is #UD without
+    // CPUID.01H:EDX.SSE2, which every x86-64 CPU has; it is not gated by
+    // CR0.EM/TS or CR4.OSFXSR. `_rdtsc` needs CPUID.1:EDX.TSC (checked in
+    // `init`) and CR4.TSD is irrelevant at CPL0. The intrinsics have side
+    // effects, so the compiler keeps the fence before the read, as Linux's
+    // `rdtsc_ordered()`.
     unsafe {
-        asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nomem, nostack));
+        _mm_lfence();
+        _rdtsc()
     }
-    (high << 32) | (low & 0xffff_ffff)
 }
 
 /// Busy-wait `us` microseconds on the calibrated TSC.
