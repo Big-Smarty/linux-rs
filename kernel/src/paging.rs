@@ -372,7 +372,8 @@ impl Tables {
                 // SAFETY: the entry is not present (checked above) and hardware
                 // never writes a non-present entry. Either the tree is
                 // unpublished (one owner, no walker) or `&mut self` is the
-                // TABLES lock on the only CPU, and a 0 -> present transition
+                // running task's own private tree (`TaskLocal`, one CPU), and a
+                // 0 -> present transition
                 // needs no invalidation. No live Rust table reference exists.
                 unsafe {
                     self.pointer(table, index)?.write_volatile(entry);
@@ -868,8 +869,8 @@ impl Tables {
 }
 
 /// The memory-mapping model's page-table operations (`kernel::mm::UserPages`)
-/// on the real tables. Locking: callers hold `&mut Tables` (the `TABLES`
-/// lock) and pass the frame allocator (the `FRAMES` guard or, before
+/// on the real tables. Locking: callers hold `&mut Tables` (the running task's
+/// own tree, no lock) and pass the frame allocator (the `FRAMES` guard or, before
 /// publication, the loader's own); none of these allocates from the heap, so
 /// the `services` rule (reserve heap memory before taking `FRAMES`) holds.
 impl Tables {
