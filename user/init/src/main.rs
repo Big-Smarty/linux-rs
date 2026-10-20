@@ -99,6 +99,8 @@ macro_rules! out {
     ($($arg:tt)*) => {{ let _ = writeln!(Out, $($arg)*); }};
 }
 
+mod tests;
+
 fn exit(code: usize) -> ! {
     loop {
         // SAFETY: exit_group takes no pointers and never returns.
@@ -312,6 +314,10 @@ fn pid() -> usize {
 }
 
 fn run(stack: &Stack) {
+    // An `execve`d image of the `proc` oracle tests prints no pid-dependent summary.
+    if stack.argv.iter().nth(1) == Some(b"execd".as_slice()) {
+        tests::proc::execd(stack.argv, stack.envp);
+    }
     out!("init: {stack:?}");
 
     expect("rsp_mod16", stack.sp % 16, 0);
@@ -416,6 +422,8 @@ fn run(stack: &Stack) {
             out!("init: rseq enosys");
         }
         Some(b"sse") => fpu_checks(),
+        // Oracle syscall suite groups (`user/init/src/tests`): `mm ids time signal fs proc`.
+        Some(mode) if tests::run_mode(mode) => {}
         _ => {}
     }
     out!("init: ok");

@@ -464,6 +464,20 @@ const DEBUG_CASES: [DebugCase; 18] = [
     },
 ];
 
+/// Expected stdout lines of the oracle syscall suite (`user/init` modes `mm ids time signal fs
+/// proc`) as observed on the pinned Linux 6.18.57 (`target/linux-reference/init-reference-006`).
+/// Tab-separated `group kind name line`, `#` comments and a header row; see the file header.
+/// The `kernel-test` cases that run these modes on this kernel are added with the syscalls they
+/// need, so nothing outside the unit test reads it yet.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the cases added with each syscall slice"
+    )
+)]
+pub(crate) const ORACLE_EXPECTED: &str = include_str!("../oracle/expected.tsv");
+
 /// One case catalog for execution and downstream evidence packaging.
 pub(crate) fn debug_case_catalog() -> impl ExactSizeIterator<Item = (&'static str, i32)> {
     DEBUG_CASES
@@ -6396,5 +6410,47 @@ mod tests {
             timed_out: true,
         };
         assert!(!validate(DEBUG_CASES[0], &timed_out, &success_serial()).0);
+    }
+
+    #[test]
+    fn oracle_expected_lines_are_consistent() {
+        let mut rows = ORACLE_EXPECTED
+            .lines()
+            .filter(|line| !line.starts_with('#'));
+        assert_eq!(rows.next(), Some("group\tkind\tname\tline"));
+        let mut checks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut summaries = BTreeMap::new();
+        for row in rows {
+            let [group, kind, name, line]: [&str; 4] =
+                row.split('\t').collect::<Vec<_>>().try_into().unwrap();
+            match kind {
+                "check" => {
+                    assert_eq!(line, format!("init: test {group}.{name} ok"));
+                    checks.entry(group).or_default().push(name);
+                }
+                "info" => assert!(line.starts_with(&format!("init: info {group}.{name} "))),
+                "summary" => {
+                    assert_eq!(name, "-");
+                    summaries.insert(group, line);
+                }
+                other => panic!("unknown kind {other}"),
+            }
+        }
+        let groups = ["mm", "ids", "time", "signal", "fs", "proc"];
+        assert_eq!(
+            checks.keys().copied().collect::<Vec<_>>().len(),
+            groups.len()
+        );
+        for group in groups {
+            let names = &checks[group];
+            let mut unique = names.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), names.len(), "{group}: duplicate check names");
+            assert_eq!(
+                summaries[group],
+                format!("init: tests {group} passed={} failed=0", names.len())
+            );
+        }
     }
 }

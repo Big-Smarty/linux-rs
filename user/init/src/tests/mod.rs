@@ -1,0 +1,292 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! Oracle syscall suite: black-box checks of Linux-visible behaviour, run unchanged on the pinned
+//! Linux 6.18.57 (the oracle, `target/linux-reference`) and on this kernel. Each check prints one
+//! line `init: test <group>.<name> ok` or `init: test <group>.<name> FAIL got=<v> want=<v>`;
+//! a group ends with `init: tests <group> passed=<n> failed=<m>`. A failing check does not stop
+//! the group, so one run shows every divergence. Expected lines: `xtask/oracle/expected.tsv`.
+//!
+//! Contract of this module (the one deliberate unsafe boundary): [`sys`] is a *safe* raw
+//! `syscall` wrapper. The tests exist to pass hostile arguments (bad pointers, huge lengths,
+//! unaligned addresses) to the kernel, which validates them with fault-aware usercopy and
+//! answers an errno; they never hand the kernel an address they own as a Rust reference except
+//! through [`addr`]/[`addr_mut`], and calls that can unmap memory (`munmap`, `mmap(MAP_FIXED)`,
+//! `brk`) only name regions the same test created. A kernel bug can still corrupt the process,
+//! which is the failure these tests report.
+// The checks compare kernel words with fixed-width ABI fields; the casts are the ABI.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::items_after_statements,
+    clippy::struct_field_names,
+    clippy::needless_pass_by_value,
+    clippy::unreadable_literal,
+    clippy::many_single_char_names,
+    clippy::doc_markdown,
+    clippy::manual_is_multiple_of,
+    clippy::cast_lossless
+)]
+
+use core::fmt::{self, Debug, Write as _};
+use core::ptr;
+use syscalls::{Errno, Sysno};
+
+use crate::exit;
+
+pub mod fs;
+pub mod ids;
+pub mod mm;
+pub mod proc;
+pub mod signal;
+pub mod time;
+
+pub type R = Result<usize, Errno>;
+
+pub const PAGE: usize = 4096;
+/// Highest user address + 1 on x86-64 with 4-level paging (`TASK_SIZE_MAX`).
+pub const TASK_SIZE: usize = 0x7fff_ffff_f000;
+
+/// Raw system call with up to six word arguments (missing ones are zero); see the module contract.
+pub fn sys(nr: Sysno, args: &[usize]) -> R {
+    let mut a = [0usize; 6];
+    a[..args.len()].copy_from_slice(args);
+    // SAFETY: per the module contract, the arguments are integers or addresses of live test
+    // buffers, or deliberately invalid addresses the kernel rejects with EFAULT; no Rust
+    // reference is handed over except via the exposed-provenance helpers below.
+    unsafe { syscalls::syscall6(nr, a[0], a[1], a[2], a[3], a[4], a[5]) }
+}
+
+/// Address of a function (for handler / restorer fields of `rt_sigaction`).
+pub fn fn_addr(f: *const ()) -> u64 {
+    f.expose_provenance() as u64
+}
+
+/// Address of `r` for a syscall argument (exposes provenance: the kernel may read it).
+pub fn addr<T: ?Sized>(r: &T) -> usize {
+    ptr::from_ref(r).cast::<u8>().expose_provenance()
+}
+
+/// Address of `r` for a syscall argument the kernel may write through.
+pub fn addr_mut<T: ?Sized>(r: &mut T) -> usize {
+    ptr::from_mut(r).cast::<u8>().expose_provenance()
+}
+
+/// Read one byte at an arbitrary mapped address (callers know it is mapped and readable).
+pub fn peek(a: usize) -> u8 {
+    // SAFETY: callers pass an address inside a mapping the test created with read permission.
+    unsafe { ptr::with_exposed_provenance::<u8>(a).read_volatile() }
+}
+
+/// Write one byte at an arbitrary mapped address (callers know it is mapped and writable).
+pub fn poke(a: usize, v: u8) {
+    // SAFETY: callers pass an address inside a mapping the test created with write permission.
+    unsafe { ptr::with_exposed_provenance_mut::<u8>(a).write_volatile(v) }
+}
+
+/// Whether every byte of `[a, a + len)` equals `v`.
+pub fn all_bytes(a: usize, len: usize, v: u8) -> bool {
+    (0..len).all(|i| peek(a + i) == v)
+}
+
+pub fn getpid() -> usize {
+    sys(Sysno::getpid, &[]).unwrap_or(usize::MAX)
+}
+
+pub fn gettid() -> usize {
+    sys(Sysno::gettid, &[]).unwrap_or(usize::MAX)
+}
+
+/// `exit_group(code)`; used by forked children.
+pub fn die(code: usize) -> ! {
+    exit(code)
+}
+
+/// A line buffered in full and written with one `write(2)`, so a result line is never split by
+/// concurrent kernel console output; overlong lines are truncated (checks stay far below this).
+struct Line {
+    buf: [u8; 384],
+    len: usize,
+}
+
+impl fmt::Write for Line {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let n = s.len().min(self.buf.len() - 1 - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// Prints one line (a newline is appended).
+pub fn emit(args: fmt::Arguments<'_>) {
+    let mut line = Line {
+        buf: [0; 384],
+        len: 0,
+    };
+    let _ = line.write_fmt(args);
+    line.buf[line.len] = b'\n';
+    let _ = sys(Sysno::write, &[1, addr(&line.buf), line.len + 1]);
+}
+
+macro_rules! line {
+    ($($arg:tt)*) => { $crate::tests::emit(format_args!($($arg)*)) };
+}
+
+/// One test group's counters and reporting.
+pub struct T {
+    group: &'static str,
+    passed: u32,
+    failed: u32,
+}
+
+impl T {
+    pub fn new(group: &'static str) -> Self {
+        Self {
+            group,
+            passed: 0,
+            failed: 0,
+        }
+    }
+
+    fn pass(&mut self, name: impl fmt::Display) {
+        self.passed += 1;
+        line!("init: test {}.{name} ok", self.group);
+    }
+
+    /// `got == want`.
+    pub fn eq<V: PartialEq + Debug>(&mut self, name: impl fmt::Display, got: V, want: V) {
+        if got == want {
+            self.pass(name);
+        } else {
+            self.failed += 1;
+            line!(
+                "init: test {}.{name} FAIL got={got:?} want={want:?}",
+                self.group
+            );
+        }
+    }
+
+    /// A predicate; `got` and `want` describe the observation and the requirement.
+    pub fn holds(&mut self, name: impl fmt::Display, cond: bool, got: impl Debug, want: &str) {
+        if cond {
+            self.pass(name);
+        } else {
+            self.failed += 1;
+            line!(
+                "init: test {}.{name} FAIL got={got:?} want={want}",
+                self.group
+            );
+        }
+    }
+
+    /// A recorded observation that is not a pass/fail check (for example the `/dev` listing).
+    pub fn info(&self, name: impl fmt::Display, args: fmt::Arguments<'_>) {
+        line!("init: info {}.{name} {args}", self.group);
+    }
+
+    /// Prints the group summary; true when nothing failed.
+    pub fn finish(self) -> bool {
+        line!(
+            "init: tests {} passed={} failed={}",
+            self.group,
+            self.passed,
+            self.failed
+        );
+        self.failed == 0
+    }
+}
+
+/// A group's verdict ends the process with status 1 when any check failed; the caller prints
+/// `init: ok` otherwise.
+pub fn conclude(ok: bool) {
+    if !ok {
+        exit(1);
+    }
+}
+
+/// A pipe pair used to probe whether an address range is readable or writable without faulting:
+/// the kernel answers EFAULT instead of delivering SIGSEGV.
+pub struct Probe {
+    read_fd: usize,
+    write_fd: usize,
+}
+
+impl Probe {
+    pub fn new() -> Self {
+        let mut fds = [0u32; 2];
+        let _ = sys(Sysno::pipe2, &[addr_mut(&mut fds), 0o4000]);
+        Self {
+            read_fd: fds[0] as usize,
+            write_fd: fds[1] as usize,
+        }
+    }
+
+    fn drain(&self) {
+        let mut scratch = [0u8; 64];
+        while let Ok(n) = sys(Sysno::read, &[self.read_fd, addr_mut(&mut scratch), 64]) {
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
+    /// `[a, a + len)` can be read by the kernel on the process's behalf (one byte per page).
+    pub fn readable(&self, a: usize, len: usize) -> bool {
+        let ok = (0..len.div_ceil(PAGE)).all(|page| {
+            let at = if page == 0 {
+                a
+            } else {
+                (a & !(PAGE - 1)) + page * PAGE
+            };
+            sys(Sysno::write, &[self.write_fd, at, 1]) == Ok(1)
+        });
+        self.drain();
+        ok
+    }
+
+    /// `[a, a + len)` can be written by the kernel on the process's behalf (one byte per page).
+    /// Non-destructive: a readable byte is written back unchanged.
+    pub fn writable(&self, a: usize, len: usize) -> bool {
+        let ok = (0..len.div_ceil(PAGE)).all(|page| {
+            let at = if page == 0 {
+                a
+            } else {
+                (a & !(PAGE - 1)) + page * PAGE
+            };
+            if sys(Sysno::write, &[self.write_fd, at, 1]) != Ok(1) {
+                let _ = sys(Sysno::write, &[self.write_fd, addr(b"x"), 1]);
+            }
+            let ok = sys(Sysno::read, &[self.read_fd, at, 1]) == Ok(1);
+            self.drain();
+            ok
+        });
+        self.drain();
+        ok
+    }
+}
+
+/// `madvise(MADV_NORMAL)`: Ok when the whole range is mapped, ENOMEM when any part is not.
+pub fn mapped(a: usize, len: usize) -> R {
+    sys(Sysno::madvise, &[a, len, 0])
+}
+
+pub fn mmap(a: usize, len: usize, prot: usize, flags: usize, fd: usize, off: usize) -> R {
+    sys(Sysno::mmap, &[a, len, prot, flags, fd, off])
+}
+
+/// Dispatch of the `argv[1]` test modes; false when `mode` names no group.
+pub fn run_mode(mode: &[u8]) -> bool {
+    let ok = match mode {
+        b"mm" => mm::run(),
+        b"ids" => ids::run(),
+        b"time" => time::run(),
+        b"signal" => signal::run(),
+        b"fs" => fs::run(),
+        b"proc" => proc::run(),
+        _ => return false,
+    };
+    conclude(ok);
+    true
+}
