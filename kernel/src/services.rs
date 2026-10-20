@@ -22,7 +22,18 @@
 //! `handle_user_fault`), which reserves heap storage, then takes [`FRAMES`] as
 //! the leaf, i.e. the order above and nothing else (the kernel never
 //! dereferences a user address, so no hardware fault occurs under a lock). No
-//! lock is held across a callback or a blocking operation; nothing here sleeps.
+//! lock is held across a callback.
+//!
+//! One exception, the blocking system calls (`pause`, `rt_sigsuspend`,
+//! `rt_sigtimedwait`, `nanosleep`, later blocking `read`): `Task::wait` halts
+//! (`sti; hlt`) with `PROCESS` and `TABLES` held, so interrupts are enabled
+//! while two `IrqMutex` guards are alive. That is sound only because **no
+//! interrupt or exception handler that can run in ring 0 takes `PROCESS`,
+//! `TABLES`, the heap or `FRAMES`**: the timer, spurious and error vectors
+//! touch only atomics and the clockevent (`TIMER_HW`), and `exit_to_user` is
+//! reached only from CPL3 entries, where no kernel lock is held. A handler
+//! that needs process state (an IRQ that wakes a reader, a VFS completion)
+//! must queue the work and let the waking task take the lock.
 //!
 //! # The rule that is easy to break
 //! [`FRAMES`] is a leaf, and the heap takes it to grow. So **never allocate
@@ -40,7 +51,7 @@
 //! # Contexts
 //! Every lock is [`IrqMutex`]: it disables local interrupts for the critical
 //! section, so a handler can never deadlock against an interrupted holder on
-//! one CPU. NMI, #DF and #MC are not excluded and MUST NOT take these locks.
+//! one CPU (except inside the halt of a blocking wait: see above). NMI, #DF and #MC are not excluded and MUST NOT take these locks.
 //! shortcut: single CPU; the spinlock inside already excludes other CPUs but
 //! per-CPU state, TLB shootdown (see `paging`) and lock-class diagnostics are
 //! not built, upgrade with SMP bring-up.

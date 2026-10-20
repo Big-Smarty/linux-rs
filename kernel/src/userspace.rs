@@ -47,7 +47,8 @@ use kernel::{
         load::{Pager, exec_file, insert_stack, map_segments},
         plan::{LoadError, LoadPlan, Unsupported},
         report::{
-            self, ExecFailed, FileRegion, InitDeath, NO_INIT, NO_ROOT, NO_ROOT_PANIC, Segfault,
+            self, BadFrame, ExecFailed, FileRegion, InitDeath, NO_INIT, NO_ROOT, NO_ROOT_PANIC,
+            Segfault,
             TrapLine,
         },
         script,
@@ -58,7 +59,7 @@ use kernel::{
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     ratelimit::RateLimit,
     signal::{
-        self, State, USER_CS,
+        self, State,
         deliver::{self, Outcome as SignalOutcome},
         frame::Sigreturn,
         info,
@@ -736,12 +737,26 @@ impl<'a> signal::Task for Syscall<'a> {
         self.regs.sp
     }
     fn rt_sigreturn(&mut self) -> Sigreturn {
-        signal::frame::rt_sigreturn(
+        let result = signal::frame::rt_sigreturn(
             &mut self.process.signal,
             self.regs,
             &mut self.space,
             &mut cpu::UserCpu::new(),
-        )
+        );
+        if result.bad_frame {
+            // `signal_fault`: printed before the SIGSEGV is forced; `regs` are
+            // whatever the failed `restore_sigcontext` left, as in Linux.
+            if printk_ratelimit(self.process, "signal_fault") {
+                let line = BadFrame {
+                    ip: self.regs.ip,
+                    sp: self.regs.sp,
+                    orig_ax: self.regs.orig_ax,
+                    region: region_of(self.process, self.regs.ip),
+                };
+                crate::log!("{}\n", line);
+            }
+        }
+        result
     }
 }
 
@@ -814,8 +829,13 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
 /// `exit_to_user_mode_loop` + `arch_do_signal_or_restart`: before every return
 /// to ring 3 (syscall, exception or interrupt from CPL3) bring the timers up
 /// to date, deliver pending signals (a handler entry or `rt_sigreturn` has
-/// rewritten `regs`, which `iretq` then installs: no `sysret` path exists), and
-/// make sure the frame can be returned to at all.
+/// rewritten `regs`, which `iretq` then installs: no `sysret` path exists) and
+/// arm the clockevent for the interval timer.
+///
+/// A frame the CPU refuses to `iretq` to (a hostile `rt_sigreturn` frame or
+/// handler address) is not predicted here: the refused `iretq` faults at
+/// `cpu::iret_site` and `cpu::fixup_bad_iret` turns that into a user exception
+/// (Linux's `.Lerror_bad_iret`), which comes back through this function.
 ///
 /// Context: interrupts masked, task context of the one process; takes
 /// `PROCESS` then `TABLES` (the shared lock order). A fatal signal never
@@ -823,7 +843,11 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
 pub fn exit_to_user(regs: &mut cpu::PtRegs) {
     loop {
         let mut process = PROCESS.lock();
-        process.signal.sync_timers(timer::ktime_get_ns());
+        // Nothing to expire or dequeue: skip the clock read (`now_ns` is only
+        // used when a pending SIGALRM leaves the queue).
+        if process.signal.itimer.next_event().is_some() || process.signal.signal_pending() {
+            process.signal.sync_timers(timer::ktime_get_ns());
+        }
         if process.signal.signal_pending() {
             let mm = process.mm;
             let mut tables = mm.lock();
@@ -856,30 +880,27 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
             continue;
         }
         // Wake the CPU for the next interval-timer expiry while ring 3 runs.
-        timer::set_itimer_ns(process.signal.itimer.next_event());
+        let expiry = process.signal.itimer.next_event();
+        timer::set_itimer_ns(expiry);
+        // `rearm` drops an expiry that fell between the `sync_timers` above and
+        // its own clock read (or while a frame was built): nothing would wake
+        // ring 3 for it. Take another pass, which expires it and sends SIGALRM.
+        if expiry.is_some_and(|at| at <= timer::ktime_get_ns()) {
+            continue;
+        }
         return;
     }
 }
 
-/// Would `iretq` to this frame fault in ring 0? 64-bit CS needs a canonical
-/// RIP, any frame a canonical RSP, a user code selector and a usable user SS.
-/// The answer is the `#GP` error code the CPU reports, in the order it checks
-/// (SDM, IRET to an outer level): an unusable CS or SS is the selector (0 for
-/// a null one), a non-canonical RIP or RSP is 0.
-fn bad_iret_error(regs: &cpu::PtRegs) -> Option<u64> {
-    use kernel::signal::Cpu;
-    const fn canonical(address: u64) -> bool {
-        // 4-level paging: bits 63..47 equal.
-        (address.cast_signed() << 16 >> 16).cast_unsigned() == address
+/// `printk_ratelimit()` called from `func`: ten lines per five seconds, and the
+/// "callbacks suppressed" line (named after the caller) when it re-opens.
+fn printk_ratelimit(process: &mut Process, func: &str) -> bool {
+    let jiffies = timer::ktime_get_ns() / kernel::time::TICK_NSEC;
+    let verdict = process.printk_ratelimit.check(jiffies);
+    if verdict.suppressed > 0 {
+        crate::log!("{}: {} callbacks suppressed\n", func, verdict.suppressed);
     }
-    if regs.cs != USER_CS && regs.cs != 0x23 {
-        return Some(regs.cs & 0xfffc);
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    if regs.ss & 3 != 3 || !cpu::UserCpu::new().ss_is_valid_user_data(regs.ss as u16) {
-        return Some(regs.ss & 0xfffc);
-    }
-    (!canonical(regs.sp) || (regs.cs == USER_CS && !canonical(regs.ip))).then_some(0)
+    verdict.allowed
 }
 
 /// `show_signal` / `show_signal_msg`: Linux prints the fault line when
@@ -908,12 +929,7 @@ fn show_unhandled_signal(
     } else {
         "show_signal"
     };
-    let jiffies = timer::ktime_get_ns() / kernel::time::TICK_NSEC;
-    let verdict = process.printk_ratelimit.check(jiffies);
-    if verdict.suppressed > 0 {
-        crate::log!("{}: {} callbacks suppressed\n", func, verdict.suppressed);
-    }
-    if !verdict.allowed {
+    if !printk_ratelimit(process, func) {
         return;
     }
     let region = region_of(process, regs.ip);

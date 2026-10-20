@@ -205,5 +205,33 @@ impl fmt::Display for TrapLine {
     }
 }
 
+/// `signal_fault`: `init[1] bad frame in rt_sigreturn frame:%p ip:%lx sp:%lx orax:%lx[ in init[...]]`
+/// (`arch/x86/kernel/signal.c:368-383`; `me->comm` is `init`, pid 1, and the line
+/// is `KERN_EMERG` for pid 1).
+///
+/// shortcut: `%p` is printed as the pinned kernel prints it before its pointer-hash
+/// key exists, `(____ptrval____)` (observed for init on the reference kernel under
+/// TCG); once the kernel has entropy (observed under KVM) the value is a per-boot
+/// keyed hash of the frame address that no other kernel can reproduce.
+pub struct BadFrame {
+    pub ip: u64,
+    pub sp: u64,
+    pub orig_ax: u64,
+    /// The file-backed VMA containing `ip` (`FileRegion::of`).
+    pub region: Option<FileRegion>,
+}
+impl fmt::Display for BadFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "init[1] bad frame in rt_sigreturn frame:(____ptrval____) ip:{:x} sp:{:x} orax:{:x}{}",
+            self.ip,
+            self.sp,
+            self.orig_ax,
+            InVma(self.region, self.ip)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests;
