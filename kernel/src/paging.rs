@@ -41,6 +41,8 @@ use x86_64::{VirtAddr, instructions::tlb};
 const PRESENT: u64 = 1;
 const WRITE: u64 = 2;
 const USER: u64 = 4;
+const PWT: u64 = 1 << 3;
+const PCD: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
 const NX: u64 = 1 << 63;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
@@ -332,6 +334,38 @@ impl Tables {
             }
         }
         Err(Error::Address)
+    }
+
+    /// Map the 4 KiB device page at physical `address` (an ACPI-described LAPIC,
+    /// IOAPIC or HPET block) uncached, writable, never executable, supervisor
+    /// only, at its direct-map address `direct_map + address`. Like every table
+    /// write, this happens before CR3 publication. Flags: PCD|PWT select PAT
+    /// entry 3 = UC, which `cpu::validate` leaves at its reset value.
+    ///
+    /// # Errors
+    /// Rejects an unaligned or unrepresentable address, a page that is already
+    /// mapped (RAM or a loader mapping: device pages must not alias memory) and
+    /// allocation failure.
+    pub fn map_mmio(
+        &mut self,
+        boot: &BootInfo,
+        allocator: &mut Allocator<'_>,
+        address: u64,
+    ) -> Result<(), Error> {
+        let virtual_address = self
+            .direct_map
+            .checked_add(address)
+            .ok_or(Error::Overflow)?;
+        if virtual_address < 0xffff_8000_0000_0000 || virtual_address >= boot.image_virtual {
+            return Err(Error::Address);
+        }
+        self.map(
+            allocator,
+            Virtual(virtual_address),
+            Physical(address),
+            PRESENT | WRITE | NX | PCD | PWT,
+            false,
+        )
     }
 
     /// Map one 4 KiB user page below `TASK_SIZE_MAX`: U/S set at every level,
