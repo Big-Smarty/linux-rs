@@ -104,23 +104,44 @@ pub(crate) fn elf_facts(bytes: &[u8]) -> io::Result<ElfFacts> {
     Ok(facts)
 }
 
-/// The deterministic newc initramfs: `/dev` (directory), `/init` (the ELF), `/linuxrc` -> `/init`.
-/// Fixed mtime 0, uid/gid 0 and sequential inode numbers; Linux-like link counts and modes.
+const S_IFMT: u32 = 0o170_000;
+const S_IFREG: u32 = 0o100_000;
+const S_IFLNK: u32 = 0o120_000;
+
+/// The files `user/init`'s `fs` and `proc` oracle tests read (name, mode, nlink, data), archived
+/// after `/dev`, `/init` and `/linuxrc` in this order (parents first). The data is part of the
+/// oracle contract: `xtask/oracle/expected.tsv` and the `fs` checks name these bytes.
+pub(crate) const TEST_FILES: [(&str, u32, u32, &[u8]); 7] = [
+    ("fixture", 0o040_755, 3, b""),
+    ("fixture/hello.txt", 0o100_644, 1, b"hello, oracle\n"),
+    ("fixture/empty", 0o100_644, 1, b""),
+    ("fixture/noexec", 0o100_755, 1, b"not an executable\n"),
+    ("fixture/sub", 0o040_755, 2, b""),
+    ("fixture/sub/nested.txt", 0o100_644, 1, b"nested\n"),
+    ("fixture/link", 0o120_777, 1, b"hello.txt"),
+];
+
+/// The deterministic newc initramfs: `/dev` (directory), `/init` (the ELF), `/linuxrc` -> `/init`,
+/// then [`TEST_FILES`]. Fixed mtime 0, uid/gid 0 and sequential inode numbers; Linux-like link
+/// counts and modes.
 ///
 /// Only `write_cpio` is used: `Writer::finish()` after a short write would emit a corrupt entry.
 pub(crate) fn initramfs(init: &[u8]) -> io::Result<Vec<u8>> {
     if u32::try_from(init.len()).is_err() {
         return Err(invalid("init does not fit a newc file size"));
     }
-    let entries = [
-        (NewcBuilder::new("dev").mode(0o040_755).nlink(2), &b""[..]),
-        (NewcBuilder::new("init").mode(0o100_755), init),
-        (NewcBuilder::new("linuxrc").mode(0o120_777), &b"/init"[..]),
-    ];
+    let entries =
+        [
+            (NewcBuilder::new("dev").mode(0o040_755).nlink(2), &b""[..]),
+            (NewcBuilder::new("init").mode(0o100_755), init),
+            (NewcBuilder::new("linuxrc").mode(0o120_777), &b"/init"[..]),
+        ]
+        .into_iter()
+        .chain(TEST_FILES.iter().map(|&(name, mode, nlink, data)| {
+            (NewcBuilder::new(name).mode(mode).nlink(nlink), data)
+        }));
     write_cpio(
-        entries
-            .into_iter()
-            .map(|(builder, data)| (builder, Cursor::new(data))),
+        entries.map(|(builder, data)| (builder, Cursor::new(data))),
         Vec::new(),
     )
 }
@@ -155,12 +176,17 @@ pub(crate) fn init_summary(init: &ElfFacts, argc: usize) -> String {
 }
 
 /// The `CHECK image inspected` tail the kernel must print for [`initramfs`], by construction:
-/// three files and the trailer, the ELF's own `PT_LOAD`/`PT_INTERP` counts, page-rounded reservation.
+/// the three base files, [`TEST_FILES`] and the trailer, the ELF's own `PT_LOAD`/`PT_INTERP` counts, page-rounded reservation.
 pub(crate) fn archive_counts(archive_len: usize, init: &ElfFacts) -> String {
     let reserved = archive_len.next_multiple_of(PAGE).max(PAGE);
+    let of_type = |kind| TEST_FILES.iter().filter(|f| f.1 & S_IFMT == kind).count();
+    let files = 3 + TEST_FILES.len();
+    let (regular, symlinks) = (1 + of_type(S_IFREG), 1 + of_type(S_IFLNK));
     format!(
-        "reserved={reserved} bytes={archive_len} records=4 files=3 regular=1 symlinks=1 trailers=1 skipped=0 elf=1 loads={} interpreters={} execution=false rootfs=false",
-        init.loads, init.interpreters
+        "reserved={reserved} bytes={archive_len} records={} files={files} regular={regular} symlinks={symlinks} trailers=1 skipped=0 elf=1 loads={} interpreters={} execution=false rootfs=false",
+        files + 1,
+        init.loads,
+        init.interpreters
     )
 }
 
@@ -235,14 +261,21 @@ mod tests {
                 ("dev", 0o040_755, 2, 0),
                 ("init", 0o100_755, 1, 251),
                 ("linuxrc", 0o120_777, 1, 5),
+                ("fixture", 0o040_755, 3, 0),
+                ("fixture/hello.txt", 0o100_644, 1, 14),
+                ("fixture/empty", 0o100_644, 1, 0),
+                ("fixture/noexec", 0o100_755, 1, 18),
+                ("fixture/sub", 0o040_755, 2, 0),
+                ("fixture/sub/nested.txt", 0o100_644, 1, 7),
+                ("fixture/link", 0o120_777, 1, 9),
                 ("TRAILER!!!", 0, 1, 0)
             ]
         );
         assert_eq!(found[1].3, init);
         assert_eq!(found[2].3, b"/init");
         // Sequential inode numbers 0, 1, 2 (write_cpio); the trailer has ino 0, mode 0, nlink 1.
-        let inodes = [0, 1, 2, 3].map(|i| hex(&archive[entry_offset(&archive, i) + 6..][..8]));
-        assert_eq!(inodes, [0, 1, 2, 0]);
+        let inodes = [0, 1, 2, 3, 10].map(|i| hex(&archive[entry_offset(&archive, i) + 6..][..8]));
+        assert_eq!(inodes, [0, 1, 2, 3, 0]);
     }
 
     fn entry_offset(archive: &[u8], index: usize) -> usize {
@@ -320,7 +353,7 @@ mod tests {
         ))
         .unwrap();
         let counts = archive_counts(4096, &facts);
-        assert!(counts.starts_with("reserved=4096 bytes=4096 records=4 files=3 regular=1 symlinks=1 trailers=1 skipped=0 elf=1 loads=2 interpreters=0 "));
+        assert!(counts.starts_with("reserved=4096 bytes=4096 records=11 files=10 regular=5 symlinks=2 trailers=1 skipped=0 elf=1 loads=2 interpreters=0 "));
         assert!(archive_counts(4097, &facts).starts_with("reserved=8192 bytes=4097 "));
         assert!(archive_counts(0, &facts).starts_with("reserved=4096 bytes=0 "));
     }
