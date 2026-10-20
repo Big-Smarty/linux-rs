@@ -10,15 +10,21 @@
 //! `pause`, `restart_syscall`, `setitimer`, `getitimer` and `alarm`.
 //!
 //! The pure decisions are in [`crate::signal`]; this file only maps the raw
-//! argument registers onto them. Two Linux behaviours stop loudly as
-//! [`Outcome::Unimplemented`] instead of guessing: `kill(0, ..)` /
-//! `kill(-1, ..)` (they depend on kernel threads and a process table that do
-//! not exist) and the CPU-time interval timers (`ITIMER_VIRTUAL`,
-//! `ITIMER_PROF`, which need the time lane's CPU accounting).
+//! argument registers onto them. A target other than the caller (another
+//! process, a process group, every process) goes through the task list
+//! ([`crate::task::Tasklist`]: `kill_something_info`, `kill_proc_info`,
+//! `send_specific`); a send to the caller itself keeps the `State`-level path
+//! whose queue semantics `crate::signal::syscalls` tests (the same send
+//! function underneath; the task-list path adds the permission check and the
+//! wake-up of the target). The CPU-time interval timers (`ITIMER_VIRTUAL`,
+//! `ITIMER_PROF`) stop loudly as [`Outcome::Unimplemented`]: they need the
+//! time lane's CPU accounting.
 
-use super::{Context, Outcome};
+use super::{Context, Outcome, error};
 use crate::signal::{
+    info::SigInfo,
     itimer::{sys_alarm, sys_getitimer, sys_setitimer},
+    syscalls::{copy_siginfo_from_user, queueinfo_perm},
     syscalls::{
         sys_kill, sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo,
         sys_rt_tgsigqueueinfo, sys_sigaltstack, sys_tgkill, sys_tkill,
@@ -49,17 +55,11 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
             let (mut state, mut pages) = ctx.parts();
             sys_sigaltstack(&mut state, &mut pages, a[0], a[1], sp)
         }
-        Sysno::kill => return unimplemented(sys_kill(&mut ctx.state(), a[0], a[1])),
-        Sysno::tkill => sys_tkill(&mut ctx.state(), a[0], a[1]),
-        Sysno::tgkill => sys_tgkill(&mut ctx.state(), a[0], a[1], a[2]),
-        Sysno::rt_sigqueueinfo => {
-            let (mut state, mut pages) = ctx.parts();
-            sys_rt_sigqueueinfo(&mut state, &mut pages, a[0], a[1], a[2])
-        }
-        Sysno::rt_tgsigqueueinfo => {
-            let (mut state, mut pages) = ctx.parts();
-            sys_rt_tgsigqueueinfo(&mut state, &mut pages, a[0], a[1], a[2], a[3])
-        }
+        Sysno::kill => return Some(kill(ctx, a)),
+        Sysno::tkill => return Some(tkill(ctx, a)),
+        Sysno::tgkill => return Some(tgkill(ctx, a)),
+        Sysno::rt_sigqueueinfo => return Some(rt_sigqueueinfo(ctx, a)),
+        Sysno::rt_tgsigqueueinfo => return Some(rt_tgsigqueueinfo(ctx, a)),
         // The syscall's value is the restored `rax` (0 after a bad frame).
         #[allow(clippy::cast_possible_wrap)]
         Sysno::rt_sigreturn => ctx.rt_sigreturn().ret as i64,
@@ -72,6 +72,123 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         _ => return None,
     };
     Some(Outcome::Return(value))
+}
+
+/// `int` syscall parameters are the low 32 bits of the register.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+const fn int(register: u64) -> i32 {
+    register as u32 as i32
+}
+
+fn status(result: Result<(), syscalls::Errno>) -> i64 {
+    result.map_or_else(error, |()| 0)
+}
+
+/// `prepare_kill_siginfo` for the caller: `SI_USER` for `kill`, `SI_TKILL`
+/// for `tkill`/`tgkill`, from the caller's tgid and uid.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn kill_info<C: Context>(ctx: &mut C, sig: i32, thread: bool) -> SigInfo {
+    let (tgid, uid) = (ctx.tgid().cast_signed(), ctx.attrs().cred.uid);
+    SigInfo::from_kill(sig as u8, thread, tgid, uid)
+}
+
+/// `kill(pid, sig)`: `kill_something_info` for every target but the caller's
+/// own process, the `State`-level send for it.
+fn kill<C: Context>(ctx: &mut C, a: [u64; 6]) -> Outcome {
+    let (pid, sig) = (int(a[0]), int(a[1]));
+    if i64::from(pid) == i64::from(ctx.tgid()) {
+        let Some(value) = sys_kill(&mut ctx.state(), a[0], a[1]) else {
+            return Outcome::Unimplemented(Sysno::kill as u32);
+        };
+        return Outcome::Return(value);
+    }
+    let info = kill_info(ctx, sig, false);
+    let t = ctx.tasks();
+    Outcome::Return(status(
+        t.list
+            .kill_something_info(t.current, sig, info, pid, t.wake),
+    ))
+}
+
+/// `tkill(tid, sig)`.
+fn tkill<C: Context>(ctx: &mut C, a: [u64; 6]) -> Outcome {
+    let (tid, sig) = (int(a[0]), int(a[1]));
+    if tid > 0 && i64::from(tid) != i64::from(ctx.tid()) {
+        return send_specific(ctx, 0, tid, sig);
+    }
+    Outcome::Return(sys_tkill(&mut ctx.state(), a[0], a[1]))
+}
+
+/// `tgkill(tgid, tid, sig)`.
+#[allow(clippy::similar_names)]
+fn tgkill<C: Context>(ctx: &mut C, a: [u64; 6]) -> Outcome {
+    let (tgid, tid, sig) = (int(a[0]), int(a[1]), int(a[2]));
+    let itself = i64::from(tid) == i64::from(ctx.tid()) && i64::from(tgid) == i64::from(ctx.tgid());
+    if tid > 0 && tgid > 0 && !itself {
+        return send_specific(ctx, tgid, tid, sig);
+    }
+    Outcome::Return(sys_tgkill(&mut ctx.state(), a[0], a[1], a[2]))
+}
+
+/// `do_tkill` for a thread other than the caller.
+#[allow(clippy::similar_names)]
+fn send_specific<C: Context>(ctx: &mut C, tgid: i32, tid: i32, sig: i32) -> Outcome {
+    let info = kill_info(ctx, sig, true);
+    let t = ctx.tasks();
+    Outcome::Return(status(
+        t.list
+            .send_specific(t.current, tgid, tid, sig, info, t.wake),
+    ))
+}
+
+/// `rt_sigqueueinfo(pid, sig, uinfo)` for a process other than the caller:
+/// copy and validate the user info, the `EPERM` rule, then `kill_proc_info`.
+fn rt_sigqueueinfo<C: Context>(ctx: &mut C, a: [u64; 6]) -> Outcome {
+    let (pid, sig) = (int(a[0]), int(a[1]));
+    if i64::from(pid) == i64::from(ctx.tgid()) {
+        let (mut state, mut pages) = ctx.parts();
+        return Outcome::Return(sys_rt_sigqueueinfo(
+            &mut state, &mut pages, a[0], a[1], a[2],
+        ));
+    }
+    let info = match copy_siginfo_from_user(ctx, sig, a[2]) {
+        Ok(info) => info,
+        Err(errno) => return Outcome::Return(error(errno)),
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    if let Err(errno) = queueinfo_perm(&info, ctx.tid() as i32, pid) {
+        return Outcome::Return(error(errno));
+    }
+    let t = ctx.tasks();
+    Outcome::Return(status(
+        t.list.kill_proc_info(t.current, sig, info, pid, t.wake),
+    ))
+}
+
+/// `rt_tgsigqueueinfo(tgid, tid, sig, uinfo)` for a thread other than the caller.
+#[allow(clippy::similar_names)]
+fn rt_tgsigqueueinfo<C: Context>(ctx: &mut C, a: [u64; 6]) -> Outcome {
+    let (tgid, tid, sig) = (int(a[0]), int(a[1]), int(a[2]));
+    let itself = i64::from(tid) == i64::from(ctx.tid()) && i64::from(tgid) == i64::from(ctx.tgid());
+    if itself || tid <= 0 || tgid <= 0 {
+        let (mut state, mut pages) = ctx.parts();
+        return Outcome::Return(sys_rt_tgsigqueueinfo(
+            &mut state, &mut pages, a[0], a[1], a[2], a[3],
+        ));
+    }
+    let info = match copy_siginfo_from_user(ctx, sig, a[3]) {
+        Ok(info) => info,
+        Err(errno) => return Outcome::Return(error(errno)),
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    if let Err(errno) = queueinfo_perm(&info, ctx.tid() as i32, tid) {
+        return Outcome::Return(error(errno));
+    }
+    let t = ctx.tasks();
+    Outcome::Return(status(
+        t.list
+            .send_specific(t.current, tgid, tid, sig, info, t.wake),
+    ))
 }
 
 #[cfg(test)]
@@ -132,15 +249,11 @@ mod tests {
             let claimed = super::dispatch(&mut t, no, [0; 6]).is_some();
             assert_eq!(claimed, no == Sysno::rt_sigaction, "{no:?}");
         }
-        // kill(0 / -1) is a loud stop, never a guess.
-        assert_eq!(
-            call(&mut t, Sysno::kill, &[0, 9]),
-            Outcome::Unimplemented(Sysno::kill as u32)
-        );
-        assert_eq!(
-            call(&mut t, Sysno::kill, &[u64::MAX, 9]),
-            Outcome::Unimplemented(Sysno::kill as u32)
-        );
+        // kill(0) signals the caller's group (init alone: the signal is
+        // dropped for it, the call succeeds); kill(-1) finds no process but
+        // init and the caller: ESRCH.
+        assert_eq!(call(&mut t, Sysno::kill, &[0, 9]), Outcome::Return(0));
+        assert_eq!(call(&mut t, Sysno::kill, &[u64::MAX, 9]), neg(Errno::ESRCH));
         // CPU-time interval timers wait for the time lane.
         assert_eq!(
             call(&mut t, Sysno::setitimer, &[1, 0, 0]),

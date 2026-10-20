@@ -34,8 +34,12 @@ pub const RLIMIT_CPU: usize = 0;
 pub const RLIMIT_FSIZE: usize = 1;
 /// `RLIMIT_STACK`.
 pub const RLIMIT_STACK: usize = 3;
+/// `RLIMIT_NPROC`.
+pub const RLIMIT_NPROC: usize = 6;
 /// `RLIMIT_NOFILE`.
 pub const RLIMIT_NOFILE: usize = 7;
+/// `RLIMIT_SIGPENDING`.
+pub const RLIMIT_SIGPENDING: usize = 11;
 /// `sysctl_nr_open` (fs/file.c:96), the ceiling `RLIMIT_NOFILE`'s hard limit may reach.
 pub const NR_OPEN: u64 = 1024 * 1024;
 

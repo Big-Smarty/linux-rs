@@ -31,7 +31,7 @@
 //!   pages in exactly like Linux; `RLIMIT_MEMLOCK` and friends come from the
 //!   fixed `INIT_RLIMITS` in `mm::Env`, not from `setrlimit`.
 
-use super::{AddressSpace, Context, Outcome, error};
+use super::{AddressSpace, Context, Files, Outcome, error};
 use crate::{
     mm::{FileMapping, MAP_ANONYMOUS, Mmap, PAGE_SIZE, VmFlags, mmap_off_to_pgoff},
     vfs::mapping::Mappable,
@@ -157,7 +157,8 @@ fn file_mapping<C: Context>(ctx: &mut C, m: &FileMapping, zero: bool) -> Outcome
         m.pgoff,
     ) {
         Ok(addr) => {
-            ctx.files().vfs.pin(m.file.id);
+            let Files { vfs, owner, .. } = ctx.files();
+            vfs.pin(owner, m.file.id);
             // shmem_mmap: file_accessed(file).
             ctx.files().vfs.file_accessed(m.file.id);
             Outcome::Return(addr.cast_signed())
@@ -170,9 +171,13 @@ fn file_mapping<C: Context>(ctx: &mut C, m: &FileMapping, zero: bool) -> Outcome
 /// shortcut: O(pins x VMAs) per call (skipped when nothing is pinned); keep a
 /// per-description VMA count when programs hold many file mappings.
 pub(super) fn unpin_unmapped<C: Context>(ctx: &mut C) {
+    let owner = ctx.files().owner;
     let mut index = ctx.files().vfs.pin_count();
     while index > 0 {
         index -= 1;
+        if ctx.files().vfs.pin_owner(index) != owner {
+            continue;
+        }
         let id = ctx.files().vfs.pin_id(index);
         let AddressSpace { mm, .. } = ctx.address_space();
         if !mm.vmas().iter().any(|vma| vma.file == Some(id)) {

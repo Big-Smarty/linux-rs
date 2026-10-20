@@ -92,7 +92,8 @@ impl Tasklist {
         };
         let mut state = self.signal_state(target).ok_or(Errno::ESRCH)?;
         let result = state.send_signal(sig, info, kind);
-        w.signal_wake(target);
+        let sched = self.sched_of(target);
+        w.signal_wake(target, sched);
         result
     }
 
@@ -163,7 +164,10 @@ impl Tasklist {
     }
 
     /// `kill_pid_info_type` for a pid that may name no task.
-    fn kill_pid_info(
+    ///
+    /// # Errors
+    /// `ESRCH` when the pid names no task, else as [`Tasklist::group_send_sig_info`].
+    pub fn kill_pid_info(
         &mut self,
         sender: Option<TaskId>,
         sig: i32,
@@ -175,6 +179,47 @@ impl Tasklist {
             .and_then(|pid| self.pid_task(pid, PidType::Pid))
             .ok_or(Errno::ESRCH)?;
         self.group_send_sig_info(sender, sig, info, target, SendTo::Group, w)
+    }
+
+    /// `kill_proc_info(sig, info, pid)` (`rt_sigqueueinfo`): the process `pid`
+    /// (`ESRCH` for 0, a negative number or a missing one).
+    ///
+    /// # Errors
+    /// As [`Tasklist::kill_pid_info`].
+    pub fn kill_proc_info(
+        &mut self,
+        sender: TaskId,
+        sig: i32,
+        info: SigInfo,
+        pid: i32,
+        w: &mut dyn Waker,
+    ) -> Result<(), Errno> {
+        let pid = if pid > 0 { self.find_vpid(pid) } else { None };
+        self.kill_pid_info(Some(sender), sig, info, pid, w)
+    }
+
+    /// `do_send_specific(tgid, pid, sig, info)` (`tkill`, `tgkill`,
+    /// `rt_tgsigqueueinfo`): the thread `tid`, which must belong to group
+    /// `tgid` when `tgid > 0`; permission, then the thread's private queue.
+    ///
+    /// # Errors
+    /// `ESRCH` for no such thread or a group mismatch, else as
+    /// [`Tasklist::group_send_sig_info`].
+    #[allow(clippy::similar_names)]
+    pub fn send_specific(
+        &mut self,
+        sender: TaskId,
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+        info: SigInfo,
+        w: &mut dyn Waker,
+    ) -> Result<(), Errno> {
+        let target = self
+            .find_task_by_vpid(tid)
+            .filter(|&t| tgid <= 0 || self.task_tgid_vnr(t) == tgid)
+            .ok_or(Errno::ESRCH)?;
+        self.group_send_sig_info(Some(sender), sig, info, target, SendTo::Thread, w)
     }
 
     /// `kill_something_info(sig, info, pid)`: `pid > 0` one process, `0` the

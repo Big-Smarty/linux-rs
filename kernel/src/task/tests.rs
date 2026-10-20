@@ -28,8 +28,8 @@ use super::{
     },
 };
 use crate::signal::{
-    SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, SIGKILL, SIGSTOP, SIGTERM,
-    SIGUSR1, SigAction, SigSet, deliver::ERESTARTSYS, info::SigInfo,
+    SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_DFL, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, SIGKILL, SIGSTOP,
+    SIGTERM, SIGUSR1, SigAction, SigSet, deliver::ERESTARTSYS, info::SigInfo,
 };
 use std::vec::Vec;
 use syscalls::Errno;
@@ -38,6 +38,8 @@ const ECHILD: i64 = -10;
 const FORK: ForkParams = ForkParams {
     rlimit_sigpending: 100,
     rlimit_nproc: 1000,
+    exit_signal: SIGCHLD,
+    clear_sighand: false,
 };
 
 #[derive(Default)]
@@ -49,7 +51,7 @@ impl Waker for Rec {
     fn child_event(&mut self, parent: TaskId) {
         self.child_events.push(parent);
     }
-    fn signal_wake(&mut self, task: TaskId) {
+    fn signal_wake(&mut self, task: TaskId, _sched: Option<crate::sched::SchedId>) {
         self.signal_wakes.push(task);
     }
 }
@@ -396,6 +398,8 @@ fn reparented_zombie_is_reaped_at_once_when_init_ignores_sigchld() {
     let (mut l, init) = list();
     l.signal_state(init).unwrap().hand.actions[usize::from(SIGCHLD) - 1].handler = SIG_IGN;
     let father = l.fork(init, FORK).unwrap();
+    // copy_sighand: father inherited SIG_IGN; it sets the default back.
+    l.signal_state(father).unwrap().hand.actions[usize::from(SIGCHLD) - 1].handler = SIG_DFL;
     let zombie = l.fork(father, FORK).unwrap();
     let live = l.fork(father, FORK).unwrap();
     // father ignores nothing: its child's exit leaves a zombie.
@@ -1084,8 +1088,13 @@ impl Waker for RqWaker<'_> {
             1,
         );
     }
-    fn signal_wake(&mut self, task: TaskId) {
+    fn signal_wake(&mut self, task: TaskId, sched: Option<crate::sched::SchedId>) {
         if task == self.init.0 {
+            assert_eq!(
+                sched,
+                Some(self.init.1),
+                "the model passes the bound handle"
+            );
             self.rq.wake_interruptible(self.init.1);
         }
     }
@@ -1100,6 +1109,7 @@ fn child_exit_wakes_only_the_parents_wait_chldexit_sleepers() {
     let child = l.fork(init, FORK).unwrap();
     let mut rq = Rq::new(4).unwrap();
     let sid = rq.add_task().unwrap();
+    l.set_sched(init, sid);
     assert!(rq.wake_up_new_task(sid));
     assert_eq!(rq.schedule().unwrap().next, sid);
     rq.prepare_to_wait(super::exit::chldexit_key(init), TaskState::Interruptible);
@@ -1128,4 +1138,37 @@ fn child_exit_wakes_only_the_parents_wait_chldexit_sleepers() {
     );
     l.exit_notify(child, &mut w).unwrap();
     assert_eq!(rq.state(sid), Some(TaskState::Running));
+}
+
+#[test]
+fn a_clone_exit_signal_other_than_sigchld_is_sent_with_the_chld_payload() {
+    // do_notify_parent: `info.si_signo = sig`; exit signal 0 or above _NSIG
+    // sends nothing but still wakes the waiters; none of them autoreaps.
+    let (mut l, init) = list();
+    l.signal_state(init).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+    let with = |signal: u8| ForkParams {
+        exit_signal: signal,
+        ..FORK
+    };
+    let child = l.fork(init, with(SIGUSR1)).unwrap();
+    let mut w = Rec::default();
+    assert_eq!(exit(&mut l, child, 4 << 8, &mut w), Notified::Zombie);
+    assert_eq!(w.child_events, [init]);
+    let (sig, info) = l.signal_state(init).unwrap().dequeue_signal().unwrap();
+    assert_eq!(sig, SIGUSR1);
+    assert_eq!(info.signo, i32::from(SIGUSR1));
+    assert_eq!(
+        (info.code, &info.body[..4]),
+        (CLD_EXITED, &2i32.to_le_bytes()[..])
+    );
+    for silent in [0, 65, 200] {
+        let child = l.fork(init, with(silent)).unwrap();
+        let mut w = Rec::default();
+        assert_eq!(exit(&mut l, child, 0, &mut w), Notified::Zombie);
+        assert_eq!(w.child_events, [init], "{silent}");
+        assert!(w.signal_wakes.is_empty(), "{silent}");
+        assert!(l.signal_state(init).unwrap().dequeue_signal().is_none());
+    }
+    // wait: a clone child is invisible to a plain wait and found by __WCLONE.
+    assert_eq!(wait_pid(&mut l, init, -1, WNOHANG).0, ECHILD);
 }

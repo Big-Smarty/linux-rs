@@ -300,6 +300,13 @@ impl Rq {
         self.queued + running + blocked
     }
 
+    /// Tasks that exist (slots in use, the idle task excluded): runnable,
+    /// sleeping or dead but not yet released by the next task.
+    #[must_use]
+    pub fn tasks_in_use(&self) -> usize {
+        self.slots.iter().skip(1).filter(|slot| slot.used).count()
+    }
+
     /// Whether a task other than the current one could run.
     #[must_use]
     pub fn has_runnable(&self) -> bool {
@@ -332,6 +339,28 @@ impl Rq {
         slot.next = None;
         slot.slice = 0;
         Ok(self.id(u32::try_from(index).map_err(|_| NoSlot)?))
+    }
+
+    /// Give back a slot [`Rq::add_task`] handed out whose task never ran and
+    /// was never queued (`copy_process` failed after `sched_fork`:
+    /// `sched_cancel_fork`). Returns whether it was freed (`false` for a stale
+    /// handle, a queued, running or sleeping task, or idle).
+    pub fn cancel_new_task(&mut self, id: SchedId) -> bool {
+        let index = id.index;
+        match self.slot(id) {
+            Some(slot)
+                if slot.state == TaskState::Running
+                    && !slot.queued
+                    && index != IDLE
+                    && index != self.curr =>
+            {
+                let generation = slot.generation.wrapping_add(1);
+                self.slots[index as usize] = Slot::FREE;
+                self.slots[index as usize].generation = generation;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn enqueue(&mut self, index: u32) {

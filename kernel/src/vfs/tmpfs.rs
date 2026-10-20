@@ -223,6 +223,13 @@ impl Tmpfs {
             .expect("stale inode handle")
     }
 
+    /// The pins on an inode (`i_count` beyond its links): working directories,
+    /// roots, open files and mappings. A leak check reads it.
+    #[must_use]
+    pub fn inode_refs(&self, id: InodeId) -> u32 {
+        self.inode(id).refs
+    }
+
     /// Pin an inode beyond its links (`ihold`/`dget`).
     pub fn iget(&mut self, id: InodeId) {
         let inode = self.inode_mut(id);

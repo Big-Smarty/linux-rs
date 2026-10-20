@@ -255,6 +255,29 @@ impl TaskSignals {
         }
     }
 
+    /// The signal state `copy_process` gives a forked child of this task
+    /// (no `CLONE_*` sharing): `copy_sighand` copies the dispositions;
+    /// `copy_signal` makes a fresh `signal_struct` (nothing pending, no group
+    /// exit or stop, the real interval timer unarmed, the limits `rlimit`);
+    /// the blocked masks and the alternate stack are copied with the task
+    /// struct (`dup_task_struct`; `sas_ss_reset` happens only for `CLONE_VM`),
+    /// the private pending queue is emptied (`init_sigpending`) and a mask
+    /// saved for `TIF_RESTORE_SIGMASK` is not carried (no fork happens while
+    /// one is armed: it is set only on the way out of the syscall that set it).
+    /// `clear_sighand` is `CLONE_CLEAR_SIGHAND` (`flush_signal_handlers(tsk, 1)`:
+    /// every disposition, `SIG_IGN` included, back to the default).
+    #[must_use]
+    pub fn fork_child(&self, rlimit_sigpending: u64, clear_sighand: bool) -> Self {
+        let mut child = Self::new(rlimit_sigpending);
+        if !clear_sighand {
+            child.hand = self.hand.clone();
+        }
+        child.thread.blocked = self.thread.blocked;
+        child.thread.real_blocked = self.thread.real_blocked;
+        child.thread.altstack = self.thread.altstack;
+        child
+    }
+
     /// The global init's: `SIGNAL_UNKILLABLE` (`copy_process`, child reaper).
     #[must_use]
     pub fn new_init(rlimit_sigpending: u64) -> Self {
@@ -404,6 +427,29 @@ impl State<'_> {
     #[must_use]
     pub fn signal_pending(&self) -> bool {
         self.sig.group_exit.is_some() || self.pending_set().0 & !self.me.blocked.0 != 0
+    }
+
+    /// `fatal_signal_pending`: `SIGKILL` is queued, or the group is already
+    /// being killed (which queues it for every thread).
+    #[must_use]
+    pub fn fatal_signal_pending(&self) -> bool {
+        self.sig.group_exit.is_some() || self.pending_set().contains(SIGKILL)
+    }
+
+    /// `unhandled_signal(tsk, sig)`: whether a fatal `sig` would end the task
+    /// without a handler having a say (what makes the kernel print the
+    /// "segfault at" / "traps:" lines): always for global init, else when the
+    /// disposition is the default or ignore and the task is not already dying.
+    #[must_use]
+    pub fn unhandled_signal(&self, sig: u8) -> bool {
+        if self.global_init {
+            return true;
+        }
+        let handler = self.hand.actions[usize::from(sig) - 1].handler;
+        if handler != SIG_IGN && handler != SIG_DFL {
+            return false;
+        }
+        !self.fatal_signal_pending()
     }
 
     /// `set_current_blocked`: SIGKILL and SIGSTOP are never blocked.

@@ -289,3 +289,27 @@ fn a_new_task_cannot_be_queued_twice() {
     assert!(!rq.wake_up_new_task(a));
     assert!(!rq.wake_up_new_task(rq.idle()));
 }
+
+#[test]
+fn a_task_that_never_ran_can_be_cancelled_and_its_slot_reused() {
+    // sched_cancel_fork: only a fresh, unqueued task.
+    let mut rq = rq(3);
+    let fresh = rq.add_task().unwrap();
+    let queued = spawn(&mut rq);
+    assert!(
+        !rq.cancel_new_task(queued),
+        "queued tasks are not cancelled"
+    );
+    assert!(!rq.cancel_new_task(rq.idle()));
+    assert!(rq.cancel_new_task(fresh));
+    assert_eq!(rq.state(fresh), None, "the handle is stale");
+    assert!(!rq.cancel_new_task(fresh));
+    // The slot is free again, with a new generation.
+    let again = rq.add_task().unwrap();
+    assert_eq!(again.index(), fresh.index());
+    assert_ne!(again, fresh);
+    assert_eq!(rq.add_task(), Err(NoSlot));
+    // A running task is not cancellable either.
+    assert_eq!(rq.schedule().unwrap().next, queued);
+    assert!(!rq.cancel_new_task(queued));
+}

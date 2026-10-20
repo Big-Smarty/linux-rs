@@ -114,8 +114,11 @@ impl fmt::Display for InVma {
 /// x86 page-fault error-code bits.
 pub const PF_PROT: u64 = 1;
 
-/// `show_signal_msg`: `init[1]: segfault at ...` (one line, no newline).
+/// `show_signal_msg`: `init[<pid>]: segfault at ...` (one line, no newline;
+/// the program name is the task's `comm`, which the caller has checked to be `init`).
 pub struct Segfault {
+    /// `task_pid_nr(tsk)`.
+    pub pid: i32,
     pub address: u64,
     pub ip: u64,
     pub sp: u64,
@@ -133,7 +136,8 @@ impl fmt::Display for Segfault {
         };
         write!(
             f,
-            "init[1]: segfault at {:x} ip {:016x} sp {:016x} error {:x}{} likely on CPU 0 (core 0, socket 0)",
+            "init[{}]: segfault at {:x} ip {:016x} sp {:016x} error {:x}{} likely on CPU 0 (core 0, socket 0)",
+            self.pid,
             self.address,
             self.ip,
             self.sp,
@@ -178,10 +182,12 @@ pub const fn user_exception(vector: u8) -> Option<UserSignal> {
     Some(UserSignal { signal, message })
 }
 
-/// `show_signal`: `traps: init[1] <type><desc> ip:%lx sp:%lx error:%lx[ in init[...]]`
+/// `show_signal`: `traps: init[<pid>] <type><desc> ip:%lx sp:%lx error:%lx[ in init[...]]`
 /// (`traps.c` defines `pr_fmt` as `"traps: " fmt`; the pinned reference prints
 /// `traps: init[1] trap int3 ip:...`).
 pub struct TrapLine {
+    /// `task_pid_nr(tsk)`.
+    pub pid: i32,
     pub kind: &'static str,
     pub desc: &'static str,
     pub ip: u64,
@@ -194,7 +200,8 @@ impl fmt::Display for TrapLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "traps: init[1] {}{} ip:{:x} sp:{:x} error:{:x}{}",
+            "traps: init[{}] {}{} ip:{:x} sp:{:x} error:{:x}{}",
+            self.pid,
             self.kind,
             self.desc,
             self.ip,
@@ -205,8 +212,8 @@ impl fmt::Display for TrapLine {
     }
 }
 
-/// `signal_fault`: `init[1] bad frame in rt_sigreturn frame:%p ip:%lx sp:%lx orax:%lx[ in init[...]]`
-/// (`arch/x86/kernel/signal.c:368-383`; `me->comm` is `init`, pid 1, and the line
+/// `signal_fault`: `init[<pid>] bad frame in rt_sigreturn frame:%p ip:%lx sp:%lx orax:%lx[ in init[...]]`
+/// (`arch/x86/kernel/signal.c:368-383`; `me->comm` is `init`, and the line
 /// is `KERN_EMERG` for pid 1).
 ///
 /// shortcut: `%p` is printed as the pinned kernel prints it before its pointer-hash
@@ -214,6 +221,8 @@ impl fmt::Display for TrapLine {
 /// TCG); once the kernel has entropy (observed under KVM) the value is a per-boot
 /// keyed hash of the frame address that no other kernel can reproduce.
 pub struct BadFrame {
+    /// `task_pid_nr(me)`.
+    pub pid: i32,
     pub ip: u64,
     pub sp: u64,
     pub orig_ax: u64,
@@ -224,7 +233,8 @@ impl fmt::Display for BadFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "init[1] bad frame in rt_sigreturn frame:(____ptrval____) ip:{:x} sp:{:x} orax:{:x}{}",
+            "init[{}] bad frame in rt_sigreturn frame:(____ptrval____) ip:{:x} sp:{:x} orax:{:x}{}",
+            self.pid,
             self.ip,
             self.sp,
             self.orig_ax,

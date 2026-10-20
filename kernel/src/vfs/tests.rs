@@ -684,6 +684,107 @@ fn pipe_buffers_merge_small_writes_and_fill_after_sixteen_pages() {
     assert_eq!(vfs.files.open_count(), 0);
 }
 
+// ---- fork and exit: descriptors, fs_struct, mapping pins ------------------------
+
+/// Install `file` at the lowest free descriptor (`get_unused_fd` + `fd_install`).
+fn install(fdt: &mut FdTable, file: FileId, cloexec: bool) -> u32 {
+    let fd = fdt.alloc_fd(0, 1024, cloexec).unwrap();
+    fdt.install(fd, file);
+    fd
+}
+
+#[test]
+fn dup_fd_gives_the_child_its_own_table_over_shared_descriptions() {
+    let (mut vfs, env) = rootfs(1 << 10);
+    let mut parent = FdTable::default();
+    let file = open(&mut vfs, &env, b"/dev/console", O_RDWR, 0).unwrap();
+    let (read, write) = vfs.pipe_create(0, &Cred::root()).unwrap();
+    assert_eq!(install(&mut parent, file, false), 0);
+    assert_eq!(install(&mut parent, read, true), 1);
+    assert_eq!(install(&mut parent, write, false), 2);
+    // A high descriptor sizes the child's table for it.
+    parent.expand(100).unwrap();
+    let high = open(&mut vfs, &env, b"/dev/console", O_RDWR, 0).unwrap();
+    let fd = parent.alloc_fd(100, 1024, false).unwrap();
+    parent.install(fd, high);
+    let open_files = vfs.files.open_count();
+
+    let mut child = vfs.dup_fd(&parent).unwrap();
+    assert_eq!(
+        vfs.files.open_count(),
+        open_files,
+        "descriptions are shared"
+    );
+    let seen = |t: &FdTable| t.iter().collect::<Vec<_>>();
+    assert_eq!(seen(&child), seen(&parent));
+    assert_eq!(seen(&child).len(), 4);
+    assert!(child.cloexec(1) && !child.cloexec(0));
+    // The tables are independent: closing in the child leaves the parent's.
+    vfs.close_files(&mut child);
+    assert_eq!(seen(&child), []);
+    assert_eq!(seen(&parent).len(), 4);
+    assert_eq!(vfs.files.open_count(), open_files);
+    // The child's next descriptor is the lowest free one of its own table.
+    let mut child = vfs.dup_fd(&parent).unwrap();
+    assert_eq!(child.close(0).map(|f| vfs.fput(f)), Some(()));
+    assert_eq!(child.alloc_fd(0, 1024, false).unwrap(), 0);
+    child.put_unused(0);
+    // Both closed: the last reference frees the descriptions and pipe ends.
+    vfs.close_files(&mut child);
+    vfs.close_files(&mut parent);
+    assert_eq!(vfs.files.open_count(), 0);
+    // An empty table duplicates to an empty table.
+    let empty = vfs.dup_fd(&FdTable::default()).unwrap();
+    assert_eq!(empty.max_fds(), 0);
+}
+
+#[test]
+fn dup_fs_and_put_fs_balance_the_directory_references() {
+    let (mut vfs, _) = rootfs(1 << 10);
+    let fs = vfs.new_fs_struct(0o077);
+    let (root, pwd) = (fs.root, fs.pwd);
+    let before = (vfs.fs.inode_refs(root), vfs.fs.inode_refs(pwd));
+    let child = vfs.dup_fs(&fs);
+    assert_eq!(child, fs, "the same root, cwd and umask");
+    assert_eq!(
+        vfs.fs.inode_refs(root),
+        before.0 + 2,
+        "root and cwd are both the root"
+    );
+    vfs.put_fs(&child);
+    assert_eq!((vfs.fs.inode_refs(root), vfs.fs.inode_refs(pwd)), before);
+}
+
+#[test]
+fn mapping_pins_belong_to_an_address_space_and_clone_with_fork() {
+    let (mut vfs, env) = rootfs(1 << 10);
+    let file = open(&mut vfs, &env, b"/dev/console", O_RDWR, 0).unwrap();
+    let id = u64::from(file.index());
+    for _ in 0..2 {
+        vfs.reserve_pin().unwrap();
+    }
+    vfs.pin(1, id);
+    vfs.pin(1, id); // idempotent per owner
+    assert_eq!(vfs.pin_count(), 1);
+    // A forked address space holds its own reference; the other owner's
+    // stays when one of them goes away.
+    vfs.pin_clone(1, 2).unwrap();
+    assert_eq!(
+        (vfs.pin_count(), vfs.pin_owner(0), vfs.pin_owner(1)),
+        (2, 1, 2)
+    );
+    vfs.unpin_all(1);
+    assert_eq!((vfs.pin_count(), vfs.pin_owner(0)), (1, 2));
+    vfs.fput(file);
+    assert_eq!(
+        vfs.files.open_count(),
+        1,
+        "the child's mapping keeps it open"
+    );
+    vfs.unpin_all(2);
+    assert_eq!((vfs.pin_count(), vfs.files.open_count()), (0, 0));
+}
+
 // ---- the initramfs unpacker ---------------------------------------------------
 
 /// One `newc` record: header, NUL-terminated name, data, 4-byte padding.

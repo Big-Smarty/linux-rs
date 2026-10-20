@@ -24,9 +24,10 @@ use super::{
     tasklist::{ExitState, PF_EXITING, PF_SIGNALED, TaskId, Tasklist},
 };
 use crate::{
-    sched::{CLASS_CHLDEXIT, WaitKey},
+    sched::{CLASS_CHLDEXIT, SchedId, WaitKey},
     signal::{
-        SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, info::SigInfo, state::Target,
+        NSIG, SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, info::SigInfo,
+        state::Target,
     },
 };
 
@@ -56,8 +57,10 @@ pub trait Waker {
     /// `__wake_up_parent`: a child of `parent` changed state (exited, stopped,
     /// continued): `wait4`/`waitid` sleepers of `parent` re-check.
     fn child_event(&mut self, parent: TaskId);
-    /// `signal_wake_up`: `task` has a signal queued.
-    fn signal_wake(&mut self, task: TaskId);
+    /// `signal_wake_up`: `task` has a signal queued. `sched` is its
+    /// scheduling handle ([`Tasklist::set_sched`]), `None` for a task that has
+    /// none bound (the host fakes).
+    fn signal_wake(&mut self, task: TaskId, sched: Option<SchedId>);
 }
 
 /// The wait queue `signal_struct::wait_chldexit` of `parent`'s thread group:
@@ -74,7 +77,7 @@ pub struct NoWake;
 
 impl Waker for NoWake {
     fn child_event(&mut self, _parent: TaskId) {}
-    fn signal_wake(&mut self, _task: TaskId) {}
+    fn signal_wake(&mut self, _task: TaskId, _sched: Option<SchedId>) {}
 }
 
 /// Why a task cannot go through [`Tasklist::exit_notify`].
@@ -282,7 +285,7 @@ impl Tasklist {
         } else {
             (CLD_EXITED, exit_code >> 8)
         };
-        let info = SigInfo::chld(
+        let mut info = SigInfo::chld(
             code,
             pid,
             uid,
@@ -290,6 +293,9 @@ impl Tasklist {
             clock_t(cpu.0),
             clock_t(cpu.1),
         );
+        // `info.si_signo = sig`: a `clone` exit signal other than SIGCHLD carries
+        // the same `_sigchld` payload.
+        info.signo = i32::from(sig);
         let mut sig = sig;
         let mut autoreap = false;
         if let Some(mut state) = self.signal_state(parent) {
@@ -302,10 +308,13 @@ impl Tasklist {
                     sig = 0;
                 }
             }
-            if sig != 0 {
+            // `valid_signal(sig) && sig`: a `clone` exit signal above `_NSIG` is
+            // never sent (it is not checked at the syscall).
+            if sig != 0 && sig <= NSIG {
                 // Only a real-time signal sent with `si_code < 0` can fail.
                 let _ = state.send_signal(sig, info, Target::Process);
-                w.signal_wake(parent);
+                let sched = self.sched_of(parent);
+                w.signal_wake(parent, sched);
             }
         }
         w.child_event(parent);
@@ -340,7 +349,8 @@ impl Tasklist {
             let action = state.hand.actions[usize::from(SIGCHLD) - 1];
             if action.handler != SIG_IGN && action.flags & SA_NOCLDSTOP == 0 {
                 let _ = state.send_signal(SIGCHLD, info, Target::Process);
-                w.signal_wake(parent);
+                let sched = self.sched_of(parent);
+                w.signal_wake(parent, sched);
             }
         }
         w.child_event(parent);

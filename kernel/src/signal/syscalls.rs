@@ -411,7 +411,7 @@ pub fn sys_tkill(state: &mut State, tid: u64, sig: u64) -> i64 {
 /// `__copy_siginfo_from_user(signo, ..)`: 48 bytes (`EFAULT`), `si_signo`
 /// overwritten, and for a `(signo, si_code)` the kernel has no layout for the
 /// 80 expansion bytes must be readable (`EFAULT`) and zero (`E2BIG`).
-fn copy_siginfo_from_user<P: UserPages>(
+pub(crate) fn copy_siginfo_from_user<P: UserPages>(
     pages: &mut P,
     signo: i32,
     uinfo: u64,
@@ -434,8 +434,8 @@ fn copy_siginfo_from_user<P: UserPages>(
 
 /// "Not even root can pretend to send signals from the kernel, nor impersonate
 /// a kill()/tgkill()": user codes `>= 0` and `SI_TKILL` only to oneself.
-fn queueinfo_perm(info: &SigInfo, state: &State, pid: i32) -> Result<(), Errno> {
-    if (info.code >= 0 || info.code == SI_TKILL) && state.pid != pid {
+pub(crate) fn queueinfo_perm(info: &SigInfo, tid: i32, pid: i32) -> Result<(), Errno> {
+    if (info.code >= 0 || info.code == SI_TKILL) && tid != pid {
         Err(Errno::EPERM)
     } else {
         Ok(())
@@ -458,7 +458,7 @@ pub fn sys_rt_sigqueueinfo<P: UserPages>(
         Ok(info) => info,
         Err(errno) => return err(errno),
     };
-    if let Err(errno) = queueinfo_perm(&info, state, pid) {
+    if let Err(errno) = queueinfo_perm(&info, state.pid, pid) {
         return err(errno);
     }
     if pid != state.tgid {
@@ -485,7 +485,7 @@ pub fn sys_rt_tgsigqueueinfo<P: UserPages>(
     if tid <= 0 || tgid <= 0 {
         return err(Errno::EINVAL);
     }
-    if let Err(errno) = queueinfo_perm(&info, state, tid) {
+    if let Err(errno) = queueinfo_perm(&info, state.pid, tid) {
         return err(errno);
     }
     send_specific(state, tgid, tid, sig, Some(info))

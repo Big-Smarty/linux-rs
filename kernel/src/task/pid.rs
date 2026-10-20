@@ -232,6 +232,14 @@ impl PidTable {
     pub const fn cursor(&self) -> u32 {
         self.next
     }
+
+    /// Heap bytes the number table holds. It is indexed by pid number, so it
+    /// grows with the highest number handed out until the cursor wraps; a leak
+    /// check subtracts it from the heap total.
+    #[must_use]
+    pub fn footprint_bytes(&self) -> usize {
+        self.entries.capacity() * core::mem::size_of::<Option<PidId>>()
+    }
 }
 
 #[cfg(test)]

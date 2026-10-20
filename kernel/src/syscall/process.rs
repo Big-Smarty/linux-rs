@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Selected semantics from Linux 6.18.57, commit
-// 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: kernel/exit.c (`sys_exit`,
+// 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: kernel/fork.c (`SYSCALL_DEFINE0(fork)`,
+// `vfork`, `clone`, `clone3`; the argument decoding is `task::fork`),
+// kernel/exit.c (`sys_exit`,
 // `sys_exit_group`, `do_group_exit`, `SYSCALL_DEFINE5(waitid)`,
 // `kernel_waitid`, `SYSCALL_DEFINE4(wait4)`, `kernel_wait4`, `do_wait`),
 // kernel/sys.c (`sys_getpid`, `getppid`, `setpgid`, `getpgid`, `getpgrp`,
@@ -14,9 +16,14 @@
 
 use super::{Context, Outcome, error};
 use crate::{
-    signal::{SIGCHLD, deliver::ERESTARTSYS, wait::wait_event_interruptible},
+    signal::{
+        SIGCHLD,
+        deliver::{ERESTARTNOINTR, ERESTARTSYS},
+        wait::wait_event_interruptible,
+    },
     task::{
         exit::chldexit_key,
+        fork::CloneArgs,
         wait::{WNOHANG, WaitInfo, WaitOpts},
     },
     usercopy::{access_ok, copy_to_user, put_user},
@@ -74,10 +81,46 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
             let t = ctx.tasks();
             value(t.list.setpgid(t.current, int(a0), int(a1)).map(|()| 0))
         }
+        Sysno::fork => clone_syscall(ctx, sysno, &CloneArgs::fork()),
+        Sysno::vfork => clone_syscall(ctx, sysno, &CloneArgs::vfork()),
+        Sysno::clone => clone_syscall(ctx, sysno, &CloneArgs::from_clone(a0, a1, a2, a3, a4)),
+        Sysno::clone3 => match CloneArgs::from_clone3(ctx, a0, a1) {
+            Ok(args) => clone_syscall(ctx, sysno, &args),
+            Err(errno) => Outcome::Return(error(errno)),
+        },
         Sysno::wait4 => Outcome::Return(wait4(ctx, int(a0), a1, uint(a2), a3)),
         Sysno::waitid => Outcome::Return(waitid(ctx, int(a0), int(a1), a2, uint(a3), a4)),
         _ => return None,
     })
+}
+
+/// `kernel_clone` for `fork`, `vfork`, `clone` and `clone3`: the argument
+/// checks of `copy_process` in Linux's order, then a request the kernel
+/// either implements (a plain copy of the process) or stops on loudly; the
+/// restart of a fork interrupted by a signal; the copy; the parent's
+/// `CLONE_PARENT_SETTID` store (its failure is ignored, as `put_user` is).
+fn clone_syscall<C: Context>(ctx: &mut C, sysno: Sysno, args: &CloneArgs) -> Outcome {
+    let unkillable = ctx.state().sig.unkillable;
+    if let Err(errno) = args.validate(unkillable) {
+        return Outcome::Return(error(errno));
+    }
+    let Ok(request) = args.request() else {
+        return Outcome::Unimplemented(sysno as u32);
+    };
+    // copy_process: a signal that arrived before the fork is delivered
+    // first (`task_sigpending(current)`), then the call starts over.
+    if ctx.state().signal_pending() {
+        return Outcome::Return(-ERESTARTNOINTR);
+    }
+    match ctx.copy_process(&request) {
+        Err(errno) => Outcome::Return(error(errno)),
+        Ok(pid) => {
+            if let Some(at) = args.parent_settid() {
+                let _ = put_user(ctx, at, &pid.to_le_bytes());
+            }
+            Outcome::Return(i64::from(pid))
+        }
+    }
 }
 
 /// `do_exit((error_code & 0xff) << 8)` / `do_group_exit` of the same value.
@@ -257,6 +300,8 @@ mod tests {
                 ForkParams {
                     rlimit_sigpending: 100,
                     rlimit_nproc: 1000,
+                    exit_signal: crate::signal::SIGCHLD,
+                    clear_sighand: false,
                 },
             )
             .unwrap()
@@ -521,6 +566,157 @@ mod tests {
 
     fn put_info(t: &mut Task) {
         assert_eq!(copy_to_user(t, 0x1000, &[0xaa; 128]), 0);
+    }
+
+    #[test]
+    fn fork_family_validates_then_copies_or_stops_loudly() {
+        use crate::signal::{SIGUSR1, info::SigInfo, state::Target};
+        let mut t = t();
+        // fork: the next pid, a child of the caller, SIGCHLD at its exit.
+        assert_eq!(call(&mut t, Sysno::fork, &[]), 2);
+        assert_eq!(t.forked[0].exit_signal, 17);
+        assert_eq!(t.tasks.children(t.current).count(), 1);
+        // clone with flags in the low word, the high word ignored; a stack
+        // pointer is the child's rsp; PARENT_SETTID stores the pid.
+        let flags = 0xdead_0000_0000_0000 | 0x10_0000 | 0x11;
+        assert_eq!(
+            call(&mut t, Sysno::clone, &[flags, 0x7000, 0x1000, 0, 0]),
+            3
+        );
+        assert_eq!(t.forked[1].child_sp, 0x7000);
+        assert_eq!(i32::from_le_bytes(read(&mut t, 0x1000)), 3);
+        // A faulting store is ignored (put_user's result is dropped).
+        assert_eq!(
+            call(&mut t, Sysno::clone, &[0x10_0000 | 0x11, 0, BAD, 0, 0]),
+            4
+        );
+        // An exit signal of 0 and one past _NSIG are fine for `clone`.
+        assert_eq!(call(&mut t, Sysno::clone, &[0, 0, 0, 0, 0]), 5);
+        assert_eq!(call(&mut t, Sysno::clone, &[200, 0, 0, 0, 0]), 6);
+        assert_eq!((t.forked[3].exit_signal, t.forked[4].exit_signal), (0, 200));
+        // copy_process' checks come first, in its order.
+        assert_eq!(
+            call(&mut t, Sysno::clone, &[0x1_0000 | 0x11, 0, 0, 0, 0]),
+            neg(Errno::EINVAL),
+            "CLONE_THREAD without CLONE_SIGHAND"
+        );
+        assert_eq!(
+            call(&mut t, Sysno::clone, &[0x1000 | 0x10_0000, 0, 0x1000, 0, 0]),
+            neg(Errno::EINVAL),
+            "CLONE_PIDFD and CLONE_PARENT_SETTID on one slot"
+        );
+        // Valid but unimplemented requests are loud stops, not errors.
+        for (sysno, args) in [
+            (Sysno::vfork, [0u64; 6]),
+            (Sysno::clone, [0x100 | 0x11, 0, 0, 0, 0, 0]),
+            (Sysno::clone, [0x8_0000 | 0x11, 0, 0, 0, 0, 0]),
+            (
+                Sysno::clone,
+                [0x1_0000 | 0x800 | 0x100 | 0x11, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            assert_eq!(
+                dispatch(&mut t, sysno as u64, args),
+                Outcome::Unimplemented(sysno as u32),
+                "{sysno:?} {args:x?}"
+            );
+        }
+        assert_eq!(t.forked.len(), 5, "no stop created a child");
+        // clone3: size and field errors, then the copy with the stack top.
+        assert_eq!(
+            call(&mut t, Sysno::clone3, &[0x1000, 63]),
+            neg(Errno::EINVAL)
+        );
+        let mut args = [0u8; 88];
+        args[32..40].copy_from_slice(&17u64.to_le_bytes());
+        args[40..48].copy_from_slice(&0x7000u64.to_le_bytes());
+        args[48..56].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert_eq!(copy_to_user(&mut t, 0x1000, &args), 0);
+        assert_eq!(call(&mut t, Sysno::clone3, &[0x1000, 88]), 7);
+        assert_eq!(t.forked[5].child_sp, 0x8000);
+        // A signal pending before the fork restarts it (-ERESTARTNOINTR).
+        let handled = t.state.hand.actions[usize::from(SIGUSR1) - 1];
+        assert_ne!(handled.handler, 0);
+        t.state
+            .send_signal(SIGUSR1, SigInfo::kill(SIGUSR1, 0, 1, 0), Target::Process)
+            .unwrap();
+        assert_eq!(call(&mut t, Sysno::fork, &[]), -513);
+        assert_eq!(t.forked.len(), 6);
+    }
+
+    #[test]
+    fn signals_reach_other_tasks_through_the_task_list() {
+        let mut t = t();
+        let child = fork(&mut t); // pid 2
+        // kill: the default action of SIGTERM kills a non-init child.
+        assert_eq!(call(&mut t, Sysno::kill, &[2, 15]), 0);
+        assert_eq!(
+            t.tasks.signal_state(child).unwrap().sig.group_exit,
+            Some(15)
+        );
+        assert_eq!(call(&mut t, Sysno::kill, &[2, 0]), 0);
+        assert_eq!(call(&mut t, Sysno::kill, &[99, 9]), neg(Errno::ESRCH));
+        assert_eq!(call(&mut t, Sysno::kill, &[2, 65]), neg(Errno::EINVAL));
+        // A group that does not exist, the caller's group, and "everything".
+        assert_eq!(
+            call(&mut t, Sysno::kill, &[(-5i64) as u64, 9]),
+            neg(Errno::ESRCH)
+        );
+        assert_eq!(call(&mut t, Sysno::kill, &[0, 0]), 0);
+        assert_eq!(
+            call(&mut t, Sysno::kill, &[u64::MAX, 0]),
+            0,
+            "init skipped, child found"
+        );
+        // tkill and tgkill name the thread; tgkill checks the group.
+        assert_eq!(call(&mut t, Sysno::tkill, &[2, 0]), 0);
+        assert_eq!(call(&mut t, Sysno::tkill, &[99, 0]), neg(Errno::ESRCH));
+        assert_eq!(call(&mut t, Sysno::tgkill, &[2, 2, 0]), 0);
+        assert_eq!(call(&mut t, Sysno::tgkill, &[1, 2, 0]), neg(Errno::ESRCH));
+        assert_eq!(call(&mut t, Sysno::tgkill, &[2, 0, 0]), neg(Errno::EINVAL));
+        // rt_sigqueueinfo: the user info is copied first (EFAULT), then the
+        // impersonation rule (SI_USER to another pid), then the lookup.
+        let mut info = [0u8; 128];
+        info[8..12].copy_from_slice(&(-1i32).to_le_bytes()); // SI_QUEUE
+        assert_eq!(copy_to_user(&mut t, 0x1000, &info), 0);
+        assert_eq!(
+            call(&mut t, Sysno::rt_sigqueueinfo, &[2, 10, BAD]),
+            neg(Errno::EFAULT)
+        );
+        assert_eq!(call(&mut t, Sysno::rt_sigqueueinfo, &[2, 10, 0x1000]), 0);
+        assert_eq!(
+            call(&mut t, Sysno::rt_sigqueueinfo, &[99, 10, 0x1000]),
+            neg(Errno::ESRCH)
+        );
+        info[8..12].copy_from_slice(&0i32.to_le_bytes()); // SI_USER
+        assert_eq!(copy_to_user(&mut t, 0x1000, &info), 0);
+        assert_eq!(
+            call(&mut t, Sysno::rt_sigqueueinfo, &[2, 10, 0x1000]),
+            neg(Errno::EPERM)
+        );
+        info[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(copy_to_user(&mut t, 0x1000, &info), 0);
+        assert_eq!(
+            call(&mut t, Sysno::rt_tgsigqueueinfo, &[2, 2, 10, 0x1000]),
+            0
+        );
+        assert_eq!(
+            call(&mut t, Sysno::rt_tgsigqueueinfo, &[1, 2, 10, 0x1000]),
+            neg(Errno::ESRCH)
+        );
+    }
+
+    #[test]
+    fn fork_limits_come_from_the_task_list() {
+        let mut t = t();
+        // max_threads is 1000 in the fake, RLIMIT_NPROC is not reached by root.
+        t.tasks = crate::task::Tasklist::new(3, &t.attrs.cred, 1000)
+            .unwrap()
+            .0;
+        t.current = t.tasks.child_reaper();
+        assert_eq!(call(&mut t, Sysno::fork, &[]), 2);
+        assert_eq!(call(&mut t, Sysno::fork, &[]), 3);
+        assert_eq!(call(&mut t, Sysno::fork, &[]), neg(Errno::EAGAIN));
     }
 
     /// Judge flaw 1: a syscall that changes credentials must publish the

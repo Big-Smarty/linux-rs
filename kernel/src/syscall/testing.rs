@@ -14,7 +14,7 @@ use crate::{
     signal::{
         self, SIGALRM, SIGUSR1, SIGUSR2, State, frame::Sigreturn, info::SigInfo, state::Target,
     },
-    task::{Attributes, TaskId, Tasklist, exit::NoWake},
+    task::{Attributes, TaskId, Tasklist, exit::NoWake, fork::ForkRequest, tasklist::ForkParams},
     usercopy::{UserPages, fake::Space},
     vfs::{FdTable, FileId, Timespec, Vfs},
 };
@@ -122,6 +122,10 @@ pub struct Task<P = Space, C = Sink> {
     pub script: Vec<(u64, u8)>,
     /// The value the fake `rt_sigreturn` reports.
     pub sigreturn_ret: u64,
+    /// The plain-copy requests `copy_process` served (the fake adds the child
+    /// to the task list only; address space, descriptors and registers are
+    /// the binary's and are exercised by the kernel-test cases).
+    pub forked: Vec<ForkRequest>,
 }
 
 fn clock() -> Timespec {
@@ -173,6 +177,7 @@ impl<P, C> Task<P, C> {
             waits: 0,
             script: Vec::new(),
             sigreturn_ret: 0,
+            forked: Vec::new(),
         }
     }
 
@@ -202,7 +207,7 @@ impl<P: UserPages, C> UserPages for Task<P, C> {
         if !self.file_pages.contains_key(&page) {
             let mut bytes = Box::new([0u8; 4096]);
             let pgoff = vma.pgoff + ((page - vma.start) >> 12);
-            self.vfs.fault_page(file, pgoff, &mut bytes).ok()?;
+            self.vfs.fault_page(0, file, pgoff, &mut bytes).ok()?;
             self.file_pages.insert(page, bytes);
         }
         self.file_pages.get_mut(&page).map(|bytes| &mut **bytes)
@@ -273,7 +278,14 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
             vfs: &mut self.vfs,
             fdt: &mut self.fdt,
             fs: &mut self.attrs.fs,
+            owner: 0,
         }
+    }
+    fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, syscalls::Errno> {
+        let params = ForkParams::of(&self.attrs, request);
+        let child = self.tasks.fork(self.current, params)?;
+        self.forked.push(*request);
+        Ok(self.tasks.task_pid_vnr(child))
     }
 }
 

@@ -1193,13 +1193,13 @@ fn file_mmap_pins_the_description_and_follows_the_file_kind() {
     // shmem_fault: page 0 is the file, page 1 holds the rest then zeros,
     // page 2 starts at 8192 >= i_size (SIGBUS).
     let mut page = [0u8; 4096];
-    t.vfs.fault_page(id, 0, &mut page).unwrap();
+    t.vfs.fault_page(0, id, 0, &mut page).unwrap();
     assert_eq!(&page[..], &content[..4096]);
-    t.vfs.fault_page(id, 1, &mut page).unwrap();
+    t.vfs.fault_page(0, id, 1, &mut page).unwrap();
     assert_eq!(&page[..904], &content[4096..]);
     assert!(page[904..].iter().all(|&byte| byte == 0));
     assert_eq!(
-        t.vfs.fault_page(id, 2, &mut page),
+        t.vfs.fault_page(0, id, 2, &mut page),
         Err(crate::vfs::mapping::FileFault::Bus)
     );
     // The page was copied: writing the file now would differ from Linux's
@@ -1319,7 +1319,7 @@ fn truncating_a_file_with_a_touched_mapping_stops_loudly() {
     // Untouched mapping: no copy exists, so truncation is ordinary.
     assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 200]), ok(0));
     let id = t.mm.find_vma(addr as u64).unwrap().file.unwrap();
-    t.vfs.fault_page(id, 0, &mut [0; 4096]).unwrap();
+    t.vfs.fault_page(0, id, 0, &mut [0; 4096]).unwrap();
     assert_eq!(
         call(&mut t, Sysno::ftruncate, &[f, 50]),
         Outcome::Unimplemented(Sysno::ftruncate as u32)
@@ -1372,7 +1372,7 @@ fn a_write_that_faults_is_not_a_coherence_stop() {
     let (f, addr) = mapped_file(&mut t, 1);
     let mut page = [0u8; 4096];
     let id = t.mm.find_vma(addr).unwrap().file.unwrap();
-    t.vfs.fault_page(id, 0, &mut page).unwrap();
+    t.vfs.fault_page(0, id, 0, &mut page).unwrap();
     assert_eq!(call(&mut t, Sysno::write, &[f, BAD, 8]), err(Errno::EFAULT));
     assert!(!t.vfs.take_coherence_loss());
 }
@@ -1383,7 +1383,7 @@ fn growing_a_file_with_a_copied_page_is_ordinary() {
     let mut t = t();
     let (f, addr) = mapped_file(&mut t, 1);
     let id = t.mm.find_vma(addr).unwrap().file.unwrap();
-    t.vfs.fault_page(id, 0, &mut [0; 4096]).unwrap();
+    t.vfs.fault_page(0, id, 0, &mut [0; 4096]).unwrap();
     assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 8192]), ok(0));
     assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 8192]), ok(0));
     assert_eq!(
