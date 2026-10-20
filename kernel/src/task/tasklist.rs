@@ -123,8 +123,15 @@ pub struct TaskStruct {
     pub exit_state: ExitState,
     /// `exit_code` (the `wait` status format).
     pub exit_code: u32,
-    /// `exit_signal` (always `SIGCHLD`: no `clone` exit-signal argument yet).
+    /// `exit_signal`: `SIGCHLD` for `fork`, the `clone` argument otherwise.
     pub exit_signal: u8,
+    /// `self_exec_id`: bumped by every `execve` ([`Tasklist::exec_committed`]),
+    /// copied to a child by `dup_task_struct`.
+    pub(super) self_exec_id: u64,
+    /// `parent_exec_id`: the parent's `self_exec_id` when this task was
+    /// cloned; `do_notify_parent` falls back to `SIGCHLD` if the parent has
+    /// exec'd since (a custom exit signal does not cross a security domain).
+    pub(super) parent_exec_id: u64,
     /// `PF_*`.
     pub flags: u32,
     /// `jobctl` (`JOBCTL_*`).
@@ -229,6 +236,8 @@ impl Tasklist {
                 exit_state: ExitState::Live,
                 exit_code: 0,
                 exit_signal: SIGCHLD,
+                self_exec_id: 0,
+                parent_exec_id: 0,
                 flags: 0,
                 jobctl: 0,
                 cred: CredSnapshot::of(cred),
@@ -314,7 +323,7 @@ impl Tasklist {
     pub fn fork(&mut self, parent: TaskId, params: ForkParams) -> Result<TaskId, Errno> {
         self.fork_allowed(parent, params)?;
         let p = self.tasks.get(parent).ok_or(Errno::ESRCH)?;
-        let (pgid, sid, cred) = (p.pids[2], p.pids[3], p.cred);
+        let (pgid, sid, cred, exec_id) = (p.pids[2], p.pids[3], p.cred, p.self_exec_id);
         // copy_sighand / copy_signal / dup_task_struct: the parent's
         // dispositions, blocked mask and altstack; nothing pending.
         let signals = Box::try_new(
@@ -333,6 +342,10 @@ impl Tasklist {
             exit_state: ExitState::Live,
             exit_code: 0,
             exit_signal: params.exit_signal,
+            // dup_task_struct copies self_exec_id; copy_process: "p->parent_exec_id
+            // = current->self_exec_id" (the real parent is `current`; no CLONE_PARENT).
+            self_exec_id: exec_id,
+            parent_exec_id: exec_id,
             flags: PF_FORKNOEXEC,
             jobctl: 0,
             cred,

@@ -29,13 +29,14 @@
 //!   close the `AC` window around exactly the copy loops below, and then needs
 //!   an exception-table fixup instead of this walk.
 //! * TOCTOU: resolution and copy happen under one exclusive borrow. The
-//!   [`UserPages`] implementor (`paging::UserSpace`) holds `&mut Tables`, i.e.
-//!   the `services::TABLES` lock, so no `mm_*` table edit (`mm_unmap`,
+//!   [`UserPages`] implementor (`paging::UserSpace`) holds `&mut Tables`, the
+//!   running task's own private tree (`userspace::TaskLocal`: no other task
+//!   or CPU reaches it, so no lock is needed), so no `mm_*` table edit (`mm_unmap`,
 //!   `mm_protect`, ...) can run between the two (the fault-in that
 //!   [`UserPages::page`] itself performs happens before it returns the frame),
 //!   and the returned page borrow ends before any such edit can start. User code does not run during a syscall (one CPU).
-//!   Upgrade path: a second task or CPU needs the address-space lock to cover
-//!   other CPUs' faults and unmaps (it does: the lock is a spinlock), plus a
+//!   Upgrade path: a second CPU, or a thread sharing the address space, needs an
+//!   address-space lock to cover other CPUs' faults and unmaps, plus a
 //!   TLB shootdown before frames are freed; direct dereference of user
 //!   addresses would instead need fault-and-fixup copies.
 //! * Short copies: like Linux, the functions return how many bytes were NOT

@@ -156,6 +156,22 @@ pub struct SigHand {
     pub actions: [SigAction; NSIG as usize],
 }
 
+impl SigHand {
+    /// `flush_signal_handlers(t, 0)` (kernel/signal.c:544): every handler goes
+    /// back to `SIG_DFL` except `SIG_IGN`, which is kept; flags, restorer and
+    /// `sa_mask` are cleared. `execve` and `CLONE_CLEAR_SIGHAND` use it.
+    pub fn flush(&mut self) {
+        for action in &mut self.actions {
+            if action.handler != SIG_IGN {
+                action.handler = SIG_DFL;
+            }
+            action.flags = 0;
+            action.restorer = 0;
+            action.mask = SigSet::EMPTY;
+        }
+    }
+}
+
 /// `struct signal_struct`: what a thread group shares.
 #[derive(Clone, Debug)]
 pub struct SignalStruct {
@@ -264,13 +280,16 @@ impl TaskSignals {
     /// the private pending queue is emptied (`init_sigpending`) and a mask
     /// saved for `TIF_RESTORE_SIGMASK` is not carried (no fork happens while
     /// one is armed: it is set only on the way out of the syscall that set it).
-    /// `clear_sighand` is `CLONE_CLEAR_SIGHAND` (`flush_signal_handlers(tsk, 1)`:
-    /// every disposition, `SIG_IGN` included, back to the default).
+    /// `clear_sighand` is `CLONE_CLEAR_SIGHAND` (`copy_sighand`, kernel/fork.c:1628:
+    /// `flush_signal_handlers(tsk, 0)`, as `execve` does: handlers back to the
+    /// default, `SIG_IGN` kept; confirmed against the pinned kernel by the
+    /// `fork.clone3-clear-sighand` oracle row).
     #[must_use]
     pub fn fork_child(&self, rlimit_sigpending: u64, clear_sighand: bool) -> Self {
         let mut child = Self::new(rlimit_sigpending);
-        if !clear_sighand {
-            child.hand = self.hand.clone();
+        child.hand = self.hand.clone();
+        if clear_sighand {
+            child.hand.flush();
         }
         child.thread.blocked = self.thread.blocked;
         child.thread.real_blocked = self.thread.real_blocked;
@@ -391,14 +410,7 @@ impl State<'_> {
     /// cleared; the altstack address and size are zeroed (its flags are not).
     /// The blocked mask, `saved_sigmask` and all pending signals are kept.
     pub fn flush_on_exec(&mut self) {
-        for action in &mut self.hand.actions {
-            if action.handler != SIG_IGN {
-                action.handler = SIG_DFL;
-            }
-            action.flags = 0;
-            action.restorer = 0;
-            action.mask = SigSet::EMPTY;
-        }
+        self.hand.flush();
         self.me.altstack.sp = 0;
         self.me.altstack.size = 0;
     }

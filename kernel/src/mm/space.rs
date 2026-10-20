@@ -179,7 +179,10 @@ impl Mm {
             exec_vm: self.exec_vm,
             stack_vm: self.stack_vm,
             locked_vm: 0,
-            def_flags: self.def_flags,
+            // mm_init: `def_flags & VM_INIT_DEF_MASK` (include/linux/mm.h:499 is
+            // VM_NOHUGEPAGE, which is VM_NONE without CONFIG_TRANSPARENT_HUGEPAGE):
+            // VM_LOCKED from mlockall(MCL_FUTURE) never crosses a fork.
+            def_flags: VmFlags::NONE,
             next_anon,
         })
     }

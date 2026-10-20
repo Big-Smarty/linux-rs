@@ -90,7 +90,7 @@ pub struct ForkRequest {
     pub exit_signal: u8,
     /// The child's initial `rsp`, 0 for the parent's.
     pub child_sp: u64,
-    /// `CLONE_CLEAR_SIGHAND`: `flush_signal_handlers(tsk, 1)` in the child.
+    /// `CLONE_CLEAR_SIGHAND`: `flush_signal_handlers(tsk, 0)` in the child (`SIG_IGN` is kept).
     pub clear_sighand: bool,
     /// `CLONE_CHILD_CLEARTID`'s pointer (the child's `clear_child_tid`), 0 if
     /// the flag is clear.

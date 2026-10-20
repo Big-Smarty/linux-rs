@@ -1432,6 +1432,7 @@ fn dup_copies_the_layout_and_counters_for_a_forked_child() {
     let a = w.map(0, 3 * P, RW, ANON).unwrap();
     assert!(w.writable(a)); // gives the VMA an anon_vma
     w.mm.locked_vm = 2;
+    w.mm.def_flags = VmFlags::LOCKED; // as mlockall(MCL_FUTURE) would leave it
     w.mm.vmas[0].flags = VmFlags(w.mm.vmas[0].flags.0 | VmFlags::LOCKED.0);
     let parent_before = w.mm.vmas().to_vec();
     let (total, stack) = (w.mm.total_vm, w.mm.stack_vm);
@@ -1442,6 +1443,9 @@ fn dup_copies_the_layout_and_counters_for_a_forked_child() {
         (child.total_vm, child.stack_vm, child.locked_vm),
         (total, stack, 0)
     );
+    // mm_init keeps only `def_flags & VM_INIT_DEF_MASK` (VM_NOHUGEPAGE: none here).
+    assert_eq!(child.def_flags, VmFlags::NONE);
+    assert_eq!(w.mm.def_flags, VmFlags::LOCKED);
     assert_eq!(
         (child.mmap_base, child.start_brk, child.brk, child.topdown),
         (w.mm.mmap_base, w.mm.start_brk, w.mm.brk, w.mm.topdown)

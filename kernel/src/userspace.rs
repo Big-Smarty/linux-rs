@@ -1009,11 +1009,12 @@ impl Syscall<'_> {
         let params = ForkParams::of(&self.own.attrs, request);
         #[cfg(feature = "qemu-self-test")]
         leak::at_fork(self.shared.get());
-        // copy_process: the limits first (EAGAIN beats ENOMEM).
-        self.shared.get().tasks.fork_allowed(parent, params)?;
         // dup_task_struct: the child's state block, so that no later step
-        // loses what it holds to an allocation failure.
+        // loses what it holds to an allocation failure. It comes first, as in
+        // Linux (kernel/fork.c:2020): ENOMEM beats the limits' EAGAIN.
         let block = Box::<TaskLocal>::try_new_uninit().map_err(|_| Errno::ENOMEM)?;
+        // copy_process: RLIMIT_NPROC and max_threads (fork.c:2059, 2072).
+        self.shared.get().tasks.fork_allowed(parent, params)?;
         // copy_mm: the VMA model, then the pages.
         let space = self.own.space.dup(&self.own.env)?;
         let tables = self.space.fork_tables().map_err(|error| {

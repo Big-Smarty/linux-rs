@@ -13,7 +13,7 @@
 //!
 //! # Contexts and locking
 //! Task context only (see `kernel::heap` for the full contract). The heap lock
-//! is [`IrqMutex`] and sits between `TABLES` and `FRAMES` in the lock order
+//! is [`IrqMutex`] and sits between `PROCESS` and `FRAMES` in the lock order
 //! (`services`): growth takes `FRAMES` while holding the heap lock, and no
 //! path holds `FRAMES` while allocating. Nothing here allocates while holding
 //! `FRAMES`, and `FRAMES` never calls the heap. Interrupt handlers and the

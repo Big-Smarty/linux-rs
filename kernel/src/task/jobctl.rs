@@ -127,11 +127,12 @@ impl Tasklist {
     }
 
     /// What `exec` commits for the process tree: `PF_FORKNOEXEC` is cleared
-    /// (`begin_new_exec`) and the credentials are published
-    /// (`commit_creds`).
+    /// and `self_exec_id` is bumped (`begin_new_exec`, fs/exec.c:1274), and the
+    /// credentials are published (`commit_creds`).
     pub fn exec_committed(&mut self, task: TaskId, cred: &super::attrs::Cred) {
         if let Some(t) = self.task_mut(task) {
             t.flags &= !PF_FORKNOEXEC;
+            t.self_exec_id = t.self_exec_id.wrapping_add(1);
         }
         self.publish_cred(task, cred);
     }

@@ -6,7 +6,8 @@
 // `find_child_reaper`/`find_new_reaper` 608-682, `kill_orphaned_pgrp` 408-431,
 // `will_become_orphaned_pgrp` 361-378, `has_stopped_jobs` 391-402),
 // kernel/signal.c (`do_notify_parent` 2254-2345, `do_notify_parent_cldstop`
-// 2365-2420, `__wake_up_parent`). All GPL-2.0-only.
+// 2365-2420, `__wake_up_parent`; the `parent_exec_id` fallback to SIGCHLD is
+// 2273-2279). All GPL-2.0-only.
 // Transformation: one thread per group, no ptrace, no subreapers, no
 // `pdeath_signal` (nothing sets it), no coredump; `release_task` of an
 // auto-reaped task is immediate (Linux defers it past the `tasklist_lock`
@@ -293,10 +294,17 @@ impl Tasklist {
             clock_t(cpu.0),
             clock_t(cpu.1),
         );
+        let mut sig = sig;
+        // "This is only possible if parent == real_parent. Check if it has
+        // changed security domain." (kernel/signal.c:2273-2279)
+        if sig != SIGCHLD
+            && self.task(tsk).map(|t| t.parent_exec_id) != self.task(parent).map(|p| p.self_exec_id)
+        {
+            sig = SIGCHLD;
+        }
         // `info.si_signo = sig`: a `clone` exit signal other than SIGCHLD carries
         // the same `_sigchld` payload.
         info.signo = i32::from(sig);
-        let mut sig = sig;
         let mut autoreap = false;
         if let Some(mut state) = self.signal_state(parent) {
             let action = state.hand.actions[usize::from(SIGCHLD) - 1];

@@ -10,9 +10,11 @@
 //! * User half (below `TASK_SIZE_MAX`): [`Tables::map_user`] and the `mm_*`
 //!   operations (`mm_map_*`, `mm_unmap`, `mm_protect`, ...) may run after
 //!   activation. They need
-//!   `&mut Tables`, i.e. the `services::TABLES` lock, so no other agent edits
-//!   or walks the tree meanwhile, and no `UserSpace` view (which borrows the
-//!   same `&mut Tables`) can hold a frame reference across the edit.
+//!   `&mut Tables`. A task's tree is private to it (`userspace::TaskLocal`,
+//!   reached only by the running task, no lock), so no other agent edits or
+//!   walks the tree meanwhile (a fork reads the parent's tree from the parent's
+//!   own context), and no `UserSpace` view (which borrows the same
+//!   `&mut Tables`) can hold a frame reference across the edit.
 //! * A not-present -> present transition needs no invalidation (hardware
 //!   caches no absent entry; SDM Vol. 3 4.10.4.3), and a new intermediate
 //!   table is zeroed before its parent entry becomes present.
@@ -740,8 +742,8 @@ impl Tables {
                         // owned by this live user leaf (`mm_map_anon`,
                         // `mm_install_page`, `map_user`: never the zero page,
                         // excluded above), mapped in the direct map, 4 KiB
-                        // long and initialised; `&self` (the `TABLES` lock or
-                        // the task's own tree) excludes a writer, user code
+                        // long and initialised; `&self` (the task's own
+                        // private tree, or the parent's from the forking parent) excludes a writer, user code
                         // does not run, and `bytes` is a different frame.
                         let source = unsafe { core::slice::from_raw_parts(source, PAGE_BYTES) };
                         bytes.copy_from_slice(source);
@@ -1159,9 +1161,9 @@ impl Backing for UserSpace<'_> {
         self.tables
     }
     fn parts<R>(&mut self, f: impl FnOnce(&mut Tables, &mut Allocator<'_>) -> R) -> R {
-        // Lock order `PROCESS` -> `TABLES` -> heap -> `FRAMES`: the caller holds
-        // `TABLES` (this view borrows it) and the model reserved its heap
-        // storage before calling; `FRAMES` is a leaf.
+        // Lock order `PROCESS` -> heap -> `FRAMES`: the tables are the running
+        // task's own (this view borrows them, no lock) and the model reserved
+        // its heap storage before calling; `FRAMES` is a leaf.
         let mut frames = crate::services::FRAMES.lock();
         f(self.tables, &mut frames)
     }

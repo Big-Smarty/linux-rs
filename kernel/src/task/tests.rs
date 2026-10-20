@@ -1172,3 +1172,63 @@ fn a_clone_exit_signal_other_than_sigchld_is_sent_with_the_chld_payload() {
     // wait: a clone child is invisible to a plain wait and found by __WCLONE.
     assert_eq!(wait_pid(&mut l, init, -1, WNOHANG).0, ECHILD);
 }
+
+#[test]
+fn a_parent_that_exec_d_gets_sigchld_instead_of_the_clone_exit_signal() {
+    // do_notify_parent (kernel/signal.c:2273-2279): the child recorded the
+    // parent's self_exec_id at clone; an exec bumps it, so the custom signal
+    // falls back to SIGCHLD (and si_signo says so).
+    let (mut l, init) = list();
+    let p = l.fork(init, FORK).unwrap();
+    for sig in [SIGUSR1, SIGCHLD] {
+        l.signal_state(p).unwrap().hand.actions[usize::from(sig) - 1].handler = 0x1000;
+    }
+    let with = ForkParams {
+        exit_signal: SIGUSR1,
+        ..FORK
+    };
+    let stale = l.fork(p, with).unwrap();
+    l.exec_committed(p, &Cred::root());
+    let after = l.fork(p, with).unwrap();
+    for (child, want) in [(stale, SIGCHLD), (after, SIGUSR1)] {
+        let mut w = Rec::default();
+        exit(&mut l, child, 0, &mut w);
+        let (sig, info) = l.signal_state(p).unwrap().dequeue_signal().unwrap();
+        assert_eq!((sig, info.signo), (want, i32::from(want)));
+    }
+}
+
+#[test]
+fn clone_clear_sighand_flushes_like_exec_and_keeps_sig_ign() {
+    // copy_sighand (kernel/fork.c:1628): `flush_signal_handlers(tsk, 0)`, which the
+    // pinned kernel confirmed (`fork.clone3-clear-sighand`): SIG_IGN survives.
+    let (mut l, init) = list();
+    {
+        let state = l.signal_state(init).unwrap();
+        let hup = &mut state.hand.actions[usize::from(SIGHUP) - 1];
+        hup.handler = SIG_IGN;
+        let usr1 = &mut state.hand.actions[usize::from(SIGUSR1) - 1];
+        (usr1.handler, usr1.flags, usr1.restorer) = (0x1000, 4, 0x2000);
+    }
+    let plain = l.fork(init, FORK).unwrap();
+    let cleared = l
+        .fork(
+            init,
+            ForkParams {
+                clear_sighand: true,
+                ..FORK
+            },
+        )
+        .unwrap();
+    let hand = |l: &mut Tasklist, task| {
+        let state = l.signal_state(task).unwrap();
+        let usr1 = state.hand.actions[usize::from(SIGUSR1) - 1];
+        let hup = state.hand.actions[usize::from(SIGHUP) - 1];
+        (
+            (usr1.handler, usr1.flags, usr1.restorer),
+            (hup.handler, hup.flags),
+        )
+    };
+    assert_eq!(hand(&mut l, plain), ((0x1000, 4, 0x2000), (SIG_IGN, 0)));
+    assert_eq!(hand(&mut l, cleared), ((SIG_DFL, 0, 0), (SIG_IGN, 0)));
+}
