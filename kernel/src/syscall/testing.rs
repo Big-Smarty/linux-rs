@@ -11,11 +11,11 @@ use super::{
 use crate::{
     cputime::CpuSample,
     mm::{Env, Mm, VmFlags, tests::Fake},
-    task::Attributes,
-    usercopy::{UserPages, fake::Space},
     signal::{
         self, SIGALRM, SIGUSR1, SIGUSR2, State, frame::Sigreturn, info::SigInfo, state::Target,
     },
+    task::Attributes,
+    usercopy::{UserPages, fake::Space},
     vfs::{FdTable, Timespec, Vfs},
 };
 extern crate std;

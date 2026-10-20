@@ -152,14 +152,14 @@ fn trap_line_formats_like_show_signal() {
 
 #[test]
 fn bad_frame_line_matches_the_pinned_kernel() {
-    let plan = LoadPlan::new(&oracle()).unwrap();
+    let mm = loaded_oracle();
     // `signal_fault` on the pinned 6.18.57 (target/sigfix-linux/linux-smoke-tcg.log: the
     // `signals` smoke's rt_sigreturn with `rsp` at 0x1000), minus the `[ time]` prefix.
     let line = BadFrame {
         ip: 0x20_55b4,
         sp: 0x1000,
         orig_ax: 0xf,
-        vmas: &plan.vmas,
+        region: FileRegion::of(&mm, 0x20_55b4),
     };
     assert_eq!(
         line.to_string(),

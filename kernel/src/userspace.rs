@@ -48,8 +48,7 @@ use kernel::{
         plan::{LoadError, LoadPlan, Unsupported},
         report::{
             self, BadFrame, ExecFailed, FileRegion, InitDeath, NO_INIT, NO_ROOT, NO_ROOT_PANIC,
-            Segfault,
-            TrapLine,
+            Segfault, TrapLine,
         },
         script,
         stack::{self, ARG_PAGES, Aux, ENVP, STACK_START, STACK_TOP, StackError},
