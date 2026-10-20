@@ -23,6 +23,7 @@ pub mod memory;
 extern crate alloc;
 pub mod mm;
 pub mod ratelimit;
+pub mod sched;
 pub mod signal;
 pub mod suite;
 pub mod sync;

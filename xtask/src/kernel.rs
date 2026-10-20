@@ -314,6 +314,38 @@ const SUCCESS_MARKERS: &[&str] = &[
     "RESULT success",
 ];
 
+/// Printed by `ktask::selftest::sched_switch` (self-test builds, `test=sched-switch` only): two
+/// kernel threads alternate through the real context switch 256 times with register and FP
+/// canaries; keyed, signal and spurious wake-ups; the timer queue wakes in expiry order; the stack
+/// pool is exhausted, refused, recycled and its handles go stale; every pool guard page is
+/// unmapped and a read of one faults at the exact instruction.
+const SCHED_SWITCH_RECORD: &str = "CHECK sched-switch ok threads=7 switches=ok regs=callee-saved first_run_abi=aligned fpu=isolated order=fifo timers=ordered wake=keyed,signal,spurious stacks=recycled pool=exhausted,reused guards=unmapped guard_fault=exact";
+
+/// Printed by `ktask::selftest::preempt_report` when `/init` dies (`test=sched-preempt` only): a
+/// kernel thread was kept runnable beside `/init`, the tick preempted `/init` at the return to
+/// ring 3 from the timer interrupt (a context switch taken inside the user-interrupt handler)
+/// repeatedly, the thread ran, and `/init` (`-- signals`) was resumed and finished correctly.
+const SCHED_PREEMPT_RECORD: &str =
+    "CHECK sched-preempt ok kthread=ran user_return_preemption=interrupt init=resumed";
+
+/// The success markers plus one extra record marker.
+const fn with_marker(extra: &'static str) -> [&'static str; SUCCESS_MARKERS.len() + 1] {
+    let mut markers = [""; SUCCESS_MARKERS.len() + 1];
+    let mut index = 0;
+    while index < SUCCESS_MARKERS.len() {
+        markers[index] = SUCCESS_MARKERS[index];
+        index += 1;
+    }
+    markers[index] = extra;
+    markers
+}
+
+/// The success markers plus the scheduler record.
+const SCHED_SWITCH_MARKERS: [&str; SUCCESS_MARKERS.len() + 1] =
+    with_marker("CHECK sched-switch ok");
+const SCHED_PREEMPT_MARKERS: [&str; SUCCESS_MARKERS.len() + 1] =
+    with_marker("CHECK sched-preempt ok");
+
 /// One oracle syscall-test group run on this kernel: `-- <group>` on the command line, the normal
 /// success markers, and every `init: test|tests|info` line equal to `xtask/oracle/expected.tsv`
 /// ([`validate_oracle`]). Add one `oracle_case!(<group>)` line to [`DEBUG_CASES`] when the group's
@@ -739,6 +771,53 @@ const DEBUG_CASES: &[DebugCase] = &[
             tsc_sources: &["pit", "hpet"],
             ..Q35_TCG
         },
+    },
+    // The scheduler on kernel threads (`ktask::selftest`): the full success path plus the
+    // `CHECK sched-switch` record, checked exactly in `validate_debug_case`.
+    DebugCase {
+        name: "sched-switch",
+        cmdline: Some("test=sched-switch"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: &SCHED_SWITCH_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: INIT_OK,
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    // A kernel thread kept runnable beside the signal smoke: the tick preempts `/init` at the
+    // return to ring 3 and the thread and `/init` alternate (`CHECK sched-preempt`, exact).
+    DebugCase {
+        name: "sched-preempt",
+        cmdline: Some("test=sched-preempt -- signals"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: &SCHED_PREEMPT_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some("init: signals ok"),
+            exact_summary: true,
+            protection: (false, false),
+        },
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    // A kernel thread overflows its stack: the fault on the pool guard page, with no room left for
+    // the exception frame, becomes a double fault on its IST stack and the kernel stops loudly.
+    DebugCase {
+        name: "kstack-overflow",
+        cmdline: Some("test=kstack-overflow"),
+        cpu: "qemu64",
+        expected_exit: 35,
+        required: &["FAIL kernel stack overflow slot=0 vector=8"],
+        forbid_success: true,
+        modules: ARCHIVE_ONLY,
+        user: User::None,
+        framebuffers: 1,
+        plat: Q35_TCG,
     },
     oracle_case!(mm),
     oracle_case!(ids),
@@ -4153,9 +4232,15 @@ fn validate_debug_case(
     )
 }
 
-/// The extra records the three mutation cases must show (the failure text, or `None`).
+/// The extra records the named cases must show (the failure text, or `None`).
 fn named_case_failure(name: &str, lines: &[&str]) -> Option<&'static str> {
     match name {
+        "sched-switch" => (!unique_exact_record(lines, "CHECK sched-switch", SCHED_SWITCH_RECORD))
+            .then_some("the scheduler case must report the exact context-switch proof"),
+        "sched-preempt" => {
+            (!unique_exact_record(lines, "CHECK sched-preempt", SCHED_PREEMPT_RECORD))
+                .then_some("the preemption case must report the exact preemption proof")
+        }
         "unmasked-timer" => {
             let observed_irq = lines.iter().any(|line| {
                 let Some(rest) = line.strip_prefix("TIMER mask observation periods=2 irq_delta=")
@@ -6418,6 +6503,99 @@ mod tests {
 
     fn case(name: &str) -> DebugCase {
         *DEBUG_CASES.iter().find(|case| case.name == name).unwrap()
+    }
+
+    #[test]
+    fn sched_preempt_case_requires_the_one_exact_record_beside_the_signal_smoke() {
+        let process = ProcessResult {
+            timed_out: false,
+            exit_code: Some(33),
+        };
+        let preempt = case("sched-preempt");
+        let with = |record: &str| {
+            success_serial()
+                .replace("argc=1", "argc=2")
+                .replace("\ninit: ok", "\ninit: signals ok\ninit: ok")
+                .replace("\nKernel panic", &format!("\n{record}\nKernel panic"))
+        };
+        assert!(validate(preempt, &process, &with(SCHED_PREEMPT_RECORD)).0);
+        // Absent, altered in any field, or printed twice: rejected.
+        assert!(!validate(preempt, &process, &with("CHECK nothing")).0);
+        for (from, to) in [
+            ("kthread=ran", "kthread=idle"),
+            (
+                "user_return_preemption=interrupt",
+                "user_return_preemption=none",
+            ),
+            ("init=resumed", "init=lost"),
+        ] {
+            assert!(
+                !validate(
+                    preempt,
+                    &process,
+                    &with(&SCHED_PREEMPT_RECORD.replace(from, to))
+                )
+                .0,
+                "{from}"
+            );
+        }
+        assert!(
+            !validate(
+                preempt,
+                &process,
+                &with(&format!("{SCHED_PREEMPT_RECORD}\n{SCHED_PREEMPT_RECORD}"))
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn sched_switch_case_requires_the_one_exact_record() {
+        let process = ProcessResult {
+            timed_out: false,
+            exit_code: Some(33),
+        };
+        let sched = case("sched-switch");
+        let with = |record: &str| {
+            success_serial().replace(
+                "init: hello from userspace",
+                &format!("{record}\ninit: hello from userspace"),
+            )
+        };
+        assert!(validate(sched, &process, &with(SCHED_SWITCH_RECORD)).0);
+        // Absent, altered in any field, or printed twice: rejected.
+        assert!(!validate(sched, &process, &success_serial()).0);
+        for (from, to) in [
+            ("threads=7", "threads=6"),
+            ("regs=callee-saved", "regs=none"),
+            ("first_run_abi=aligned", "first_run_abi=skewed"),
+            ("fpu=isolated", "fpu=shared"),
+            ("timers=ordered", "timers=unordered"),
+            ("guard_fault=exact", "guard_fault=none"),
+        ] {
+            assert!(
+                !validate(
+                    sched,
+                    &process,
+                    &with(&SCHED_SWITCH_RECORD.replace(from, to))
+                )
+                .0,
+                "{from}"
+            );
+        }
+        assert!(
+            !validate(
+                sched,
+                &process,
+                &with(&format!("{SCHED_SWITCH_RECORD}\n{SCHED_SWITCH_RECORD}"))
+            )
+            .0
+        );
+        // The plain success case does not need it, and the overflow case is a
+        // negative one that must not claim success.
+        assert!(validate(case("success"), &process, &success_serial()).0);
+        let overflow = case("kstack-overflow");
+        assert!(overflow.forbid_success && overflow.expected_exit == 35);
     }
 
     fn images(modules: &[Module]) -> String {

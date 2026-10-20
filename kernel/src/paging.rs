@@ -203,7 +203,10 @@ impl Tables {
             ];
             for (start, end, flags) in sections {
                 for address in (start..end).step_by(PAGE_BYTES) {
-                    if guards.contains(&address) {
+                    if guards.contains(&address)
+                        || cpu::kstack_slot_of(address)
+                            .is_some_and(|slot| address == cpu::kstack_guard(slot))
+                    {
                         continue;
                     }
                     let physical = boot
@@ -703,7 +706,7 @@ impl Tables {
             .1;
         let alias = self.lookup(Virtual(boot.direct_map + boot.image_physical))?;
         let mut guards_absent = true;
-        for guard in cpu::guards() {
+        for guard in cpu::guards().into_iter().chain(cpu::kstack_guards()) {
             guards_absent &= self.lookup(Virtual(guard))?.is_none();
         }
         Ok(text & (WRITE | NX) == 0

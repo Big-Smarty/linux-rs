@@ -245,6 +245,13 @@ pub enum TestMode {
     /// QEMU self-test only: treat the machine as a hypervisor with x2APIC so
     /// the x2APIC register backend runs under TCG (no KVM signature there).
     ForceX2apic,
+    /// QEMU self-test only: run the scheduler self-test (`ktask::selftest`).
+    SchedSwitch,
+    /// QEMU self-test only: overflow a kernel thread's stack on purpose.
+    KstackOverflow,
+    /// QEMU self-test only: keep a kernel thread runnable beside `/init`, so
+    /// the tick preempts `/init` at the return to ring 3 (`ktask::selftest`).
+    SchedPreempt,
 }
 
 #[repr(C)]
@@ -514,17 +521,20 @@ impl BootInfo {
             // physical entry's editable command line must not choose them.
             #[cfg(feature = "qemu-self-test")]
             {
-                info.test = match info.command_line() {
-                    b"test=panic" => TestMode::Panic,
-                    b"test=unexpected-fault" => TestMode::UnexpectedFault,
-                    b"test=unexpected-page-fault" => TestMode::UnexpectedPageFault,
-                    b"test=unexpected-breakpoint" => TestMode::UnexpectedBreakpoint,
-                    b"test=unexpected-interrupt" => TestMode::UnexpectedInterrupt,
-                    b"test=unmasked-timer" => TestMode::UnmaskedTimer,
-                    b"test=irq-restore-early" => TestMode::IrqRestoreEarly,
-                    b"test=bad-map" => TestMode::BadMap,
-                    b"test=firmware-x2apic" => TestMode::FirmwareX2apic,
-                    b"test=force-x2apic" => TestMode::ForceX2apic,
+                info.test = match command_line_value(info.command_line(), b"test").unwrap_or(b"") {
+                    b"panic" => TestMode::Panic,
+                    b"unexpected-fault" => TestMode::UnexpectedFault,
+                    b"unexpected-page-fault" => TestMode::UnexpectedPageFault,
+                    b"unexpected-breakpoint" => TestMode::UnexpectedBreakpoint,
+                    b"unexpected-interrupt" => TestMode::UnexpectedInterrupt,
+                    b"unmasked-timer" => TestMode::UnmaskedTimer,
+                    b"irq-restore-early" => TestMode::IrqRestoreEarly,
+                    b"bad-map" => TestMode::BadMap,
+                    b"firmware-x2apic" => TestMode::FirmwareX2apic,
+                    b"force-x2apic" => TestMode::ForceX2apic,
+                    b"sched-switch" => TestMode::SchedSwitch,
+                    b"kstack-overflow" => TestMode::KstackOverflow,
+                    b"sched-preempt" => TestMode::SchedPreempt,
                     _ => TestMode::Normal,
                 };
             }

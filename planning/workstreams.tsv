@@ -1922,7 +1922,7 @@ ws-kernel-reboot-c	kernel/reboot.c	docs/subsystems/firmware.md	P0	not_started
 ws-kernel-resource-c	kernel/resource.c	docs/subsystems/process.md	P0	not_started
 ws-kernel-resource-kunit-c	kernel/resource_kunit.c	docs/subsystems/process.md	P0	not_started
 ws-kernel-rseq-c	kernel/rseq.c	docs/subsystems/process.md	P0	not_started
-ws-kernel-sched	kernel/sched	docs/subsystems/process.md	P0	not_started
+ws-kernel-sched	kernel/sched	docs/subsystems/process.md	P0	in_progress
 ws-kernel-seccomp-c	kernel/seccomp.c	docs/subsystems/security.md	P0	not_started
 ws-kernel-signal-c	kernel/signal.c	docs/subsystems/process.md	P0	in_progress
 ws-kernel-stacktrace-c	kernel/stacktrace.c	docs/subsystems/observability.md	P1	not_started

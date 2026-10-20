@@ -1069,3 +1069,63 @@ fn many_children_exit_and_are_reaped_without_leaking_ids() {
     assert_eq!(l.children(init).count(), 0);
     assert_eq!(l.processes().count(), 1);
 }
+
+/// The scheduler seam: the model's `Waker` realised on `sched::Rq`, as the
+/// binary does it (`SchedWaker`).
+struct RqWaker<'a> {
+    rq: &'a mut crate::sched::Rq,
+    init: (TaskId, crate::sched::SchedId),
+}
+impl Waker for RqWaker<'_> {
+    fn child_event(&mut self, parent: TaskId) {
+        self.rq.wake_up_key(
+            super::exit::chldexit_key(parent),
+            crate::sched::WakeMode::Interruptible,
+            1,
+        );
+    }
+    fn signal_wake(&mut self, task: TaskId) {
+        if task == self.init.0 {
+            self.rq.wake_interruptible(self.init.1);
+        }
+    }
+}
+
+#[test]
+fn child_exit_wakes_only_the_parents_wait_chldexit_sleepers() {
+    // kernel/exit.c do_wait: the parent sleeps on its own signal_struct's
+    // wait_chldexit (TASK_INTERRUPTIBLE); __wake_up_parent wakes that queue.
+    use crate::sched::{Rq, TaskState};
+    let (mut l, init) = list();
+    let child = l.fork(init, FORK).unwrap();
+    let mut rq = Rq::new(4).unwrap();
+    let sid = rq.add_task().unwrap();
+    assert!(rq.wake_up_new_task(sid));
+    assert_eq!(rq.schedule().unwrap().next, sid);
+    rq.prepare_to_wait(super::exit::chldexit_key(init), TaskState::Interruptible);
+    rq.schedule();
+    assert_eq!(rq.state(sid), Some(TaskState::Interruptible));
+    assert_ne!(
+        super::exit::chldexit_key(init),
+        super::exit::chldexit_key(child)
+    );
+    // The child's own queue (it has no children to wait for) wakes nobody.
+    assert_eq!(
+        rq.wake_up_key(
+            super::exit::chldexit_key(child),
+            crate::sched::WakeMode::Interruptible,
+            1
+        ),
+        0
+    );
+    let mut w = RqWaker {
+        rq: &mut rq,
+        init: (init, sid),
+    };
+    assert_eq!(
+        l.exit_prepare(child, 0, false),
+        ExitPrep::Proceed { group_dead: true }
+    );
+    l.exit_notify(child, &mut w).unwrap();
+    assert_eq!(rq.state(sid), Some(TaskState::Running));
+}

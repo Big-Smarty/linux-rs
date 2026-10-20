@@ -31,7 +31,7 @@
 #[cfg_attr(feature = "baremetal-suite", allow(unused_imports))]
 use crate::{
     boot::{BootError, BootInfo},
-    console, cpu,
+    console, cpu, ktask,
     memory::{Error as MemoryError, PAGE, PAGE_BYTES, Physical},
     paging::{self, Tables, UserSpace},
     services::{self, Service},
@@ -59,6 +59,7 @@ use kernel::{
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     ratelimit::RateLimit,
+    sched::{SchedId, WaitKey, WakeMode},
     signal::{
         self, State,
         deliver::{self, Outcome as SignalOutcome},
@@ -71,7 +72,7 @@ use kernel::{
     },
     task::{
         self, Attributes, TaskId, Tasklist,
-        exit::{ExitPrep, NoWake},
+        exit::{ExitPrep, Waker, chldexit_key},
     },
     usercopy::{self, UserPages},
     vfs::{
@@ -478,6 +479,30 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
     })
 }
 
+/// The task model's [`Waker`] on the scheduler's wait queues: `child_event` is
+/// `__wake_up_parent` (`__wake_up_sync_key` on the parent's `wait_chldexit`,
+/// `TASK_INTERRUPTIBLE`, one exclusive waiter), `signal_wake` is
+/// `signal_wake_up` on the task's scheduling handle. Both take `RQ`, a leaf
+/// that any lock may precede (`services`).
+/// shortcut: a table of one entry, because init is the only task (no `fork`
+/// yet); upgrade by storing the [`SchedId`] in the task model's per-task
+/// record when `copy_process` can create tasks.
+#[derive(Default)]
+struct SchedWaker {
+    init: Option<(TaskId, SchedId)>,
+}
+
+impl Waker for SchedWaker {
+    fn child_event(&mut self, parent: TaskId) {
+        ktask::wake_up_key(chldexit_key(parent), WakeMode::Interruptible, 1);
+    }
+    fn signal_wake(&mut self, task: TaskId) {
+        if let Some((_, sched)) = self.init.filter(|&(id, _)| id == task) {
+            ktask::signal_wake_up(sched);
+        }
+    }
+}
+
 /// The one process: what the syscall and fault paths need once init runs
 /// (frames, boot info and the heap are in `services`/`kalloc`). Later syscall
 /// groups extend it (file table, credentials, signals, ...); exactly one is
@@ -494,8 +519,8 @@ pub struct Process {
     pub tasks: Tasklist,
     /// `current`: init, the only task.
     pub current: TaskId,
-    /// Wake-ups of other tasks' sleepers: there are none yet.
-    wake: NoWake,
+    /// Wake-ups of other tasks' sleepers, through the scheduler.
+    wake: SchedWaker,
     /// `mm->exe_file`: the open description the image was loaded from (its
     /// `FileInfo::id` is `exec`).
     exe_file: FileId,
@@ -877,13 +902,18 @@ impl<'a> signal::Task for Syscall<'a> {
     fn now_ns(&self) -> u64 {
         timer::ktime_get_ns()
     }
-    fn wait(&mut self, deadline_ns: Option<u64>) {
-        // The task leaves the CPU for the wait (`schedule()`): the halted CPU is
-        // idle time, not the task's.
+    fn wait(&mut self, key: WaitKey, deadline_ns: Option<u64>) {
+        // The task leaves the CPU for the wait (`schedule()`): the time until it
+        // is chosen again is not the task's.
         CPUTIME.sleep_begin(timer::ktime_get_ns());
-        // The interval timer is a wake-up source of every sleep.
-        timer::set_itimer_ns(self.state().sig.itimer.next_event());
-        timer::wait_event(deadline_ns);
+        // The interval timer is a wake-up source of every sleep: it rides on the
+        // task's timed wake-up (the queue holds one entry per task), and the
+        // woken loop's `sync_timers` turns the expiry into `SIGALRM`.
+        let wake_at = [deadline_ns, self.state().sig.itimer.next_event()]
+            .into_iter()
+            .flatten()
+            .min();
+        ktask::sleep_current(key, wake_at);
         CPUTIME.sleep_end(timer::ktime_get_ns());
     }
     fn user_sp(&self) -> u64 {
@@ -973,6 +1003,7 @@ fn init_died(code: u32) -> ! {
             "CHECK user-faults ok handled={}\n",
             USER_FAULTS_HANDLED.load(core::sync::atomic::Ordering::Relaxed)
         );
+        ktask::selftest::preempt_report();
     }
     crate::log!("{}\n", InitDeath(code));
     #[cfg(feature = "qemu-self-test")]
@@ -1038,6 +1069,9 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
 /// returns: init's death panics, as Linux's `do_exit` does for pid 1.
 pub fn exit_to_user(regs: &mut cpu::PtRegs) {
     loop {
+        // `exit_to_user_mode_loop`: `TIF_NEED_RESCHED` first; this task continues,
+        // with everything re-examined below, when it is chosen again.
+        ktask::preempt_user(regs.orig_ax == u64::MAX);
         let mut process = PROCESS.lock();
         // Nothing to expire or dequeue: skip the clock read (`now_ns` is only
         // used when a pending SIGALRM leaves the queue).
@@ -1679,7 +1713,12 @@ fn run_lines(paths: impl Iterator<Item = &'static str>) {
 const FALLBACK_NAMES: [&str; 4] = ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"];
 
 /// Start init, or end the boot the way Linux does when it cannot.
-pub fn run(user: Result<Loaded, Error>) -> ! {
+///
+/// Returns only when init's task has left the CPU for good and nothing else is
+/// runnable, which in the bare-metal suite is the end of a group (the caller
+/// tears the process down and starts the next); in any other boot init's death
+/// ends the boot, so a return is the caller's failure to report.
+pub fn run(user: Result<Loaded, Error>) {
     match user {
         Ok(init) => start(init),
         Err(Error::NoInit) => {
@@ -1810,12 +1849,13 @@ pub fn teardown() {
 #[cfg(feature = "baremetal-suite")]
 pub fn locks_free() -> bool {
     PROCESS.is_free()
+        && ktask::locks_free()
         && services::TABLES.is_free()
         && services::FRAMES.is_free()
         && crate::kalloc::lock_free()
 }
 
-fn start(mut init: Loaded) -> ! {
+fn start(mut init: Loaded) {
     check_user_image(&init, &mut services::TABLES.lock().user_space());
     crate::log!("Run /init as init process\n");
     // SAFETY: BSP, CPL0, IF clear (nothing since the timer test re-enabled it
@@ -1880,7 +1920,7 @@ fn start(mut init: Loaded) -> ! {
     PROCESS.install(Process {
         tasks,
         current,
-        wake: NoWake,
+        wake: SchedWaker::default(),
         exe_file: init.exec,
         mm: &services::TABLES,
         attrs,
@@ -1897,9 +1937,23 @@ fn start(mut init: Loaded) -> ! {
     // user-copy faults from ring 3.
     #[cfg(all(feature = "boot-proofs", not(feature = "baremetal-suite")))]
     check_mm_usercopy();
+    crate::unwrap(ktask::init(), "scheduler");
+    #[cfg(feature = "qemu-self-test")]
+    match crate::services::boot().test {
+        kernel::boot::TestMode::SchedSwitch => ktask::selftest::sched_switch(),
+        kernel::boot::TestMode::KstackOverflow => ktask::selftest::kstack_overflow(),
+        kernel::boot::TestMode::SchedPreempt => ktask::selftest::start_preempt_hog(),
+        _ => {}
+    }
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all
-    // state used by the syscall/fault paths is in `PROCESS` and `services`; `kernel_main`'s
-    // frame is abandoned, its stack top is TSS.RSP0.
-    unsafe { cpu::enter_user(entry, sp) }
+    // state used by the syscall/fault paths is in `PROCESS` and `services`;
+    // `kernel_main`'s frame stays on the boot stack, which is idle's from here on.
+    unsafe {
+        ktask::start_init(entry, sp, |sched| {
+            let mut process = PROCESS.lock();
+            let init = process.current;
+            process.wake.init = Some((init, sched));
+        });
+    }
 }
