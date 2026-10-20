@@ -6,7 +6,7 @@
 //! `mm/fault.c` (`__bad_area_nosemaphore`), `arch/x86/include/uapi/asm/{sigcontext,ucontext}.h`,
 //! `include/uapi/asm-generic/{siginfo,signal-defs}.h`, `arch/x86/include/uapi/asm/signal.h`.
 //!
-//! Assembly proof (AGENTS.md rule 3) common to the seven stubs below: they run in user mode
+//! Assembly proof (AGENTS.md rule 3) common to the eight stubs below: they run in user mode
 //! (CPL 3), need no CPU feature beyond x86-64, never touch the FPU, and do not unwind
 //! (`naked_asm!`, `extern "C"`, panic=abort). They exist because each must control an exact
 //! instruction sequence a signal interrupts or a register file a signal restores, which neither
