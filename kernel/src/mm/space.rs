@@ -9,7 +9,7 @@
 // (`vm_start_gap`, `vm_end_gap`). GPL-2.0.
 // Transformation: the maple tree and the `vma_iterator` become a sorted
 // `Vec<Vma>` (the same first-VMA-with-end>addr lookup); `anon_vma` objects
-// become an identity (`Option<u32>`) because only their equality is
+// become an identity (`Option<u64>`) because only their equality is
 // observable to merging; locks, RCU, rmap, hooks, mempolicy, userfaultfd and
 // sealing are absent (single task, anonymous and file identity only). A
 // fallible allocation (`Vec::try_reserve`) replaces every `kmem_cache_alloc`
@@ -56,7 +56,7 @@ pub struct Vma {
     /// `vm_file` identity ([`super::FileInfo::id`]); `None` is anonymous.
     pub file: Option<u64>,
     /// `anon_vma` identity; `None` until the first write fault.
-    pub anon: Option<u32>,
+    pub anon: Option<u64>,
 }
 
 impl Vma {
@@ -100,7 +100,7 @@ pub struct Mm {
     pub locked_vm: u64,
     /// `mm->def_flags` (`mlockall(MCL_FUTURE)` is not implemented: stays empty).
     pub def_flags: VmFlags,
-    next_anon: u32,
+    next_anon: u64,
 }
 
 pub(super) const fn enomem<T>() -> Result<T, Errno> {
@@ -199,9 +199,10 @@ impl Mm {
         Ok(())
     }
 
-    /// `insert_vm_struct`: link a VMA built by the loader (stack, vDSO). The
-    /// caller owns the statistics (`create_init_stack_vma` sets
-    /// `stack_vm = total_vm = 1` by hand).
+    /// `insert_vm_struct`: link a VMA built by the loader (stack, vDSO).
+    /// Unlike Linux, whose `create_init_stack_vma` sets `stack_vm = total_vm`
+    /// by hand, the statistics are accounted here so the counters can never
+    /// disagree with the VMA set (a later unmap cannot underflow them).
     ///
     /// # Errors
     /// `ENOMEM` if it intersects a VMA, is refused by the overcommit policy
@@ -217,7 +218,12 @@ impl Mm {
             vma.pgoff = vma.start >> PAGE_SHIFT;
         }
         let at = self.lower(vma.start);
-        self.insert_at(at, vma)
+        self.insert_at(at, vma)?;
+        self.stat_add(vma.flags, vma.pages());
+        if vma.flags.contains(VmFlags::LOCKED) {
+            self.locked_vm += vma.pages();
+        }
+        Ok(())
     }
 
     /// `__split_vma`: split `vmas[idx]` at `addr` (`start < addr < end`) into
@@ -276,15 +282,23 @@ impl Mm {
             self.data_vm += npages;
         }
     }
+    /// `vm_stat_account` with a negative count. Linux only `VM_WARN_ON`s on
+    /// underflow; a bookkeeping bug must not become a user-reachable panic, so
+    /// the counters saturate (the invariant is checked in debug builds).
     pub(super) fn stat_sub(&mut self, flags: VmFlags, npages: u64) {
-        self.total_vm -= npages;
-        if is_exec_mapping(flags) {
-            self.exec_vm -= npages;
+        debug_assert!(self.total_vm >= npages, "total_vm underflow");
+        self.total_vm = self.total_vm.saturating_sub(npages);
+        let field = if is_exec_mapping(flags) {
+            &mut self.exec_vm
         } else if is_stack_mapping(flags) {
-            self.stack_vm -= npages;
+            &mut self.stack_vm
         } else if is_data_mapping(flags) {
-            self.data_vm -= npages;
-        }
+            &mut self.data_vm
+        } else {
+            return;
+        };
+        debug_assert!(*field >= npages, "vm statistic underflow");
+        *field = field.saturating_sub(npages);
     }
 
     /// `mlock_future_ok`.
@@ -641,11 +655,19 @@ impl Mm {
     /// `vms_complete_munmap_vmas`: drop the gathered VMAs and their statistics.
     pub(super) fn complete_munmap(&mut self, g: &Gathered) {
         self.vmas.drain(g.lo..g.hi);
-        self.locked_vm -= g.locked_vm;
-        self.total_vm -= g.nr_pages;
-        self.exec_vm -= g.exec_vm;
-        self.stack_vm -= g.stack_vm;
-        self.data_vm -= g.data_vm;
+        debug_assert!(
+            self.locked_vm >= g.locked_vm
+                && self.total_vm >= g.nr_pages
+                && self.exec_vm >= g.exec_vm
+                && self.stack_vm >= g.stack_vm
+                && self.data_vm >= g.data_vm,
+            "vm statistic underflow"
+        );
+        self.locked_vm = self.locked_vm.saturating_sub(g.locked_vm);
+        self.total_vm = self.total_vm.saturating_sub(g.nr_pages);
+        self.exec_vm = self.exec_vm.saturating_sub(g.exec_vm);
+        self.stack_vm = self.stack_vm.saturating_sub(g.stack_vm);
+        self.data_vm = self.data_vm.saturating_sub(g.data_vm);
     }
 }
 
@@ -658,7 +680,7 @@ pub(super) struct MergeReq {
     pub flags: VmFlags,
     pub pgoff: u64,
     pub file: Option<u64>,
-    pub anon: Option<u32>,
+    pub anon: Option<u64>,
 }
 
 /// `struct vma_munmap_struct` results.

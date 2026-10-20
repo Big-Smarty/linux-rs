@@ -22,7 +22,7 @@ use syscalls::Errno;
 use super::{
     env::{Env, FileInfo, RLIM_INFINITY},
     flags::{
-        LEGACY_MAP_MASK, MAP_DROPPABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_HUGETLB, MAP_LOCKED,
+        LEGACY_MAP_MASK, MAP_ANONYMOUS, MAP_DROPPABLE, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_HUGETLB, MAP_LOCKED,
         MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE,
         MAP_TYPE, PAGE_SHIFT, PAGE_SIZE, PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ,
         PROT_SEM, PROT_WRITE, VmFlags, calc_vm_flag_bits, calc_vm_prot_bits, offset_in_page,
@@ -91,6 +91,8 @@ impl Mm {
     /// `ksys_mmap_pgoff` + `vm_mmap_pgoff` + `do_mmap` for a call that already
     /// passed the x86 offset check ([`mmap_off_to_pgoff`]) and, unless
     /// `MAP_ANONYMOUS`, resolved the descriptor (`EBADF`) into `file`.
+    /// Caller obligation (debug-asserted): `file.is_some()` exactly when
+    /// `MAP_ANONYMOUS` is clear.
     ///
     /// # Errors
     /// Linux's, in Linux's order; see the inline step comments.
@@ -109,6 +111,7 @@ impl Mm {
         pgoff: u64,
         file: Option<&FileInfo>,
     ) -> Result<Mmap, Errno> {
+        debug_assert_eq!(file.is_some(), flags & MAP_ANONYMOUS == 0);
         // ksys_mmap_pgoff: hugetlb files and MAP_HUGETLB
         match file {
             Some(f) if f.hugepages => return Ok(Mmap::Unsupported(Unsupported::Hugetlb)),
@@ -338,7 +341,10 @@ impl Mm {
     ///
     /// On `Err` the tables and statistics are unchanged; the VMAs overlapping
     /// the range may have been split at its edges, exactly as `__mmap_setup`
-    /// leaves them when a later check fails.
+    /// leaves them when a limit check fails. When storage for the new VMA
+    /// cannot be reserved this is *stronger* than Linux, which by then has
+    /// cleared the old PTEs (`vms_clean_up_area`) and leaves a hole after
+    /// `vms_abort_munmap_vmas`; the model fails before touching the tables.
     ///
     /// # Errors
     /// `ENOMEM`: `max_map_count` for a hole punch, `RLIMIT_AS`/`RLIMIT_DATA`,

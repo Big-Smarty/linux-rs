@@ -276,6 +276,12 @@ impl Mm {
         } else {
             self.arch_get_unmapped_area(env, addr, len, pgoff, flags)?
         };
+        // `IS_ERR_VALUE(addr)`: an address in [-4095, -1] is returned as an
+        // errno before any other check (only `MAP_FIXED` can reach this, as the
+        // arch function hands the caller's address back unexamined).
+        if addr >= u64::MAX - 4094 {
+            return Err(Errno::new(addr.wrapping_neg() as i32));
+        }
         if addr > TASK_SIZE - len {
             return Err(Errno::ENOMEM);
         }

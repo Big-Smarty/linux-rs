@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Host tests of the memory-mapping model. Expected values come from three
-//! sources, named per test: `oracle` = a line recorded on the pinned Linux
-//! 6.18.57 (`target/linux-reference/init-reference-005/oracle-mm-tcg.log`,
-//! check name quoted), `src` = derived by hand from the cited pinned source
-//! (no oracle covers it), `model` = a property of this model itself.
+//! sources, named per test: `oracle` = the value transcribed from the oracle
+//! test `user/init/src/tests/mm.rs` (check name quoted), whose 121 `mm` checks
+//! all passed on the pinned Linux 6.18.57 (`xtask/oracle/expected.tsv`; the
+//! local capture is `target/linux-reference/init-reference-006`, whose logs
+//! hold only `ok` lines: the values are in the test source), `src` = derived
+//! by hand from the cited pinned source (no oracle covers it), `model` = a
+//! property of this model itself.
 //! Blind spot: `Vec::try_reserve` failure is not injectable on the host.
 #![allow(
     clippy::doc_markdown,
@@ -135,8 +138,7 @@ impl W {
             anon: None,
         };
         mm.insert_vm_struct(&env, stack).unwrap();
-        mm.total_vm = STACK_PAGES;
-        mm.stack_vm = STACK_PAGES;
+        assert_eq!((mm.total_vm, mm.stack_vm), (STACK_PAGES, STACK_PAGES));
         Self {
             env,
             mm,
@@ -261,7 +263,7 @@ fn layout_default_matches_oracle_top() {
 fn layout_stack_rlimit_gap_and_clamp() {
     let mut env = Env::init(1 << 17, 0);
     env.rlimit_stack = 1 << 30;
-    assert_eq!(pick_mmap_base(&env).0, TASK_SIZE - (1 << 30) - 0x10_0000);
+    assert_eq!(pick_mmap_base(&env).0, 0x7fff_bfef_f000);
     env.rlimit_stack = RLIM_INFINITY;
     assert_eq!(pick_mmap_base(&env).0, 0x1555_5555_6000);
     env.rlimit_stack = 0;
@@ -269,7 +271,7 @@ fn layout_stack_rlimit_gap_and_clamp() {
     env.rlimit_stack = 120 * 1024 * 1024; // + 1 MiB guard = 121 MiB < 128 MiB
     assert_eq!(pick_mmap_base(&env).0, MMAP_TOP);
     env.rlimit_stack = 200 * 1024 * 1024;
-    assert_eq!(pick_mmap_base(&env).0, TASK_SIZE - 201 * 1024 * 1024);
+    assert_eq!(pick_mmap_base(&env).0, 0x7fff_f36f_f000);
 }
 
 // ---- mmap ---------------------------------------------------------------
@@ -893,7 +895,6 @@ fn exec_world() -> (W, u64) {
             anon: None,
         };
         w.mm.insert_vm_struct(&env, v).unwrap();
-        w.mm.total_vm += (e - s) / P;
     };
     let base = VmFlags::MAYREAD | VmFlags::MAYWRITE | VmFlags::MAYEXEC;
     ins(
@@ -966,11 +967,7 @@ fn brk_heap_is_separate_from_bss_and_extends_in_place() {
     assert_eq!(h.flags, VmFlags::DATA_DEFAULT | VmFlags::ACCOUNT);
     assert_eq!(h.pgoff, start >> 12);
     // data_vm and total_vm moved with it.
-    assert_eq!(
-        w.mm.data_vm,
-        2 + 5,
-        "bss + heap (the file data page is not accounted by this fixture)"
-    );
+    assert_eq!(w.mm.data_vm, 1 + 2 + 5, "data page + bss + heap");
 }
 
 /// src: include/linux/mm.h check_data_rlimit: (brk - start_brk) + (end_data -
@@ -1071,9 +1068,31 @@ fn fault_signals() {
     assert_eq!(w.fault(0x1000, 0), map(0x1000));
     assert_eq!(w.fault(0, PF_WRITE), map(0));
     assert_eq!(w.fault(TASK_SIZE, 0), map(TASK_SIZE));
+    // The vsyscall page (CONFIG_LEGACY_VSYSCALL_XONLY=y): a user fetch is
+    // emulated by Linux, here a loud distinct outcome; a write or a data read
+    // is refused by emulate_vsyscall itself and ends as SEGV_MAPERR.
     assert_eq!(
-        w.fault(0xffff_ffff_ff60_0000, PF_INSTR),
+        w.fault(0xffff_ffff_ff60_0400, PF_INSTR),
+        FaultOutcome::Vsyscall {
+            address: 0xffff_ffff_ff60_0400,
+            error_code: PF_INSTR | PF_USER
+        }
+    );
+    assert_eq!(
+        w.fault(0xffff_ffff_ff60_0000, PF_WRITE | PF_INSTR),
         map(0xffff_ffff_ff60_0000)
+    );
+    assert_eq!(
+        w.fault(0xffff_ffff_ff60_0000, 0),
+        map(0xffff_ffff_ff60_0000)
+    );
+    assert_eq!(
+        w.fault(0xffff_ffff_ff60_1000, PF_INSTR),
+        map(0xffff_ffff_ff60_1000)
+    );
+    assert_eq!(
+        w.fault(0xffff_ffff_ff60_0000, PF_RSVD | PF_INSTR),
+        FaultOutcome::PgtableBad
     );
     assert_eq!(
         w.fault(0xffff_8000_0000_0000, PF_WRITE),
@@ -1343,4 +1362,31 @@ fn random_sequences_keep_invariants() {
         }
         let _ = format!("{:?}", w.mm);
     }
+}
+
+/// src: mm/mmap.c `__get_unmapped_area`: `if (IS_ERR_VALUE(addr)) return addr;`
+/// precedes the `TASK_SIZE`/alignment checks, so a `MAP_FIXED` address in
+/// [-4095, -1] is the errno `-addr` (the arch function returns it untouched).
+#[test]
+fn mmap_fixed_error_range_address_is_an_errno() {
+    let mut w = W::new();
+    let f = ANON | MAP_FIXED;
+    assert_eq!(w.map(u64::MAX, P, RW, f), Err(Errno::EPERM)); // -1
+    assert_eq!(w.map(u64::MAX - 11, P, RW, f), Err(Errno::ENOMEM)); // -12
+    assert_eq!(w.map(u64::MAX - 21, P, RW, f), Err(Errno::EINVAL)); // -22
+    assert_eq!(w.map(u64::MAX - 4094, P, RW, f), Err(Errno::new(4095)));
+    // One below the range is an ordinary out-of-range address.
+    assert_eq!(w.map(u64::MAX - 4095, P, RW, f), Err(Errno::ENOMEM));
+    w.check_invariants();
+}
+
+/// model: a loader-built VMA is accounted by `insert_vm_struct`, so unmapping
+/// it cannot underflow the counters.
+#[test]
+fn inserted_vma_is_accounted_and_unmaps_cleanly() {
+    let mut w = W::new();
+    assert_eq!((w.mm.total_vm, w.mm.stack_vm), (STACK_PAGES, STACK_PAGES));
+    assert_eq!(w.munmap(STACK_START, STACK_PAGES * P), Ok(()));
+    assert_eq!((w.mm.total_vm, w.mm.stack_vm), (0, 0));
+    assert!(w.mm.vmas().is_empty());
 }

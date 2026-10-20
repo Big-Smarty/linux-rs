@@ -21,9 +21,13 @@
 //!   never reaches here; a kernel-mode instruction fetch from user memory
 //!   (`(error_code & (PF_USER | PF_INSTR)) == PF_INSTR`) is an oops the caller
 //!   handles before calling.
-//! * Not modelled, named: vsyscall-page emulation (`emulate_vsyscall`; with the
-//!   declared `vsyscall` default Linux emulates a fetch at the vsyscall
-//!   addresses, this reports `SEGV_MAPERR`), protection keys and shadow stacks
+//! * The vsyscall page: the reference configuration has
+//!   `CONFIG_LEGACY_VSYSCALL_XONLY=y`, so a user instruction fetch there is
+//!   emulated by `emulate_vsyscall`, which this model does not implement. It is
+//!   reported as the distinct, loud [`FaultOutcome::Vsyscall`] (never a quiet
+//!   `SIGSEGV`); only the cases where `emulate_vsyscall` itself returns false
+//!   (a write, or a data read) continue to `SEGV_MAPERR`.
+//! * Not modelled, named: protection keys and shadow stacks
 //!   (the declared CPU/config has neither, so `PF_PK`/`PF_SHSTK`/`PF_SGX` are
 //!   always an access error), prefetch erratum fix-ups (`is_prefetch`).
 
@@ -35,6 +39,8 @@ use super::{
 };
 use crate::usercopy::TASK_SIZE_MAX;
 
+/// `VSYSCALL_ADDR` (-10 MiB).
+pub const VSYSCALL_ADDR: u64 = 0xffff_ffff_ff60_0000;
 pub const PF_PROT: u64 = 1 << 0;
 pub const PF_WRITE: u64 = 1 << 1;
 pub const PF_USER: u64 = 1 << 2;
@@ -66,6 +72,11 @@ pub enum FaultOutcome {
     /// `pgtable_bad`: a reserved bit in a user PTE; Linux oopses and kills the
     /// task with `SIGKILL`.
     PgtableBad,
+    /// A user instruction fetch at the vsyscall page (`0xffffffffff600000`
+    /// page): Linux emulates `gettimeofday`/`time`/`getcpu` here
+    /// (`emulate_vsyscall`, `vsyscall=xonly`). Not implemented: the caller must
+    /// stop loudly or implement the emulation; nothing was changed.
+    Vsyscall { address: u64, error_code: u64 },
     /// The VMA is file-backed: `->fault`/`do_wp_page` need the page cache.
     NeedsFile { address: u64, write: bool },
 }
@@ -108,13 +119,23 @@ impl Mm {
     ) -> FaultOutcome {
         let segv = |code| FaultOutcome::Segv { code, address };
         // fault_in_kernel_space(): everything at or above TASK_SIZE_MAX that
-        // is not the vsyscall page; both end in bad_area_nosemaphore here.
-        if address >= TASK_SIZE_MAX {
+        // is not the vsyscall page ends in bad_area_nosemaphore.
+        let vsyscall = address & !(PAGE_SIZE - 1) == VSYSCALL_ADDR;
+        if address >= TASK_SIZE_MAX && !vsyscall {
             return segv(SegvCode::MapErr);
         }
         // Reserved bits are never expected in the user portion of the tables.
         if error_code & PF_RSVD != 0 {
             return FaultOutcome::PgtableBad;
+        }
+        // emulate_vsyscall(): writes and kernel-privilege faults are never
+        // fixed up; a data read is denied (`address != regs->ip`), approximated
+        // by PF_INSTR since the instruction pointer is not an input here.
+        if vsyscall && error_code & (PF_WRITE | PF_USER) == PF_USER && error_code & PF_INSTR != 0 {
+            return FaultOutcome::Vsyscall {
+                address,
+                error_code,
+            };
         }
         let write = error_code & (PF_WRITE | PF_SHSTK) != 0;
 
