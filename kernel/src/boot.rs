@@ -130,6 +130,17 @@ pub struct BootInfo {
     command_line_length: usize,
 }
 
+// SAFETY: `BootInfo` is plain immutable data after construction: its raw
+// pointers address the loader's response allocations, which stay reserved and
+// are never written after the handoff (see `take`), every method takes `&self`
+// and there is no interior mutability. `module_bytes` is unsafe and carries its
+// own aliasing contract. Sharing or moving it between CPUs therefore creates
+// no data race; it is only ever installed once into the kernel's static
+// (`services::BOOT`) before any second CPU exists.
+unsafe impl Send for BootInfo {}
+// SAFETY: as above.
+unsafe impl Sync for BootInfo {}
+
 /// Linux x86 `COMMAND_LINE_SIZE` (arch/x86/include/asm/setup.h), NUL included.
 /// Linux silently truncates a longer line; a cut word or a cut `--` separator
 /// would change its meaning, so this loader boundary rejects it instead.

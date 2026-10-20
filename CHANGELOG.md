@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Kernel services foundation ([record](docs/implementation.md#kernel-services-foundation)): `BootInfo`, the frame allocator and the page tables live in synchronised statics (`services.rs`, lock order `PROCESS` -> `TABLES` -> heap -> `FRAMES`); user mappings can be mapped, unmapped, protected and freed after CR3 activation (`invlpg`, atomic PTE updates, rollback; `UserSpace` borrows `&mut Tables`); a fallible kernel heap (vendored `buddy_system_allocator` 0.13.0 over buddy frames) with `alloc` built `--cfg no_global_oom_handling` so infallible `Box::new`/`Vec::push` do not exist in the kernel; `Process` context and `syscall::dispatch(&mut impl Context, ..)` with `syscall/` split into `mod.rs`, `io.rs`, `process.rs`. New QEMU records `CHECK user-mm` and `CHECK heap`; no syscall added, no behavior visible to `/init` changed.
+
 ## v0.1.0 — 2026-10-19
 
 Bounded continuation checkpoint on `main` 6aaeb93 (PRs #1–#10, each merged after an independent agent `COMMENT` review); gate results, artifact hashes, fresh-clone comparison and the not-done list are in the [implementation record](docs/implementation.md#v010-continuation-checkpoint). Not whole-kernel completion, physical or performance qualification.

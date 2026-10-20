@@ -7,6 +7,7 @@ pub mod boot;
 pub mod config;
 pub mod exec;
 pub mod firmware;
+pub mod heap;
 pub mod image;
 pub mod memory;
 pub mod sync;

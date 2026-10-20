@@ -2,11 +2,20 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+// Fallible allocation API (`Box::try_new`, `Vec::push_within_capacity`); the
+// infallible one does not exist in target builds, see `kalloc`. Only the
+// self-test uses them so far.
+#![cfg_attr(
+    feature = "qemu-self-test",
+    feature(allocator_ext, vec_push_within_capacity)
+)]
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 compile_error!(
     "the kernel requires --target x86_64-unknown-none; host tools/tests do not enable freestanding"
 );
+
+extern crate alloc;
 
 // Links the scalar `memset`/`memcpy` providers the compiler emits calls to.
 use kernel::{boot, firmware, image, memory};
@@ -14,7 +23,9 @@ use linux_rs_runtime as _;
 
 mod console;
 mod cpu;
+mod kalloc;
 mod paging;
+mod services;
 mod userspace;
 
 use boot::TestMode;
@@ -137,16 +148,19 @@ extern "C" fn kernel_main() -> ! {
     // SAFETY: _start has established our BSS stack, long mode and IF/DF=0. This
     // is the one BSP handoff; loader memory is never reclaimed in this cell.
     let (boot, acpi) = loader_handoff(framebuffer);
-    inspect_boot_images(&boot);
+    // The handoff is immutable from here on; `'static` lets the allocator
+    // borrow it and keeps it reachable after this frame is abandoned.
+    let boot = services::BOOT.init(boot);
+    inspect_boot_images(boot);
     // SAFETY: one constructor call consumes usable RAM ownership from the
     // trusted handoff, no DMA/AP/firmware mutation or competing allocator.
-    let mut allocator = unwrap(unsafe { Allocator::new(&boot) }, "allocator");
+    let mut allocator = unwrap(unsafe { Allocator::new(boot) }, "allocator");
     check_frame_ownership(&mut allocator);
-    let mut tables = unwrap(paging::Tables::build(&boot, &mut allocator), "tables-build");
+    let mut tables = unwrap(paging::Tables::build(boot, &mut allocator), "tables-build");
     #[cfg(feature = "qemu-self-test")]
     {
         unwrap(
-            paging::Tables::failure_tests(&boot, &mut allocator, tables.pages),
+            paging::Tables::failure_tests(boot, &mut allocator, tables.pages),
             "table-allocation-rollback",
         );
         log!(
@@ -155,13 +169,13 @@ extern "C" fn kernel_main() -> ! {
         );
     }
     require(
-        unwrap(tables.check_permissions(&boot), "permissions"),
+        unwrap(tables.check_permissions(boot), "permissions"),
         "table-permissions",
     );
-    // Kernel tables only; user mappings below are added to the same unpublished
-    // tree, so the published root is still written only before CR3 loads.
+    // Kernel tables only; init's mappings below are added before CR3 loads,
+    // which `paging`'s update rules allow but no longer require.
     let table_pages = tables.pages;
-    let user = userspace::load(&boot, &mut allocator, &mut tables);
+    let user = userspace::load(boot, &mut allocator, &mut tables);
     // SAFETY: the fully constructed tree covers current image/stack, descriptor,
     // loader/firmware/metadata and framebuffer resources at unchanged addresses;
     // guard/image-alias holes are intentional; no SMP/PCID/global translations.
@@ -169,7 +183,7 @@ extern "C" fn kernel_main() -> ! {
         tables.activate();
     }
     require(tables.is_active(), "cr3-owned-root");
-    check_module_epoch(&boot, &tables);
+    check_module_epoch(boot, &tables);
     require(
         unwrap(tables.lookup(Virtual(cpu::guards()[0])), "guard-lookup").is_none(),
         "stack-guard-unmapped",
@@ -178,9 +192,11 @@ extern "C" fn kernel_main() -> ! {
         "CHECK paging ok tables={} wx=separated guards=5 image_alias=absent\n",
         table_pages
     );
-    check_exceptions(&boot, &mut allocator);
+    check_exceptions(boot, &mut allocator);
     #[cfg(feature = "qemu-self-test")]
     check_allocator_recovery(&mut allocator);
+    #[cfg(feature = "qemu-self-test")]
+    check_user_mm(&mut tables, &mut allocator);
     unwrap(cpu::start_timer(acpi.legacy_pic), "timer-init");
     unwrap(
         cpu::irq_guard_test(
@@ -221,8 +237,25 @@ extern "C" fn kernel_main() -> ! {
         allocator.available(),
         tables.pages
     );
+    publish_services(allocator, tables);
     // Diverges: init runs and its death ends the boot, or Linux's failure text.
     userspace::run(user)
+}
+
+/// The boot-phase locals end here: the frame allocator and the published tables
+/// move into their statics, since `kernel_main`'s frame becomes init's kernel
+/// stack and the syscall/fault paths allocate and edit tables from there.
+fn publish_services(allocator: Allocator<'static>, tables: paging::Tables) {
+    services::FRAMES.install(allocator);
+    services::TABLES.install(tables);
+    // The heap is usable from here on (it grows from `FRAMES`).
+    #[cfg(feature = "qemu-self-test")]
+    {
+        unwrap(kalloc::self_test(), "heap");
+        log!(
+            "CHECK heap ok vec=1000 box=4096 align=4096 growth=buddy-frames oom=failed-cleanly recovered=true over_cap=rejected accounting=restored\n"
+        );
+    }
 }
 
 fn loader_handoff(framebuffer: bool) -> (boot::BootInfo, firmware::Acpi) {
@@ -360,6 +393,14 @@ fn check_exceptions(boot: &boot::BootInfo, allocator: &mut Allocator<'_>) {
         cpu::unexpected_interrupt();
     }
     assert!(boot.test != TestMode::Panic, "controlled panic case");
+}
+
+#[cfg(feature = "qemu-self-test")]
+fn check_user_mm(tables: &mut paging::Tables, allocator: &mut Allocator<'_>) {
+    unwrap(tables.user_mm_tests(allocator), "user-mm");
+    log!(
+        "CHECK user-mm ok pages=3 rollback_points=3 tlb=invlpg protect=ro unmap=3 conflict=rolled-back accounting=restored\n"
+    );
 }
 
 fn fail() -> ! {

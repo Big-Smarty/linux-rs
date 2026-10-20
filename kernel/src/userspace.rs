@@ -4,15 +4,15 @@
 //! then runs init: ring-3 entry, the syscall and exception handlers called by
 //! `cpu.rs`, and init's death.
 //!
-//! State used after ring 3 starts lives in statics (`STATE`), never in
-//! `kernel_main`'s frame, whose stack is reused as init's kernel stack.
+//! State used after ring 3 starts lives in statics (`PROCESS` here, `BOOT`,
+//! `FRAMES` and `TABLES` in `services`), never in `kernel_main`'s frame, whose
+//! stack is reused as init's kernel stack.
 //!
 //! Context: BSP, interrupts off, before the owned CR3 is published. The module
 //! payloads are only readable while the loader mapping epoch is active, so the
 //! file bytes are copied into freshly allocated user frames here and no
-//! payload borrow survives this function. Every table write precedes
-//! `Tables::activate`, so the "all software table writes happen before CR3
-//! publication" invariant of `paging` holds unchanged.
+//! payload borrow survives this function. These table writes happen to precede
+//! `Tables::activate`; `paging`'s update rules permit user-half edits after it.
 //!
 //! shortcut: frames and tables of a failed load are not returned; any failure
 //! is fatal for the boot (Linux panics when init cannot be started). Upgrade
@@ -23,12 +23,12 @@
 use crate::{
     boot::{BootError, BootInfo},
     console, cpu,
-    memory::{Allocator, Error as MemoryError, PAGE, Physical},
+    memory::{Allocator, Error as MemoryError, PAGE, PAGE_BYTES, Physical},
     paging::{self, Tables, UserSpace},
+    services::{self, Service},
 };
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
-    cell::UnsafeCell,
     iter,
 };
 use kernel::{
@@ -43,9 +43,8 @@ use kernel::{
         stack::{self, ARG_PAGES, Aux, ENVP, EXPAND_PAGES, STACK_START, STACK_TOP, StackError},
     },
     image::{cpio::FileType, elf::Elf},
-    sync::RawSpinLock,
-    syscall::{self, Console, Outcome},
-    usercopy,
+    syscall::{self, Console, Context, Outcome},
+    usercopy::{self, UserPages},
 };
 use syscalls::Errno;
 
@@ -127,8 +126,8 @@ impl From<ArgsError> for Error {
     }
 }
 
-/// Everything later stages need once `/init` is mapped. Plain data apart from
-/// the unique `UserSpace`; belongs in a static before ring 3 is entered.
+/// Everything later stages need once `/init` is mapped. Plain data; the mapped
+/// pages live in the tables, which belong in `services::TABLES` before ring 3.
 pub struct Loaded {
     pub entry: u64,
     pub sp: u64,
@@ -136,7 +135,6 @@ pub struct Loaded {
     pub brk: u64,
     pub argc: u64,
     pub vmas: Vmas,
-    pub space: UserSpace,
 }
 
 fn weak_random() -> [u8; 16] {
@@ -323,6 +321,10 @@ fn load_init(
         &aux,
     )?;
     let top = top.into_reserved();
+    // SAFETY: `top` is the live order-two reservation just made; no token,
+    // reference or mapping of it exists yet. Afterwards each page is its own
+    // order-zero reservation, as `map_user` requires for later unmapping.
+    unsafe { allocator.split_reserved_order(top, 2)? };
     for page in 0..ARG_PAGES as u64 {
         let address = STACK_TOP - (ARG_PAGES as u64 - page) * PAGE;
         let physical = Physical(top.0 + page * PAGE);
@@ -346,39 +348,58 @@ fn load_init(
         brk: plan.brk,
         argc: built.argc,
         vmas: plan.vmas,
-        // SAFETY: this is the only handle ever created, and no other reference
-        // to a user frame exists (frames were handed to `map_user` as raw
-        // physical addresses); the tree is published by the caller and kept.
-        space: unsafe { tables.user_space() },
     })
 }
 
-/// What the syscall and fault paths need once init runs.
-struct State {
-    space: UserSpace,
-    vmas: Vmas,
+/// The one process: what the syscall and fault paths need once init runs
+/// (frames, boot info and the heap are in `services`/`kalloc`). Later syscall
+/// groups extend it (file table, credentials, signals, ...); exactly one is
+/// reachable until tasks exist.
+///
+/// Lock order: `PROCESS` -> `TABLES` -> heap -> `FRAMES` (`services`). The
+/// handler holds `PROCESS` for the whole syscall (a single task cannot
+/// re-enter), so a field needs no lock of its own.
+pub struct Process {
+    /// Task id; `pid == tgid` for the single-threaded init.
+    #[allow(dead_code, reason = "read by gettid and the identity group")]
+    pub pid: u32,
+    /// Thread-group id: what `getpid` reports.
+    pub tgid: u32,
+    /// The address space (`mm`): the published page tables.
+    pub mm: &'static Service<Tables>,
+    /// File-backed VMAs from the exec plan (segfault report). When this becomes
+    /// a `Vec`, `try_reserve` it BEFORE taking a `FRAMES` guard (`services`).
+    /// shortcut: fixed array, no anonymous VMAs yet; the mm group replaces it
+    /// with a sorted `Vec` grown by `try_reserve`.
+    pub vmas: Vmas,
+    /// `mm->start_brk`, and the initial `mm->brk`.
+    #[allow(dead_code, reason = "read by the brk syscall (mm group)")]
+    pub brk: u64,
 }
 
-/// A `State` shared with entry code. Single CPU: the only accessors are the
-/// syscall handler and the fatal exception handler, which cannot interleave
-/// (a syscall runs with IF/TF cleared and ring 0 takes no user exception);
-/// `LOCK` makes that explicit and keeps the access sound if that changes.
-struct Shared(UnsafeCell<Option<State>>);
-// SAFETY: every access goes through `with`/`install`, which hold `LOCK`.
-unsafe impl Sync for Shared {}
-static LOCK: RawSpinLock = RawSpinLock::new();
-static STATE: Shared = Shared(UnsafeCell::new(None));
+static PROCESS: Service<Process> = Service::new();
 
-fn install(state: State) {
-    let _owner = LOCK.lock();
-    // SAFETY: `LOCK` is held, so this is the only access to the cell.
-    unsafe { *STATE.0.get() = Some(state) };
+/// Syscall context: the process plus its user-memory view (a borrow of the
+/// locked tables, so no map/unmap can run mid-syscall) and the console.
+struct Syscall<'a> {
+    process: &'a mut Process,
+    space: UserSpace<'a>,
+    tty: Tty,
 }
 
-fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
-    let _owner = LOCK.lock();
-    // SAFETY: `LOCK` is held, so this is the only access to the cell.
-    unsafe { (*STATE.0.get()).as_mut().map(f) }
+impl UserPages for Syscall<'_> {
+    fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+        self.space.page(page, write)
+    }
+}
+
+impl Context for Syscall<'_> {
+    fn console(&mut self) -> &mut dyn Console {
+        &mut self.tty
+    }
+    fn tgid(&self) -> u32 {
+        self.process.tgid
+    }
 }
 
 /// init's `/dev/console`: the same sinks as `log!`.
@@ -410,12 +431,17 @@ fn init_died(code: u32) -> ! {
 /// `regs.ax`. Interrupts are off and the CPU is on the `BOOT_STACK` top.
 pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
     let args = [regs.di, regs.si, regs.dx, regs.r10, regs.r8, regs.r9];
-    let Some(outcome) =
-        with(|state| syscall::dispatch(&mut state.space, &mut Tty, regs.orig_ax, args))
-    else {
-        crate::log!("FAIL syscall before init state\n");
-        crate::fail();
+    let mut process = PROCESS.lock();
+    let mm = process.mm;
+    let mut tables = mm.lock();
+    let mut context = Syscall {
+        space: tables.user_space(),
+        process: &mut process,
+        tty: Tty,
     };
+    let outcome = syscall::dispatch(&mut context, regs.orig_ax, args);
+    drop(tables);
+    drop(process);
     match outcome {
         Outcome::Return(value) => regs.ax = value.cast_unsigned(),
         Outcome::Exit(code) => init_died(code),
@@ -430,10 +456,7 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
 /// no signal handler can exist yet, so the signal's default action (terminate)
 /// runs, the exit code is the signal number, and init's death panics.
 pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) -> ! {
-    let Some(vmas) = with(|state| state.vmas) else {
-        crate::log!("FAIL user exception before init state vector={}\n", vector);
-        crate::fail();
-    };
+    let vmas = PROCESS.lock().vmas;
     if vector == 14 {
         let line = Segfault {
             address,
@@ -470,32 +493,31 @@ pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) -> ! {
 }
 
 /// Exercise the one user-copy mechanism on the real owned tables.
-fn check_user_image(init: &mut Loaded) {
+fn check_user_image(init: &Loaded, space: &mut UserSpace<'_>) {
     let mut word = [0u8; 8];
     crate::require(
-        usercopy::copy_from_user(&mut init.space, &mut word, init.sp) == 0,
+        usercopy::copy_from_user(space, &mut word, init.sp) == 0,
         "user-stack-readable",
     );
     crate::require(u64::from_le_bytes(word) == init.argc, "user-argc");
     // Writable-path walk: store the value that is already there.
     crate::require(
-        usercopy::copy_to_user(&mut init.space, init.sp, &word) == 0,
+        usercopy::copy_to_user(space, init.sp, &word) == 0,
         "user-stack-writable",
     );
     crate::require(
-        usercopy::copy_from_user(&mut init.space, &mut word, STACK_START - 8) == 8
-            && word == [0; 8],
+        usercopy::copy_from_user(space, &mut word, STACK_START - 8) == 8 && word == [0; 8],
         "user-below-stack-unmapped",
     );
     crate::require(
-        usercopy::copy_from_user(&mut init.space, &mut word, usercopy::TASK_SIZE_MAX - 4) == 8,
+        usercopy::copy_from_user(space, &mut word, usercopy::TASK_SIZE_MAX - 4) == 8,
         "user-range-limit",
     );
     crate::require(
         init.vmas.find(init.entry).is_some(),
         "user-entry-file-backed",
     );
-    let audit = crate::unwrap(init.space.audit(), "user-isolation-audit");
+    let audit = crate::unwrap(space.audit(), "user-isolation-audit");
     crate::log!(
         "CHECK userspace-audit ok user_pages={} user_tables={} kernel_entries={} kernel_user_bits=0 above_task_size=0\n",
         audit.user_pages,
@@ -539,7 +561,7 @@ const FALLBACK_NAMES: [&str; 4] = ["/sbin/init", "/etc/init", "/bin/init", "/bin
 /// Start init, or end the boot the way Linux does when it cannot.
 pub fn run(user: Result<Loaded, Error>) -> ! {
     match user {
-        Ok(init) => start(init),
+        Ok(init) => start(&init),
         Err(Error::NoInit) => {
             // Linux: `init_eaccess("/init")` fails, `prepare_namespace` finds no
             // root device and panics (init/do_mounts.c:236).
@@ -579,8 +601,8 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
     }
 }
 
-fn start(mut init: Loaded) -> ! {
-    check_user_image(&mut init);
+fn start(init: &Loaded) -> ! {
+    check_user_image(init, &mut services::TABLES.lock().user_space());
     crate::log!("Run /init as init process\n");
     // SAFETY: BSP, CPL0, IF clear (nothing since the timer test re-enabled it
     // except the guarded sections, which restore it off), descriptors installed
@@ -602,13 +624,16 @@ fn start(mut init: Loaded) -> ! {
         protection.smap
     );
     let (entry, sp) = (init.entry, init.sp);
-    install(State {
-        space: init.space,
+    PROCESS.install(Process {
+        pid: 1,
+        tgid: 1,
+        mm: &services::TABLES,
         vmas: init.vmas,
+        brk: init.brk,
     });
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all
-    // state used by the syscall/fault paths is in `STATE`; `kernel_main`'s
+    // state used by the syscall/fault paths is in `PROCESS` and `services`; `kernel_main`'s
     // frame is abandoned, its stack top is TSS.RSP0.
     unsafe { cpu::enter_user(entry, sp) }
 }

@@ -23,12 +23,15 @@
 //!   implementation that dereferences user addresses directly MUST open and
 //!   close the `AC` window around exactly the copy loops below, and then needs
 //!   an exception-table fixup instead of this walk.
-//! * TOCTOU: there is one user task and one CPU, and user code does not run
-//!   while a syscall executes, so no other agent can unmap or remap a page
-//!   between resolution and the copy. Upgrade path: once a second task, a
-//!   second CPU, or an `munmap`/`mprotect` syscall exists, resolution and copy
-//!   must be one atomic step under the address-space lock, or move to
-//!   fault-and-fixup copies.
+//! * TOCTOU: resolution and copy happen under one exclusive borrow. The
+//!   [`UserPages`] implementor (`paging::UserSpace`) holds `&mut Tables`, i.e.
+//!   the `services::TABLES` lock, so `unmap_user`/`protect_user`/`map_user`
+//!   cannot run between the two, and the returned page borrow ends before any
+//!   such edit can start. User code does not run during a syscall (one CPU).
+//!   Upgrade path: a second task or CPU needs the address-space lock to cover
+//!   other CPUs' faults and unmaps (it does: the lock is a spinlock), plus a
+//!   TLB shootdown before frames are freed; direct dereference of user
+//!   addresses would instead need fault-and-fixup copies.
 //! * Short copies: like Linux, the functions return how many bytes were NOT
 //!   copied. Bytes before the first inaccessible page are copied; a failed
 //!   `copy_from_user` zero-fills the remainder of the destination.
