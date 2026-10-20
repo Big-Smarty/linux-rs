@@ -182,6 +182,18 @@ pub struct SignalStruct {
     shared: Pending,
 }
 
+impl SignalStruct {
+    /// `signal->flags = SIGNAL_GROUP_EXIT; signal->group_exit_code = code`
+    /// (`do_group_exit`, `complete_signal`, `synchronize_group_exit`): the
+    /// assignment replaces the other flag bits, so the stop and `CLD_*` state
+    /// is dropped with them.
+    pub fn start_group_exit(&mut self, code: u32) {
+        self.group_exit = Some(code);
+        self.job_flags = 0;
+        self.stop_code = 0;
+    }
+}
+
 /// The signal fields of one `struct task_struct`.
 #[derive(Clone, Debug)]
 pub struct ThreadSignal {
@@ -460,7 +472,7 @@ impl State<'_> {
             && !sig_kernel_coredump(sig)
         {
             // Start the group exit: the exit code is the signal itself.
-            self.sig.group_exit = Some(u32::from(sig));
+            self.sig.start_group_exit(u32::from(sig));
             self.me.private.signal.add(SIGKILL);
         }
     }
@@ -653,7 +665,10 @@ impl State<'_> {
 
     /// `do_group_exit(code)`: the exit code of the dying process.
     pub fn group_exit_code(&mut self, code: u32) -> u32 {
-        *self.sig.group_exit.get_or_insert(code)
+        if self.sig.group_exit.is_none() {
+            self.sig.start_group_exit(code);
+        }
+        self.sig.group_exit.unwrap_or(code)
     }
 }
 

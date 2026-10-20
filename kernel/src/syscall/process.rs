@@ -15,7 +15,7 @@
 use super::{Context, Outcome, error};
 use crate::{
     signal::{SIGCHLD, deliver::ERESTARTSYS, wait::wait_event_interruptible},
-    task::wait::{WNOHANG, WaitOpts},
+    task::wait::{WNOHANG, WaitInfo, WaitOpts},
     usercopy::{access_ok, copy_to_user, put_user},
 };
 use syscalls::{Errno, Sysno};
@@ -143,31 +143,34 @@ fn waitid<C: Context>(
     options: u32,
     ru: u64,
 ) -> i64 {
-    let mut wo = {
-        // `pidfd_get_pid`: the descriptor must be an open pidfd. There is no
-        // pidfd file type yet (`pidfd_open` stops the kernel), so every
-        // descriptor, open or not, is `EBADF`.
+    // `pidfd_get_pid`: the descriptor must be an open pidfd. There is no
+    // pidfd file type yet (`pidfd_open` stops the kernel), so every
+    // descriptor, open or not, is `EBADF`.
+    let prepared = {
         let t = ctx.tasks();
-        let prepared = t
-            .list
-            .prepare_waitid(t.current, which, upid, options, |_fd| Err(Errno::EBADF));
-        match prepared {
-            Ok(wo) => wo,
-            Err(errno) => return error(errno),
-        }
+        t.list
+            .prepare_waitid(t.current, which, upid, options, |_fd| Err(Errno::EBADF))
     };
-    let mut ret = do_wait(ctx, &mut wo);
-    // kernel_waitid
-    if ret == 0 && options & WNOHANG == 0 && wo.flags & WNOHANG != 0 {
-        ret = error(Errno::EAGAIN);
-    }
+    // A `kernel_waitid_prepare` error is `kernel_waitid`'s return value: the
+    // wrapper still stores the (all-zero) `waitid_info`.
+    let (mut ret, info) = match prepared {
+        Ok(mut wo) => {
+            let mut ret = do_wait(ctx, &mut wo);
+            // kernel_waitid
+            if ret == 0 && options & WNOHANG == 0 && wo.flags & WNOHANG != 0 {
+                ret = error(Errno::EAGAIN);
+            }
+            if ret > 0 && ru != 0 && copy_to_user(ctx, ru, &rusage(wo.rusage.0, wo.rusage.1)) != 0 {
+                return error(Errno::EFAULT);
+            }
+            (ret, wo.info)
+        }
+        Err(errno) => (error(errno), WaitInfo::default()),
+    };
     let mut signo = 0u32;
     if ret > 0 {
         signo = u32::from(SIGCHLD);
         ret = 0;
-        if ru != 0 && copy_to_user(ctx, ru, &rusage(wo.rusage.0, wo.rusage.1)) != 0 {
-            return error(Errno::EFAULT);
-        }
     }
     if infop == 0 {
         return ret;
@@ -180,10 +183,10 @@ fn waitid<C: Context>(
     let fields: [(u64, [u8; 4]); 6] = [
         (0, signo.to_le_bytes()),
         (4, [0; 4]),
-        (8, wo.info.cause.to_le_bytes()),
-        (16, wo.info.pid.to_le_bytes()),
-        (20, wo.info.uid.to_le_bytes()),
-        (24, wo.info.status.to_le_bytes()),
+        (8, info.cause.to_le_bytes()),
+        (16, info.pid.to_le_bytes()),
+        (20, info.uid.to_le_bytes()),
+        (24, info.status.to_le_bytes()),
     ];
     for (offset, bytes) in fields {
         if !put_user(ctx, infop + offset, &bytes) {
@@ -439,20 +442,25 @@ mod tests {
             neg(Errno::EFAULT),
             "EFAULT replaces ECHILD"
         );
-        // Argument checks come first and store nothing.
-        put_info(&mut t);
+        // Argument errors are `kernel_waitid`'s return value: the wrapper
+        // still stores the zeroed siginfo (and an unwritable one is EFAULT).
         for (which, id, options) in [
             (9, 0, WEXITED),
             (0, 0, 0),
             (0, 0, WNOHANG),
             (0, 0, WEXITED | 0x10),
         ] {
+            put_info(&mut t);
             assert_eq!(
                 call(&mut t, Sysno::waitid, &[which, id, 0x1000, options, 0]),
                 neg(Errno::EINVAL)
             );
+            assert_eq!(fields(&mut t), [0; 6]);
+            assert_eq!(
+                call(&mut t, Sysno::waitid, &[which, id, BAD, options, 0]),
+                neg(Errno::EFAULT)
+            );
         }
-        assert_eq!(fields(&mut t), [0xaaaa_aaaau32 as i32; 6]);
         // P_PIDFD: no descriptor is a pidfd.
         assert_eq!(
             call(&mut t, Sysno::waitid, &[3, 999, 0, WEXITED | WNOHANG, 0]),

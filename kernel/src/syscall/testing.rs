@@ -102,6 +102,14 @@ pub struct Task<P = Space, C = Sink> {
     pub exe: Option<FileId>,
     /// `(ip, sp)` of the last `start_thread`.
     pub started: Option<(u64, u64)>,
+    /// shortcut: this is a second signal object for the task `current`, whose
+    /// own is in `tasks` (the binary has only the latter, via
+    /// `Tasklist::signal_state`). Exec, wait and exit tests that touch both
+    /// exercise a different arrangement than the boot. The signal tests need
+    /// a non-init process (`global_init` and `SIGNAL_UNKILLABLE` are derived
+    /// from the task list's init), so unify them when the fake gets a forked
+    /// non-init current task (the fork lane).
+    ///
     /// The signal state: a non-init process whose `SIGUSR1`, `SIGUSR2` and
     /// `SIGALRM` have handlers, so sending them queues rather than kills.
     pub state: State<'static>,

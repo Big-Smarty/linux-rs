@@ -275,7 +275,8 @@ impl Tasklist {
 
     /// `copy_process`' publication (`fork`, no `CLONE_*` sharing): a child of
     /// `parent` in its process group and session, `exit_signal = SIGCHLD`,
-    /// `PF_FORKNOEXEC`, the parent's credentials, default signal state.
+    /// `PF_FORKNOEXEC`, the parent's credentials and, as a shortcut, a *default*
+    /// signal state (see the comment at the allocation).
     ///
     /// Order of failures as in Linux: the `max_threads`/`RLIMIT_NPROC` check
     /// (`EAGAIN`), then pid allocation (`EAGAIN`, `ENOMEM`); a pending fatal
@@ -291,13 +292,19 @@ impl Tasklist {
         }
         let (pgid, sid, cred) = (p.pids[2], p.pids[3], p.cred);
         // copy_process: `nr_threads >= max_threads` is EAGAIN for everyone;
-        // RLIMIT_NPROC is waived with CAP_SYS_RESOURCE.
+        // RLIMIT_NPROC is waived with CAP_SYS_RESOURCE (shortcut T9: Linux
+        // counts per-user ucounts).
         if self.nr_threads >= self.max_threads {
             return Err(Errno::EAGAIN);
         }
         if !cred.cap_sys_resource && u64::from(self.nr_threads) >= params.rlimit_nproc {
             return Err(Errno::EAGAIN);
         }
+        // shortcut: default dispositions, empty mask and reset altstack, where
+        // `copy_process` copies the parent's actions and blocked mask
+        // (`copy_sighand`, `dup_task_struct`), keeps the altstack unless
+        // `CLONE_VM`, and clears only pending signals and the itimer; the
+        // fork lane must take the parent's signal state before wiring `fork`.
         let signals =
             Box::try_new(TaskSignals::new(params.rlimit_sigpending)).map_err(|_| Errno::ENOMEM)?;
         let own = self.alloc_pid()?;

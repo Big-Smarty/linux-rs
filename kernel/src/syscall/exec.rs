@@ -274,7 +274,11 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &Prepared) -> Outcome {
     let mapped = {
         let AddressSpace { mm, env, pages } = ctx.address_space();
         let unmapped = mm.munmap(env, &mut *pages, 0, TASK_SIZE);
-        *mm = Mm::new(env);
+        // A failed munmap keeps the old mm (its VMAs still describe the live
+        // frames and PTEs, which dropping it would leak); the task dies below.
+        if unmapped.is_ok() {
+            *mm = Mm::new(env);
+        }
         unmapped.map_err(LoadError::Errno).and_then(|()| {
             insert_stack(mm, env, p.plan.exec_stack)?;
             map_segments(&p.plan, &p.bytes, &exec_file(id), mm, env, &mut *pages)?;

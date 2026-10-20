@@ -33,7 +33,7 @@
 //! commits to, which every later task/scheduler/VFS change extends, is:
 //!
 //! ```text
-//! TASKLIST -> VFS -> heap -> FRAMES        (TASKLIST = tasklist_lock + siglock + pidmap_lock)
+//! TASKLIST -> VFS -> TABLES -> heap -> FRAMES  (TASKLIST = tasklist_lock + siglock + pidmap_lock)
 //! TASKLIST -> TIMERQ -> TIMER_HW
 //! any lock -> RQ                           (RQ: scheduler run queue, a leaf, callable from hardirq)
 //! ```

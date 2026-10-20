@@ -126,9 +126,7 @@ impl Tasklist {
         // synchronize_group_exit: the last thread starts the group exit if
         // nobody did; `signal->flags = SIGNAL_GROUP_EXIT` drops the stop bits.
         if state.sig.group_exit.is_none() {
-            state.sig.group_exit = Some(code);
-            state.sig.job_flags = 0;
-            state.sig.stop_code = 0;
+            state.sig.start_group_exit(code);
         }
         let group_code = state.sig.group_exit.unwrap_or(0);
         // The one thread: `live` drops to zero.
@@ -338,6 +336,22 @@ impl Tasklist {
 
     // ---- orphaned process groups ----------------------------------------------
 
+    /// `task_pgrp(parent)` and `task_session(parent)`. A `None` parent is the
+    /// idle task (`init_task`, init's `real_parent`), whose group and session
+    /// are `init_struct_pid`; it is not `is_global_init`.
+    fn group_and_session(
+        &self,
+        parent: Option<TaskId>,
+    ) -> (Option<super::pid::PidId>, Option<super::pid::PidId>) {
+        match parent {
+            Some(t) => (
+                self.task_pid_type(t, PidType::Pgid),
+                self.task_pid_type(t, PidType::Sid),
+            ),
+            None => (Some(self.init_struct_pid()), Some(self.init_struct_pid())),
+        }
+    }
+
     /// `will_become_orphaned_pgrp`: no member (other than `ignored`, a task
     /// that is leaving) has a parent in another group of the same session.
     #[must_use]
@@ -354,15 +368,13 @@ impl Tasklist {
             if Some(p) == ignored || t.exit_state != ExitState::Live {
                 continue;
             }
-            let Some(parent) = t.real_parent else {
-                continue;
-            };
-            if self.is_global_init(parent) {
+            if t.real_parent
+                .is_some_and(|parent| self.is_global_init(parent))
+            {
                 continue;
             }
-            if self.task_pid_type(parent, PidType::Pgid) != Some(pgrp)
-                && self.task_pid_type(parent, PidType::Sid) == self.task_pid_type(p, PidType::Sid)
-            {
+            let (parent_pgrp, parent_sid) = self.group_and_session(t.real_parent);
+            if parent_pgrp != Some(pgrp) && parent_sid == self.task_pid_type(p, PidType::Sid) {
                 return false;
             }
         }
@@ -404,9 +416,9 @@ impl Tasklist {
             // was the only connection outside.
             Some(parent) => (Some(parent), None),
         };
-        let Some(parent) = parent else { return };
-        if self.task_pid_type(parent, PidType::Pgid) != Some(pgrp)
-            && self.task_pid_type(parent, PidType::Sid) == self.task_pid_type(tsk, PidType::Sid)
+        let (parent_pgrp, parent_sid) = self.group_and_session(parent);
+        if parent_pgrp != Some(pgrp)
+            && parent_sid == self.task_pid_type(tsk, PidType::Sid)
             && self.will_become_orphaned_pgrp(pgrp, ignored)
             && self.has_stopped_jobs(pgrp)
         {

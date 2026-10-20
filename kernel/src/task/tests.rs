@@ -791,6 +791,58 @@ fn orphaned_process_groups() {
 }
 
 #[test]
+fn init_is_a_connection_to_the_idle_tasks_session() {
+    // kernel/exit.c:361-378: init's real_parent is the idle task, which is not
+    // is_global_init and whose group and session are init_struct_pid. After
+    // setpgid(init, 1, 1) init's group is 1 and its session is still
+    // init_struct_pid, so group 1 is not orphaned.
+    let (mut l, init) = list();
+    l.setpgid(init, 1, 1).unwrap();
+    let pgrp = l.task_pid_type(init, PidType::Pgid).unwrap();
+    assert_ne!(pgrp, l.init_struct_pid());
+    assert!(!l.will_become_orphaned_pgrp(pgrp, None));
+    assert!(!l.is_pgrp_orphaned(init));
+    // Left in init_struct_pid (its own group as the idle task's), it is.
+    let (l, init) = list();
+    assert!(l.is_pgrp_orphaned(init));
+}
+
+#[test]
+fn a_group_exit_drops_the_stop_state() {
+    // kernel/signal.c complete_signal 1041-1043, kernel/exit.c do_group_exit
+    // 1119: `signal->flags = SIGNAL_GROUP_EXIT` replaces SIGNAL_STOP_STOPPED.
+    let (mut l, init) = list();
+    let child = l.fork(init, FORK).unwrap();
+    let mark = |l: &mut Tasklist| {
+        let sig = &mut l.task_mut(child).unwrap().signals.signal;
+        sig.job_flags = super::exit::SIGNAL_STOP_STOPPED;
+        sig.stop_code = 19;
+    };
+    mark(&mut l);
+    l.do_group_exit(child, 3);
+    let sig = &l.task(child).unwrap().signals.signal;
+    assert_eq!(
+        (sig.job_flags, sig.stop_code, sig.group_exit),
+        (0, 0, Some(3))
+    );
+    // A fatal signal (complete_signal) does the same.
+    let (mut l, init) = list();
+    let child = l.fork(init, FORK).unwrap();
+    mark(&mut l);
+    l.signal_state(child)
+        .unwrap()
+        .send_signal(
+            SIGTERM,
+            SigInfo::kernel(SIGTERM),
+            crate::signal::state::Target::Process,
+        )
+        .unwrap();
+    let sig = &l.task(child).unwrap().signals.signal;
+    assert_eq!((sig.job_flags, sig.stop_code), (0, 0));
+    assert_eq!(sig.group_exit, Some(u32::from(SIGTERM)));
+}
+
+#[test]
 fn kill_permission_uses_the_credential_snapshots() {
     // kernel/signal.c check_kill_permission / kill_ok_by_cred.
     let (mut l, init) = list();
