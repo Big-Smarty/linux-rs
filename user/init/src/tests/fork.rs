@@ -53,7 +53,9 @@ pub fn run() -> bool {
     sigchld(&mut t);
     orphans(&mut t);
     clone_arguments(&mut t);
+    clone_details(&mut t);
     exec(&mut t);
+    exec_exit_signal(&mut t);
     reap_all();
     t.finish()
 }
@@ -291,6 +293,7 @@ fn inheritance(t: &mut T) {
     let _ = sigaction(SIGUSR2, 0, 0);
     let _ = sigaction(SIGUSR1, 0, 0);
     let _ = sigaction(SIGHUP, 0, 0);
+    resources(t);
     // x87/SSE state and the %fs base are copied; the child's changes stay its own.
     set_mxcsr(0x1f80 | 1 << 13); // round down
     let tls = addr(&MEMORY);
@@ -318,6 +321,106 @@ fn inheritance(t: &mut T) {
     );
     set_mxcsr(0x1f80);
     let _ = sys(Sysno::arch_prctl, &[0x1002, 0]);
+}
+
+/// The alternate signal stack, resource limits, command name and credentials are copied by
+/// `dup_task_struct`/`copy_signal`/`copy_creds`; the child's changes stay its own.
+fn resources(t: &mut T) {
+    reap_all();
+    const SS_DISABLE: u64 = 2;
+    static ALTSTACK: [u64; 1024] = [0; 1024];
+    // sigaltstack(2): {ss_sp, ss_flags (+ padding), ss_size}.
+    let alt = [addr(&ALTSTACK) as u64, 0, 8192];
+    let _ = sys(Sysno::sigaltstack, &[addr(&alt), 0]);
+    let child = spawn(|| {
+        let mut now = [0u64; 3];
+        let _ = sys(Sysno::sigaltstack, &[0, addr_mut(&mut now)]);
+        let off = [0u64, SS_DISABLE, 0];
+        let disabled = sys(Sysno::sigaltstack, &[addr(&off), 0]);
+        flag(0, now == alt) | flag(1, disabled == Ok(0))
+    });
+    t.eq(
+        "fork-sigaltstack-copied",
+        wait4(child as isize, 0),
+        (Ok(child), 3 << 8),
+    );
+    let mut now = [0u64; 3];
+    let _ = sys(Sysno::sigaltstack, &[0, addr_mut(&mut now)]);
+    t.eq("fork-sigaltstack-is-private", now, alt);
+    let off = [0u64, SS_DISABLE, 0];
+    let _ = sys(Sysno::sigaltstack, &[addr(&off), 0]);
+
+    // RLIMIT_NOFILE (7).
+    let limit = [777u64, 4096];
+    let _ = sys(Sysno::prlimit64, &[0, 7, addr(&limit), 0]);
+    let child = spawn(|| {
+        let mut now = [0u64; 2];
+        let _ = sys(Sysno::prlimit64, &[0, 7, 0, addr_mut(&mut now)]);
+        let lower = [100u64, 4096];
+        let set = sys(Sysno::prlimit64, &[0, 7, addr(&lower), 0]);
+        flag(0, now == limit) | flag(1, set == Ok(0))
+    });
+    t.eq(
+        "fork-rlimits-copied",
+        wait4(child as isize, 0),
+        (Ok(child), 3 << 8),
+    );
+    let mut now = [0u64; 2];
+    let _ = sys(Sysno::prlimit64, &[0, 7, 0, addr_mut(&mut now)]);
+    t.eq("fork-rlimits-are-private", now, limit);
+    let restore = [1024u64, 4096];
+    let _ = sys(Sysno::prlimit64, &[0, 7, addr(&restore), 0]);
+
+    // The command name (PR_SET_NAME 15, PR_GET_NAME 16).
+    let _ = sys(Sysno::prctl, &[15, addr(b"forkcomm\0")]);
+    let child = spawn(|| {
+        let mut name = [0u8; 16];
+        let got = sys(Sysno::prctl, &[16, addr_mut(&mut name)]);
+        let set = sys(Sysno::prctl, &[15, addr(b"child\0")]);
+        flag(0, got == Ok(0) && name.starts_with(b"forkcomm\0")) | flag(1, set == Ok(0))
+    });
+    t.eq(
+        "fork-comm-copied",
+        wait4(child as isize, 0),
+        (Ok(child), 3 << 8),
+    );
+    let mut name = [0u8; 16];
+    let _ = sys(Sysno::prctl, &[16, addr_mut(&mut name)]);
+    t.eq(
+        "fork-comm-is-private",
+        name.starts_with(b"forkcomm\0"),
+        true,
+    );
+    let _ = sys(Sysno::prctl, &[15, addr(b"init\0")]);
+
+    // Credentials: real, effective and saved ids and the supplementary groups.
+    let ids = || {
+        let (mut uid, mut gid) = ([0u32; 3], [0u32; 3]);
+        let _ = sys(
+            Sysno::getresuid,
+            &[
+                addr_mut(&mut uid),
+                addr_mut(&mut uid[1]),
+                addr_mut(&mut uid[2]),
+            ],
+        );
+        let _ = sys(
+            Sysno::getresgid,
+            &[
+                addr_mut(&mut gid),
+                addr_mut(&mut gid[1]),
+                addr_mut(&mut gid[2]),
+            ],
+        );
+        (uid, gid, sys(Sysno::getgroups, &[0, 0]))
+    };
+    let mine = ids();
+    let child = spawn(|| usize::from(ids() == mine));
+    t.eq(
+        "fork-credentials-copied",
+        wait4(child as isize, 0),
+        (Ok(child), 1 << 8),
+    );
 }
 
 /// `stmxcsr`: the SSE control/status register of this task.
@@ -689,6 +792,200 @@ fn kills(t: &mut T) {
         wait4(sleeper as isize, 0),
         (Ok(sleeper), SIGTERM as i32),
     );
+    group_and_broadcast_kills(t);
+    queued_signals(t);
+    reap_all();
+}
+
+/// A child that sleeps until a signal kills it.
+fn sleep_child() -> usize {
+    let _ = sys(Sysno::pause, &[]);
+    0
+}
+
+/// `kill(-pgid)`, `kill(0)`, `kill(-1)` and `tkill` reaching other tasks. The parent puts
+/// children into a group of their own with `setpgid` (allowed for a child that has not
+/// executed), so init's group is never signalled.
+fn group_and_broadcast_kills(t: &mut T) {
+    reap_all();
+    let (a, b, c) = (spawn(sleep_child), spawn(sleep_child), spawn(sleep_child));
+    t.eq(
+        "setpgid-child-new-group",
+        sys(Sysno::setpgid, &[a, a]),
+        Ok(0),
+    );
+    t.eq(
+        "setpgid-child-joins-group",
+        sys(Sysno::setpgid, &[b, a]),
+        Ok(0),
+    );
+    t.eq(
+        "kill-group",
+        sys(Sysno::kill, &[a.wrapping_neg(), SIGTERM]),
+        Ok(0),
+    );
+    t.eq(
+        "kill-group-first-member",
+        wait4(a as isize, 0),
+        (Ok(a), SIGTERM as i32),
+    );
+    t.eq(
+        "kill-group-second-member",
+        wait4(b as isize, 0),
+        (Ok(b), SIGTERM as i32),
+    );
+    t.eq(
+        "kill-group-spares-other-groups",
+        sys(Sysno::kill, &[c, 0]),
+        Ok(0),
+    );
+    t.eq(
+        "kill-reaped-group",
+        sys(Sysno::kill, &[a.wrapping_neg(), 0]),
+        Err(Errno::ESRCH),
+    );
+    t.eq(
+        "kill-missing-group",
+        sys(Sysno::kill, &[99_999usize.wrapping_neg(), SIGTERM]),
+        Err(Errno::ESRCH),
+    );
+    // tkill reaches another task like tgkill.
+    t.eq("tkill-child", sys(Sysno::tkill, &[c, SIGTERM]), Ok(0));
+    t.eq(
+        "tkill-then-wait4",
+        wait4(c as isize, 0),
+        (Ok(c), SIGTERM as i32),
+    );
+    t.eq(
+        "tkill-bad-tid",
+        sys(Sysno::tkill, &[0, SIGTERM]),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "tkill-missing-tid",
+        sys(Sysno::tkill, &[99_999, SIGTERM]),
+        Err(Errno::ESRCH),
+    );
+    // kill(0) signals the sender's whole group, the sender included: the leader blocks the
+    // signal after forking its member, so only the member dies and the leader sees it pending.
+    let leader = spawn(|| {
+        let _ = sys(Sysno::setpgid, &[0, 0]);
+        let member = spawn(sleep_child);
+        block(bit(SIGTERM));
+        let sent = sys(Sysno::kill, &[0, SIGTERM]);
+        let mut pending = 0u64;
+        let _ = sys(Sysno::rt_sigpending, &[addr_mut(&mut pending), 8]);
+        flag(0, sent == Ok(0))
+            | flag(1, wait4(member as isize, 0) == (Ok(member), SIGTERM as i32))
+            | flag(2, pending & bit(SIGTERM) != 0)
+    });
+    t.eq(
+        "kill-zero-signals-own-group",
+        wait4(leader as isize, 0),
+        (Ok(leader), 7 << 8),
+    );
+    // kill(-1) reaches every task but init and the sender.
+    reap_all();
+    let victim = spawn(sleep_child);
+    let sender = spawn(|| usize::from(sys(Sysno::kill, &[usize::MAX, SIGUSR2]) == Ok(0)));
+    t.eq(
+        "kill-all-skips-the-sender",
+        wait4(sender as isize, 0),
+        (Ok(sender), 1 << 8),
+    );
+    t.eq(
+        "kill-all-reaches-the-others",
+        wait4(victim as isize, 0),
+        (Ok(victim), SIGUSR2 as i32),
+    );
+    reap_all();
+}
+
+/// `rt_sigqueueinfo` and `rt_tgsigqueueinfo` to another task: the `siginfo` arrives as sent,
+/// and a user-forged `si_code` is `EPERM` before the target is looked up.
+fn queued_signals(t: &mut T) {
+    reap_all();
+    let mut info = [0i32; 32];
+    info[0] = SIGUSR1 as i32;
+    info[2] = -1; // SI_QUEUE
+    info[4] = 1234; // si_pid, passed through
+    info[5] = 77; // si_uid, passed through
+    info[6] = 0x55; // si_int
+    // The blocked signal is inherited, so it is pending when the child starts waiting for it.
+    block(bit(SIGUSR1));
+    let receiver = || {
+        spawn(|| {
+            let set = bit(SIGUSR1);
+            let mut got = [0i32; 32];
+            let five = [5i64, 0];
+            let r = sys(
+                Sysno::rt_sigtimedwait,
+                &[addr(&set), addr_mut(&mut got), addr(&five), 8],
+            );
+            flag(0, r == Ok(SIGUSR1))
+                | flag(1, got[2] == -1)
+                | flag(2, got[4] == 1234)
+                | flag(3, got[5] == 77)
+                | flag(4, got[6] == 0x55)
+        })
+    };
+    let first = receiver();
+    t.eq(
+        "rt_sigqueueinfo-other",
+        sys(Sysno::rt_sigqueueinfo, &[first, SIGUSR1, addr(&info)]),
+        Ok(0),
+    );
+    t.eq(
+        "rt_sigqueueinfo-received-as-sent",
+        wait4(first as isize, 0),
+        (Ok(first), 0x1f << 8),
+    );
+    let second = receiver();
+    t.eq(
+        "rt_tgsigqueueinfo-wrong-group",
+        sys(
+            Sysno::rt_tgsigqueueinfo,
+            &[second + 1, second, SIGUSR1, addr(&info)],
+        ),
+        Err(Errno::ESRCH),
+    );
+    t.eq(
+        "rt_tgsigqueueinfo-bad-tid",
+        sys(Sysno::rt_tgsigqueueinfo, &[second, 0, SIGUSR1, addr(&info)]),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "rt_tgsigqueueinfo-other",
+        sys(
+            Sysno::rt_tgsigqueueinfo,
+            &[second, second, SIGUSR1, addr(&info)],
+        ),
+        Ok(0),
+    );
+    t.eq(
+        "rt_tgsigqueueinfo-received-as-sent",
+        wait4(second as isize, 0),
+        (Ok(second), 0x1f << 8),
+    );
+    // si_code >= 0 or SI_TKILL cannot be sent to another task, whether or not it exists.
+    for (name, code) in [("si-user", 0), ("si-tkill", -6)] {
+        let mut forged = info;
+        forged[2] = code;
+        t.eq(
+            format_args!("rt_sigqueueinfo-{name}-is-eperm"),
+            sys(Sysno::rt_sigqueueinfo, &[second, SIGUSR1, addr(&forged)]),
+            Err(Errno::EPERM),
+        );
+        t.eq(
+            format_args!("rt_tgsigqueueinfo-{name}-is-eperm"),
+            sys(
+                Sysno::rt_tgsigqueueinfo,
+                &[second, second, SIGUSR1, addr(&forged)],
+            ),
+            Err(Errno::EPERM),
+        );
+    }
+    block(0);
     reap_all();
 }
 
@@ -1033,6 +1330,171 @@ fn clone_arguments(t: &mut T) {
     );
 }
 
+/// The accepted `clone`/`clone3` requests that change something in the child: the sizes of the
+/// `clone3` structure, `CLONE_CLEAR_SIGHAND`, the child's stack pointer and
+/// `CLONE_CHILD_CLEARTID`.
+fn clone_details(t: &mut T) {
+    reap_all();
+    const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+    const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
+    let mut args = [0u64; 12];
+    args[4] = SIGCHLD as u64;
+    // A larger structure with zero trailing bytes, and the smallest accepted size.
+    for (name, size) in [
+        ("clone3-larger-struct-zero-tail", 96),
+        ("clone3-minimum-size", 64),
+    ] {
+        match sys(Sysno::clone3, &[addr(&args), size]) {
+            Ok(0) => die(23),
+            Ok(pid) => t.eq(name, wait4(pid as isize, 0), (Ok(pid), 23 << 8)),
+            Err(e) => t.eq(name, Err::<(R, i32), _>(e), Ok((Ok(0), 0))),
+        }
+    }
+    // CLONE_CLEAR_SIGHAND is `flush_signal_handlers(tsk, 0)`: handlers back to the default,
+    // flags and restorer cleared, but an ignored signal stays ignored (as at `execve`).
+    let _ = sigaction(SIGUSR1, on_chld_ptr(), SA_SIGINFO);
+    let _ = sigaction(SIGHUP, 1, 0);
+    let mut flush = args;
+    flush[0] = CLONE_CLEAR_SIGHAND;
+    match sys(Sysno::clone3, &[addr(&flush), 88]) {
+        Ok(0) => {
+            let mut usr1 = KSigaction::default();
+            let mut hup = KSigaction::default();
+            let _ = sys(Sysno::rt_sigaction, &[SIGUSR1, 0, addr_mut(&mut usr1), 8]);
+            let _ = sys(Sysno::rt_sigaction, &[SIGHUP, 0, addr_mut(&mut hup), 8]);
+            let clear = |a: &KSigaction, handler| {
+                a.handler == handler && a.flags == 0 && a.restorer == 0 && a.mask == 0
+            };
+            die(flag(0, clear(&usr1, 0)) | flag(1, clear(&hup, 1)));
+        }
+        Ok(pid) => t.eq(
+            "clone3-clear-sighand",
+            wait4(pid as isize, 0),
+            (Ok(pid), 3 << 8),
+        ),
+        Err(e) => t.eq(
+            "clone3-clear-sighand",
+            Err::<(R, i32), _>(e),
+            Ok((Ok(0), 0)),
+        ),
+    }
+    // Without the flag the same child keeps both.
+    let child = spawn(|| {
+        let mut usr1 = KSigaction::default();
+        let mut hup = KSigaction::default();
+        let _ = sys(Sysno::rt_sigaction, &[SIGUSR1, 0, addr_mut(&mut usr1), 8]);
+        let _ = sys(Sysno::rt_sigaction, &[SIGHUP, 0, addr_mut(&mut hup), 8]);
+        flag(0, usr1.handler == on_chld_ptr()) | flag(1, hup.handler == 1)
+    });
+    t.eq(
+        "fork-keeps-dispositions-without-clear-sighand",
+        wait4(child as isize, 0),
+        (Ok(child), 3 << 8),
+    );
+    let _ = sigaction(SIGUSR1, 0, 0);
+    let _ = sigaction(SIGHUP, 0, 0);
+    // The child's stack pointer: `clone` takes the new top, `clone3` the lowest address and
+    // the size (the child starts at their sum); 0 keeps the parent's. The child compares its
+    // `rsp` and exits at once (it never uses the new stack).
+    static STACK: [u64; 512] = [0; 512];
+    let top = addr(&STACK) + core::mem::size_of_val(&STACK);
+    let status = |pid: R| pid.map(|pid| (pid, wait4(pid as isize, 0)));
+    t.eq(
+        "clone-new-stack-pointer",
+        status(stack_probe(56, SIGCHLD, top, top)).map(|(pid, w)| (w.0 == Ok(pid), w.1)),
+        Ok((true, 1 << 8)),
+    );
+    t.eq(
+        "clone-zero-stack-keeps-the-parents",
+        status(stack_probe(56, SIGCHLD, 0, top)).map(|(pid, w)| (w.0 == Ok(pid), w.1)),
+        Ok((true, 0)),
+    );
+    let mut with_stack = args;
+    with_stack[5] = addr(&STACK) as u64;
+    with_stack[6] = core::mem::size_of_val(&STACK) as u64;
+    t.eq(
+        "clone3-new-stack-pointer",
+        status(stack_probe(435, addr(&with_stack), 88, top)).map(|(pid, w)| (w.0 == Ok(pid), w.1)),
+        Ok((true, 1 << 8)),
+    );
+    // CLONE_CHILD_CLEARTID of a private address space: accepted, its pointer unchecked, and
+    // nothing is written (the child's `mm_release` writes only when the mm is shared).
+    let mut word = 0x1234u32;
+    let ptr = [addr_mut(&mut word), BAD];
+    for (index, name) in [
+        (0, "clone-child-cleartid"),
+        (1, "clone-child-cleartid-bad-pointer"),
+    ] {
+        match sys(
+            Sysno::clone,
+            &[CLONE_CHILD_CLEARTID as usize | SIGCHLD, 0, 0, ptr[index], 0],
+        ) {
+            Ok(0) => die(9),
+            Ok(pid) => t.eq(name, wait4(pid as isize, 0), (Ok(pid), 9 << 8)),
+            Err(e) => t.eq(name, Err::<(R, i32), _>(e), Ok((Ok(0), 0))),
+        }
+    }
+    let mut cleartid = args;
+    cleartid[0] = CLONE_CHILD_CLEARTID;
+    cleartid[2] = addr_mut(&mut word) as u64;
+    match sys(Sysno::clone3, &[addr(&cleartid), 88]) {
+        Ok(0) => die(9),
+        Ok(pid) => t.eq(
+            "clone3-child-cleartid",
+            (wait4(pid as isize, 0), word),
+            ((Ok(pid), 9 << 8), 0x1234),
+        ),
+        Err(e) => t.eq(
+            "clone3-child-cleartid",
+            ((Err::<usize, _>(e), 0), 0),
+            ((Ok(0), 0), 0x1234),
+        ),
+    }
+    reap_all();
+}
+
+/// Issues a `clone`-family system call (`nr` with `a0`, `a1` in `rdi`, `rsi` and zeros in the
+/// other argument registers) whose child exits at once with status 1 if its `rsp` is
+/// `expect_sp` and 0 otherwise; the parent gets the call's result.
+///
+/// `asm!` proof (needed because the child continues on the stack the kernel gives it, so no
+/// Rust code may run in it): user mode x86-64; `syscall` clobbers `rcx`, `r11` and returns in
+/// `rax`; `rdi`, `rsi`, `rdx`, `r10`, `r8` carry the arguments (`r9` is unused by `clone`
+/// and `clone3`); `r12` holds `expect_sp` and is preserved across the call. In the child
+/// (`rax == 0`) the code uses registers only (no stack access, no memory), compares `rsp`
+/// with `r12`, sets `edi` to 0 or 1 and calls `exit_group` (231), which does not return; in
+/// the parent the block falls through with the result in `rax`. The stack is untouched in
+/// both (`nostack`); flags are clobbered by the compare, which Rust's asm! default allows.
+fn stack_probe(nr: usize, a0: usize, a1: usize, expect_sp: usize) -> R {
+    let ret: usize;
+    // SAFETY: as the function's proof; `a0` is a flag word or a pointer to a live `clone_args`
+    // that the kernel only reads.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 2f",
+            "xor edi, edi",
+            "cmp rsp, r12",
+            "sete dil",
+            "mov eax, 231",
+            "syscall",
+            "2:",
+            inlateout("rax") nr => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") 0usize,
+            in("r10") 0usize,
+            in("r8") 0usize,
+            in("r12") expect_sp,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    Errno::from_ret(ret)
+}
+
 fn exec(t: &mut T) {
     reap_all();
     let init = b"/init\0";
@@ -1058,6 +1520,83 @@ fn exec(t: &mut T) {
     );
     let _ = sys(Sysno::close, &[read_end]);
     let _ = sys(Sysno::close, &[write_end]);
+}
+
+/// `do_notify_parent` falls back to `SIGCHLD` when the parent has exec'd since the `clone`
+/// (`parent_exec_id != parent->self_exec_id`, kernel/signal.c:2278): a custom exit signal does not
+/// cross a security domain. The parent clones with exit signal `SIGUSR1`, then executes
+/// `/init execsig <child>`, which releases the child and reports which signal its child's death
+/// raised (blocked in both, so it is queued); the exit status is that signal number.
+fn exec_exit_signal(t: &mut T) {
+    reap_all();
+    let mut fds = [0u32; 2];
+    let _ = sys(Sysno::pipe2, &[addr_mut(&mut fds), 0]);
+    let (read_end, write_end) = (fds[0] as usize, fds[1] as usize);
+    block(bit(SIGUSR1) | bit(SIGUSR2) | bit(SIGCHLD));
+    let parent = spawn(|| match sys(Sysno::clone, &[SIGUSR1, 0, 0, 0, 0]) {
+        Ok(0) => {
+            // Wait for the parent's release (SIGUSR2, blocked and so pending), then exit.
+            let set = bit(SIGUSR2);
+            let mut info = [0i32; 32];
+            let ten = [10i64, 0];
+            let _ = sys(
+                Sysno::rt_sigtimedwait,
+                &[addr(&set), addr_mut(&mut info), addr(&ten), 8],
+            );
+            0
+        }
+        Ok(child) => {
+            let mut digits = [0u8; 24];
+            let mut start = digits.len() - 1;
+            let mut rest = child;
+            loop {
+                start -= 1;
+                digits[start] = b'0' + (rest % 10) as u8;
+                rest /= 10;
+                if rest == 0 {
+                    break;
+                }
+            }
+            let argv = [
+                addr(b"/init\0"),
+                addr(b"execsig\0"),
+                addr(&digits[start]),
+                0,
+            ];
+            let envp = [0usize];
+            let _ = sys(Sysno::dup3, &[write_end, 1, 0]);
+            let _ = sys(Sysno::execve, &[addr(b"/init\0"), addr(&argv), addr(&envp)]);
+            // Only reached if execve failed.
+            99
+        }
+        Err(_) => 98,
+    });
+    t.eq(
+        "exec-resets-the-clone-exit-signal",
+        wait4(parent as isize, 0),
+        (Ok(parent), (SIGCHLD as i32) << 8),
+    );
+    block(0);
+    reap_all();
+    let _ = sys(Sysno::close, &[read_end]);
+    let _ = sys(Sysno::close, &[write_end]);
+}
+
+/// The image `/init execsig <child pid>` of [`exec_exit_signal`]: release the child with
+/// `SIGUSR2`, wait for the signal its death raises and exit with that signal's number.
+pub fn execsig(argv: crate::Strings) -> ! {
+    let pid = argv.iter().nth(2).map_or(0, |text| {
+        text.iter().fold(0, |n, d| n * 10 + usize::from(d - b'0'))
+    });
+    let _ = sys(Sysno::kill, &[pid, SIGUSR2]);
+    let set = bit(SIGUSR1) | bit(SIGCHLD);
+    let mut info = [0i32; 32];
+    let ten = [10i64, 0];
+    let got = sys(
+        Sysno::rt_sigtimedwait,
+        &[addr(&set), addr_mut(&mut info), addr(&ten), 8],
+    );
+    die(got.unwrap_or(0))
 }
 
 /// `forkleak` mode: 200 rounds of fork, exit and wait. Prints the counts (identical on the

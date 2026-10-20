@@ -540,6 +540,27 @@ impl Rq {
         self.need_resched = false;
     }
 
+    /// The bare-metal suite's group end from inside a task: every task but
+    /// idle is dead at once (queued, sleeping or current), the queue is empty,
+    /// so the current task's next [`Rq::schedule`] switches to idle and no
+    /// wake-up can make a task of the group runnable again. The slots are
+    /// released by [`Rq::free`] (the current one) and [`Rq::reset`] (the rest).
+    ///
+    /// # Panics
+    /// When the idle task is current (nothing to abandon from).
+    pub fn abandon(&mut self) {
+        assert!(self.curr != IDLE, "Rq::abandon from idle");
+        for slot in self.slots.iter_mut().skip(1).filter(|slot| slot.used) {
+            slot.state = TaskState::Dead;
+            slot.key = WaitKey::NONE;
+            slot.queued = false;
+            slot.next = None;
+        }
+        self.head = None;
+        self.tail = None;
+        self.queued = 0;
+    }
+
     /// `do_task_dead`'s state change: the current task is dead and must call
     /// [`Rq::schedule`] one last time. Its slot is released by [`Rq::free`]
     /// once another task runs (`finish_task_switch`).

@@ -32,12 +32,15 @@ pub(super) const ALL_PASS: &[(&str, bool)] = &[
     ("signal", true),
     ("fork", true),
 ];
-/// A run that selects three probes ending abnormally (a SIGSEGV, an unimplemented
-/// syscall, a loop that outruns the one-second group bound), then one real group.
+/// A run that selects five probes ending abnormally (a SIGSEGV, an unimplemented
+/// syscall, a loop that outruns the one-second group bound, that loop in a child while init
+/// waits, init exiting with a spinning child), then one real group.
 pub(super) const STOPS: &[(&str, bool)] = &[
     ("fault", false),
     ("io_uring", false),
     ("spin", false),
+    ("spinchild", false),
+    ("orphan", false),
     ("ids", true),
 ];
 
@@ -120,7 +123,7 @@ pub(super) fn validate(
     for &(group, must_pass) in groups {
         let prefix = format!("  {group} stopped: FAIL ");
         if !must_pass
-            && matches!(group, "io_uring" | "spin")
+            && matches!(group, "io_uring" | "spin" | "spinchild")
             && !lines[complete_at..]
                 .iter()
                 .any(|line| line.starts_with(&prefix))
@@ -190,7 +193,7 @@ fn check_group(
     let cause = match group {
         "fault" => "init signal 11",
         "io_uring" => "kernel stop",
-        "spin" => "timeout",
+        "spin" | "spinchild" => "timeout",
         _ => "init exit 0",
     };
     if !result.contains(&format!("cause=\"{cause}\"")) {
@@ -200,8 +203,17 @@ fn check_group(
     if group == "io_uring" && !body.contains(&"FAIL syscall unimplemented nr=425") {
         return Err("io_uring probe must end in the unimplemented-syscall stop".to_owned());
     }
-    if group == "spin" && !body.contains(&"FAIL group timeout after 1 s") {
-        return Err("spin probe must end in the group time bound".to_owned());
+    if matches!(group, "spin" | "spinchild") && !body.contains(&"FAIL group timeout after 1 s") {
+        return Err(format!("{group} probe must end in the group time bound"));
+    }
+    // The scenario really happened: a child was forked before the group ended.
+    for (probe, line) in [
+        ("spinchild", "init: child spinning on purpose"),
+        ("orphan", "init: leaving an orphan spinning"),
+    ] {
+        if group == probe && !body.contains(&line) {
+            return Err(format!("{probe} probe must print `{line}`"));
+        }
     }
     if group == "fault"
         && !body
@@ -849,7 +861,13 @@ mod tests {
             } else if group == "fault" {
                 writeln!(log, "init[1]: segfault at 0 ip 0000000000243a3d sp 00007fffffffed80 error 4 in init[42a3d,20a000+47000] likely on CPU 0 (core 0, socket 0)").unwrap();
                 writeln!(log, "SUITE group {group} result=fail cause=\"init signal 11\" matched=0 expected=0 observed=0 mismatches=0 millis=1").unwrap();
-            } else if group == "spin" {
+            } else if group == "orphan" {
+                writeln!(log, "init: leaving an orphan spinning").unwrap();
+                writeln!(log, "SUITE group {group} result=fail cause=\"init exit 0\" matched=0 expected=0 observed=0 mismatches=0 millis=1").unwrap();
+            } else if matches!(group, "spin" | "spinchild") {
+                if group == "spinchild" {
+                    writeln!(log, "init: child spinning on purpose").unwrap();
+                }
                 writeln!(log, "FAIL group timeout after 1 s").unwrap();
                 writeln!(log, "SUITE group {group} result=fail cause=\"timeout\" matched=0 expected=0 observed=0 mismatches=0 millis=1000").unwrap();
             } else {
@@ -895,7 +913,7 @@ mod tests {
             for &(group, must_pass) in groups {
                 let stop = match group {
                     "io_uring" => "FAIL syscall unimplemented nr=425",
-                    "spin" => "FAIL group timeout after 1 s",
+                    "spin" | "spinchild" => "FAIL group timeout after 1 s",
                     _ => continue,
                 };
                 if !must_pass {
@@ -945,6 +963,29 @@ mod tests {
         let stops = log_of(STOPS);
         let error = judge(&stops.replace("  spin stopped: FAIL", "  spin x"), STOPS).unwrap_err();
         assert!(error.contains("failure detail"), "{error}");
+    }
+
+    #[test]
+    fn the_child_probes_must_show_their_scenario_and_end_as_declared() {
+        let stops = log_of(STOPS);
+        // The scenario line is what proves a child was forked before the group ended.
+        for line in [
+            "init: child spinning on purpose",
+            "init: leaving an orphan spinning",
+        ] {
+            let error = judge(&stops.replace(line, "init: other"), STOPS).unwrap_err();
+            assert!(error.contains("probe must print"), "{error}");
+        }
+        // The orphan probe ends by init's exit; a time bound there would be a different defect.
+        let error = judge(
+            &stops.replace(
+                "SUITE group orphan result=fail cause=\"init exit 0\"",
+                "SUITE group orphan result=fail cause=\"timeout\"",
+            ),
+            STOPS,
+        )
+        .unwrap_err();
+        assert!(error.contains("must end with `init exit 0`"), "{error}");
     }
 
     #[test]

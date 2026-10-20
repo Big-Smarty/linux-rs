@@ -318,6 +318,10 @@ fn run(stack: &Stack) {
     if stack.argv.iter().nth(1) == Some(b"execd".as_slice()) {
         tests::proc::execd(stack.argv, stack.envp);
     }
+    // The image of the `fork` group's exec-id check: also silent, and exits with a signal number.
+    if stack.argv.iter().nth(1) == Some(b"execsig".as_slice()) {
+        tests::fork::execsig(stack.argv);
+    }
     out!("init: {stack:?}");
 
     expect("rsp_mod16", stack.sp % 16, 0);
@@ -418,6 +422,20 @@ fn run(stack: &Stack) {
                 core::hint::spin_loop();
             }
         }
+        // Group ends in the context of a child: init sleeps in `wait4` while the child
+        // spins, so the group's time bound finds the child on the CPU (the suite must
+        // end the whole group, not just that task), and `orphan` exits init while the
+        // child still spins (the next group must still start).
+        Some(b"spinchild") => {
+            out!("init: child spinning on purpose");
+            fork_spinner();
+            // SAFETY: wait4 for any child, no status pointer, no options, no rusage.
+            let _ = unsafe { syscalls::syscall4(Sysno::wait4, usize::MAX, 0, 0, 0) };
+        }
+        Some(b"orphan") => {
+            out!("init: leaving an orphan spinning");
+            fork_spinner();
+        }
         Some(b"fault") => {
             out!("init: faulting on purpose");
             // SAFETY: not sound, deliberately: the read of address 0 must raise SIGSEGV.
@@ -467,6 +485,18 @@ fn run(stack: &Stack) {
         _ => {}
     }
     out!("init: ok");
+}
+
+/// Forks a child that spins for ever; returns its pid in the parent.
+fn fork_spinner() -> usize {
+    // SAFETY: fork takes no arguments and no pointers; the child touches nothing shared.
+    match Errno::from_ret(unsafe { raw::syscall0(Sysno::fork as usize) }) {
+        Ok(0) => loop {
+            core::hint::spin_loop();
+        },
+        Ok(pid) => pid,
+        Err(error) => fail("fork", error),
+    }
 }
 
 /// Page faults taken by init itself, in ring 3: demand-zero read and write faults on a fresh

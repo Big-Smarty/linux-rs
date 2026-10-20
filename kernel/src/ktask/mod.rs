@@ -156,10 +156,11 @@ struct Threads(UnsafeCell<[Thread; SLOTS]>);
 
 // SAFETY: a `Thread` is touched only (a) by `spawn`, while its slot is unowned
 // (just handed out by `Rq::add_task`, not yet queued, so no other flow can name
-// it), and (b) by `context_switch`, whose preconditions are IF=0 on the single
+// it), (b) by `context_switch`, whose preconditions are IF=0 on the single
 // CPU, so the two tasks involved are the only flows that exist and the running
-// one is the caller. There is no other accessor and no reference outlives such
-// a section.
+// one is the caller, and (c) by `set_current_cr3`, which writes only the
+// running task's own `cr3` with IF=0 (no switch can interleave). There is no
+// other accessor and no reference outlives such a section.
 unsafe impl Sync for Threads {}
 
 static THREADS: Threads = Threads(UnsafeCell::new([Thread::NEW; SLOTS]));
@@ -249,6 +250,23 @@ pub fn reset_group() {
     TIMERQ.lock().clear();
     SWITCH_PREV.store(NO_PREV, Ordering::Relaxed);
     cpu::swap_bad_iret_depth(0);
+}
+
+/// The bare-metal suite's end of a group from inside one of its tasks (the
+/// group's init, or a child that was current at a kernel stop or the time
+/// bound): every task of the group dies at once and the CPU goes to idle, whose
+/// loop sees init gone and returns to the suite, which tears the group down.
+/// Without this the dying task's successor would be another task of the
+/// finished group (an orphan that may spin for ever).
+///
+/// Context: task, IF=0, on that task's kernel stack, no `RQ` guard held.
+#[cfg(feature = "baremetal-suite")]
+pub fn abandon_group() -> ! {
+    RQ.lock().abandon();
+    schedule();
+    // The current task is dead and not queued, so `schedule` cannot return here.
+    crate::log!("FAIL abandoned task resumed\n");
+    crate::fail()
 }
 
 /// Whether the boot context (the idle task) is current. The suite's group end
@@ -465,7 +483,9 @@ pub unsafe fn start_init(entry: u64, sp: u64, cr3: u64, bound: impl FnOnce(Sched
     );
     bound(init);
     wake_up_new_task(init);
-    idle_loop(|| state(init).is_none());
+    // Gone, or dead because `abandon_group` ended the whole group from another
+    // task's context (its slot is released by `reset_group`, not by a switch).
+    idle_loop(|| state(init).is_none_or(|s| s == TaskState::Dead));
 }
 
 /// Record `cr3` as the tree of the running task (it is already loaded): the

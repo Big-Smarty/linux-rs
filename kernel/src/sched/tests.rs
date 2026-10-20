@@ -197,6 +197,31 @@ fn reset_drops_every_task_and_returns_to_idle() {
 }
 
 #[test]
+fn abandon_kills_every_task_and_the_next_schedule_is_idle() {
+    let mut rq = rq(6);
+    let [a, b, c] = [spawn(&mut rq), spawn(&mut rq), spawn(&mut rq)];
+    assert_eq!(rq.schedule().unwrap().next, a);
+    rq.prepare_to_wait(key(1), TaskState::Interruptible);
+    assert_eq!(rq.schedule().unwrap().next, b);
+    // b is current, c is queued, a sleeps.
+    rq.abandon();
+    assert!(!rq.has_runnable());
+    for id in [a, b, c] {
+        assert_eq!(rq.state(id), Some(TaskState::Dead));
+    }
+    // Nothing wakes a dead task, by key or directly.
+    assert_eq!(rq.wake_up_key(key(1), WakeMode::Normal, 0), 0);
+    assert!(!rq.try_to_wake_up(a) && !rq.wake_interruptible(c));
+    let switch = rq.schedule().unwrap();
+    assert_eq!((switch.prev, switch.next), (b, rq.idle()));
+    assert!(rq.free(b));
+    assert_eq!(rq.schedule(), None);
+    assert_eq!(rq.nr_active(), 0);
+    rq.reset();
+    assert_eq!(rq.state(a), None);
+}
+
+#[test]
 fn signal_wakes_interruptible_only() {
     let mut rq = rq(4);
     let [a, b] = [spawn(&mut rq), spawn(&mut rq)];

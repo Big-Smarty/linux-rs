@@ -37,7 +37,9 @@
 //! group outran its bound): the latter two end the group only if
 //! `groups_lock_free` (`userspace::locks_free`, which covers the scheduler's `RQ`
 //! and `TIMERQ`, and `ARCHIVES`: the locks the abandoned stack could still hold), else the suite aborts with its results
-//! so far. The summary takes none of those locks.
+//! so far. The summary takes none of those locks. A group is its whole task set: it
+//! ends in the context of whichever task is current (init, or a child at a kernel stop
+//! or the time bound), and `ktask::abandon_group` kills every task of it at once.
 //!
 //! # Time bounds
 //! A group has `DEFAULT_TIMEOUT_S` (command line `suite_timeout_s=`) on the raw
@@ -92,10 +94,12 @@ const NONE: usize = usize::MAX;
 const MAX_GROUPS: usize = 8;
 /// Extra `suite_groups=` words of the QEMU harness: `/init` modes that end a
 /// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not; a
-/// loop that never ends), proving that a bad group ends only itself. They have no expected output, so
-/// they always count as failed.
+/// loop that never ends; the same loop in a child while init waits for it, so the time bound
+/// finds a child on the CPU; init exiting with a child still spinning), proving that a bad
+/// group ends only itself and ends as a whole. They have no expected output, so they always
+/// count as failed.
 #[cfg(feature = "qemu-self-test")]
-const PROBES: [&str; 3] = ["fault", "io_uring", "spin"];
+const PROBES: [&str; 5] = ["fault", "io_uring", "spin", "spinchild", "orphan"];
 #[cfg(not(feature = "qemu-self-test"))]
 const PROBES: [&str; 0] = [];
 /// Longest log line kept whole by the replay and the stop-line search.
@@ -935,7 +939,7 @@ fn group_ended(cause: Cause) -> ! {
     // returns to `start_next`, which tears the group down on the boot stack
     // (the pool stack this runs on belongs to the task being freed).
     cpu::interrupts_off();
-    ktask::exit_current()
+    ktask::abandon_group()
 }
 
 /// Whether every lock the abandoned stack of a stopped group could still hold
