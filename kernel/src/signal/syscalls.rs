@@ -650,6 +650,32 @@ mod tests {
         assert!(!st.pending_set().contains(17));
     }
 
+    fn handled(sig: u8) -> State {
+        let mut st = State::new(7, 0, 100_000);
+        st.actions[usize::from(sig) - 1].handler = 0x1000;
+        st.blocked.add(sig);
+        st
+    }
+    fn drain(st: &mut State) -> usize {
+        st.blocked = SigSet::EMPTY;
+        let mut n = 0;
+        while st.dequeue_signal().is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn rt_tkill_queue_holds_64_entries_then_eagain() {
+        // The array cap is 64 RT entries per queue (shortcut in state.rs).
+        let mut st = handled(40);
+        for n in 0..70u32 {
+            let want = if n < 64 { 0 } else { EAGAIN };
+            assert_eq!(sys_tkill(&mut st, 7, 40), want, "tkill {n}");
+        }
+        assert_eq!(drain(&mut st), 64);
+    }
+
     #[test]
     fn rt_sigaction_immutable_is_einval() {
         let mut st = init();

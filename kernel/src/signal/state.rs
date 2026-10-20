@@ -15,10 +15,14 @@
 //! * One thread: `tsk->pending` is [`Target::Thread`], `shared_pending` is
 //!   [`Target::Process`]; both are drained by the same task, private first.
 //! * Allocation: queued `siginfo` lives in two fixed arrays of
-//!   [`QUEUE_CAPACITY`]; no allocation, so a full array behaves like
-//!   `sigqueue_alloc` failing (the signal bit is still set, the `siginfo` is
-//!   lost, `-EAGAIN` for user-queued real-time signals).
-//!   shortcut: the pending limit is `min(RLIMIT_SIGPENDING, 2 * QUEUE_CAPACITY)`;
+//!   [`QUEUE_CAPACITY`]; no allocation. A classic signal (1..=31) has at most
+//!   one entry per queue (`legacy_queue`), so [`CLASSIC_SLOTS`] slots are
+//!   reserved for them and a classic `siginfo` (a forced fault's included) is
+//!   never lost. Real-time signals share [`RT_QUEUE_CAPACITY`] slots per
+//!   queue; a full RT quota behaves like `sigqueue_alloc` failing (the signal
+//!   bit is still set, the `siginfo` is lost, `-EAGAIN` for user-queued
+//!   real-time signals).
+//!   shortcut: the RT pending limit is `min(RLIMIT_SIGPENDING, 64 per queue)`;
 //!   it becomes the plain rlimit once the heap-backed queue replaces the
 //!   arrays (fallible `try_reserve`, never an infallible push).
 //! * `wants_signal`: the task is assumed running or already due to dequeue (it
@@ -34,8 +38,12 @@ use super::{
 };
 use syscalls::Errno;
 
-/// Entries per pending queue (see the module contract).
-pub const QUEUE_CAPACITY: usize = 64;
+/// Real-time `siginfo` entries per pending queue (see the module contract).
+pub const RT_QUEUE_CAPACITY: usize = 64;
+/// One slot per classic signal `1..=31`.
+pub const CLASSIC_SLOTS: usize = 31;
+/// Array size of a pending queue.
+pub const QUEUE_CAPACITY: usize = RT_QUEUE_CAPACITY + CLASSIC_SLOTS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -373,7 +381,16 @@ impl State {
             let counted = (self.private.len + self.shared.len) as u64 + 1;
             let allowed = override_rlimit || counted <= self.rlimit_sigpending;
             let pending = self.pending_mut(target);
-            if allowed && pending.len < QUEUE_CAPACITY {
+            // Classic signals have at most one entry (legacy_queue above), so
+            // their reserved slots never run out; only RT entries are capped.
+            let room = sig < SIGRTMIN
+                || pending
+                    .entries()
+                    .iter()
+                    .filter(|q| q.signo >= i32::from(SIGRTMIN))
+                    .count()
+                    < RT_QUEUE_CAPACITY;
+            if allowed && room {
                 pending.queue[pending.len] = info;
                 pending.len += 1;
             } else if sig >= SIGRTMIN && info.code != SI_USER {

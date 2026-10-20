@@ -32,7 +32,7 @@ use super::{
         restart_without_handler,
     },
     frame::{FIX_EFLAGS, FRAME_SIZE, INFO, MAX_FRAME_SIZE, rt_sigreturn},
-    info::{SEGV_MAPERR, SigInfo},
+    info::{SEGV_MAPERR, SI_QUEUE, SigInfo},
     linux_frames,
     state::{State, Target},
     syscalls::StackT,
@@ -1390,4 +1390,45 @@ fn spurious_math_fault_updates_arch_info_without_a_signal() {
     st.force_fault(&f);
     assert_eq!((st.arch.trap_nr, st.arch.error_code), (16, 0));
     assert!(!st.signal_pending());
+}
+
+fn segv_handler_state() -> State {
+    let mut st = handler_state();
+    st.actions[usize::from(SIGSEGV) - 1] = SigAction {
+        handler: 0x40_3000,
+        flags: SA_SIGINFO | SA_RESTORER,
+        restorer: 0x40_2000,
+        mask: SigSet::EMPTY,
+    };
+    st
+}
+
+#[test]
+fn a_full_rt_quota_never_loses_a_fault_siginfo() {
+    // Classic signals have reserved slots (legacy_queue allows one entry each),
+    // so a forced fault bypasses the RT cap like `override_rlimit` in
+    // `__send_signal_locked` (kernel/signal.c:1126).
+    let mut st = segv_handler_state();
+    st.blocked.add(40);
+    for v in 0..64 {
+        let info = SigInfo::rt(40, SI_QUEUE, 1, 0, v);
+        st.send_signal(40, info, Target::Thread).unwrap();
+    }
+    let info = SigInfo::rt(40, SI_QUEUE, 1, 0, 64);
+    assert_eq!(
+        st.send_signal(40, info, Target::Thread),
+        Err(::syscalls::Errno::EAGAIN)
+    );
+    st.force_fault(&crate::signal::info::page_fault(
+        crate::signal::info::PageFault::Segv(SEGV_MAPERR),
+        0xdead000,
+        6,
+    ));
+    let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
+    do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu);
+    assert_eq!((r.ip, r.di), (0x40_3000, 11));
+    let info = read(&mut space, r.si, 128);
+    assert_eq!(info[0..4], 11i32.to_le_bytes());
+    assert_eq!(info[8..12], SEGV_MAPERR.to_le_bytes());
+    assert_eq!(info[16..24], 0xdead000u64.to_le_bytes());
 }
