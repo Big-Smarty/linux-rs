@@ -995,3 +995,55 @@ Limits, stated plainly:
 - No SMP, no interrupt remapping, no hrtimer/timer wheel/NOHZ, no clocksource watchdog, no `adjtimex`/`CLOCK_*` ABI (no syscalls were added). `wait_until_ns` supports one waiter at a time and the legacy PIT path sleeps at tick granularity (up to 1 ms late).
 - Device pages are mapped into the still-unpublished tree after `userspace::load` and before `Tables::activate`, so the foundation's rule that the kernel half is immutable after activation is unchanged; no post-activation MMIO mapping exists (a later hotplug/ioremap needs the services' post-activation paging ops and an explicit rule extension).
 
+
+## Identity and process-attribute syscalls
+
+Worktree `ids`, branch `feat/syscalls-ids`. The `ids` oracle group (157 checks, `-- ids`) now passes on this kernel with the **158 output lines (157 `init: test ids.<name> ok` plus `init: tests ids passed=157 failed=0`) identical to the pinned Linux 6.18.57's** (`xtask/oracle/expected.tsv`), in the new 19th `kernel-test` case `oracle-ids`. Declared configuration as in [`config.rs`](../kernel/src/config.rs); a single task, one CPU, one user namespace, no LSM.
+
+### What was added
+
+| Piece | Where | Linux source |
+| --- | --- | --- |
+| Per-task state: `Cred` (root, no supplementary groups), `Rlimits` (`INIT_RLIMITS`, `RLIMIT_NPROC`/`SIGPENDING` = `max_threads/2` from the free pages, `do_prlimit` validation), `FsContext` (umask 0022, cwd text `/`, the seam for the VFS lane), `comm`, `personality`, `clear_child_tid`, `robust_list`, ppid/pgid/sid = 0 | `kernel/src/task.rs` (`Attributes`, host-tested), held in `Process.attrs` | `init/init_task.c`, `include/asm-generic/resource.h`, `kernel/fork.c` `set_max_threads`/`fork_init`, `fs/fs_struct.c`, `kernel/groups.c` |
+| 30 syscalls | `kernel/src/syscall/ids.rs`, one `.or_else` line in `syscall::dispatch` | `kernel/sys.c`, `kernel/groups.c`, `kernel/exec_domain.c`, `kernel/fork.c`, `kernel/futex/syscalls.c`, `kernel/sched/syscalls.c`, `arch/x86/kernel/process{,_64}.c`, `fs/d_path.c` |
+| `put_user` (one store, all or nothing) and `strncpy_from_user` | `kernel/src/usercopy.rs` (the one user-copy mechanism) | `arch/x86/include/asm/uaccess.h`, `lib/strncpy_from_user.c` |
+| FS/GS base access: `loadseg(FS, 0)` + MSR write through the vendored `x86_64` crate (`FS::set_reg`, `FsBase`, `GsBase`); reads are the MSRs (Linux's `x86_fsbase_read_cpu`) | `kernel/src/cpu.rs` (4 functions), reached through `Context::{fs,gs}_base`/`set_*` | `arch/x86/kernel/process_64.c` |
+| `Context` gains `tid`, `attrs`, the four base accessors and `machine()` (uptime, total/free pages for `sysinfo`) | `kernel/src/syscall/mod.rs`, `testing.rs`, `userspace.rs` | |
+| The harness case kind | `xtask/src/kernel.rs` (`oracle_case!`, `User::Oracle`, `validate_oracle`) | see [kernel tooling](kernel-tooling.md#oracle-group-cases) |
+
+Per-syscall summary (all numbers are x86-64): `getuid`/`geteuid`/`getgid`/`getegid` (102/107/104/108), `getresuid`/`getresgid` (118/120; three `put_user`s in order), `getgroups` (115; `int` size, `-EINVAL` below the count, stores per group), `getppid` (110), `gettid` (186), `getpgrp` (111), `getpgid` (121) and `getsid` (124) (lookup succeeds only for the caller, otherwise `-ESRCH`), `getpriority` (140; `PRIO_PROCESS`/`PGRP`/`USER` rules, `-EINVAL` for `which` outside 0..=2), `set_tid_address` (218), `set_robust_list` (273; only `len == 24`), `personality` (135; stored, and it really changes `uname`: `UNAME26` rewrites the release to `2.6.78`, `PER_LINUX32` the machine to `i686`), `sched_getscheduler` (145), `sched_get_priority_max/min` (146/147), `sched_getaffinity`/`sched_setaffinity` (204/203; CPU 0 only, including Linux's `len * 8` wrap in `unsigned int` and the order of `-EINVAL`/`-EFAULT`/`-ESRCH`), `getrlimit`/`setrlimit`/`prlimit64` (97/160/302; new limit validated, old value copied out after the store), `umask` (95), `getcwd` (79), `uname` (63; `copy_to_user` of 390 bytes, then the two overrides), `sysinfo` (99; 112 bytes, byte-scaled counters, uptime rounded up), `arch_prctl` (158) and `prctl` (157).
+
+**`uname` values.** `sysname` `Linux`, `nodename` `(none)` (`CONFIG_DEFAULT_HOSTNAME`), `release` `6.18.57` (the oracle's own build also printed exactly this; `UTS_RELEASE` of the pinned tag without `LOCALVERSION`), `machine` `x86_64`, `domainname` `(none)`. `version` is `#1 linux-rs`: Linux prints `#<build number> <flags> <date>`, this kernel has no build counter, so it names itself; the oracle only requires a non-empty string.
+
+**`prctl`.** Implemented: `PR_GET_DUMPABLE` (1, `SUID_DUMP_USER`), `PR_GET_TIMERSLACK` (50000 ns, `init_task`), `PR_GET_NO_NEW_PRIVS` (0, with Linux's `-EINVAL` for any nonzero `arg2..arg5`), `PR_SET_NAME`/`PR_GET_NAME` (`strncpy_from_user` of 15 bytes, `strscpy_pad`, 16-byte copy-out; init starts as `init`). Every other number in `include/uapi/linux/prctl.h` (1..16, 19..47, 50..78, `PR_SET_PTRACER`, `PR_SET_VMA`, `PR_GET_AUXV`) returns `Outcome::Unimplemented` and stops the kernel loudly; numbers Linux does not define (0, 17, 18, 48, 49, 79.., negative `int`s) get its `default: -EINVAL`.
+
+**`arch_prctl`.** `ARCH_SET_FS/GS` (`-EPERM` at or above `TASK_SIZE_MAX`), `ARCH_GET_FS/GS`, `ARCH_GET_CPUID` (1). `ARCH_SET_CPUID` and the `XCOMP` family (xstate permission model, CPUID faulting) stop the kernel. `ARCH_MAP_VDSO_*`, the `ADDRESS_MASKING` options and the `SHSTK` options are `-EINVAL` because the pinned reference configuration has `# CONFIG_CHECKPOINT_RESTORE is not set`, no `CONFIG_ADDRESS_MASKING`, and `# CONFIG_X86_USER_SHADOW_STACK is not set` (`shstk_prctl` is the `-EINVAL` stub). A finite `RLIMIT_CPU` also stops the kernel (it arms the POSIX CPU timer in Linux, which does not exist here) after the normal validation, storing nothing.
+
+### Shortcuts (each is also a `shortcut:` or contract comment at its site)
+
+* Credentials are fixed root and nothing can change them (`setuid` & co. are not implemented and would stop the kernel); `capable(CAP_SYS_RESOURCE)` is therefore always true and there is no LSM hook. Upgrade with the credentials/capabilities slice (`cred` becomes shared and copy-on-write).
+* Rlimits are stored faithfully, but enforcement belongs to the subsystems that consume them (fd table, `mmap`, `fork`, signals); only the storage and the `getrlimit` family exist.
+* `uptime` is the PIT tick count (divisor 11932 of 1,193,182 Hz) converted to nanoseconds, counted from timer start; replace by the boot clock when the timekeeping lane lands. `sysinfo` memory is `Allocator::total()`/`available()` (managed and free 4 KiB pages), `procs` is the one task, loads are 0.
+* `cwd` is the text `/`; `FsContext` is the seam for the real dentry/mount pair, and `getcwd` formats that text instead of walking `d_path`.
+* `getpriority`/`sched_getscheduler` return the constants for a task with nice 0 and `SCHED_NORMAL`; the setters are not implemented and stop the kernel, so the constants cannot go stale.
+* `set_tid_address` and `set_robust_list` store the pointers; nothing consumes them until exit/futex exist (`mm_release` clears `clear_child_tid`, `exit_robust_list` walks the list).
+* FS/GS selectors are loaded with the null selector before the base write as Linux does, but a user `mov %fs` of a GDT selector between calls is read back from the MSR, not tracked.
+
+### The five design questions
+
+* *Can I use a preexisting crate?* The syscall numbers and `Errno` come from the vendored `syscalls` crate (already used); the segment/MSR access from the vendored `x86_64` crate (`FsBase`, `GsBase`, `FS::set_reg`), so no new `asm!`. No crate offers Linux's `prlimit`, `prctl`, `uname` or `sysinfo` semantics, and a `bitflags`/`zerocopy` dependency would buy nothing for the handful of fixed-layout byte arrays built here (`to_le_bytes` into fixed buffers; layouts are asserted by tests). No new dependency, no `docs/dependencies.md` change.
+* *Can I bundle functionality together?* One state struct (`task::Attributes`) and one group file instead of per-syscall modules: the calls share the lookup rule (`find_task`), the user-copy helpers and the limits/credentials state. The user-copy additions extend the single `usercopy` mechanism rather than adding a second one.
+* *Can I simplify things?* Only the caller exists, so `find_task_by_vpid` is `pid == tid`, `getpgid`/`getsid` are field reads, and the affinity mask is bit 0. Constants stand where the setters do not exist (nice, scheduler policy, dumpable, timer slack). No heap use, no allocation: all buffers are fixed-size stack arrays.
+* *Is this secure?* Every user address goes through `usercopy` (range check, page walk, no direct dereference). `put_user` is all-or-nothing as an x86 store is; `copy_to_user` keeps Linux's short-copy behaviour. `arch_prctl` refuses bases at or above `TASK_SIZE_MAX` (`-EPERM`), which is also what keeps the value canonical for the MSR write (`VirtAddr::new_truncate` cannot misbehave). Arguments are truncated to their C types exactly where Linux does (`int`, `unsigned int`, `pid_t`), including the `len * 8` wrap in `sched_getaffinity`. A user can no longer reach `Unimplemented` via an unknown option number (only through numbers Linux defines); that remains the documented single-init shortcut in `syscall::dispatch`. No FSGSBASE instructions (CR4.FSGSBASE stays clear). Not covered: any adversarial multi-task case, since there is one task.
+* *How can I improve this?* Replace the PIT-derived uptime with the timekeeping clock, the cwd text with a dentry, the constants with real scheduler state, and add the setters (`setpriority`, `setuid` family, `sched_setscheduler`, `PR_SET_*`) together with the credential/capability model; move `Attributes` into the `task_struct`/`cred`/`signal_struct` analogues when more than one task exists.
+
+### Definition of done and status
+
+| Item | Evidence | Status |
+| --- | --- | --- |
+| Every `ids` check passes with Linux's exact output | `oracle-ids`: 157 `init: test ids.*` lines plus the summary equal `expected.tsv` one for one | done (QEMU TCG `qemu64` only) |
+| Errno and check order per syscall (argument truncation, `EFAULT`/`ESRCH`/`EINVAL` precedence, store-before-copyout in `prlimit64`, partial stores) | 13 host tests in `syscall/ids.rs`, 3 in `task.rs`, 2 in `usercopy.rs` | done for the exercised and the neighbouring cases; no differential fuzz |
+| `prctl`/`arch_prctl` options Linux implements but this slice does not stop loudly; undefined numbers are `-EINVAL` | `prctl_options_names_and_unknown_numbers`, `arch_prctl_matches_process_64`, `a_finite_cpu_limit_stops_instead_of_storing` | done |
+| Harness: one generic exact-line validator, one line per group | `oracle_case!`, `validate_oracle`; unit tests `oracle_case_requires_every_expected_line_exactly_in_order`, `oracle_info_rows_match_by_name_only` | done |
+| Behaviour on real hardware, KVM, other QEMU CPU models, `sysinfo` uptime against a real clock | not run | not done |
+| Independent review | not done | not done |
