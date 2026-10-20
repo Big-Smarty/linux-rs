@@ -10,7 +10,7 @@
 // arch/x86/kernel/traps.c, arch/x86/mm/fault.c, kernel/exit.c. All GPL-2.0
 // (uapi headers GPL-2.0 WITH Linux-syscall-note).
 // Transformation: one thread group of one thread (pid == tgid == tid), so the
-// per-thread/shared queues, `siglock`, wakeups, ptrace, job control, posix
+// per-thread/shared queues, `siglock`, wakeups, ptrace, posix
 // timers, signalfd, `sigtimedwait` and the x32/ia32 frames are not modelled;
 // x86_64 native frames with FXSR-only FPU state (declared `noxsave`) are.
 #![forbid(unsafe_code)]
@@ -39,6 +39,7 @@ pub mod deliver;
 pub mod frame;
 pub mod info;
 pub mod itimer;
+pub mod jobctl;
 pub mod state;
 pub mod syscalls;
 pub mod wait;

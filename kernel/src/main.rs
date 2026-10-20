@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #![no_std]
 #![no_main]
-// Fallible allocation API (`Box::try_new`, `Vec::push_within_capacity`); the
-// infallible one does not exist in target builds, see `kalloc`. The task
-// list (library) does the per-task allocation; only the boot proofs use these
-// two forms in the binary.
-#![cfg_attr(
-    feature = "boot-proofs",
-    feature(allocator_ext, vec_push_within_capacity)
-)]
+// Fallible allocation API (`Box::try_new`, `Box::try_new_uninit`,
+// `Vec::push_within_capacity`); the infallible one does not exist in target
+// builds, see `kalloc`. The task state of `userspace` (fork, init) and the boot
+// proofs use these forms in the binary.
+#![feature(allocator_ext)]
+#![cfg_attr(feature = "boot-proofs", feature(vec_push_within_capacity))]
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 compile_error!(

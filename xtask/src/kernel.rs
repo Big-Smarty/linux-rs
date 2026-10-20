@@ -207,6 +207,14 @@ enum User {
     /// Runs one oracle syscall-test group (`-- <group>`, `user/init/src/tests`) to `init: ok`;
     /// every `init: test|tests|info` line equals the pinned Linux's ([`validate_oracle`]).
     Oracle(&'static str),
+    /// `-- forkleak`: 200 fork/exit/wait rounds; the counts line equals the pinned Linux's and
+    /// the free RAM `sysinfo` reports is exactly the same before and after the rounds (every
+    /// frame and kernel object came back).
+    ForkLeak,
+    /// `-- forkbomb` (this kernel only): fork until `EAGAIN` (the kernel-stack pool is the
+    /// limit), kill and reap everything, twice; every child reaped, a fork works afterwards and
+    /// the free RAM is the same after both floods.
+    ForkBomb,
     /// No `/init` in any archive: Linux's `prepare_namespace` failure text.
     NoRoot,
     /// The kernel-run bare-metal suite (`suite`): the groups it runs, each with whether it must
@@ -280,6 +288,8 @@ const IRQ_GUARD_RECORD: &str = "CHECK irq-guard ok nested=2 out_of_order=true sa
 /// one user-copy mechanism on the real tables, faulting pages in with Linux's short-copy results.
 /// What init's `demand` mode prints after taking its own ring-3 page faults.
 const DEMAND_MODE_LINE: &str = "init: demand ok";
+/// The first line of `-- forkleak` (counts only; identical on the pinned Linux).
+const FORKLEAK_MODE_LINE: &str = "init: forkleak warm=true rounds=200 reaped=200 none_left=true";
 const MM_USERCOPY_RECORD: &str = "CHECK mm-usercopy ok fault_in=read,write short_write=4 hole=8 readonly=refused zero_page=shared range=refused protnone=inverted,restored fixed=replaced stack=grown unmap=restored";
 const PF_GPR_RECORD: &str = "CHECK page-fault-gprs ok gprs=15";
 const MEMORY_RUNTIME_RECORD: &str = "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true";
@@ -824,6 +834,51 @@ const DEBUG_CASES: &[DebugCase] = &[
     oracle_case!(time),
     oracle_case!(fs),
     oracle_case!(signal),
+    // Process creation and exit on the task model: `fork`/`clone`/`clone3` arguments and
+    // inheritance, wait statuses, `SIGCHLD`, orphans, `execve` in a child (`user/init` group
+    // `fork`, recorded on the pinned Linux 6.18.57).
+    oracle_case!(fork),
+    // The process group: pipes between tasks (blocking reads and writes, EOF, `SIGPIPE`), `poll`,
+    // job control (stop, continue, once-only reports, `SIGCHLD` info), sessions, process groups,
+    // `execve` into a pipe (`user/init` group `proc`, recorded on the pinned Linux 6.18.57).
+    oracle_case!(proc),
+    // Job control beyond `proc`: the four stop signals, `WNOWAIT`/`WCONTINUED`, `SIGCHLD` for
+    // stops, orphaned process groups (`SIGHUP` + `SIGCONT`, terminal stop signals dropped),
+    // `setpgid`/`getsid` across sessions and after `execve` (`user/init` group `jobctl`,
+    // recorded on the pinned Linux 6.18.57).
+    oracle_case!(jobctl),
+    // Pipes and `poll` between tasks: blocking reads and writes with partial progress, `SIGPIPE`
+    // and `EPIPE` for a sleeping writer, interrupted and restarted calls, `poll` events, timeouts,
+    // wake-ups and its restart after a stop (`user/init` group `pipe`, recorded on the pinned
+    // Linux 6.18.57).
+    oracle_case!(pipe),
+    // 200 fork/exit/wait rounds: nothing is left behind (`user/init` mode `forkleak`).
+    // Pool exhaustion and every unwinding path of `copy_process` (this kernel only: Linux's limit
+    // is `max_threads`, not a stack pool).
+    DebugCase {
+        name: "forkbomb",
+        cmdline: Some("-- forkbomb"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::ForkBomb,
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    DebugCase {
+        name: "forkleak",
+        cmdline: Some("-- forkleak"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::ForkLeak,
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
     // The signal smoke run on the other two clockevent paths: the PIT-only periodic timer (an
     // `ITIMER_REAL` wake-up served at tick granularity) and the KVM TSC-deadline timer.
     DebugCase {
@@ -924,12 +979,16 @@ const SUITE_CASES: &[DebugCase] = &[
             ..Q35_TCG
         },
     },
-    // A segfaulting /init, a syscall Linux has and this kernel does not, and an /init that
-    // loops forever (ended by the one-second group bound) end only their own group runs; the
-    // group after them still runs and passes, and the suite reports failure.
+    // A segfaulting /init, a syscall Linux has and this kernel does not, an /init that loops
+    // forever (ended by the one-second group bound), the same loop in a forked child while
+    // init waits for it (the bound finds the child on the CPU) and an /init that exits with a
+    // child still spinning end only their own group runs, as a whole; the group after them
+    // still runs and passes, and the suite reports failure.
     DebugCase {
         name: "baremetal-suite-stops",
-        cmdline: Some("suite_pause_ms=50 suite_timeout_s=1 suite_groups=fault,io_uring,spin,ids"),
+        cmdline: Some(
+            "suite_pause_ms=50 suite_timeout_s=1 suite_groups=fault,io_uring,spin,spinchild,orphan,block,ids",
+        ),
         cpu: "qemu64",
         expected_exit: 35,
         required: &["CHECKPOINT bootstrap-complete"],
@@ -942,7 +1001,8 @@ const SUITE_CASES: &[DebugCase] = &[
 ];
 
 /// Expected stdout lines of the oracle syscall suite (`user/init` modes `mm ids time signal fs
-/// proc`) as observed on the pinned Linux 6.18.57 (`target/linux-reference/init-reference-006`).
+/// proc fork jobctl pipe`) as observed on the pinned Linux 6.18.57 (`target/linux-reference`:
+/// `init-reference-006` for the first six, `-009`/`-010` for `fork`, `-011` for `jobctl` and `pipe`).
 /// Tab-separated `group kind name line`, `#` comments and a header row; see the file header.
 /// [`oracle_rows`] reads it; the `kernel-test` cases made by `oracle_case!` compare a run of the
 /// mode on this kernel against it.
@@ -4353,7 +4413,10 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
             exact_summary,
             protection,
         } => (argc, mode_line, exact_summary, protection),
-        User::Segfault | User::Unimplemented | User::Oracle(_) => (2, None, true, (false, false)),
+        User::ForkLeak => (2, Some(FORKLEAK_MODE_LINE), true, (false, false)),
+        User::ForkBomb | User::Segfault | User::Unimplemented | User::Oracle(_) => {
+            (2, None, true, (false, false))
+        }
     };
     let audit = find.at(
         &|line| line.starts_with("CHECK userspace-audit ok user_pages="),
@@ -4394,6 +4457,12 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     if let Some(mode_line) = mode_line {
         positions.push(find.exact(mode_line, "init mode line")?);
     }
+    if user == User::ForkLeak {
+        positions.push(find.at(&forkleak_ram_unchanged, "unchanged free RAM record")?);
+    }
+    if user == User::ForkBomb {
+        positions.extend(forkbomb_records(&find)?);
+    }
     if let User::Oracle(group) = user {
         let (first, last) = validate_oracle(lines, group)?;
         positions.push(first);
@@ -4432,6 +4501,93 @@ fn oracle_rows(group: &str) -> impl Iterator<Item = (&'static str, &'static str)
             );
             (row_group == group).then_some((kind, line))
         })
+}
+
+/// `init: forkleak free_ram before=N after=N` with `N` equal: the free RAM `sysinfo` reports did
+/// not move across the 200 rounds (after two warm-up rounds).
+fn forkleak_ram_unchanged(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("init: forkleak free_ram before=") else {
+        return false;
+    };
+    let Some((before, after)) = rest.split_once(" after=") else {
+        return false;
+    };
+    matches!(
+        (before.parse::<u64>(), after.parse::<u64>()),
+        (Ok(before), Ok(after)) if before == after && before > 0
+    )
+}
+
+/// `CHECK fork-objects forks=202 heap=a/b files=a/b file_refs=a/b pins=a/b root_refs=a/b slots=a/b threads=a/b`
+/// (printed by the self-test kernel when init exits): the 202 forks of `-- forkleak` happened and
+/// every live-object count, sampled before the 3rd fork and at init's exit, is the same, which
+/// the free-RAM line cannot show (a leaked file reference, inode pin, task slot or heap byte).
+fn forkleak_objects_unchanged(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("CHECK fork-objects forks=202 ") else {
+        return false;
+    };
+    let mut fields = 0;
+    for (index, field) in rest.split(' ').enumerate() {
+        let Some((name, pair)) = field.split_once('=') else {
+            return false;
+        };
+        let Some((was, now)) = pair.split_once('/') else {
+            return false;
+        };
+        let want = [
+            "heap",
+            "files",
+            "file_refs",
+            "pins",
+            "root_refs",
+            "slots",
+            "threads",
+        ];
+        if want.get(index) != Some(&name)
+            || was != now
+            || was.parse::<u64>().is_err()
+            || (name == "heap" && was == "0")
+        {
+            return false;
+        }
+        fields += 1;
+    }
+    fields == 7
+}
+
+/// `-- forkbomb`: the three records, in order. Each flood forks until `EAGAIN` (at least 100
+/// children: the pool holds 127), reaps every child it made, the second makes as many as the
+/// first and a fork works again afterwards, and the free RAM after the floods is equal.
+fn forkbomb_records(find: &Finder<'_>) -> Result<Vec<usize>, String> {
+    let flood = |line: &str, round: &str| -> Option<usize> {
+        let rest = line.strip_prefix(&format!("init: forkbomb {round} children="))?;
+        let (children, rest) = rest.split_once(" eagain=true reaped=")?;
+        let (reaped, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+        let children: usize = children.parse().ok()?;
+        let again_ok = round == "first" || tail == "again=true";
+        (children >= 100 && reaped.parse() == Ok(children) && again_ok).then_some(children)
+    };
+    let first = find.at(&|line| flood(line, "first").is_some(), "first flood record")?;
+    let second = find.at(
+        &|line| flood(line, "second").is_some(),
+        "second flood record",
+    )?;
+    let counts = (
+        flood(find.lines[first], "first"),
+        flood(find.lines[second], "second"),
+    );
+    if counts.0 != counts.1 {
+        return Err("the two floods made a different number of children".to_owned());
+    }
+    let ram = find.at(
+        &|line| {
+            line.strip_prefix("init: forkbomb free_ram after_first=")
+                .and_then(|rest| rest.split_once(" after_second="))
+                .is_some_and(|(a, b)| a == b && a.parse::<u64>().is_ok_and(|n| n > 0))
+        },
+        "unchanged free RAM record",
+    )?;
+    Ok(vec![first, second, ram])
 }
 
 /// The line prefixes of an oracle test group's output; everything else the guest prints (kernel
@@ -4532,6 +4688,25 @@ fn user_faults_handled(line: &str, demand: bool) -> bool {
         .is_some_and(|count| count >= u64::from(demand))
 }
 
+/// `CHECK kstack-usage max_used=N usable=M ...` (printed by the self-test kernel when init exits):
+/// the deepest kernel stack use any measured system call, exception or exit reached. A regression
+/// guard, not Linux behaviour: some use is recorded and it stays within half of the usable stack
+/// (0 would mean the measurement did not run; observed 15,424 of 65,536 bytes, deepest in `fork`).
+fn kstack_usage_ok(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("CHECK kstack-usage max_used=") else {
+        return false;
+    };
+    let Some((used, rest)) = rest.split_once(" usable=") else {
+        return false;
+    };
+    let (usable, _) = rest.split_once(' ').unwrap_or((rest, ""));
+    // The pool stacks are 64 KiB usable; a record that claims another size is not this kernel's.
+    usable == "65536"
+        && used
+            .parse::<u64>()
+            .is_ok_and(|used| used > 0 && used <= 65536 / 2)
+}
+
 /// The records after the summary line, by what init did.
 fn user_tail(
     find: &Finder<'_>,
@@ -4541,15 +4716,26 @@ fn user_tail(
 ) -> Result<Vec<usize>, String> {
     const DEATH: &str = "Kernel panic - not syncing: Attempted to kill init! exitcode=";
     Ok(match user {
-        User::Ok { .. } | User::Oracle(_) => vec![
-            find.exact("init: ok", "init: ok")?,
-            find.at(
-                &|line| user_faults_handled(line, demand),
-                "handled ring-3 page faults record",
-            )?,
-            find.exact(&format!("{DEATH}0x00000000"), "init death panic")?,
-            find.exact("RESULT success", "RESULT success")?,
-        ],
+        User::Ok { .. } | User::Oracle(_) | User::ForkLeak | User::ForkBomb => {
+            let mut tail = vec![find.exact("init: ok", "init: ok")?];
+            if user == User::ForkLeak {
+                // Printed by the kernel when init exits, before the death panic.
+                tail.push(find.at(
+                    &forkleak_objects_unchanged,
+                    "unchanged kernel objects record",
+                )?);
+            }
+            tail.extend([
+                find.at(
+                    &|line| user_faults_handled(line, demand),
+                    "handled ring-3 page faults record",
+                )?,
+                find.at(&kstack_usage_ok, "kernel stack usage record")?,
+                find.exact(&format!("{DEATH}0x00000000"), "init death panic")?,
+                find.exact("RESULT success", "RESULT success")?,
+            ]);
+            tail
+        }
         User::Segfault => vec![
             find.exact("init: faulting on purpose", "fault announcement")?,
             find.at(
@@ -6779,6 +6965,29 @@ mod tests {
                 serial.replace("handled=7", "handled=many"),
             ),
             (
+                "no kernel stack usage record",
+                serial.replace(
+                    "CHECK kstack-usage max_used=7432",
+                    "CHECK kstack-usage-x max_used=7432",
+                ),
+            ),
+            (
+                "kernel stack use beyond half the stack",
+                serial.replace("max_used=7432", "max_used=40000"),
+            ),
+            (
+                "kernel stack use of zero",
+                serial.replace("max_used=7432", "max_used=0"),
+            ),
+            (
+                "kernel stack use that would overflow when doubled",
+                serial.replace("max_used=7432", "max_used=9223372036854775808"),
+            ),
+            (
+                "kernel stack record claiming another stack size",
+                serial.replace("usable=65536", "usable=999999"),
+            ),
+            (
                 "duplicate init: ok",
                 serial.replace("init: ok", "init: ok\ninit: ok"),
             ),
@@ -6843,7 +7052,7 @@ mod tests {
             .unwrap()
             .replace("argc=1", "argc=2")
             .replace(
-                "\ninit: ok\nCHECK user-faults ok handled=7\nKernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
+                "\ninit: ok\nCHECK user-faults ok handled=7\nCHECK kstack-usage max_used=7432 usable=65536 slot=0 syscall=1 measured=244 exec=0 signal=0 fault=0 fork=0 syscall=7432 exception=0 between=880 exit=4616\nKernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
                 "",
             );
         let segfault = format!(
@@ -7003,6 +7212,7 @@ mod tests {
             &fixture::init_summary(&expected().init, 1),
             "init: ok",
             "CHECK user-faults ok handled=7",
+            "CHECK kstack-usage max_used=7432 usable=65536 slot=0 syscall=1 measured=244 exec=0 signal=0 fault=0 fork=0 syscall=7432 exception=0 between=880 exit=4616",
             "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
             "RESULT success",
         ]
@@ -7525,6 +7735,160 @@ mod tests {
     }
 
     #[test]
+    fn forkleak_case_requires_the_counts_and_an_unchanged_free_ram() {
+        let process = ProcessResult {
+            exit_code: Some(33),
+            timed_out: false,
+        };
+        let case = case("forkleak");
+        assert_eq!(case.cmdline, Some("-- forkleak"));
+        assert_eq!(case.user, User::ForkLeak);
+        let serial = |lines: &[&str]| {
+            let lines = lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>();
+            validate(case, &process, &oracle_serial(&lines))
+        };
+        let counts = FORKLEAK_MODE_LINE;
+        let ram = "init: forkleak free_ram before=453361664 after=453361664";
+        let objects = "CHECK fork-objects forks=202 heap=484795/484795 files=2/2 file_refs=5/5 pins=1/1 root_refs=5/5 slots=1/1 threads=1/1";
+        let with_objects = |lines: &[&str], objects: &str| {
+            let serial = oracle_serial(&lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>());
+            // The kernel prints the record when init exits, after `init: ok`.
+            validate(
+                case,
+                &process,
+                &serial.replacen("\ninit: ok\n", &format!("\ninit: ok\n{objects}\n"), 1),
+            )
+            .0
+        };
+        assert!(with_objects(&[counts, ram], objects));
+        for (what, bad) in [
+            (
+                "heap grew",
+                objects.replace("484795/484795", "484795/484796"),
+            ),
+            ("a file kept", objects.replace("files=2/2", "files=2/3")),
+            (
+                "a file reference kept",
+                objects.replace("file_refs=5/5", "file_refs=5/6"),
+            ),
+            ("a pin kept", objects.replace("pins=1/1", "pins=1/2")),
+            (
+                "a task slot kept",
+                objects.replace("slots=1/1", "slots=1/2"),
+            ),
+            ("too few forks", objects.replace("forks=202", "forks=3")),
+            ("a field missing", objects.replace(" threads=1/1", "")),
+            ("no record", String::new()),
+        ] {
+            assert!(!with_objects(&[counts, ram], &bad), "{what}");
+        }
+        let (accepted, _) = serial(&[counts, ram]);
+        assert!(!accepted, "the kernel's record is required");
+        // Leaked memory, a missing record, wrong counts, a zero reading and reordered records.
+        for (what, lines) in [
+            (
+                "less free RAM",
+                vec![
+                    counts,
+                    "init: forkleak free_ram before=453361664 after=453357568",
+                ],
+            ),
+            (
+                "more free RAM",
+                vec![counts, "init: forkleak free_ram before=1 after=2"],
+            ),
+            ("no RAM record", vec![counts]),
+            ("no counts", vec![ram]),
+            (
+                "fewer children reaped",
+                vec![
+                    "init: forkleak warm=true rounds=200 reaped=199 none_left=true",
+                    ram,
+                ],
+            ),
+            (
+                "unreadable",
+                vec![counts, "init: forkleak free_ram before=0 after=0"],
+            ),
+            ("reordered", vec![ram, counts]),
+        ] {
+            assert!(!with_objects(&lines, objects), "{what}");
+        }
+    }
+
+    #[test]
+    fn forkbomb_case_requires_clean_floods_and_an_unchanged_free_ram() {
+        let process = ProcessResult {
+            exit_code: Some(33),
+            timed_out: false,
+        };
+        let case = case("forkbomb");
+        assert_eq!(case.cmdline, Some("-- forkbomb"));
+        let first = "init: forkbomb first children=127 eagain=true reaped=127";
+        let second = "init: forkbomb second children=127 eagain=true reaped=127 again=true";
+        let ram = "init: forkbomb free_ram after_first=453357568 after_second=453357568";
+        let check = |lines: &[&str]| {
+            let lines = lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>();
+            validate(case, &process, &oracle_serial(&lines)).0
+        };
+        assert!(check(&[first, second, ram]));
+        for (what, lines) in [
+            (
+                "leaked RAM",
+                vec![
+                    first,
+                    second,
+                    "init: forkbomb free_ram after_first=2 after_second=1",
+                ],
+            ),
+            (
+                "a child not reaped",
+                vec![
+                    "init: forkbomb first children=127 eagain=true reaped=126",
+                    second,
+                    ram,
+                ],
+            ),
+            (
+                "no EAGAIN",
+                vec![
+                    "init: forkbomb first children=127 eagain=false reaped=127",
+                    second,
+                    ram,
+                ],
+            ),
+            (
+                "too few children",
+                vec![
+                    "init: forkbomb first children=5 eagain=true reaped=5",
+                    second,
+                    ram,
+                ],
+            ),
+            (
+                "different floods",
+                vec![
+                    first,
+                    "init: forkbomb second children=120 eagain=true reaped=120 again=true",
+                    ram,
+                ],
+            ),
+            (
+                "no fork afterwards",
+                vec![
+                    first,
+                    "init: forkbomb second children=127 eagain=true reaped=127 again=false",
+                    ram,
+                ],
+            ),
+            ("missing RAM", vec![first, second]),
+            ("reordered", vec![second, first, ram]),
+        ] {
+            assert!(!check(&lines), "{what}");
+        }
+    }
+
+    #[test]
     fn oracle_case_requires_every_expected_line_exactly_in_order() {
         let process = ProcessResult {
             exit_code: Some(33),
@@ -7642,7 +8006,9 @@ mod tests {
                 other => panic!("unknown kind {other}"),
             }
         }
-        let groups = ["mm", "ids", "time", "signal", "fs", "proc"];
+        let groups = [
+            "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe",
+        ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),
             groups.len()

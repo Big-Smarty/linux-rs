@@ -1421,3 +1421,48 @@ fn inserted_vma_is_accounted_and_unmaps_cleanly() {
     assert_eq!((w.mm.total_vm, w.mm.stack_vm), (0, 0));
     assert_eq!(w.mm.map_count(), 0);
 }
+
+/// src: kernel/fork.c `dup_mmap` and mm/rmap.c `anon_vma_fork`: counters and
+/// layout copied, `locked_vm` 0 and `VM_LOCKED` cleared, a VMA with an
+/// `anon_vma` gets a new one of its own, a `VM_ACCOUNT` VMA is charged again;
+/// the parent is untouched.
+#[test]
+fn dup_copies_the_layout_and_counters_for_a_forked_child() {
+    let mut w = W::new();
+    let a = w.map(0, 3 * P, RW, ANON).unwrap();
+    assert!(w.writable(a)); // gives the VMA an anon_vma
+    w.mm.locked_vm = 2;
+    w.mm.def_flags = VmFlags::LOCKED; // as mlockall(MCL_FUTURE) would leave it
+    w.mm.vmas[0].flags = VmFlags(w.mm.vmas[0].flags.0 | VmFlags::LOCKED.0);
+    let parent_before = w.mm.vmas().to_vec();
+    let (total, stack) = (w.mm.total_vm, w.mm.stack_vm);
+    let child = w.mm.dup(&w.env).unwrap();
+    assert_eq!(w.mm.vmas(), parent_before.as_slice(), "parent untouched");
+    assert_eq!(child.vmas().len(), parent_before.len());
+    assert_eq!(
+        (child.total_vm, child.stack_vm, child.locked_vm),
+        (total, stack, 0)
+    );
+    // mm_init keeps only `def_flags & VM_INIT_DEF_MASK` (VM_NOHUGEPAGE: none here).
+    assert_eq!(child.def_flags, VmFlags::NONE);
+    assert_eq!(w.mm.def_flags, VmFlags::LOCKED);
+    assert_eq!(
+        (child.mmap_base, child.start_brk, child.brk, child.topdown),
+        (w.mm.mmap_base, w.mm.start_brk, w.mm.brk, w.mm.topdown)
+    );
+    for (p, c) in parent_before.iter().zip(child.vmas()) {
+        assert_eq!(
+            (p.start, p.end, p.pgoff, p.file),
+            (c.start, c.end, c.pgoff, c.file)
+        );
+        assert!(!c.flags.intersects(VmFlags::LOCKED));
+        assert_eq!(p.anon.is_some(), c.anon.is_some());
+    }
+    // The mapped VMA's anon_vma is a fresh one, not the parent's.
+    let pa = w.mm.find_vma(a).unwrap().anon;
+    let ca = child.find_vma(a).unwrap().anon;
+    assert!(pa.is_some() && ca.is_some() && pa != ca);
+    // A charge the policy refuses (more pages than RAM) fails the whole dup.
+    let tiny = Env::init(16, 0);
+    assert_eq!(w.mm.dup(&tiny).err(), Some(Errno::ENOMEM));
+}

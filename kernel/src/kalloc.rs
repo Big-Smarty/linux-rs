@@ -13,7 +13,7 @@
 //!
 //! # Contexts and locking
 //! Task context only (see `kernel::heap` for the full contract). The heap lock
-//! is [`IrqMutex`] and sits between `TABLES` and `FRAMES` in the lock order
+//! is [`IrqMutex`] and sits between `PROCESS` and `FRAMES` in the lock order
 //! (`services`): growth takes `FRAMES` while holding the heap lock, and no
 //! path holds `FRAMES` while allocating. Nothing here allocates while holding
 //! `FRAMES`, and `FRAMES` never calls the heap. Interrupt handlers and the
@@ -144,9 +144,17 @@ pub fn lock_free() -> bool {
     HEAP.0.try_lock().is_some()
 }
 
-#[cfg(feature = "boot-proofs")]
+#[cfg(any(feature = "boot-proofs", feature = "qemu-self-test"))]
 fn stats() -> kernel::heap::HeapStats {
     HEAP.0.lock().stats()
+}
+
+/// Bytes the callers of the heap currently hold (`HeapStats::requested`): the
+/// self-test builds compare it before and after a workload to find a leak of
+/// kernel objects that the frame count would hide.
+#[cfg(feature = "qemu-self-test")]
+pub fn requested_bytes() -> usize {
+    stats().requested
 }
 
 /// Executed heap proof on the real allocator: fallible Vec/Box, alignment,
@@ -183,12 +191,18 @@ pub fn self_test() -> Result<(), &'static str> {
     if stats().requested != base.requested || stats().allocated != base.allocated {
         return Err("accounting-small");
     }
-    // Growth: more than the heap can have free forces buddy-frame chunks.
+    // Growth: more than the heap can have free forces buddy-frame chunks. How much
+    // is free depends on how the boot (the size of the initramfs unpacked into
+    // it) left the last chunk, so take 128 KiB buffers until a chunk has been
+    // added; the chunk cap is 4 MiB, so 64 of them (8 MiB) always get there.
     let grown = stats();
-    let mut buffers: [Vec<u8>; 8] = core::array::from_fn(|_| Vec::new());
+    let mut buffers: [Vec<u8>; 64] = core::array::from_fn(|_| Vec::new());
     for buffer in &mut buffers {
         buffer.try_reserve_exact(128 << 10).map_err(|_| "grow")?;
         buffer.push_within_capacity(1).map_err(|_| "grow-push")?;
+        if stats().chunks > grown.chunks {
+            break;
+        }
     }
     let after = stats();
     if after.chunks <= grown.chunks

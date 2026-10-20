@@ -294,7 +294,8 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &Prepared) -> Outcome {
             LoadError::Unsupported(_) => Outcome::Unimplemented(sysno as u32),
         };
     }
-    ctx.files().vfs.pin(id);
+    let Files { vfs, owner, .. } = ctx.files();
+    vfs.pin(owner, id);
     // flush_signal_handlers(me, 0) and the new name.
     ctx.state().flush_on_exec();
     ctx.attrs().comm = p.comm;

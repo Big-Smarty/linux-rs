@@ -132,6 +132,61 @@ impl Mm {
         }
     }
 
+    /// The VMA half of `dup_mm` / `dup_mmap` for a forked child: the layout,
+    /// the program break and every counter are copied, the VMAs are copied in
+    /// address order, `mlock` state is not inherited (`VM_LOCKED_MASK` is
+    /// cleared on each copy and `locked_vm` starts at 0) and each VMA that has
+    /// an `anon_vma` gets a new one of its own (`anon_vma_fork`: the child's
+    /// VMAs never share one, so two neighbours that shared it in the parent no
+    /// longer merge on that account). A `VM_ACCOUNT` VMA is charged to the
+    /// overcommit policy again, as `security_vm_enough_memory_mm` does.
+    ///
+    /// The caller copies the pages (`copy_page_range`): this returns only the
+    /// model. `VM_DONTCOPY` (`madvise(MADV_DONTFORK)`) and `VM_WIPEONFORK` are
+    /// not reachable (`madvise` implements only `MADV_NORMAL`).
+    ///
+    /// # Errors
+    /// `ENOMEM`: the VMA vector cannot be reserved, or the charge is refused.
+    /// Nothing of the parent changes.
+    pub fn dup(&self, env: &Env) -> Result<Self, Errno> {
+        let mut vmas = Vec::new();
+        vmas.try_reserve_exact(self.vmas.len())
+            .map_err(|_| Errno::ENOMEM)?;
+        let mut next_anon = self.next_anon;
+        for vma in &self.vmas {
+            if vma.flags.contains(VmFlags::ACCOUNT) && !env.enough_memory(vma.pages()) {
+                return enomem();
+            }
+            let mut copy = *vma;
+            copy.flags = VmFlags(copy.flags.0 & !(VmFlags::LOCKED.0 | VmFlags::LOCKONFAULT.0));
+            if copy.anon.is_some() {
+                copy.anon = Some(next_anon);
+                next_anon += 1;
+            }
+            vmas.push_within_capacity(copy).map_err(|_| Errno::ENOMEM)?;
+        }
+        Ok(Self {
+            vmas,
+            mmap_base: self.mmap_base,
+            mmap_legacy_base: self.mmap_legacy_base,
+            topdown: self.topdown,
+            start_brk: self.start_brk,
+            brk: self.brk,
+            start_data: self.start_data,
+            end_data: self.end_data,
+            total_vm: self.total_vm,
+            data_vm: self.data_vm,
+            exec_vm: self.exec_vm,
+            stack_vm: self.stack_vm,
+            locked_vm: 0,
+            // mm_init: `def_flags & VM_INIT_DEF_MASK` (include/linux/mm.h:499 is
+            // VM_NOHUGEPAGE, which is VM_NONE without CONFIG_TRANSPARENT_HUGEPAGE):
+            // VM_LOCKED from mlockall(MCL_FUTURE) never crosses a fork.
+            def_flags: VmFlags::NONE,
+            next_anon,
+        })
+    }
+
     /// The VMAs in address order (`/proc/self/maps` order).
     #[must_use]
     pub fn vmas(&self) -> &[Vma] {

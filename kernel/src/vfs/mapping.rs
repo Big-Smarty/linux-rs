@@ -48,10 +48,13 @@ use crate::{
 };
 use syscalls::Errno;
 
-/// A reference on an open file description held by a mapping (`vm_file`).
+/// A reference on an open file description held by the mappings of one address
+/// space (`vm_file`): `owner` names that address space (a forked child has its
+/// own; there is one pin list for the system).
 #[derive(Clone, Copy, Debug)]
 pub struct Pin {
     pub file: FileId,
+    pub owner: u32,
     /// A page was copied out of the file for this description's mappings.
     pub snapshot: bool,
 }
@@ -124,15 +127,20 @@ impl Vfs {
         self.pins.try_reserve(1).map_err(|_| Errno::ENOMEM)
     }
 
-    /// A mapping now holds the open file description `id` (`FileInfo::id`);
-    /// idempotent. Storage was reserved by [`Vfs::reserve_pin`].
+    /// A mapping of address space `owner` now holds the open file description
+    /// `id` (`FileInfo::id`); idempotent per owner. Storage was reserved by
+    /// [`Vfs::reserve_pin`].
     ///
     /// # Panics
     /// If `id` is not an open description (a kernel bug) or no room was
     /// reserved.
-    pub fn pin(&mut self, id: u64) {
+    pub fn pin(&mut self, owner: u32, id: u64) {
         let file = file_of(id);
-        if self.pins.iter().any(|pin| pin.file == file) {
+        if self
+            .pins
+            .iter()
+            .any(|pin| pin.file == file && pin.owner == owner)
+        {
             return;
         }
         self.files.dup(file);
@@ -140,11 +148,50 @@ impl Vfs {
             self.pins
                 .push_within_capacity(Pin {
                     file,
+                    owner,
                     snapshot: false
                 })
                 .is_ok(),
             "pin storage was not reserved"
         );
+    }
+
+    /// `dup_mmap`'s `get_file(vma->vm_file)` for a forked child: address
+    /// space `to` holds every description `from` holds (and inherits whether
+    /// its pages were copied out of the file, since the child's pages are
+    /// copies of the parent's). Storage is reserved first: all or nothing.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn pin_clone(&mut self, from: u32, to: u32) -> KResult<()> {
+        let count = self.pins.iter().filter(|pin| pin.owner == from).count();
+        self.pins.try_reserve(count).map_err(|_| Errno::ENOMEM)?;
+        for index in 0..self.pins.len() {
+            let pin = self.pins[index];
+            if pin.owner == from {
+                self.files.dup(pin.file);
+                let pushed = self.pins.push_within_capacity(Pin { owner: to, ..pin });
+                debug_assert!(pushed.is_ok(), "reserved above");
+            }
+        }
+        Ok(())
+    }
+
+    /// `exit_mmap`'s `fput(vma->vm_file)`: address space `owner` is gone.
+    pub fn unpin_all(&mut self, owner: u32) {
+        let mut index = self.pins.len();
+        while index > 0 {
+            index -= 1;
+            if self.pins[index].owner == owner {
+                self.unpin(index);
+            }
+        }
+    }
+
+    /// The address space that holds pin `index`.
+    #[must_use]
+    pub fn pin_owner(&self, index: usize) -> u32 {
+        self.pins[index].owner
     }
 
     /// Number of descriptions pinned by mappings.
@@ -177,6 +224,7 @@ impl Vfs {
     /// pin list are reconciled after every mapping change).
     pub fn fault_page(
         &mut self,
+        owner: u32,
         id: u64,
         pgoff: u64,
         bytes: &mut [u8; PAGE_SIZE],
@@ -185,7 +233,7 @@ impl Vfs {
         let slot = self
             .pins
             .iter()
-            .position(|pin| pin.file == file)
+            .position(|pin| pin.file == file && pin.owner == owner)
             .expect("faulting file is pinned");
         let inode = self
             .files

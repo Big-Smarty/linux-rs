@@ -2,7 +2,8 @@
 // Linux 6.18.57 (commit 2ff600d29ee478d0a8d46ef8a58afb5e038fe692), all GPL-2.0:
 // kernel/sched/core.c (`schedule` 7025, `__schedule` 6801, `context_switch` 5293,
 // `finish_task_switch` 5168, `schedule_tail` 5262, `do_task_dead` 6953,
-// `wake_up_new_task` 4831), arch/x86/kernel/process_64.c (`__switch_to`,
+// `wake_up_new_task` 4831, `sched_cancel_fork`), kernel/fork.c
+// (`dup_task_struct`), arch/x86/kernel/process_64.c (`__switch_to`,
 // `save_fsgs`, `load_seg_legacy`), arch/x86/kernel/process.c (`ret_from_fork`
 // 151, `copy_thread`), arch/x86/include/asm/switch_to.h (`switch_to_asm`,
 // `struct inactive_task_frame`, `update_task_stack`), kernel/sched/idle.c
@@ -22,34 +23,40 @@
 //!
 //! # Contexts and locks
 //! * `schedule()` runs in task context with interrupts masked and **no lock
-//!   guard of this module held**. The single user process still reaches it with
-//!   its `PROCESS` and `TABLES` guards alive (the blocking syscalls of
-//!   `userspace`); that is sound only because no other task takes them, and the
-//!   task-model lane removes it (seam, below).
+//!   guard of this module held**. A user task reaches it only from
+//!   `Task::wait` (`userspace::Syscall::wait`), which has dropped the `PROCESS`
+//!   guard first, and from `exit_to_user`, which holds none (`services`).
 //! * Lock classes (acquire left to right, never the reverse):
 //!   `TIMERQ -> TIMER_HW`; `RQ` is a leaf and may be taken under any lock, from
 //!   hardirq too. `TIMERQ` and `RQ` are never held together: expiry drains the
 //!   queue under `TIMERQ`, releases it, and only then wakes under `RQ`.
-//! * Interrupt handlers reach this module through [`timer_interrupt`] and
-//!   [`scheduler_tick`] only; both take `TIMERQ`/`RQ` with interrupts already
-//!   masked and allocate nothing (all storage is reserved in [`init`]).
+//! * Interrupt handlers reach this module through [`timer_interrupt`],
+//!   [`scheduler_tick`] and [`charge_tick`] only; they take `TIMERQ`/`RQ` with
+//!   interrupts already masked and allocate nothing (all storage is reserved in
+//!   [`init`]).
 //!
-//! # The seam for the task-model lane
-//! A task is a [`SchedId`]; the model stores one per task and keeps its own state
-//! (`Process`, credentials, files, mm) keyed by it. It calls
-//! * [`spawn_user`] with the `PtRegs` of the new task's first return to ring 3
-//!   (fork builds the child's from the parent's, `ax = 0`) and gets the id back;
+//! # What a task is, and who creates one
+//! A task is a [`SchedId`] plus a [`Thread`] register context. The task model
+//! (`userspace`) keeps its own per-task state keyed by the same handle. It calls
+//! * [`prepare_fork`] with the child's first `PtRegs` and the root of its page
+//!   tables (a copy of the caller's live x87/SSE and segment state is taken) and
+//!   gets the handle back; [`wake_up_new_task`] makes it runnable once the task
+//!   list knows it, [`cancel_new_task`] gives it back if the fork fails;
+//! * [`start_init`] for the first user task;
 //! * [`sleep_current`] for every blocking wait (`signal::Task::wait` is its only
-//!   caller today), [`wake_up_key`] / [`signal_wake_up`] / [`wake_up_task`] to
-//!   end one, and [`exit_current`] at the end of `do_exit`;
-//! * [`current`] to find out who it is running as.
+//!   caller), [`wake_up_key`] / [`signal_wake_up`] to end one, [`stop_current`] /
+//!   [`wake_stopped`] for a job-control stop and its `SIGCONT`, and
+//!   [`exit_current`] at the end of `do_exit`;
+//! * [`current`] to find out who it is running as, [`cpu_account`] for the
+//!   task's CPU-time account.
 //!
-//! Per-task context that switches with the task (user FP state, segment
-//! registers and bases, the bad-iret depth, `TSS.RSP0`) is saved and restored
-//! here; address-space switching (`switch_mm`) and the accounting hooks
-//! (`sched_in`/`sched_out`) are the model lane's to add to [`context_switch`].
-//! shortcut: `CpuAccount`, `PROCESS` and `TABLES` are still process-wide
-//! singletons; they become per-task with the model lane.
+//! Per-task context that switches with the task: user FP state, segment
+//! registers and bases, the bad-iret depth, `TSS.RSP0`, **CR3** (`switch_mm`: a
+//! task with its own tree gets it; idle runs on whichever tree is active, as
+//! `active_mm`) and the CPU-time accounting (`sched_info`: off the CPU is not
+//! the task's time).
+//! shortcut: the tree is reloaded with a full TLB flush (no PCID, no lazy TLB
+//! tracking beyond "idle keeps what is loaded").
 #![allow(
     clippy::cast_possible_truncation,
     reason = "stack addresses and slot indices are bounded by the pool"
@@ -69,13 +76,14 @@ use core::{
     ptr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use kernel::cputime::CpuAccount;
 use kernel::sched::{
     NoSlot, Rq, SchedId, Switch, TaskState, WaitKey, WakeMode, timerq::TimerQueue,
 };
 
 /// Scheduler slots: the idle task (slot 0, on the boot stack) and one per pool
 /// stack (slot `n` runs on `KSTACKS[n - 1]`).
-const SLOTS: usize = cpu::KSTACK_SLOTS + 1;
+pub const SLOTS: usize = cpu::KSTACK_SLOTS + 1;
 
 /// `STACK_END_MAGIC` (include/uapi/linux/magic.h): the lowest usable word of a
 /// task stack, checked on every switch-out.
@@ -120,6 +128,10 @@ struct Thread {
     segments: Segments,
     /// `BAD_IRET_DEPTH` of this task while it is off the CPU.
     bad_iret_depth: u64,
+    /// The root of the task's page tables (`mm->pgd`), loaded into CR3 when the
+    /// task is switched in; 0 for a task that runs on whatever tree is active
+    /// (kernel threads and idle: `active_mm`).
+    cr3: u64,
 }
 
 impl Thread {
@@ -136,6 +148,7 @@ impl Thread {
             gs_base: 0,
         },
         bad_iret_depth: 0,
+        cr3: 0,
     };
 }
 
@@ -144,13 +157,51 @@ struct Threads(UnsafeCell<[Thread; SLOTS]>);
 
 // SAFETY: a `Thread` is touched only (a) by `spawn`, while its slot is unowned
 // (just handed out by `Rq::add_task`, not yet queued, so no other flow can name
-// it), and (b) by `context_switch`, whose preconditions are IF=0 on the single
+// it), (b) by `context_switch`, whose preconditions are IF=0 on the single
 // CPU, so the two tasks involved are the only flows that exist and the running
-// one is the caller. There is no other accessor and no reference outlives such
-// a section.
+// one is the caller, and (c) by `set_current_cr3`, which writes only the
+// running task's own `cr3` with IF=0 (no switch can interleave). There is no
+// other accessor and no reference outlives such a section.
 unsafe impl Sync for Threads {}
 
 static THREADS: Threads = Threads(UnsafeCell::new([Thread::NEW; SLOTS]));
+
+/// CPU-time accounting of each task (`task_struct::utime`/`stime`,
+/// `se.sum_exec_runtime`), indexed by scheduler slot. A task is "asleep" to
+/// its account whenever it is off the CPU (blocked or waiting its turn), set
+/// at every switch, so a tick is charged only to the task that was running.
+/// All fields are atomics (`cputime`): the tick interrupt writes them.
+static CPU_TIME: [CpuAccount; SLOTS] = [const { CpuAccount::new() }; SLOTS];
+
+/// The accounting of task `id` (a stale handle names whichever task holds the
+/// slot now, whose account is then read: callers hold live handles).
+pub fn cpu_account(id: SchedId) -> &'static CpuAccount {
+    &CPU_TIME[id.index()]
+}
+
+/// `account_process_tick`: the tick found the running task in user mode
+/// (`user`) or in the kernel on its behalf, `periods` ticks long; an idle CPU
+/// charges nobody. Interrupt context (RQ is a leaf any context may take).
+pub fn charge_tick(user: bool, periods: u64) {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    let slot = RQ.lock().curr().index();
+    if slot != 0 {
+        CPU_TIME[slot].tick(user, periods);
+    }
+}
+
+/// Scheduler slots in use, the idle task excluded (leak checks).
+#[cfg(feature = "qemu-self-test")]
+pub fn tasks_in_use() -> usize {
+    RQ.lock().tasks_in_use()
+}
+
+/// `nr_running + nr_uninterruptible` (what `loadavg` counts).
+pub fn nr_active() -> usize {
+    RQ.lock().nr_active()
+}
 
 fn thread(slot: usize) -> *mut Thread {
     assert!(slot < SLOTS, "scheduler slot out of range");
@@ -202,6 +253,23 @@ pub fn reset_group() {
     cpu::swap_bad_iret_depth(0);
 }
 
+/// The bare-metal suite's end of a group from inside one of its tasks (the
+/// group's init, or a child that was current at a kernel stop or the time
+/// bound): every task of the group dies at once and the CPU goes to idle, whose
+/// loop sees init gone and returns to the suite, which tears the group down.
+/// Without this the dying task's successor would be another task of the
+/// finished group (an orphan that may spin for ever).
+///
+/// Context: task, IF=0, on that task's kernel stack, no `RQ` guard held.
+#[cfg(feature = "baremetal-suite")]
+pub fn abandon_group() -> ! {
+    RQ.lock().abandon();
+    schedule();
+    // The current task is dead and not queued, so `schedule` cannot return here.
+    crate::log!("FAIL abandoned task resumed\n");
+    crate::fail()
+}
+
 /// Whether the boot context (the idle task) is current. The suite's group end
 /// uses it to know whether it can switch away (a task) or already is where
 /// teardown runs.
@@ -236,15 +304,25 @@ struct ForkFrame {
 /// 16-aligned (see its proof).
 const _: () = assert!(size_of::<ForkFrame>().is_multiple_of(16) && size_of::<PtRegs>() % 16 == 8);
 
-/// Create a task that starts at `ret_from_fork_asm`: a ring-3 task when
-/// `func` is `None` (it returns to user mode with `regs`), else a kernel thread
-/// running `func(arg)` and exiting when it returns. `user` is whether it owns
-/// user FP/segment state.
-fn spawn(
-    func: Option<extern "C" fn(usize)>,
-    arg: usize,
+/// What a new task starts with: its first user registers, FP and segment state
+/// and page tables (`copy_thread`'s result).
+struct Start {
     regs: PtRegs,
     user: bool,
+    fx: FxImage,
+    segments: Segments,
+    cr3: u64,
+}
+
+/// Create a task that starts at `ret_from_fork_asm`, **not yet runnable**: a
+/// ring-3 task when `func` is `None` (it returns to user mode with
+/// `start.regs`), else a kernel thread running `func(arg)` and exiting when
+/// it returns. The caller makes it runnable with [`wake_up_new_task`] once
+/// everything that names it exists (`sched_fork` ... `wake_up_new_task`).
+fn prepare(
+    func: Option<extern "C" fn(usize)>,
+    arg: usize,
+    start: Start,
 ) -> Result<SchedId, NoSlot> {
     let id = RQ.lock().add_task()?;
     let slot = id.index();
@@ -272,35 +350,95 @@ fn spawn(
                     0,
                 ],
                 ret: cpu::ret_from_fork_asm as *const () as u64,
-                regs,
+                regs: start.regs,
             },
         );
         ptr::write_volatile(cpu::kstack_lowest(pool) as *mut u64, STACK_END_MAGIC);
+        // SAFETY: the same exclusive, never-run pool stack; `frame` is its
+        // first live address (`selftest::paint_stack`'s contract).
+        #[cfg(feature = "qemu-self-test")]
+        selftest::paint_stack(pool, frame as u64);
         let thread = thread(slot);
         *thread = Thread {
             sp: frame as u64,
-            user,
-            fx: FxImage::initial(),
-            segments: Segments::default(),
+            user: start.user,
+            fx: start.fx,
+            segments: start.segments,
             bad_iret_depth: 0,
+            cr3: start.cr3,
         };
     }
-    let queued = RQ.lock().wake_up_new_task(id);
-    debug_assert!(queued, "a fresh task is runnable");
+    // The task starts off the CPU: its time counts from its first switch-in.
+    let now = timer::ktime_get_ns();
+    CPU_TIME[slot].start(now);
+    CPU_TIME[slot].sleep_begin(now);
     Ok(id)
 }
 
-/// Create a ring-3 task whose first run returns to user mode with `regs`
-/// (`copy_thread` + `wake_up_new_task`). It owns user FP state (initial image)
-/// and segment state (null selectors, zero bases).
-///
-/// # Errors
-/// [`NoSlot`] when the stack pool is exhausted (fork's `-EAGAIN`).
+/// [`prepare`] and make it runnable.
+#[cfg(feature = "qemu-self-test")]
+fn spawn(
+    func: Option<extern "C" fn(usize)>,
+    arg: usize,
+    regs: PtRegs,
+    user: bool,
+) -> Result<SchedId, NoSlot> {
+    let id = prepare(
+        func,
+        arg,
+        Start {
+            regs,
+            user,
+            fx: FxImage::initial(),
+            segments: Segments::default(),
+            cr3: 0,
+        },
+    )?;
+    wake_up_new_task(id);
+    Ok(id)
+}
+
+/// `wake_up_new_task`: the prepared task joins the tail of the run queue.
 ///
 /// # Panics
-/// Before [`init`].
-pub fn spawn_user(regs: PtRegs) -> Result<SchedId, NoSlot> {
-    spawn(None, 0, regs, true)
+/// For a handle that is not a prepared, unqueued task.
+pub fn wake_up_new_task(id: SchedId) {
+    let queued = RQ.lock().wake_up_new_task(id);
+    assert!(queued, "a fresh task is runnable");
+}
+
+/// `sched_cancel_fork`: a prepared task that will never run (the fork failed
+/// after [`prepare_fork`]); its slot and stack are free again.
+pub fn cancel_new_task(id: SchedId) {
+    let freed = RQ.lock().cancel_new_task(id);
+    debug_assert!(freed, "only a prepared task is cancelled");
+}
+
+/// `dup_task_struct` + `copy_thread` for a forked child, **not yet runnable**
+/// ([`wake_up_new_task`]): a ring-3 task whose first return to user mode has
+/// `regs`, with a copy of the calling task's live x87/SSE state and segment
+/// registers and bases, and the page tables whose root is `cr3`.
+///
+/// Context: the calling task is a ring-3 task inside a system call, IF=0, so
+/// its user FP and segment state is still live in the registers (they are
+/// saved only when it is switched out).
+///
+/// # Errors
+/// [`NoSlot`] when no scheduler slot or stack is free (fork's `-EAGAIN`).
+pub fn prepare_fork(regs: PtRegs, cr3: u64) -> Result<SchedId, NoSlot> {
+    let mut fx = FxImage::initial();
+    cpu::fpu_save(&mut fx);
+    prepare(
+        None,
+        0,
+        Start {
+            regs,
+            user: true,
+            fx,
+            segments: Segments::save(),
+            cr3,
+        },
+    )
 }
 
 /// Start the first user task and become the idle task (`rest_init`'s
@@ -308,16 +446,18 @@ pub fn spawn_user(regs: PtRegs) -> Result<SchedId, NoSlot> {
 /// runnable: never in a normal boot (the death of init ends it), once per group
 /// in the bare-metal suite, whose group end leaves the CPU for good with
 /// [`exit_current`]. `bound` receives the init task's handle before the first
-/// switch (the task model's [`Waker`](kernel::task::exit::Waker) learns which
-/// scheduling handle is init); it runs with IF clear and no scheduler lock held.
+/// switch (the task model binds it to its task and publishes init's state under
+/// it); it runs with IF clear and no scheduler lock held.
 ///
 /// # Safety
 /// BSP at CPL0, IF clear, after `cpu::install_descriptors`,
-/// `cpu::enable_syscalls` and `cpu::init_user_fpu`; the active tree maps `entry`
-/// (executable) and `sp` (writable) for the user; everything the syscall and
-/// fault paths use is in statics (`PROCESS`, `services`); the caller's frame
-/// stays on the boot stack, which only idle uses from here on.
-pub unsafe fn start_init(entry: u64, sp: u64, bound: impl FnOnce(SchedId)) {
+/// `cpu::enable_syscalls` and `cpu::init_user_fpu`; `cr3` is the root of a live
+/// page-table tree, owned by init until it exits, whose kernel half is the
+/// published one and whose user half maps `entry` (executable) and `sp`
+/// (writable) for the user; everything the syscall and fault paths use is in
+/// statics (`PROCESS`, `LOCALS`, `services`); the caller's frame stays on the
+/// boot stack, which only idle uses from here on.
+pub unsafe fn start_init(entry: u64, sp: u64, cr3: u64, bound: impl FnOnce(SchedId)) {
     // SAFETY: forwarded caller contract (BSP, CPL0, no ring-3 task yet).
     unsafe { cpu::prepare_user_segments() };
     let regs = PtRegs {
@@ -331,9 +471,36 @@ pub unsafe fn start_init(entry: u64, sp: u64, bound: impl FnOnce(SchedId)) {
         orig_ax: u64::MAX,
         ..PtRegs::default()
     };
-    let init = crate::unwrap(spawn_user(regs).map_err(|_| "no task slot"), "spawn-init");
+    let init = crate::unwrap(
+        prepare(
+            None,
+            0,
+            Start {
+                regs,
+                user: true,
+                fx: FxImage::initial(),
+                segments: Segments::default(),
+                cr3,
+            },
+        )
+        .map_err(|_| "no task slot"),
+        "spawn-init",
+    );
     bound(init);
-    idle_loop(|| state(init).is_none());
+    wake_up_new_task(init);
+    // Gone, or dead because `abandon_group` ended the whole group from another
+    // task's context (its slot is released by `reset_group`, not by a switch).
+    idle_loop(|| state(init).is_none_or(|s| s == TaskState::Dead));
+}
+
+/// Record `cr3` as the tree of the running task (it is already loaded): the
+/// task moved to another tree itself, as `exit_mm` does. Context: task, IF=0.
+pub fn set_current_cr3(cr3: u64) {
+    let slot = RQ.lock().curr().index();
+    // SAFETY: module `Threads` argument (b): IF=0 on the single CPU, and the
+    // running task's own `Thread` is read only by the switch-in/out code that
+    // runs in this task's context.
+    unsafe { (*thread(slot)).cr3 = cr3 };
 }
 
 /// `current`, as a handle.
@@ -369,10 +536,37 @@ pub fn wake_up_key(key: WaitKey, mode: WakeMode, nr_exclusive: usize) -> usize {
     RQ.lock().wake_up_key(key, mode, nr_exclusive)
 }
 
-/// `signal_wake_up`: wake an interruptible sleeper (the signal sender calls it
-/// after queueing the signal). Whether it was asleep.
-pub fn signal_wake_up(id: SchedId) -> bool {
-    RQ.lock().wake_interruptible(id)
+/// `signal_wake_up(t, resume)`: wake an interruptible sleeper (the signal
+/// sender calls it after queueing the signal); with `resume` (a fatal signal,
+/// `TASK_WAKEKILL`) a job-control-stopped task too. Whether it was asleep.
+pub fn signal_wake_up(id: SchedId, resume: bool) -> bool {
+    RQ.lock().signal_wake_up_state(id, resume)
+}
+
+/// `wake_up_state(t, __TASK_STOPPED)`: `SIGCONT` ends a job-control stop.
+/// Whether the task was stopped.
+pub fn wake_stopped(id: SchedId) -> bool {
+    RQ.lock().wake_stopped(id)
+}
+
+/// The tail of `do_signal_stop`: `set_special_state(TASK_STOPPED)` and
+/// `schedule()`. The current task leaves the CPU until [`wake_stopped`]
+/// (`SIGCONT`) or a fatal signal's [`signal_wake_up`] with `resume` ends the
+/// stop, then returns. The caller has decided to stop (no fatal signal was
+/// pending) with IF=0 just before, so nothing can wake the task between the
+/// state change and the switch (single CPU, no preemption of ring 0).
+///
+/// Context: task, IF=0, no lock held (nothing is held across `schedule()`).
+///
+/// # Panics
+/// With interrupts enabled, before [`init`], or from the idle task.
+pub fn stop_current() {
+    assert!(
+        !cpu::interrupts_enabled(),
+        "stop_current with interrupts on"
+    );
+    RQ.lock().stop_current();
+    schedule();
 }
 
 /// `schedule()`: give the CPU to the next runnable task, or to idle. A caller
@@ -476,9 +670,29 @@ fn context_switch(switch: Switch) {
             (*prev_thread).segments = Segments::save();
         }
         (*prev_thread).bad_iret_depth = cpu::swap_bad_iret_depth((*next_thread).bad_iret_depth);
+        // `switch_mm_irqs_off`: a task with its own tree gets it; the others
+        // (idle, kernel threads) run on whichever is active (`active_mm`).
+        let next_cr3 = (*next_thread).cr3;
+        if next_cr3 != 0 && cpu::active_tables() != next_cr3 {
+            // `next_cr3` is the root of `next`'s page tables, alive until
+            // `next` exits (exit_mm moves CR3 to the kernel tree first and only
+            // then frees them); its kernel half is a copy of the published one,
+            // so every address this code uses (text, this and the next kernel
+            // stack, descriptors, the heap) stays mapped; IF=0 on the BSP; no
+            // PCID or global translations exist: `activate_tables`' contract.
+            cpu::activate_tables(next_cr3);
+        }
         if (*next_thread).user {
             cpu::fpu_restore(&(*next_thread).fx);
             (*next_thread).segments.load();
+        }
+        // `sched_info`/`update_rq_clock` for the two: off the CPU is not their time.
+        let now = timer::ktime_get_ns();
+        if prev != 0 {
+            CPU_TIME[prev].sleep_begin(now);
+        }
+        if next != 0 {
+            CPU_TIME[next].sleep_end(now);
         }
         cpu::set_kernel_stack(stack_top(next));
         SWITCH_PREV.store(switch.prev.to_raw(), Ordering::Relaxed);
@@ -518,6 +732,8 @@ pub(crate) extern "C" fn ret_from_fork(
 /// `do_task_dead`: the current task is finished. It leaves the CPU for good;
 /// the next task releases its slot and stack ([`finish_task_switch`]).
 pub fn exit_current() -> ! {
+    #[cfg(feature = "qemu-self-test")]
+    selftest::note_stack_depth(RQ.lock().curr());
     RQ.lock().exit_current();
     schedule();
     // A dead task is never queued, so `schedule` cannot return here.

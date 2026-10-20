@@ -1370,10 +1370,11 @@ pub fn unexpected_interrupt() -> ! {
 //
 // Kernel stack: ring-3 -> ring-0 transitions of every kind (exception, IRQ and
 // SYSCALL) run on the top of the running task's own kernel stack, a slot of the
-// `KSTACKS` pool (4 KiB unmapped guard page, 64 KiB usable; the deepest path, a
-// 2 KiB tty chunk plus formatting, is far below that), whose top `ktask` makes
-// both `TSS.RSP0` and `KERNEL_STACK_TOP` on every switch. The boot stack is the
-// idle task's. NMI, #DF, #MC and #DB keep their IST stacks.
+// `KSTACKS` pool (4 KiB unmapped guard page, 64 KiB usable; the deepest path
+// measured, `fork` at 15,424 bytes by `ktask::selftest`'s `CHECK kstack-usage`,
+// is under a quarter of that), whose top `ktask` makes both `TSS.RSP0` and
+// `KERNEL_STACK_TOP` on every switch. The boot stack is the idle task's. NMI,
+// #DF, #MC and #DB keep their IST stacks.
 
 /// Linux `struct pt_regs` (arch/x86/include/asm/ptrace.h, GPL-2.0), lowest
 /// address first: the layout `syscall_entry` and the exception/interrupt

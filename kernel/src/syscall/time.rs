@@ -103,6 +103,9 @@ pub enum RestartFn {
     Hrtimer,
     /// `alarm_timer_nsleep_restart`.
     Alarm,
+    /// `do_restart_poll` (`syscall::poll`): `rmtp` is `ufds`, `clockid` the
+    /// bits of `nfds`, `expires_ns` the absolute end (-1: no timeout).
+    Poll,
 }
 
 /// The `restart_block.nanosleep` fields `nanosleep`/`clock_nanosleep` fill.
@@ -216,7 +219,13 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
             Err(Never) => return Some(Outcome::Unimplemented(sysno as u32)),
         },
         Sysno::nanosleep => nanosleep(ctx, args[0], args[1]),
-        Sysno::restart_syscall => restart_syscall(ctx),
+        Sysno::restart_syscall => {
+            let block = ctx.restart_block();
+            if block.func == RestartFn::Poll {
+                return Some(super::poll::restart(ctx, block, sysno));
+            }
+            restart_syscall(ctx)
+        }
         Sysno::gettimeofday => gettimeofday(ctx, args[0], args[1]),
         Sysno::time => time(ctx, args[0]),
         Sysno::times => times(ctx, args[0]),
@@ -536,7 +545,8 @@ fn restart_syscall<C: Context>(ctx: &mut C) -> i64 {
     // `restart->nanosleep.clockid`: the hrtimer clock id (1 monotonic, 7
     // boottime, 11 TAI) or the `alarmtimer_type` (0 realtime, 1 boottime).
     let kclock = match (block.func, block.clockid) {
-        (RestartFn::None, _) => return error(Errno::EINTR),
+        // `do_restart_poll` is dispatched before this function.
+        (RestartFn::None | RestartFn::Poll, _) => return error(Errno::EINTR),
         (RestartFn::Hrtimer, 1) => Kclock::Monotonic,
         (RestartFn::Hrtimer, 7) => Kclock::Boottime,
         (RestartFn::Hrtimer, _) => Kclock::Tai,

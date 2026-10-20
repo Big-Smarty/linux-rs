@@ -46,6 +46,12 @@ fn synced<T: Task>(task: &mut T) -> State<'_> {
     state
 }
 
+/// `signal_pending(current)` after the timers are brought up to date: an
+/// `ITIMER_REAL` that expired is `SIGALRM` pending before the answer.
+pub fn signal_pending_synced<T: Task>(task: &mut T) -> bool {
+    synced(task).signal_pending()
+}
+
 /// `-ERESTARTSYS` (512): what an interruptible wait returns when a signal is
 /// pending; the return path turns it into `-EINTR` (handler without
 /// `SA_RESTART`) or restarts the call.

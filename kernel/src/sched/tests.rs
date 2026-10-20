@@ -197,6 +197,31 @@ fn reset_drops_every_task_and_returns_to_idle() {
 }
 
 #[test]
+fn abandon_kills_every_task_and_the_next_schedule_is_idle() {
+    let mut rq = rq(6);
+    let [a, b, c] = [spawn(&mut rq), spawn(&mut rq), spawn(&mut rq)];
+    assert_eq!(rq.schedule().unwrap().next, a);
+    rq.prepare_to_wait(key(1), TaskState::Interruptible);
+    assert_eq!(rq.schedule().unwrap().next, b);
+    // b is current, c is queued, a sleeps.
+    rq.abandon();
+    assert!(!rq.has_runnable());
+    for id in [a, b, c] {
+        assert_eq!(rq.state(id), Some(TaskState::Dead));
+    }
+    // Nothing wakes a dead task, by key or directly.
+    assert_eq!(rq.wake_up_key(key(1), WakeMode::Normal, 0), 0);
+    assert!(!rq.try_to_wake_up(a) && !rq.wake_interruptible(c));
+    let switch = rq.schedule().unwrap();
+    assert_eq!((switch.prev, switch.next), (b, rq.idle()));
+    assert!(rq.free(b));
+    assert_eq!(rq.schedule(), None);
+    assert_eq!(rq.nr_active(), 0);
+    rq.reset();
+    assert_eq!(rq.state(a), None);
+}
+
+#[test]
 fn signal_wakes_interruptible_only() {
     let mut rq = rq(4);
     let [a, b] = [spawn(&mut rq), spawn(&mut rq)];
@@ -288,4 +313,62 @@ fn a_new_task_cannot_be_queued_twice() {
     let a = spawn(&mut rq);
     assert!(!rq.wake_up_new_task(a));
     assert!(!rq.wake_up_new_task(rq.idle()));
+}
+
+#[test]
+fn a_task_that_never_ran_can_be_cancelled_and_its_slot_reused() {
+    // sched_cancel_fork: only a fresh, unqueued task.
+    let mut rq = rq(3);
+    let fresh = rq.add_task().unwrap();
+    let queued = spawn(&mut rq);
+    assert!(
+        !rq.cancel_new_task(queued),
+        "queued tasks are not cancelled"
+    );
+    assert!(!rq.cancel_new_task(rq.idle()));
+    assert!(rq.cancel_new_task(fresh));
+    assert_eq!(rq.state(fresh), None, "the handle is stale");
+    assert!(!rq.cancel_new_task(fresh));
+    // The slot is free again, with a new generation.
+    let again = rq.add_task().unwrap();
+    assert_eq!(again.index(), fresh.index());
+    assert_ne!(again, fresh);
+    assert_eq!(rq.add_task(), Err(NoSlot));
+    // A running task is not cancellable either.
+    assert_eq!(rq.schedule().unwrap().next, queued);
+    assert!(!rq.cancel_new_task(queued));
+}
+
+#[test]
+fn a_stopped_task_leaves_the_queue_and_only_sigcont_or_a_fatal_signal_wakes_it() {
+    // TASK_STOPPED = __TASK_STOPPED | TASK_WAKEKILL (do_signal_stop's set_special_state).
+    let mut rq = rq(6);
+    let [a, b] = [spawn(&mut rq), spawn(&mut rq)];
+    assert_eq!(rq.schedule().unwrap().next, a);
+    rq.stop_current();
+    let switch = rq.schedule().unwrap();
+    assert_eq!((switch.prev, switch.next), (a, b));
+    assert_eq!(rq.state(a), Some(TaskState::Stopped));
+    // Not on the queue, not counted as load (only uninterruptible sleepers are).
+    assert_eq!(rq.nr_active(), 1);
+    // No key, no TASK_NORMAL wake-up, no ordinary signal wake-up reaches it.
+    assert_eq!(rq.wake_up_key(WaitKey::NONE, WakeMode::Normal, 0), 0);
+    assert!(!rq.try_to_wake_up(a));
+    assert!(!rq.wake_interruptible(a));
+    assert!(!rq.signal_wake_up_state(a, false));
+    assert_eq!(rq.state(a), Some(TaskState::Stopped));
+    // SIGCONT wakes only a stopped task; a fatal signal (resume) wakes it too.
+    assert!(!rq.wake_stopped(b), "b is running");
+    assert!(rq.wake_stopped(a));
+    assert_eq!(rq.state(a), Some(TaskState::Running));
+    assert!(!rq.wake_stopped(a), "once");
+    // It runs again in queue order.
+    rq.prepare_to_wait(key(1), TaskState::Interruptible);
+    assert_eq!(rq.schedule().unwrap().next, a);
+    rq.stop_current();
+    assert_eq!(rq.schedule().unwrap().next, rq.idle());
+    assert!(rq.signal_wake_up_state(a, true));
+    assert!(rq.has_runnable());
+    // An interruptible sleeper still wakes without `resume`.
+    assert!(rq.signal_wake_up_state(b, false));
 }

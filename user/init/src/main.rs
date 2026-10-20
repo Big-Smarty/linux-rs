@@ -318,6 +318,14 @@ fn run(stack: &Stack) {
     if stack.argv.iter().nth(1) == Some(b"execd".as_slice()) {
         tests::proc::execd(stack.argv, stack.envp);
     }
+    // The image of the `fork` group's exec-id check: also silent, and exits with a signal number.
+    if stack.argv.iter().nth(1) == Some(b"execsig".as_slice()) {
+        tests::fork::execsig(stack.argv);
+    }
+    // The image of the `jobctl` group's `setpgid`-after-`execve` check: silent too.
+    if stack.argv.iter().nth(1) == Some(b"jobwait".as_slice()) {
+        tests::jobctl::jobwait();
+    }
     out!("init: {stack:?}");
 
     expect("rsp_mod16", stack.sp % 16, 0);
@@ -418,6 +426,46 @@ fn run(stack: &Stack) {
                 core::hint::spin_loop();
             }
         }
+        // Group ends in the context of a child: init sleeps in `wait4` while the child
+        // spins, so the group's time bound finds the child on the CPU (the suite must
+        // end the whole group, not just that task), and `orphan` exits init while the
+        // child still spins (the next group must still start).
+        Some(b"spinchild") => {
+            out!("init: child spinning on purpose");
+            fork_spinner();
+            // SAFETY: wait4 for any child, no status pointer, no options, no rusage.
+            let _ = unsafe { syscalls::syscall4(Sysno::wait4, usize::MAX, 0, 0, 0) };
+        }
+        Some(b"orphan") => {
+            out!("init: leaving an orphan spinning");
+            fork_spinner();
+        }
+        // Every task asleep and nothing to wake it: init reads an empty pipe whose write
+        // end it holds itself, as Linux would sleep on it forever. The suite's time bound
+        // must end the group from the idle CPU.
+        Some(b"block") => {
+            out!("init: blocking on an empty pipe on purpose");
+            let mut fds = [0u32; 2];
+            // SAFETY: `fds` is a live 8-byte buffer for the two descriptors; a one-byte
+            // read into a live stack byte.
+            let (made, read) = unsafe {
+                let made = syscalls::syscall2(
+                    Sysno::pipe2,
+                    ptr::from_mut(&mut fds).expose_provenance(),
+                    0,
+                );
+                let mut byte = 0u8;
+                let read = syscalls::syscall3(
+                    Sysno::read,
+                    fds[0] as usize,
+                    ptr::from_mut(&mut byte).expose_provenance(),
+                    1,
+                );
+                (made, read)
+            };
+            expect("block-pipe", made, Ok(0));
+            fail("block", read);
+        }
         Some(b"fault") => {
             out!("init: faulting on purpose");
             // SAFETY: not sound, deliberately: the read of address 0 must raise SIGSEGV.
@@ -462,11 +510,23 @@ fn run(stack: &Stack) {
             demand_paging();
             out!("init: demand ok");
         }
-        // Oracle syscall suite groups (`user/init/src/tests`): `mm ids time signal fs proc`.
+        // Oracle syscall suite groups (`user/init/src/tests`): `mm ids time signal fs proc fork jobctl pipe`.
         Some(mode) if tests::run_mode(mode) => {}
         _ => {}
     }
     out!("init: ok");
+}
+
+/// Forks a child that spins for ever; returns its pid in the parent.
+fn fork_spinner() -> usize {
+    // SAFETY: fork takes no arguments and no pointers; the child touches nothing shared.
+    match Errno::from_ret(unsafe { raw::syscall0(Sysno::fork as usize) }) {
+        Ok(0) => loop {
+            core::hint::spin_loop();
+        },
+        Ok(pid) => pid,
+        Err(error) => fail("fork", error),
+    }
 }
 
 /// Page faults taken by init itself, in ring 3: demand-zero read and write faults on a fresh

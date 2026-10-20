@@ -194,6 +194,47 @@ impl Vfs {
         }
     }
 
+    /// `copy_fs_struct`: a forked child's own `fs_struct` with the same root,
+    /// working directory and umask; each directory gets a new reference
+    /// (`get_fs_root`, `get_fs_pwd`).
+    pub fn dup_fs(&mut self, fs: &FsStruct) -> FsStruct {
+        self.fs.iget(fs.root);
+        self.fs.iget(fs.pwd);
+        *fs
+    }
+
+    /// `exit_fs` -> `free_fs_struct`: the task's references on its root and
+    /// working directory are dropped.
+    pub fn put_fs(&mut self, fs: &FsStruct) {
+        self.fs.iput(fs.root);
+        self.fs.iput(fs.pwd);
+    }
+
+    /// `dup_fd` (`copy_files`): the child's descriptor table, every open
+    /// description gaining a reference (`get_file`). Pipe ends are counted per
+    /// description, not per descriptor, so they do not change.
+    ///
+    /// # Errors
+    /// `ENOMEM`; nothing changed.
+    pub fn dup_fd(&mut self, fdt: &super::FdTable) -> KResult<super::FdTable> {
+        let child = fdt.duplicate()?;
+        for (_, file, _) in child.iter() {
+            self.files.dup(file);
+        }
+        Ok(child)
+    }
+
+    /// `close_files` (`exit_files`): every descriptor is closed in ascending
+    /// order and its description released.
+    pub fn close_files(&mut self, fdt: &mut super::FdTable) {
+        let fds = u32::try_from(fdt.max_fds()).unwrap_or(u32::MAX);
+        for fd in 0..fds {
+            if let Some(file) = fdt.close(fd) {
+                self.fput(file);
+            }
+        }
+    }
+
     /// The caller's `fs_struct` update (`set_fs_pwd`): pins the new directory
     /// before dropping the old one.
     pub fn set_pwd(&mut self, fs: &mut FsStruct, dir: InodeId) {
@@ -874,14 +915,28 @@ impl Vfs {
             .expect("stale pipe handle")
     }
 
-    /// Mutable access to a pipe.
+    /// Mutable access to a pipe. Counts as a state change for the sleepers of
+    /// the pipe ([`Vfs::take_pipe_events`]): data written or consumed, the
+    /// capacity changed.
     ///
     /// # Panics
     /// On a stale handle (a kernel bug).
     pub fn pipe_mut(&mut self, id: super::PipeId) -> &mut Pipe {
+        self.pipe_events = self.pipe_events.wrapping_add(1);
         self.pipes[id.0 as usize]
             .as_mut()
             .expect("stale pipe handle")
+    }
+
+    /// Whether any pipe changed since the last call: the owner of the
+    /// scheduler then wakes the pipe sleepers (`wake_up_interruptible` on
+    /// `rd_wait`/`wr_wait`, which the pure VFS cannot do), before it sleeps
+    /// itself and when the system call ends. A pipe end released (`pipe_release`
+    /// wakes both queues) is a change too.
+    pub fn take_pipe_events(&mut self) -> bool {
+        let changed = self.pipe_events != self.pipe_events_seen;
+        self.pipe_events_seen = self.pipe_events;
+        changed
     }
 
     /// Shared access for the syscall layer.

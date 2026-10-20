@@ -33,6 +33,7 @@ mod fs;
 mod ids;
 mod io;
 mod memory;
+mod poll;
 mod process;
 mod signal;
 #[cfg(test)]
@@ -45,7 +46,9 @@ use crate::{
     config,
     exec::load::Pager,
     mm::{Env, Mm},
-    task::{Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE, TaskId, Tasklist, exit::Waker},
+    task::{
+        Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE, TaskId, Tasklist, exit::Waker, fork::ForkRequest,
+    },
     usercopy::UserPages,
     vfs::{Cred, FdTable, FileId, FsStruct, Vfs, mapping::Mappable},
 };
@@ -76,6 +79,9 @@ pub struct Files<'a> {
     pub vfs: &'a mut Vfs,
     pub fdt: &'a mut FdTable,
     pub fs: &'a mut FsStruct,
+    /// The address space whose mappings pin open files (`mm`): the key of
+    /// [`Vfs::pin`]. Every task has its own.
+    pub owner: u32,
 }
 
 /// The task list and the caller's place in it (`current`), with the way to
@@ -147,6 +153,17 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     /// `current->files`, `current->fs` (the same value as `attrs().fs`) and the
     /// mounted rootfs.
     fn files(&mut self) -> Files<'_>;
+    /// `copy_process` followed by `wake_up_new_task` for a plain process copy
+    /// ([`ForkRequest`]): the child gets its own copy of the address space,
+    /// descriptor table, `fs_struct` and signal state, joins the task list as
+    /// a child of the caller and becomes runnable; its first return to user
+    /// mode has `rax` 0. The pure argument checks and the pending-signal
+    /// restart are the caller's. Returns the child's pid.
+    ///
+    /// # Errors
+    /// `EAGAIN` (`max_threads`, `RLIMIT_NPROC`, pid space, no task slot or
+    /// kernel stack), `ENOMEM`, as `copy_process`.
+    fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, Errno>;
     /// `current_cred()` as the VFS needs it.
     fn cred(&mut self) -> Cred {
         Cred::of_task(&self.attrs().cred)
@@ -196,18 +213,12 @@ pub enum Outcome {
     Exit { code: u32, group: bool },
     /// A syscall inside Linux's table that this slice does not implement.
     Unimplemented(u32),
-    /// The single task would sleep (an empty pipe, a full pipe, console input)
-    /// and there is no other task or interrupt-driven source to wake it:
-    /// Linux would block forever, so the kernel stops loudly.
-    Blocked(u32),
 }
 
 /// Why a file syscall ends other than with a value (internal to the groups).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stop {
     Errno(Errno),
-    /// [`Outcome::Blocked`].
-    Blocked,
     /// A Linux behaviour that is not ported yet ([`Outcome::Unimplemented`]).
     Unimplemented,
 }
@@ -226,7 +237,6 @@ pub(crate) fn outcome(number: u32, result: Sys) -> Outcome {
     match result {
         Ok(value) => Outcome::Return(value),
         Err(Stop::Errno(errno)) => Outcome::Return(error(errno)),
-        Err(Stop::Blocked) => Outcome::Blocked(number),
         Err(Stop::Unimplemented) => Outcome::Unimplemented(number),
     }
 }
@@ -254,6 +264,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
     // One line per group, in table order of their first number.
     let outcome = fd::dispatch(ctx, sysno, args)
         .or_else(|| fs::dispatch(ctx, sysno, args))
+        .or_else(|| poll::dispatch(ctx, sysno, args))
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
         .or_else(|| exec::dispatch(ctx, sysno, args))

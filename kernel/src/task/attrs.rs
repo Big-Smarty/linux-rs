@@ -34,8 +34,12 @@ pub const RLIMIT_CPU: usize = 0;
 pub const RLIMIT_FSIZE: usize = 1;
 /// `RLIMIT_STACK`.
 pub const RLIMIT_STACK: usize = 3;
+/// `RLIMIT_NPROC`.
+pub const RLIMIT_NPROC: usize = 6;
 /// `RLIMIT_NOFILE`.
 pub const RLIMIT_NOFILE: usize = 7;
+/// `RLIMIT_SIGPENDING`.
+pub const RLIMIT_SIGPENDING: usize = 11;
 /// `sysctl_nr_open` (fs/file.c:96), the ceiling `RLIMIT_NOFILE`'s hard limit may reach.
 pub const NR_OPEN: u64 = 1024 * 1024;
 
@@ -204,8 +208,10 @@ pub struct Attributes {
     pub comm: [u8; COMM_LEN],
     /// `task_struct::personality` (`PER_LINUX = 0`).
     pub personality: u32,
-    /// `task_struct::clear_child_tid` (`set_tid_address`). Nothing clears it
-    /// yet: that is `mm_release` at exit, which a single immortal init lacks.
+    /// `task_struct::clear_child_tid` (`set_tid_address`, `CLONE_CHILD_CLEARTID`).
+    /// Exit does not process it (`mm_release` writes 0 and wakes the futex
+    /// only when `mm_users > 1`; every mm here is private, so it is
+    /// unobservable until `CLONE_VM` exists).
     pub clear_child_tid: u64,
     /// `task_struct::robust_list` (`set_robust_list`), walked at exit only.
     pub robust_list: u64,

@@ -21,7 +21,7 @@ use super::{
         SIGNAL_STOP_STOPPED,
     },
     pid::{PidId, PidType},
-    tasklist::{ExitState, JOBCTL_STOPPED, TaskId, Tasklist},
+    tasklist::{ExitState, TaskId, Tasklist},
 };
 use crate::signal::{SIGCHLD, SIGCONT, deliver::ERESTARTSYS};
 use syscalls::Errno;
@@ -340,8 +340,10 @@ impl Tasklist {
         }
         let pid = self.task_pid_vnr(p);
         let Some(t) = self.task_mut(p) else { return 0 };
-        // task_stopped_code: `SIGNAL_STOP_STOPPED` and the task in `__TASK_STOPPED`.
-        if t.jobctl & JOBCTL_STOPPED == 0 || t.signals.signal.job_flags & SIGNAL_STOP_STOPPED == 0 {
+        // task_stopped_code (not ptraced): `SIGNAL_STOP_STOPPED`, whatever the
+        // task's own state (a stopped child that `SIGKILL` woke is still reported
+        // until it exits).
+        if t.signals.signal.job_flags & SIGNAL_STOP_STOPPED == 0 {
             return 0;
         }
         let exit_code = t.signals.signal.stop_code;

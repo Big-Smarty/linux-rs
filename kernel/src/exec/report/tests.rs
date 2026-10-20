@@ -43,6 +43,7 @@ fn init_death_and_no_init_text_are_linux_exact() {
 fn segfault_line_matches_the_oracle_byte_for_byte() {
     let mm = loaded_oracle();
     let line = Segfault {
+        pid: 1,
         address: 0,
         ip: 0x20_55b4,
         sp: 0x7ffd_2010_a150,
@@ -60,6 +61,7 @@ fn segfault_line_matches_the_oracle_byte_for_byte() {
 fn segfault_outside_a_file_mapping_has_no_vma_part_and_kernel_addresses_look_like_prot() {
     let mm = loaded_oracle();
     let line = Segfault {
+        pid: 1,
         address: 0xffff_8000_0000_1000,
         ip: 0x7fff_ffff_e000,
         sp: 0x7fff_ffff_ee40,
@@ -72,6 +74,7 @@ fn segfault_outside_a_file_mapping_has_no_vma_part_and_kernel_addresses_look_lik
     );
     // The bss/heap side of the last data page, and the byte past a region.
     let inside = Segfault {
+        pid: 1,
         address: 0,
         ip: 0x20_cfff,
         sp: 0,
@@ -80,6 +83,7 @@ fn segfault_outside_a_file_mapping_has_no_vma_part_and_kernel_addresses_look_lik
     };
     assert!(inside.to_string().contains(" in init[9fff,20c000+1000]"));
     let past = Segfault {
+        pid: 1,
         address: 0,
         ip: 0x20_d000,
         sp: 0,
@@ -125,6 +129,7 @@ fn user_exceptions_map_to_linux_signals_and_messages() {
 fn trap_line_formats_like_show_signal() {
     let mm = loaded_oracle();
     let line = TrapLine {
+        pid: 1,
         kind: "",
         desc: "general protection fault",
         ip: 0x20_55b4,
@@ -137,6 +142,7 @@ fn trap_line_formats_like_show_signal() {
         "traps: init[1] general protection fault ip:2055b4 sp:7ffd2010a150 error:0 in init[45b4,204000+7000]"
     );
     let divide = TrapLine {
+        pid: 1,
         kind: "trap ",
         desc: "divide error",
         ip: 1,
@@ -156,6 +162,7 @@ fn bad_frame_line_matches_the_pinned_kernel() {
     // `signal_fault` on the pinned 6.18.57 (target/sigfix-linux/linux-smoke-tcg.log: the
     // `signals` smoke's rt_sigreturn with `rsp` at 0x1000), minus the `[ time]` prefix.
     let line = BadFrame {
+        pid: 1,
         ip: 0x20_55b4,
         sp: 0x1000,
         orig_ax: 0xf,
@@ -164,5 +171,43 @@ fn bad_frame_line_matches_the_pinned_kernel() {
     assert_eq!(
         line.to_string(),
         "init[1] bad frame in rt_sigreturn frame:(____ptrval____) ip:2055b4 sp:1000 orax:f in init[45b4,204000+7000]"
+    );
+}
+
+#[test]
+fn the_lines_name_the_pid_of_the_faulting_task() {
+    let line = Segfault {
+        pid: 42,
+        address: 8,
+        ip: 0x20_55b4,
+        sp: 0x7ffd_2010_a150,
+        error: 4,
+        region: None,
+    };
+    assert!(line.to_string().starts_with("init[42]: segfault at 8 ip "));
+    let trap = TrapLine {
+        pid: 7,
+        kind: "trap ",
+        desc: "int3",
+        ip: 1,
+        sp: 2,
+        error: 0,
+        region: None,
+    };
+    assert_eq!(
+        trap.to_string(),
+        "traps: init[7] trap int3 ip:1 sp:2 error:0"
+    );
+    let frame = BadFrame {
+        pid: 300,
+        ip: 1,
+        sp: 2,
+        orig_ax: 3,
+        region: None,
+    };
+    assert!(
+        frame
+            .to_string()
+            .starts_with("init[300] bad frame in rt_sigreturn")
     );
 }

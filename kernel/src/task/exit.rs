@@ -6,7 +6,8 @@
 // `find_child_reaper`/`find_new_reaper` 608-682, `kill_orphaned_pgrp` 408-431,
 // `will_become_orphaned_pgrp` 361-378, `has_stopped_jobs` 391-402),
 // kernel/signal.c (`do_notify_parent` 2254-2345, `do_notify_parent_cldstop`
-// 2365-2420, `__wake_up_parent`). All GPL-2.0-only.
+// 2365-2420, `__wake_up_parent`; the `parent_exec_id` fallback to SIGCHLD is
+// 2273-2279). All GPL-2.0-only.
 // Transformation: one thread per group, no ptrace, no subreapers, no
 // `pdeath_signal` (nothing sets it), no coredump; `release_task` of an
 // auto-reaped task is immediate (Linux defers it past the `tasklist_lock`
@@ -24,27 +25,17 @@ use super::{
     tasklist::{ExitState, PF_EXITING, PF_SIGNALED, TaskId, Tasklist},
 };
 use crate::{
-    sched::{CLASS_CHLDEXIT, WaitKey},
+    sched::{CLASS_CHLDEXIT, SchedId, WaitKey},
     signal::{
-        SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, info::SigInfo, state::Target,
+        NSIG, SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, info::SigInfo,
+        state::Target,
     },
 };
 
-/// `SIGNAL_STOP_STOPPED`: a job-control stop is in effect.
-pub const SIGNAL_STOP_STOPPED: u32 = 0x1;
-/// `SIGNAL_STOP_CONTINUED`: `SIGCONT` since the last `WCONTINUED` report.
-pub const SIGNAL_STOP_CONTINUED: u32 = 0x2;
-/// `SIGNAL_CLD_STOPPED`: the parent owes a stop notification.
-pub const SIGNAL_CLD_STOPPED: u32 = 0x10;
-/// `SIGNAL_CLD_CONTINUED`: the parent owes a continue notification.
-pub const SIGNAL_CLD_CONTINUED: u32 = 0x20;
-
-/// `CLD_*` (`si_code` of `SIGCHLD`).
-pub const CLD_EXITED: i32 = 1;
-pub const CLD_KILLED: i32 = 2;
-pub const CLD_DUMPED: i32 = 3;
-pub const CLD_STOPPED: i32 = 5;
-pub const CLD_CONTINUED: i32 = 6;
+pub use crate::signal::jobctl::{
+    CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, SIGNAL_CLD_CONTINUED,
+    SIGNAL_CLD_STOPPED, SIGNAL_STOP_CONTINUED, SIGNAL_STOP_STOPPED,
+};
 
 /// `USER_HZ`: `clock_t` ticks per second in `siginfo` and `times`.
 const USER_HZ: u64 = 100;
@@ -56,8 +47,14 @@ pub trait Waker {
     /// `__wake_up_parent`: a child of `parent` changed state (exited, stopped,
     /// continued): `wait4`/`waitid` sleepers of `parent` re-check.
     fn child_event(&mut self, parent: TaskId);
-    /// `signal_wake_up`: `task` has a signal queued.
-    fn signal_wake(&mut self, task: TaskId);
+    /// `signal_wake_up(t, resume)`: `task` has a signal queued. `sched` is its
+    /// scheduling handle ([`Tasklist::set_sched`]), `None` for a task that has
+    /// none bound (the host fakes). `resume` (`TASK_WAKEKILL`) is set when the
+    /// signal is fatal, so a job-control-stopped task wakes to die.
+    fn signal_wake(&mut self, task: TaskId, sched: Option<SchedId>, resume: bool);
+    /// `wake_up_state(t, __TASK_STOPPED)`: `SIGCONT` ended `task`'s job-control
+    /// stop (`prepare_signal`).
+    fn wake_stopped(&mut self, task: TaskId, sched: Option<SchedId>);
 }
 
 /// The wait queue `signal_struct::wait_chldexit` of `parent`'s thread group:
@@ -74,7 +71,8 @@ pub struct NoWake;
 
 impl Waker for NoWake {
     fn child_event(&mut self, _parent: TaskId) {}
-    fn signal_wake(&mut self, _task: TaskId) {}
+    fn signal_wake(&mut self, _task: TaskId, _sched: Option<SchedId>, _resume: bool) {}
+    fn wake_stopped(&mut self, _task: TaskId, _sched: Option<SchedId>) {}
 }
 
 /// Why a task cannot go through [`Tasklist::exit_notify`].
@@ -132,13 +130,13 @@ impl Tasklist {
     /// `PF_SIGNALED` (killed by a signal).
     pub fn exit_prepare(&mut self, task: TaskId, code: u32, signaled: bool) -> ExitPrep {
         let init = self.is_global_init(task);
-        let Some(state) = self.signal_state(task) else {
+        let Some(mut state) = self.signal_state(task) else {
             return ExitPrep::Proceed { group_dead: true };
         };
         // synchronize_group_exit: the last thread starts the group exit if
         // nobody did; `signal->flags = SIGNAL_GROUP_EXIT` drops the stop bits.
         if state.sig.group_exit.is_none() {
-            state.sig.start_group_exit(code);
+            state.start_group_exit(code);
         }
         let group_code = state.sig.group_exit.unwrap_or(0);
         // The one thread: `live` drops to zero.
@@ -282,7 +280,7 @@ impl Tasklist {
         } else {
             (CLD_EXITED, exit_code >> 8)
         };
-        let info = SigInfo::chld(
+        let mut info = SigInfo::chld(
             code,
             pid,
             uid,
@@ -291,6 +289,16 @@ impl Tasklist {
             clock_t(cpu.1),
         );
         let mut sig = sig;
+        // "This is only possible if parent == real_parent. Check if it has
+        // changed security domain." (kernel/signal.c:2273-2279)
+        if sig != SIGCHLD
+            && self.task(tsk).map(|t| t.parent_exec_id) != self.task(parent).map(|p| p.self_exec_id)
+        {
+            sig = SIGCHLD;
+        }
+        // `info.si_signo = sig`: a `clone` exit signal other than SIGCHLD carries
+        // the same `_sigchld` payload.
+        info.signo = i32::from(sig);
         let mut autoreap = false;
         if let Some(mut state) = self.signal_state(parent) {
             let action = state.hand.actions[usize::from(SIGCHLD) - 1];
@@ -302,10 +310,13 @@ impl Tasklist {
                     sig = 0;
                 }
             }
-            if sig != 0 {
+            // `valid_signal(sig) && sig`: a `clone` exit signal above `_NSIG` is
+            // never sent (it is not checked at the syscall).
+            if sig != 0 && sig <= NSIG {
                 // Only a real-time signal sent with `si_code < 0` can fail.
                 let _ = state.send_signal(sig, info, Target::Process);
-                w.signal_wake(parent);
+                let sched = self.sched_of(parent);
+                w.signal_wake(parent, sched, false);
             }
         }
         w.child_event(parent);
@@ -340,7 +351,8 @@ impl Tasklist {
             let action = state.hand.actions[usize::from(SIGCHLD) - 1];
             if action.handler != SIG_IGN && action.flags & SA_NOCLDSTOP == 0 {
                 let _ = state.send_signal(SIGCHLD, info, Target::Process);
-                w.signal_wake(parent);
+                let sched = self.sched_of(parent);
+                w.signal_wake(parent, sched, false);
             }
         }
         w.child_event(parent);

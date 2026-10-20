@@ -36,9 +36,12 @@ use syscalls::{Errno, Sysno};
 
 use crate::exit;
 
+pub mod fork;
 pub mod fs;
 pub mod ids;
+pub mod jobctl;
 pub mod mm;
+pub mod pipe;
 pub mod proc;
 pub mod signal;
 pub mod smoke;
@@ -223,6 +226,18 @@ impl T {
         }
     }
 
+    /// The checks passed and failed so far.
+    pub fn counts(&self) -> (u32, u32) {
+        (self.passed, self.failed)
+    }
+
+    /// Adds the counts of checks another process of the group printed (a child that ran part of
+    /// the group and handed its totals back).
+    pub fn add(&mut self, passed: u32, failed: u32) {
+        self.passed += passed;
+        self.failed += failed;
+    }
+
     /// A recorded observation that is not a pass/fail check (for example the `/dev` listing).
     pub fn info(&self, name: impl fmt::Display, args: fmt::Arguments<'_>) {
         line!("init: info {}.{name} {args}", self.group);
@@ -330,8 +345,21 @@ pub fn run_mode(mode: &[u8]) -> bool {
             smoke::run();
             return true;
         }
+        b"fork" => fork::run(),
+        // The leak check of the fork lane (not an oracle group): see `fork::forkleak`.
+        b"forkleak" => {
+            fork::forkleak();
+            return true;
+        }
+        // Candidate-only exhaustion check of the fork lane: see `fork::forkbomb`.
+        b"forkbomb" => {
+            fork::forkbomb();
+            return true;
+        }
         b"fs" => fs::run(),
         b"proc" => proc::run(),
+        b"jobctl" => jobctl::run(),
+        b"pipe" => pipe::run(),
         _ => return false,
     };
     conclude(ok);

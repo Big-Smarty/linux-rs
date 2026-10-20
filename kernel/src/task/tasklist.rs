@@ -40,6 +40,7 @@ use super::{
 };
 use crate::{
     arena::{Arena, Id},
+    sched::SchedId,
     signal::{Ids, SIGCHLD, State, TaskSignals},
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -53,11 +54,6 @@ pub const PF_EXITING: u32 = 0x4;
 pub const PF_FORKNOEXEC: u32 = 0x40;
 /// `PF_SIGNALED`: killed by a signal.
 pub const PF_SIGNALED: u32 = 0x400;
-
-/// `JOBCTL_STOPPED`: mirrors `__TASK_STOPPED`, set by `do_signal_stop`. The
-/// scheduler's task state is the authority once it exists; the wait code reads
-/// this bit as `task_is_stopped()`.
-pub const JOBCTL_STOPPED: u32 = 1 << 26;
 
 /// `exit_state` (`EXIT_ZOMBIE`, `EXIT_DEAD`; `EXIT_TRACE` needs ptrace).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,12 +118,17 @@ pub struct TaskStruct {
     pub exit_state: ExitState,
     /// `exit_code` (the `wait` status format).
     pub exit_code: u32,
-    /// `exit_signal` (always `SIGCHLD`: no `clone` exit-signal argument yet).
+    /// `exit_signal`: `SIGCHLD` for `fork`, the `clone` argument otherwise.
     pub exit_signal: u8,
+    /// `self_exec_id`: bumped by every `execve` ([`Tasklist::exec_committed`]),
+    /// copied to a child by `dup_task_struct`.
+    pub(super) self_exec_id: u64,
+    /// `parent_exec_id`: the parent's `self_exec_id` when this task was
+    /// cloned; `do_notify_parent` falls back to `SIGCHLD` if the parent has
+    /// exec'd since (a custom exit signal does not cross a security domain).
+    pub(super) parent_exec_id: u64,
     /// `PF_*`.
     pub flags: u32,
-    /// `jobctl` (`JOBCTL_*`).
-    pub jobctl: u32,
     pub cred: CredSnapshot,
     /// `signal->leader`: a session leader.
     pub session_leader: bool,
@@ -138,6 +139,10 @@ pub struct TaskStruct {
     /// `signal->cutime`/`cstime`: the times of reaped children.
     pub cutime_ns: u64,
     pub cstime_ns: u64,
+    /// The task's scheduling handle (the scheduler owns its state; the model
+    /// only needs the handle to name whom to wake). `None` until the owner
+    /// binds one with [`Tasklist::set_sched`].
+    pub sched: Option<SchedId>,
     /// `sighand` + `signal_struct` + the task's signal fields.
     pub(super) signals: Box<TaskSignals>,
 }
@@ -150,6 +155,26 @@ pub struct ForkParams {
     /// `RLIMIT_NPROC`'s soft limit: the `copy_process` `EAGAIN` check is
     /// bypassed for `CAP_SYS_RESOURCE`/`CAP_SYS_ADMIN` (root).
     pub rlimit_nproc: u64,
+    /// `args->exit_signal`: the signal the parent receives when the child
+    /// exits (`SIGCHLD` for `fork`; 0 for none; `clone` may name another,
+    /// which makes the child a "clone child" for `__WCLONE`).
+    pub exit_signal: u8,
+    /// `CLONE_CLEAR_SIGHAND`: the child starts with default dispositions.
+    pub clear_sighand: bool,
+}
+
+impl ForkParams {
+    /// The limits of the forking task and the request's exit signal and
+    /// signal-handler choice.
+    #[must_use]
+    pub fn of(attrs: &super::attrs::Attributes, request: &super::fork::ForkRequest) -> Self {
+        Self {
+            rlimit_sigpending: attrs.rlimits.get(super::attrs::RLIMIT_SIGPENDING).cur,
+            rlimit_nproc: attrs.rlimits.get(super::attrs::RLIMIT_NPROC).cur,
+            exit_signal: request.exit_signal,
+            clear_sighand: request.clear_sighand,
+        }
+    }
 }
 
 pub struct Tasklist {
@@ -204,14 +229,16 @@ impl Tasklist {
                 exit_state: ExitState::Live,
                 exit_code: 0,
                 exit_signal: SIGCHLD,
+                self_exec_id: 0,
+                parent_exec_id: 0,
                 flags: 0,
-                jobctl: 0,
                 cred: CredSnapshot::of(cred),
                 session_leader: false,
                 utime_ns: 0,
                 stime_ns: 0,
                 cutime_ns: 0,
                 cstime_ns: 0,
+                sched: None,
                 signals,
             },
             None,
@@ -274,9 +301,9 @@ impl Tasklist {
     }
 
     /// `copy_process`' publication (`fork`, no `CLONE_*` sharing): a child of
-    /// `parent` in its process group and session, `exit_signal = SIGCHLD`,
-    /// `PF_FORKNOEXEC`, the parent's credentials and, as a shortcut, a *default*
-    /// signal state (see the comment at the allocation).
+    /// `parent` in its process group and session, `exit_signal` from the
+    /// arguments, `PF_FORKNOEXEC`, the parent's credentials and the signal
+    /// state `copy_sighand`/`copy_signal` give it ([`TaskSignals::fork_child`]).
     ///
     /// Order of failures as in Linux: the `max_threads`/`RLIMIT_NPROC` check
     /// (`EAGAIN`), then pid allocation (`EAGAIN`, `ENOMEM`); a pending fatal
@@ -286,27 +313,16 @@ impl Tasklist {
     /// # Errors
     /// `EAGAIN`, `ENOMEM`, `ESRCH` for a stale or exiting parent.
     pub fn fork(&mut self, parent: TaskId, params: ForkParams) -> Result<TaskId, Errno> {
+        self.fork_allowed(parent, params)?;
         let p = self.tasks.get(parent).ok_or(Errno::ESRCH)?;
-        if p.exit_state != ExitState::Live {
-            return Err(Errno::ESRCH);
-        }
-        let (pgid, sid, cred) = (p.pids[2], p.pids[3], p.cred);
-        // copy_process: `nr_threads >= max_threads` is EAGAIN for everyone;
-        // RLIMIT_NPROC is waived with CAP_SYS_RESOURCE (shortcut T9: Linux
-        // counts per-user ucounts).
-        if self.nr_threads >= self.max_threads {
-            return Err(Errno::EAGAIN);
-        }
-        if !cred.cap_sys_resource && u64::from(self.nr_threads) >= params.rlimit_nproc {
-            return Err(Errno::EAGAIN);
-        }
-        // shortcut: default dispositions, empty mask and reset altstack, where
-        // `copy_process` copies the parent's actions and blocked mask
-        // (`copy_sighand`, `dup_task_struct`), keeps the altstack unless
-        // `CLONE_VM`, and clears only pending signals and the itimer; the
-        // fork lane must take the parent's signal state before wiring `fork`.
-        let signals =
-            Box::try_new(TaskSignals::new(params.rlimit_sigpending)).map_err(|_| Errno::ENOMEM)?;
+        let (pgid, sid, cred, exec_id) = (p.pids[2], p.pids[3], p.cred, p.self_exec_id);
+        // copy_sighand / copy_signal / dup_task_struct: the parent's
+        // dispositions, blocked mask and altstack; nothing pending.
+        let signals = Box::try_new(
+            p.signals
+                .fork_child(params.rlimit_sigpending, params.clear_sighand),
+        )
+        .map_err(|_| Errno::ENOMEM)?;
         let own = self.alloc_pid()?;
         let task = TaskStruct {
             pids: [Some(own), Some(own), pgid, sid],
@@ -317,15 +333,19 @@ impl Tasklist {
             next_sibling: None,
             exit_state: ExitState::Live,
             exit_code: 0,
-            exit_signal: SIGCHLD,
+            exit_signal: params.exit_signal,
+            // dup_task_struct copies self_exec_id; copy_process: "p->parent_exec_id
+            // = current->self_exec_id" (the real parent is `current`; no CLONE_PARENT).
+            self_exec_id: exec_id,
+            parent_exec_id: exec_id,
             flags: PF_FORKNOEXEC,
-            jobctl: 0,
             cred,
             session_leader: false,
             utime_ns: 0,
             stime_ns: 0,
             cutime_ns: 0,
             cstime_ns: 0,
+            sched: None,
             signals,
         };
         match self.publish(task, Some(parent)) {
@@ -335,6 +355,42 @@ impl Tasklist {
                 Err(errno)
             }
         }
+    }
+
+    /// The checks `copy_process` makes before it allocates anything for the
+    /// child: a live parent, then `RLIMIT_NPROC` and `max_threads`.
+    ///
+    /// # Errors
+    /// `ESRCH` for a stale or exiting parent; `EAGAIN`.
+    pub fn fork_allowed(&self, parent: TaskId, params: ForkParams) -> Result<(), Errno> {
+        let p = self.tasks.get(parent).ok_or(Errno::ESRCH)?;
+        if p.exit_state != ExitState::Live {
+            return Err(Errno::ESRCH);
+        }
+        // `nr_threads >= max_threads` is EAGAIN for everyone; RLIMIT_NPROC is
+        // waived with CAP_SYS_RESOURCE (shortcut T9: Linux counts per-user
+        // ucounts).
+        if self.nr_threads >= self.max_threads {
+            return Err(Errno::EAGAIN);
+        }
+        if !p.cred.cap_sys_resource && u64::from(self.nr_threads) >= params.rlimit_nproc {
+            return Err(Errno::EAGAIN);
+        }
+        Ok(())
+    }
+
+    /// Bind the scheduling handle of `task` (`wake_up_new_task` is the
+    /// owner's, after this).
+    pub fn set_sched(&mut self, task: TaskId, sched: SchedId) {
+        if let Some(t) = self.tasks.get_mut(task) {
+            t.sched = Some(sched);
+        }
+    }
+
+    /// The scheduling handle of `task`, if one was bound.
+    #[must_use]
+    pub fn sched_of(&self, task: TaskId) -> Option<SchedId> {
+        self.tasks.get(task)?.sched
     }
 
     /// `release_task`: the dead task leaves the lists, its pids are freed when
@@ -405,6 +461,12 @@ impl Tasklist {
     #[must_use]
     pub const fn nr_threads(&self) -> u32 {
         self.nr_threads
+    }
+
+    /// Heap bytes of the pid number table (grows with the highest pid number).
+    #[must_use]
+    pub fn pid_table_bytes(&self) -> usize {
+        self.table.footprint_bytes()
     }
 
     /// `for_each_process`: creation order.
@@ -585,19 +647,29 @@ impl Tasklist {
 
     /// The ids a signal sent by `task` carries (derived, not stored twice).
     #[must_use]
-    pub fn signal_ids(&self, task: TaskId) -> Option<Ids> {
+    pub fn signal_ids(&self, task: TaskId, curr: bool) -> Option<Ids> {
         let t = self.tasks.get(task)?;
         Some(Ids {
             pid: self.task_pid_vnr(task),
             tgid: self.task_tgid_vnr(task),
             uid: t.cred.uid,
             global_init: self.is_global_init(task),
+            exiting: t.flags & PF_EXITING != 0,
+            curr,
         })
     }
 
-    /// The `State` view of `task`'s signal objects.
+    /// The `State` view of `task`'s signal objects, as seen by another task
+    /// (`task_curr` false): what a sender, a waiter or a test examines.
     pub fn signal_state(&mut self, task: TaskId) -> Option<State<'_>> {
-        let ids = self.signal_ids(task)?;
+        self.signal_state_as(task, false)
+    }
+
+    /// [`Tasklist::signal_state`] with `curr` = `task_curr(task)`: the task is
+    /// the one running this code (its own state, or the target of a signal it
+    /// sends itself), which `wants_signal` reads.
+    pub fn signal_state_as(&mut self, task: TaskId, curr: bool) -> Option<State<'_>> {
+        let ids = self.signal_ids(task, curr)?;
         Some(self.tasks.get_mut(task)?.signals.view(ids))
     }
 

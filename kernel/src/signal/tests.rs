@@ -1597,3 +1597,31 @@ fn force_fault_records_trap_error_and_keeps_cr2_for_non_page_faults() {
     assert_eq!(read(&mut space, sc + 152, 8), 0x18u64.to_le_bytes()); // err
     assert_eq!(read(&mut space, sc + 176, 8), 0x1234u64.to_le_bytes()); // cr2
 }
+
+/// kernel/signal.c `unhandled_signal`: global init always; else the default or
+/// ignore disposition and not already dying. Decides whether the kernel
+/// prints the "segfault at" and "traps:" lines.
+#[test]
+fn unhandled_signal_follows_the_disposition_and_a_dying_task() {
+    let init = State::standalone_init(100);
+    init.hand.actions[usize::from(SIGSEGV) - 1].handler = 0x1000;
+    assert!(init.unhandled_signal(SIGSEGV), "global init: always");
+    let mut task = State::standalone(7, 0, 100);
+    assert!(task.unhandled_signal(SIGSEGV), "default action");
+    task.hand.actions[usize::from(SIGSEGV) - 1].handler = SIG_IGN;
+    assert!(
+        task.unhandled_signal(SIGSEGV),
+        "ignored counts as unhandled"
+    );
+    task.hand.actions[usize::from(SIGSEGV) - 1].handler = 0x1000;
+    assert!(!task.unhandled_signal(SIGSEGV), "a handler");
+    task.hand.actions[usize::from(SIGSEGV) - 1].handler = 0;
+    assert!(!task.fatal_signal_pending());
+    task.send_signal(SIGKILL, SigInfo::kill(SIGKILL, 0, 1, 0), Target::Process)
+        .unwrap();
+    assert!(task.fatal_signal_pending());
+    assert!(
+        !task.unhandled_signal(SIGSEGV),
+        "dying: new signals are ignored"
+    );
+}

@@ -352,15 +352,13 @@ fn status(result: Result<(), Errno>) -> i64 {
     result.map_or_else(err, |()| 0)
 }
 
-/// `kill(pid, sig)`. `None` means the target selection (`pid == 0`: the
-/// caller's process group, `pid == -1`: every process) depends on a process
-/// table this model does not have; the caller reports an unimplemented
-/// syscall instead of guessing.
-///
-/// shortcut: a positive `pid` other than this process is `ESRCH` and a
-/// `pid < -1` (a process group other than init's, which has pgid <= 1) is
-/// `ESRCH`; that is exact for a system with one process and wrong the moment a
-/// second exists. Upgrade with the pid table (`find_vpid`, `__kill_pgrp_info`).
+/// `kill(pid, sig)` for a process table of one: the caller's own pid, a
+/// positive `pid` other than it and a `pid < -1` are `ESRCH`. `None` for
+/// `pid == 0` (the caller's group) and `pid == -1` (everyone), which need the
+/// task list: the binary sends the caller's own pid through here (the signal
+/// state is the caller's own, so the delivery needs no lock) and everything else
+/// through `Tasklist::kill_something_info`, which is exact for any number of
+/// processes.
 pub fn sys_kill(state: &mut State, pid: u64, sig: u64) -> Option<i64> {
     let (pid, sig) = (int(pid), int(sig));
     Some(if pid > 0 {
@@ -411,7 +409,7 @@ pub fn sys_tkill(state: &mut State, tid: u64, sig: u64) -> i64 {
 /// `__copy_siginfo_from_user(signo, ..)`: 48 bytes (`EFAULT`), `si_signo`
 /// overwritten, and for a `(signo, si_code)` the kernel has no layout for the
 /// 80 expansion bytes must be readable (`EFAULT`) and zero (`E2BIG`).
-fn copy_siginfo_from_user<P: UserPages>(
+pub(crate) fn copy_siginfo_from_user<P: UserPages>(
     pages: &mut P,
     signo: i32,
     uinfo: u64,
@@ -434,8 +432,8 @@ fn copy_siginfo_from_user<P: UserPages>(
 
 /// "Not even root can pretend to send signals from the kernel, nor impersonate
 /// a kill()/tgkill()": user codes `>= 0` and `SI_TKILL` only to oneself.
-fn queueinfo_perm(info: &SigInfo, state: &State, pid: i32) -> Result<(), Errno> {
-    if (info.code >= 0 || info.code == SI_TKILL) && state.pid != pid {
+pub(crate) fn queueinfo_perm(info: &SigInfo, tid: i32, pid: i32) -> Result<(), Errno> {
+    if (info.code >= 0 || info.code == SI_TKILL) && tid != pid {
         Err(Errno::EPERM)
     } else {
         Ok(())
@@ -458,7 +456,7 @@ pub fn sys_rt_sigqueueinfo<P: UserPages>(
         Ok(info) => info,
         Err(errno) => return err(errno),
     };
-    if let Err(errno) = queueinfo_perm(&info, state, pid) {
+    if let Err(errno) = queueinfo_perm(&info, state.pid, pid) {
         return err(errno);
     }
     if pid != state.tgid {
@@ -485,7 +483,7 @@ pub fn sys_rt_tgsigqueueinfo<P: UserPages>(
     if tid <= 0 || tgid <= 0 {
         return err(Errno::EINVAL);
     }
-    if let Err(errno) = queueinfo_perm(&info, state, tid) {
+    if let Err(errno) = queueinfo_perm(&info, state.pid, tid) {
         return err(errno);
     }
     send_specific(state, tgid, tid, sig, Some(info))

@@ -37,7 +37,9 @@
 //! group outran its bound): the latter two end the group only if
 //! `groups_lock_free` (`userspace::locks_free`, which covers the scheduler's `RQ`
 //! and `TIMERQ`, and `ARCHIVES`: the locks the abandoned stack could still hold), else the suite aborts with its results
-//! so far. The summary takes none of those locks.
+//! so far. The summary takes none of those locks. A group is its whole task set: it
+//! ends in the context of whichever task is current (init, or a child at a kernel stop
+//! or the time bound), and `ktask::abandon_group` kills every task of it at once.
 //!
 //! # Time bounds
 //! A group has `DEFAULT_TIMEOUT_S` (command line `suite_timeout_s=`) on the raw
@@ -83,19 +85,22 @@ const DEFAULT_PAUSE_MS: usize = 6000;
 /// slow framebuffer should not come near this.
 const DEFAULT_TIMEOUT_S: u64 = 120;
 /// Groups that sleep on the monotonic clock and so cannot run without it.
-const NEEDS_CLOCK: [&str; 2] = ["time", "signal"];
+const NEEDS_CLOCK: [&str; 6] = ["time", "signal", "fork", "proc", "jobctl", "pipe"];
 const CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_PROOFS: usize = 40;
 /// Inventory facts the summary repeats: cpu, memory, platform, time, display, pci, adapters.
 const KEYS: usize = 7;
 const NONE: usize = usize::MAX;
-const MAX_GROUPS: usize = 8;
+const MAX_GROUPS: usize = 10;
 /// Extra `suite_groups=` words of the QEMU harness: `/init` modes that end a
 /// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not; a
-/// loop that never ends), proving that a bad group ends only itself. They have no expected output, so
-/// they always count as failed.
+/// loop that never ends; the same loop in a child while init waits for it, so the time bound
+/// finds a child on the CPU; init exiting with a child still spinning; every task asleep
+/// with nothing to wake it, so the bound finds the CPU idle), proving that a bad
+/// group ends only itself and ends as a whole. They have no expected output, so they always
+/// count as failed.
 #[cfg(feature = "qemu-self-test")]
-const PROBES: [&str; 3] = ["fault", "io_uring", "spin"];
+const PROBES: [&str; 6] = ["fault", "io_uring", "spin", "spinchild", "orphan", "block"];
 #[cfg(not(feature = "qemu-self-test"))]
 const PROBES: [&str; 0] = [];
 /// Longest log line kept whole by the replay and the stop-line search.
@@ -935,7 +940,7 @@ fn group_ended(cause: Cause) -> ! {
     // returns to `start_next`, which tears the group down on the boot stack
     // (the pool stack this runs on belongs to the task being freed).
     cpu::interrupts_off();
-    ktask::exit_current()
+    ktask::abandon_group()
 }
 
 /// Whether every lock the abandoned stack of a stopped group could still hold

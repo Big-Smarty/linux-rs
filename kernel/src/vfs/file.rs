@@ -152,6 +152,18 @@ impl FileTable {
     pub fn open_count(&self) -> usize {
         self.files.iter().flatten().count()
     }
+
+    /// The references held on all open descriptions together (descriptors,
+    /// mappings, a running `read`): a leak check sees a description kept alive
+    /// by one reference too many, which [`FileTable::open_count`] does not.
+    #[must_use]
+    pub fn total_refs(&self) -> u64 {
+        self.files
+            .iter()
+            .flatten()
+            .map(|file| u64::from(file.refs))
+            .sum()
+    }
 }
 
 /// `struct files_struct` (single-threaded sharing: one owner).
@@ -328,6 +340,33 @@ impl FdTable {
             map.replace(fd as usize, cloexec);
         }
         Ok(old)
+    }
+
+    /// The descriptor table of a forked child (`dup_fd` without the `fget`
+    /// per descriptor, which [`super::Vfs::dup_fd`] adds): the same
+    /// descriptors and close-on-exec bits in a table sized for the highest
+    /// open one (at least `NR_OPEN_DEFAULT`), `next_fd` 0 as `dup_fd` leaves
+    /// it. Nothing is shared with `self`; on failure nothing was changed.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub(super) fn duplicate(&self) -> KResult<Self> {
+        let mut new = Self::default();
+        let Some(highest) = self.fds.iter().rposition(Option::is_some) else {
+            return Ok(new);
+        };
+        new.expand(highest as u64)?;
+        let bits = new.fds.len();
+        for (fd, file, cloexec) in self.iter() {
+            new.fds[fd as usize] = Some(file);
+            if let Some(mut map) = Bitmap::new(&mut new.open, bits) {
+                map.replace(fd as usize, true);
+            }
+            if let Some(mut map) = Bitmap::new(&mut new.cloexec, bits) {
+                map.replace(fd as usize, cloexec);
+            }
+        }
+        Ok(new)
     }
 
     /// Every populated descriptor with its close-on-exec flag.

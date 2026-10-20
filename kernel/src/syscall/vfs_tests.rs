@@ -17,7 +17,7 @@ use std::{string::String, vec::Vec};
 
 use super::{
     Outcome, dispatch, error,
-    testing::{Task, task},
+    testing::{Task, WaitHook, task, would_hang},
 };
 use crate::signal::{SIG_IGN, SIGALRM, SIGPIPE, SIGXFSZ, SigSet};
 use crate::vfs::{
@@ -305,11 +305,8 @@ fn pipes_transfer_bytes_and_stop_loudly_where_linux_would_sleep() {
     );
     assert_eq!(call(&mut t, Sysno::read, &[r, OUT + 32, 10]), ok(3));
     assert_eq!(get(&mut t, OUT + 32, 3), b"abc");
-    // Empty with a writer: Linux sleeps, nothing can wake it.
-    assert_eq!(
-        call(&mut t, Sysno::read, &[r, OUT + 32, 10]),
-        Outcome::Blocked(0)
-    );
+    // Empty with a writer: Linux sleeps, and nothing can wake the only task.
+    assert!(would_hang(|| call(&mut t, Sysno::read, &[r, OUT + 32, 10])));
     assert_eq!(
         call(&mut t, Sysno::pread64, &[r, OUT + 32, 1, 0]),
         err(Errno::ESPIPE)
@@ -337,8 +334,8 @@ fn blocking_pipe_and_console_waits_are_interrupted_by_a_signal() {
     let mut t = t();
     assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
     // A timer is the only thing that can wake the task: with none armed the
-    // wait would never end and the kernel stops loudly.
-    assert_eq!(call(&mut t, Sysno::read, &[3, BUF, 1]), Outcome::Blocked(0));
+    // wait would never end (Linux sleeps forever too).
+    assert!(would_hang(|| call(&mut t, Sysno::read, &[3, BUF, 1])));
     assert_eq!(call(&mut t, Sysno::alarm, &[1]), ok(0));
     // `anon_pipe_read`: nothing read, `-ERESTARTSYS` with SIGALRM pending.
     assert_eq!(call(&mut t, Sysno::read, &[3, BUF, 1]), ok(-512));
@@ -361,10 +358,7 @@ fn blocking_pipe_and_console_waits_are_interrupted_by_a_signal() {
     for _ in 0..16 {
         assert_eq!(call(&mut full, Sysno::write, &[4, BUF, 4096]), ok(4096));
     }
-    assert_eq!(
-        call(&mut full, Sysno::write, &[4, BUF, 1]),
-        Outcome::Blocked(1)
-    );
+    assert!(would_hang(|| call(&mut full, Sysno::write, &[4, BUF, 1])));
     assert_eq!(call(&mut full, Sysno::alarm, &[1]), ok(0));
     assert_eq!(call(&mut full, Sysno::write, &[4, BUF, 1]), ok(-512));
     // Room for exactly one page: the write that then fills it returns the
@@ -374,7 +368,7 @@ fn blocking_pipe_and_console_waits_are_interrupted_by_a_signal() {
 }
 
 #[test]
-fn a_wait_whose_only_wakeup_expired_into_nothing_stops_loudly() {
+fn a_wait_whose_only_wakeup_expired_into_nothing_sleeps_forever() {
     // One-shot alarm whose SIGALRM is ignored, then blocked: it fires during
     // the wait, never becomes pending, and nothing else could wake the task.
     for blocked in [false, true] {
@@ -386,7 +380,7 @@ fn a_wait_whose_only_wakeup_expired_into_nothing_stops_loudly() {
             t.state.hand.actions[usize::from(SIGALRM) - 1].handler = SIG_IGN;
         }
         assert_eq!(call(&mut t, Sysno::alarm, &[1]), ok(0));
-        assert_eq!(call(&mut t, Sysno::read, &[3, BUF, 1]), Outcome::Blocked(0));
+        assert!(would_hang(|| call(&mut t, Sysno::read, &[3, BUF, 1])));
         assert_eq!(t.now, 1_000_000_000, "the timer had expired first");
     }
 }
@@ -492,7 +486,7 @@ fn console_descriptors_write_through_the_tty_and_block_on_read() {
     put(&mut t, BUF, b"a\nb");
     assert_eq!(call(&mut t, Sysno::write, &[1, BUF, 3]), ok(3));
     assert_eq!(t.sink.0, b"a\r\nb", "ONLCR");
-    assert_eq!(call(&mut t, Sysno::read, &[0, BUF, 1]), Outcome::Blocked(0));
+    assert!(would_hang(|| call(&mut t, Sysno::read, &[0, BUF, 1])));
     assert_eq!(
         call(&mut t, Sysno::ioctl, &[0, 0x5401, OUT]),
         ok(0),
@@ -1193,13 +1187,13 @@ fn file_mmap_pins_the_description_and_follows_the_file_kind() {
     // shmem_fault: page 0 is the file, page 1 holds the rest then zeros,
     // page 2 starts at 8192 >= i_size (SIGBUS).
     let mut page = [0u8; 4096];
-    t.vfs.fault_page(id, 0, &mut page).unwrap();
+    t.vfs.fault_page(0, id, 0, &mut page).unwrap();
     assert_eq!(&page[..], &content[..4096]);
-    t.vfs.fault_page(id, 1, &mut page).unwrap();
+    t.vfs.fault_page(0, id, 1, &mut page).unwrap();
     assert_eq!(&page[..904], &content[4096..]);
     assert!(page[904..].iter().all(|&byte| byte == 0));
     assert_eq!(
-        t.vfs.fault_page(id, 2, &mut page),
+        t.vfs.fault_page(0, id, 2, &mut page),
         Err(crate::vfs::mapping::FileFault::Bus)
     );
     // The page was copied: writing the file now would differ from Linux's
@@ -1319,7 +1313,7 @@ fn truncating_a_file_with_a_touched_mapping_stops_loudly() {
     // Untouched mapping: no copy exists, so truncation is ordinary.
     assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 200]), ok(0));
     let id = t.mm.find_vma(addr as u64).unwrap().file.unwrap();
-    t.vfs.fault_page(id, 0, &mut [0; 4096]).unwrap();
+    t.vfs.fault_page(0, id, 0, &mut [0; 4096]).unwrap();
     assert_eq!(
         call(&mut t, Sysno::ftruncate, &[f, 50]),
         Outcome::Unimplemented(Sysno::ftruncate as u32)
@@ -1372,7 +1366,7 @@ fn a_write_that_faults_is_not_a_coherence_stop() {
     let (f, addr) = mapped_file(&mut t, 1);
     let mut page = [0u8; 4096];
     let id = t.mm.find_vma(addr).unwrap().file.unwrap();
-    t.vfs.fault_page(id, 0, &mut page).unwrap();
+    t.vfs.fault_page(0, id, 0, &mut page).unwrap();
     assert_eq!(call(&mut t, Sysno::write, &[f, BAD, 8]), err(Errno::EFAULT));
     assert!(!t.vfs.take_coherence_loss());
 }
@@ -1383,7 +1377,7 @@ fn growing_a_file_with_a_copied_page_is_ordinary() {
     let mut t = t();
     let (f, addr) = mapped_file(&mut t, 1);
     let id = t.mm.find_vma(addr).unwrap().file.unwrap();
-    t.vfs.fault_page(id, 0, &mut [0; 4096]).unwrap();
+    t.vfs.fault_page(0, id, 0, &mut [0; 4096]).unwrap();
     assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 8192]), ok(0));
     assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 8192]), ok(0));
     assert_eq!(
@@ -1508,4 +1502,368 @@ fn partial_unmap_keeps_the_pin_and_a_second_mmap_shares_it() {
     // The first page of the first mapping goes; the rest of it keeps the file.
     assert_eq!(call(&mut t, Sysno::munmap, &[addr, 4096]), ok(0));
     assert_eq!(t.vfs.pin_count(), 1);
+}
+
+// ---- pipes between tasks, poll, F_SETPIPE_SZ ----------------------------------
+
+use crate::vfs::{FdTable, Vfs, file::FileKind};
+use std::boxed::Box;
+
+/// The pipe behind descriptor `fd`.
+fn pipe_of(vfs: &Vfs, fdt: &FdTable, fd: u32) -> crate::vfs::PipeId {
+    match vfs.files.get(fdt.get(fd).unwrap()).kind {
+        FileKind::Pipe { pipe, .. } => pipe,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// What another task does to descriptor `fd`'s pipe while this one sleeps: push
+/// `data` as one buffer.
+fn writes(fd: u32, data: &'static [u8]) -> WaitHook {
+    Box::new(move |vfs, fdt| {
+        let pipe = pipe_of(vfs, fdt, fd);
+        vfs.pipe_mut(pipe).push_page(data).unwrap();
+    })
+}
+
+/// Another task closes descriptor `fd` (the last reference to its end).
+fn closes(fd: u32) -> WaitHook {
+    Box::new(move |vfs, fdt| {
+        let id = fdt.close(fd).unwrap();
+        vfs.fput(id);
+    })
+}
+
+#[test]
+fn a_blocked_read_wakes_when_another_task_writes_or_closes() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    // Data: the read returns what arrived (a short read), after one sleep.
+    t.on_wait.push(writes(3, b"hi"));
+    assert_eq!(call(&mut t, Sysno::read, &[3, OUT + 32, 16]), ok(2));
+    assert_eq!(get(&mut t, OUT + 32, 2), b"hi");
+    assert_eq!(t.waits, 1);
+    // A spurious wake-up (nothing changed) sleeps again; then the writer closes: EOF.
+    t.on_wait.push(Box::new(|_, _| {}));
+    t.on_wait.push(closes(4));
+    assert_eq!(call(&mut t, Sysno::read, &[3, OUT + 32, 16]), ok(0));
+    assert_eq!(t.waits, 3);
+    assert!(t.vfs.take_pipe_events(), "the close is a pipe event");
+    assert!(!t.vfs.take_pipe_events(), "events are reported once");
+}
+
+#[test]
+fn a_blocked_write_keeps_what_it_wrote_across_sleeps() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    put(&mut t, BUF, &[7; 4096]);
+    for _ in 0..16 {
+        assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 4096]), ok(4096));
+    }
+    // Two pages and a bit into a full pipe: room for one page appears, then the
+    // reader goes away. One page is written, SIGPIPE is raised, and the partial
+    // count (not -EPIPE) is the result.
+    t.on_wait.push(Box::new(|vfs, fdt| {
+        let pipe = pipe_of(vfs, fdt, 3);
+        vfs.pipe_mut(pipe).consume(4096);
+    }));
+    t.on_wait.push(closes(3));
+    put(&mut t, BUF, &[8; 4096]);
+    assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 8192 + 100]), ok(4096));
+    assert_eq!(t.waits, 2);
+    assert!(t.state.pending_set().contains(SIGPIPE));
+}
+
+#[test]
+fn a_write_of_at_most_a_page_waits_for_room_and_is_never_split() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    put(&mut t, BUF, &[1; 4096]);
+    for _ in 0..15 {
+        assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 4096]), ok(4096));
+    }
+    // The sixteenth buffer holds 4095 bytes: one byte of room, which a 100-byte
+    // write does not use (`PIPE_BUF` atomicity: all of it in one slot or none).
+    assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 4095]), ok(4095));
+    t.on_wait.push(Box::new(|vfs, fdt| {
+        let pipe = pipe_of(vfs, fdt, 3);
+        assert_eq!(
+            vfs.pipe_ref(pipe).available(),
+            15 * 4096 + 4095,
+            "nothing yet"
+        );
+        vfs.pipe_mut(pipe).consume(4096);
+    }));
+    assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 100]), ok(100));
+    let pipe = pipe_of(&t.vfs, &t.fdt, 3);
+    assert_eq!(t.vfs.pipe_ref(pipe).available(), 14 * 4096 + 4095 + 100);
+}
+
+#[test]
+fn a_blocked_write_to_a_nonblocking_or_signalled_pipe_does_not_sleep() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    put(&mut t, BUF, &[1; 4096]);
+    for _ in 0..16 {
+        assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 4096]), ok(4096));
+    }
+    // A signal pending with nothing written restarts the call; the sleep is skipped.
+    t.state
+        .send_signal(
+            SIGALRM,
+            crate::signal::info::SigInfo::kernel(SIGALRM),
+            crate::signal::state::Target::Process,
+        )
+        .unwrap();
+    let waits = t.waits;
+    assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 1]), ok(-512));
+    assert_eq!(t.waits, waits);
+}
+
+const POLLIN: u16 = 1;
+const POLLOUT: u16 = 4;
+const POLLERR: u16 = 8;
+const POLLHUP: u16 = 0x10;
+const POLLNVAL: u16 = 0x20;
+
+/// `struct pollfd` array in user memory at `OUT + 256`.
+fn pollfds(t: &mut Task, entries: &[(i32, u16)]) -> u64 {
+    let at = OUT + 256;
+    let mut bytes = Vec::new();
+    for &(fd, events) in entries {
+        bytes.extend_from_slice(&fd.to_le_bytes());
+        bytes.extend_from_slice(&events.to_le_bytes());
+        bytes.extend_from_slice(&0xffffu16.to_le_bytes());
+    }
+    put(t, at, &bytes);
+    at
+}
+
+fn revents(t: &mut Task, index: usize) -> u16 {
+    let bytes = get(t, OUT + 256 + 8 * index as u64 + 6, 2);
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn poll(t: &mut Task, entries: &[(i32, u16)], timeout: i32) -> Outcome {
+    let at = pollfds(t, entries);
+    call(
+        t,
+        Sysno::poll,
+        &[at, entries.len() as u64, u64::from(timeout as u32)],
+    )
+}
+
+#[test]
+fn poll_reports_pipe_console_and_file_events_like_linux() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    // Empty pipe: the write end is writable, the read end is not readable.
+    assert_eq!(poll(&mut t, &[(3, POLLIN), (4, POLLOUT)], 0), ok(1));
+    assert_eq!((revents(&mut t, 0), revents(&mut t, 1)), (0, POLLOUT));
+    // Data: readable; events that were not asked for are masked out.
+    put(&mut t, BUF, b"x");
+    assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 1]), ok(1));
+    assert_eq!(poll(&mut t, &[(3, POLLIN | POLLOUT)], 0), ok(1));
+    assert_eq!(revents(&mut t, 0), POLLIN);
+    assert_eq!(poll(&mut t, &[(3, POLLOUT)], 0), ok(0));
+    // Writer closed: POLLHUP is reported whatever was asked, with the data still readable.
+    assert_eq!(call(&mut t, Sysno::close, &[4]), ok(0));
+    assert_eq!(poll(&mut t, &[(3, POLLIN)], 0), ok(1));
+    assert_eq!(revents(&mut t, 0), POLLIN | POLLHUP);
+    assert_eq!(call(&mut t, Sysno::read, &[3, OUT, 1]), ok(1));
+    assert_eq!(poll(&mut t, &[(3, 0)], 0), ok(1));
+    assert_eq!(revents(&mut t, 0), POLLHUP);
+    // A write end with no reader: POLLERR.
+    let mut u = self::t();
+    assert_eq!(call(&mut u, Sysno::pipe2, &[OUT, 0]), ok(0));
+    assert_eq!(call(&mut u, Sysno::close, &[3]), ok(0));
+    assert_eq!(poll(&mut u, &[(4, 0)], 0), ok(1));
+    assert_eq!(revents(&mut u, 0), POLLERR);
+    // A full pipe is not writable.
+    let mut full = self::t();
+    assert_eq!(call(&mut full, Sysno::pipe2, &[OUT, 0]), ok(0));
+    put(&mut full, BUF, &[1; 4096]);
+    for _ in 0..16 {
+        assert_eq!(call(&mut full, Sysno::write, &[4, BUF, 4096]), ok(4096));
+    }
+    assert_eq!(poll(&mut full, &[(4, POLLOUT)], 0), ok(0));
+    // The console is writable and never readable; a regular file and /dev/null always both.
+    assert_eq!(poll(&mut t, &[(0, POLLIN | POLLOUT)], 0), ok(1));
+    assert_eq!(revents(&mut t, 0), POLLOUT);
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644)) as i32;
+    assert_eq!(poll(&mut t, &[(f, POLLIN | POLLOUT)], 0), ok(1));
+    assert_eq!(revents(&mut t, 0), POLLIN | POLLOUT);
+    // Not open: POLLNVAL; negative: skipped (revents 0, not counted); both in one call.
+    assert_eq!(
+        poll(&mut t, &[(99, POLLIN), (-1, POLLIN), (f, POLLOUT)], 0),
+        ok(2)
+    );
+    assert_eq!(
+        (revents(&mut t, 0), revents(&mut t, 1), revents(&mut t, 2)),
+        (POLLNVAL, 0, POLLOUT)
+    );
+    // An O_PATH descriptor is not valid for poll either.
+    let p = fd(open(&mut t, "/f", crate::vfs::O_PATH, 0)) as i32;
+    assert_eq!(poll(&mut t, &[(p, POLLIN)], 0), ok(1));
+    assert_eq!(revents(&mut t, 0), POLLNVAL);
+}
+
+#[test]
+fn poll_argument_errors() {
+    let mut t = t();
+    // nfds above RLIMIT_NOFILE (1024): EINVAL before anything is read.
+    assert_eq!(
+        call(&mut t, Sysno::poll, &[BAD, 1025, 0]),
+        err(Errno::EINVAL)
+    );
+    assert_eq!(call(&mut t, Sysno::poll, &[BAD, 1, 0]), err(Errno::EFAULT));
+    // No descriptors: the timeout alone.
+    assert_eq!(call(&mut t, Sysno::poll, &[0, 0, 0]), ok(0));
+    // The count is a 32-bit `unsigned int` and the timeout an `int`.
+    assert_eq!(
+        call(&mut t, Sysno::poll, &[0, 1 << 32, 0]),
+        ok(0),
+        "nfds is truncated to 0"
+    );
+    // The revents of an unwritable array fault after the poll (an array whose
+    // second entry is on an unmapped page: the first entry's revents is stored).
+    t.pages.map(0x6000, true);
+    let at = 0x6000 + 4096 - 8;
+    let mut entry = Vec::new();
+    entry.extend_from_slice(&(-1i32).to_le_bytes());
+    entry.extend_from_slice(&1u16.to_le_bytes());
+    entry.extend_from_slice(&0xffffu16.to_le_bytes());
+    put(&mut t, at, &entry);
+    assert_eq!(call(&mut t, Sysno::poll, &[at, 2, 0]), err(Errno::EFAULT));
+}
+
+#[test]
+fn poll_sleeps_until_an_event_the_timeout_or_a_signal() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    // The timeout: 10 ms from now plus the hrtimer slack of a normal task (50 us).
+    let start = t.now;
+    assert_eq!(poll(&mut t, &[(3, POLLIN)], 10), ok(0));
+    assert_eq!(revents(&mut t, 0), 0);
+    assert_eq!(t.now - start, 10_000_000 + 50_000);
+    // An event: the data another task writes ends the sleep with that one descriptor ready.
+    t.on_wait.push(writes(3, b"z"));
+    assert_eq!(poll(&mut t, &[(3, POLLIN)], -1), ok(1));
+    assert_eq!(revents(&mut t, 0), POLLIN);
+    // A spurious wake-up goes back to sleep and the end stays the original one.
+    let _ = t.vfs.take_pipe_events();
+    let mut u = self::t();
+    assert_eq!(call(&mut u, Sysno::pipe2, &[OUT, 0]), ok(0));
+    u.on_wait.push(Box::new(|_, _| {}));
+    let start = u.now;
+    assert_eq!(poll(&mut u, &[(3, POLLIN)], 5), ok(0));
+    assert_eq!(u.now - start, 5_000_000 + 50_000);
+    assert_eq!(u.waits, 2);
+    // Nothing can wake it: it sleeps forever, as Linux does.
+    let mut v = self::t();
+    assert_eq!(call(&mut v, Sysno::pipe2, &[OUT, 0]), ok(0));
+    assert!(would_hang(|| poll(&mut v, &[(3, POLLIN)], -1)));
+}
+
+#[test]
+fn poll_interrupted_by_a_signal_restarts_with_its_original_end() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    t.script_signal(4_000_000, SIGALRM);
+    // -ERESTART_RESTARTBLOCK, and the block holds the array, its length and the end.
+    assert_eq!(poll(&mut t, &[(3, POLLIN)], 10), ok(-516));
+    let block = *t.clocks.restarts.last().unwrap();
+    assert_eq!(
+        (block.func, block.rmtp, block.clockid, block.expires_ns),
+        (crate::syscall::RestartFn::Poll, OUT + 256, 1, 10_000_000)
+    );
+    // `restart_syscall` polls again until that end; the timeout runs out: 0.
+    t.state.flush_signals(!0);
+    assert_eq!(call(&mut t, Sysno::restart_syscall, &[]), ok(0));
+    assert_eq!(t.now, 10_000_000 + 50_000);
+    // With a signal pending on entry even a zero timeout answers -ERESTARTNOHAND
+    // (turned into the restart block): `do_poll` checks `signal_pending` when nothing is ready.
+    t.state
+        .send_signal(
+            SIGALRM,
+            crate::signal::info::SigInfo::kernel(SIGALRM),
+            crate::signal::state::Target::Process,
+        )
+        .unwrap();
+    assert_eq!(poll(&mut t, &[(3, POLLIN)], 0), ok(-516));
+    let block = *t.clocks.restarts.last().unwrap();
+    assert_eq!(
+        block.expires_ns, 0,
+        "a zero timeout restarts as a zero timeout"
+    );
+    // ... but a ready descriptor wins over the signal.
+    assert_eq!(poll(&mut t, &[(3, POLLIN), (0, POLLOUT)], 0), ok(1));
+    // No timeout at all is stored as -1.
+    t.on_wait.clear();
+    t.script_signal(t.now + 1, SIGALRM);
+    assert_eq!(poll(&mut t, &[(3, POLLIN)], -1), ok(-516));
+    assert_eq!(t.clocks.restarts.last().unwrap().expires_ns, -1);
+}
+
+#[test]
+fn f_setpipe_sz_rounds_up_to_pages_and_refuses_to_drop_data() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    let set = |t: &mut Task, size: u64| call(t, Sysno::fcntl, &[3, 1031, size]);
+    assert_eq!(set(&mut t, 4096), ok(4096));
+    assert_eq!(
+        call(&mut t, Sysno::fcntl, &[4, 1032, 0]),
+        ok(4096),
+        "either end"
+    );
+    assert_eq!(set(&mut t, 5000), ok(8192));
+    assert_eq!(set(&mut t, 1), ok(4096), "at least a page");
+    assert_eq!(set(&mut t, 0), ok(4096));
+    assert_eq!(
+        set(&mut t, 1 << 20),
+        ok(1 << 20),
+        "root may exceed pipe-max-size"
+    );
+    assert_eq!(set(&mut t, (1 << 31) + 1), err(Errno::EINVAL));
+    assert_eq!(set(&mut t, 1 << 31), ok(1 << 31));
+    // Two buffers of data: no smaller than two pages.
+    assert_eq!(set(&mut t, 65536), ok(65536));
+    put(&mut t, BUF, &[1; 4096]);
+    for _ in 0..2 {
+        assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 4096]), ok(4096));
+    }
+    assert_eq!(set(&mut t, 4096), err(Errno::EBUSY));
+    assert_eq!(set(&mut t, 8192), ok(8192));
+    assert_eq!(call(&mut t, Sysno::fcntl, &[3, 1032, 0]), ok(8192));
+    // The new room is usable: a third page does not fit in two slots, a smaller pipe is full.
+    assert_eq!(
+        call(&mut t, Sysno::fcntl, &[4, 4, u64::from(O_NONBLOCK)]),
+        ok(0)
+    );
+    assert_eq!(call(&mut t, Sysno::write, &[4, BUF, 1]), err(Errno::EAGAIN));
+    // A file that is not a pipe: EBADF. A non-root task: the accounting it would need is missing.
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    assert_eq!(
+        call(&mut t, Sysno::fcntl, &[f, 1031, 4096]),
+        err(Errno::EBADF)
+    );
+    t.attrs.cred.euid = 1000;
+    assert_eq!(
+        call(&mut t, Sysno::fcntl, &[3, 1031, 4096]),
+        Outcome::Unimplemented(72)
+    );
+}
+
+#[test]
+fn legacy_pipe_is_pipe2_without_flags() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe, &[OUT]), ok(0));
+    assert_eq!((u32_at(&mut t, OUT), u32_at(&mut t, OUT + 4)), (3, 4));
+    assert_eq!(
+        call(&mut t, Sysno::fcntl, &[3, 1, 0]),
+        ok(0),
+        "no close-on-exec"
+    );
+    assert_eq!(call(&mut t, Sysno::fcntl, &[3, 3, 0]), ok(0), "blocking");
+    assert_eq!(call(&mut t, Sysno::pipe, &[BAD]), err(Errno::EFAULT));
 }
