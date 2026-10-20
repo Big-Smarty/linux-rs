@@ -623,7 +623,11 @@ pub fn run() {
     let file = sys(Sysno::open, &[addr(b"/sig-bus\0"), O_CREAT_RDWR, 0o600]);
     expect("open-bus", file.is_ok(), true);
     let file = file.unwrap_or(usize::MAX);
-    expect("write-bus", sys(Sysno::write, &[file, addr(b"x"), 1]), Ok(1));
+    expect(
+        "write-bus",
+        sys(Sysno::write, &[file, addr(b"x"), 1]),
+        Ok(1),
+    );
     let map = sys(Sysno::mmap, &[0, 2 * 4096, 1, 2, file, 0]);
     expect("mmap-bus", map.is_ok(), true);
     let map = map.unwrap_or(0);
