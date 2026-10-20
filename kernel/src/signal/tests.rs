@@ -1490,3 +1490,36 @@ fn altstack_overflow_with_mapped_memory_below_fails_the_frame() {
     // cross the base.
     altstack_overflow(0x2000, STACK_LO + 0x4000 + 0x300);
 }
+
+#[test]
+fn handle_pending_signals_loops_after_a_failed_frame() {
+    // A handler without a restorer fails its frame (SIGSEGV forced); the loop
+    // must continue and take the fatal SIGSEGV instead of resuming user mode.
+    let mut st = State::new_init(1000);
+    st.actions[usize::from(SIGUSR1) - 1] = SigAction {
+        handler: 0x40_1000,
+        ..SigAction::default()
+    };
+    let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
+    send(&mut st, SIGUSR1);
+    assert_eq!(
+        handle_pending_signals(&mut st, &mut r, &mut space, &mut cpu),
+        Outcome::Exit {
+            exit_code: 11,
+            core: true
+        }
+    );
+}
+
+#[test]
+fn a_default_stop_signal_stops_the_task() {
+    let mut st = State::new(5, 0, 100);
+    st.blocked.add(SIGTSTP);
+    send(&mut st, SIGTSTP);
+    st.blocked = SigSet::EMPTY;
+    let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
+    assert_eq!(
+        do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu),
+        Outcome::Stop(SIGTSTP)
+    );
+}
