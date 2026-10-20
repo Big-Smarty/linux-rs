@@ -19,6 +19,16 @@
 //!   atomic read-modify-write (hardware may set accessed/dirty concurrently)
 //!   followed by `invlpg` of that page; only then may a frame be reused or
 //!   freed.
+//! * `PROT_NONE` representation (`mm_protect`): a user PTE with the present bit
+//!   clear, [`PROTNONE`] (bit 8, Linux's `_PAGE_PROTNONE`) set and the frame
+//!   address kept. Hardware ignores every other bit of a not-present entry, so
+//!   it faults with P=0 and cannot reach the frame, while software still knows
+//!   which frame the page holds (`pte_present()` in Linux is "P or PROTNONE").
+//!   Every walker that means "mapped" tests [`MAPPED`], every walker that means
+//!   "reachable by the CPU" tests `PRESENT` (so `usercopy` refuses it).
+//! * The shared zero page (`mm_map_zero`) is one frame allocated at boot
+//!   ([`Tables::init_zero_page`]), mapped read-only by any number of PTEs and
+//!   never reclaimed: `mm_unmap` recognises it by address.
 //! * Intermediate user tables are never freed before address-space teardown.
 //!   shortcut: no teardown exists (one process, init's death ends the boot);
 //!   upgrade with `exit`/`execve` (Linux `free_pgtables`).
@@ -47,6 +57,10 @@ const USER: u64 = 4;
 const PWT: u64 = 1 << 3;
 const PCD: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
+/// Software `_PAGE_PROTNONE` (the global bit position, unused in user PTEs).
+const PROTNONE: u64 = 1 << 8;
+/// A leaf that holds a page: reachable (`PRESENT`) or `PROT_NONE`.
+const MAPPED: u64 = PRESENT | PROTNONE;
 const NX: u64 = 1 << 63;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 const LARGE: u64 = 2 * 1024 * 1024;
@@ -120,6 +134,8 @@ pub struct Tables {
     root: Physical,
     direct_map: u64,
     pub pages: usize,
+    /// The shared read-only zero page, once [`Tables::init_zero_page`] ran.
+    zero: Option<Physical>,
 }
 
 impl Tables {
@@ -129,6 +145,7 @@ impl Tables {
             root,
             direct_map: boot.direct_map,
             pages: 1,
+            zero: None,
         };
         let result = (|| {
             let guards = cpu::guards();
@@ -306,7 +323,7 @@ impl Tables {
         for (level, &index) in indices.iter().enumerate() {
             let old = self.read(table, index)?;
             if level == leaf_level {
-                if old & PRESENT != 0 {
+                if old & MAPPED != 0 {
                     return Err(Error::Conflict);
                 }
                 let entry = physical.0 | flags | if large { HUGE } else { 0 };
@@ -793,6 +810,366 @@ impl Tables {
     }
 }
 
+/// The memory-mapping model's page-table operations (`kernel::mm::UserPages`)
+/// on the real tables. Locking: callers hold `&mut Tables` (the `TABLES`
+/// lock) and pass the frame allocator (the `FRAMES` guard or, before
+/// publication, the loader's own); none of these allocates from the heap, so
+/// the `services` rule (reserve heap memory before taking `FRAMES`) holds.
+impl Tables {
+    /// Allocate the shared zero page. Call once, before any `mm_map_zero`.
+    ///
+    /// # Errors
+    /// Frame exhaustion; `Conflict` if called twice.
+    pub fn init_zero_page(&mut self, allocator: &mut Allocator<'_>) -> Result<(), Error> {
+        if self.zero.is_some() {
+            return Err(Error::Conflict);
+        }
+        // The allocator zeroes every frame it issues; this one is never mapped
+        // writable and never written through the direct map.
+        self.zero = Some(allocator.allocate()?.into_reserved());
+        Ok(())
+    }
+
+    /// Visit the leaf slots of `[start, start + pages * 4096)` (clamped to the
+    /// user range) whose page tables exist, skipping absent table levels so a
+    /// sparse multi-terabyte range costs only the tables that are present.
+    /// `visit(address, slot)`; the slot is a valid PTE address (`pointer`).
+    fn for_each_user_slot(&self, start: u64, pages: u64, mut visit: impl FnMut(u64, *mut u64)) {
+        let end = pages
+            .checked_mul(PAGE)
+            .and_then(|n| start.checked_add(n))
+            .map_or(TASK_SIZE_MAX, |end| end.min(TASK_SIZE_MAX));
+        let mut address = start & !(PAGE - 1);
+        'range: while address < end {
+            let mut table = self.root;
+            for shift in [39u32, 30, 21] {
+                let index = ((address >> shift) & 511) as usize;
+                let entry = self.read(table, index).unwrap_or(0);
+                // A huge or supervisor entry in the user half is an isolation
+                // bug the audit reports; never walk through it.
+                if entry & PRESENT == 0 || entry & HUGE != 0 || entry & USER == 0 {
+                    address = (address | ((1u64 << shift) - 1)) + 1;
+                    continue 'range;
+                }
+                table = Physical(entry & ADDRESS);
+            }
+            let table_end = (address | (LARGE - 1)) + 1;
+            while address < end.min(table_end) {
+                if let Ok(slot) = self.pointer(table, ((address >> 12) & 511) as usize) {
+                    visit(address, slot);
+                }
+                address += PAGE;
+            }
+        }
+    }
+
+    /// What the model sees at `page`.
+    #[must_use]
+    pub fn mm_lookup(&self, page: u64) -> kernel::mm::Pte {
+        use kernel::mm::Pte;
+        let Ok(Some(slot)) = self.user_slot(page) else {
+            return Pte::Absent;
+        };
+        // SAFETY: `user_slot` returned an aligned PTE of this tree inside the
+        // direct map; a volatile read creates no reference and observes
+        // hardware accessed/dirty updates.
+        let entry = unsafe { ptr::read_volatile(slot) };
+        if entry & MAPPED == 0 {
+            Pte::Absent
+        } else if Some(Physical(entry & ADDRESS)) == self.zero {
+            Pte::ZeroPage
+        } else {
+            Pte::Anon {
+                writable: entry & WRITE != 0,
+            }
+        }
+    }
+
+    /// Map the zero page read-only at `page` (`do_anonymous_page` read fault).
+    ///
+    /// # Errors
+    /// Table allocation failure (`Error::Memory`); a mapped page is `Conflict`.
+    pub fn mm_map_zero(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        page: u64,
+        exec: bool,
+    ) -> Result<(), Error> {
+        let zero = self.zero.ok_or(Error::Address)?;
+        let flags = PRESENT | USER | if exec { 0 } else { NX };
+        self.map(allocator, Virtual(page), zero, flags, false)
+    }
+
+    /// Give `page` a private zeroed frame (`do_anonymous_page` write fault,
+    /// `wp_page_copy` from the zero page): hardware-writable iff `write`.
+    ///
+    /// # Errors
+    /// Frame or table exhaustion; nothing changed then.
+    pub fn mm_map_anon(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        page: u64,
+        write: bool,
+        exec: bool,
+    ) -> Result<(), Error> {
+        let frame = allocator.allocate()?.into_reserved();
+        let flags = PRESENT | USER | if write { WRITE } else { 0 } | if exec { 0 } else { NX };
+        let result = self.mm_install(allocator, page, frame, flags);
+        if result.is_err() {
+            // SAFETY: `frame` is the order-zero reservation made above and
+            // `mm_install` failed without publishing it.
+            unsafe { allocator.reclaim_reserved(frame)? };
+        }
+        result
+    }
+
+    /// Install `frame` (an order-zero reservation) as the page's PTE: into an
+    /// empty slot, or over the zero page (then the old translation is
+    /// invalidated). Anything else is `Conflict`.
+    fn mm_install(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        page: u64,
+        frame: Physical,
+        flags: u64,
+    ) -> Result<(), Error> {
+        if let Some(slot) = self.user_slot(page)? {
+            // SAFETY: as in `unmap_user`.
+            let entry = unsafe { AtomicU64::from_ptr(slot) };
+            let old = entry.load(Ordering::Acquire);
+            if old & MAPPED != 0 {
+                if Some(Physical(old & ADDRESS)) != self.zero || old & USER == 0 {
+                    return Err(Error::Conflict);
+                }
+                entry.store(frame.0 | flags, Ordering::Release);
+                // A not-present -> present change needs no invalidation, but
+                // this replaces a live read-only translation of the zero page.
+                tlb::flush(VirtAddr::new(page));
+                return Ok(());
+            }
+        }
+        self.map(allocator, Virtual(page), frame, flags, false)
+    }
+
+    /// Install a private frame holding `bytes` (the loader's page-cache
+    /// stand-in); `accessible == false` keeps it behind a `PROT_NONE` PTE.
+    ///
+    /// # Errors
+    /// As [`Tables::mm_map_anon`].
+    pub fn mm_install_page(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        page: u64,
+        prot: kernel::mm::PageProt,
+        bytes: &[u8; PAGE_BYTES],
+    ) -> Result<(), Error> {
+        let mut frame = allocator.allocate()?;
+        frame.bytes().copy_from_slice(bytes);
+        let frame = frame.into_reserved();
+        let flags = if prot.accessible {
+            PRESENT | USER | if prot.write { WRITE } else { 0 } | if prot.exec { 0 } else { NX }
+        } else {
+            PROTNONE | USER | NX
+        };
+        let result = self.map(allocator, Virtual(page), frame, flags, false);
+        if result.is_err() {
+            // SAFETY: as in `mm_map_anon`.
+            unsafe { allocator.reclaim_reserved(frame)? };
+        }
+        result
+    }
+
+    /// `wp_page_reuse`: set the hardware write bit of the present private page.
+    pub fn mm_make_writable(&mut self, page: u64) {
+        let Ok(Some(slot)) = self.user_slot(page) else {
+            return;
+        };
+        // SAFETY: as in `unmap_user`.
+        let entry = unsafe { AtomicU64::from_ptr(slot) };
+        let mut old = entry.load(Ordering::Acquire);
+        // Never on a not-present (PROT_NONE) entry, the zero page or a
+        // supervisor entry: the model only asks for exclusive anonymous pages.
+        while old & PRESENT != 0 && old & USER != 0 && Some(Physical(old & ADDRESS)) != self.zero {
+            match entry.compare_exchange_weak(old, old | WRITE, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(current) => old = current,
+            }
+        }
+        // A stale read-only translation would fault again; drop it.
+        tlb::flush(VirtAddr::new(page));
+    }
+
+    /// Remove every mapping in the range, invalidate it on this CPU and return
+    /// the data frames (never the zero page) to the allocator. Returns how many
+    /// data frames were freed.
+    pub fn mm_unmap(&mut self, allocator: &mut Allocator<'_>, start: u64, pages: u64) -> u64 {
+        let zero = self.zero;
+        let mut freed = 0;
+        self.for_each_user_slot(start, pages, |address, slot| {
+            // SAFETY: `slot` is a PTE of this tree (see `for_each_user_slot`);
+            // `&mut self` excludes software writers and `AtomicU64` makes the
+            // swap atomic against the hardware's accessed/dirty updates.
+            let entry = unsafe { AtomicU64::from_ptr(slot) };
+            let seen = entry.load(Ordering::Acquire);
+            // Never clear what is not a user page (the audit reports it).
+            if seen & MAPPED == 0 || seen & USER == 0 {
+                return;
+            }
+            let old = entry.swap(0, Ordering::AcqRel);
+            if old & PRESENT != 0 {
+                // Single CPU: `invlpg` retires the cached translation. SMP needs
+                // a shootdown acknowledged before the frame is freed.
+                tlb::flush(VirtAddr::new(address));
+            }
+            let frame = Physical(old & ADDRESS);
+            if Some(frame) != zero {
+                // SAFETY: a user leaf is the unique owner of an order-zero
+                // reservation (`mm_map_anon`/`mm_install_page`/`map_user`), the
+                // PTE is cleared and invalidated above, and no `UserSpace`
+                // borrow can be live (we hold `&mut self`).
+                if unsafe { allocator.reclaim_reserved(frame) }.is_ok() {
+                    freed += 1;
+                }
+            }
+        });
+        freed
+    }
+
+    /// `change_protection`: re-protect the mapped pages of the range. The write
+    /// bit is only ever cleared here (a private page becomes writable again
+    /// through the write fault), `!exec` sets NX, and `!accessible` turns the
+    /// PTE into the `PROT_NONE` form (frame kept).
+    pub fn mm_protect(&mut self, start: u64, pages: u64, prot: kernel::mm::PageProt) {
+        self.for_each_user_slot(start, pages, |address, slot| {
+            // SAFETY: as in `mm_unmap`.
+            let entry = unsafe { AtomicU64::from_ptr(slot) };
+            let mut old = entry.load(Ordering::Acquire);
+            loop {
+                if old & MAPPED == 0 || old & USER == 0 {
+                    return;
+                }
+                let keep = old & !(PRESENT | PROTNONE | WRITE | NX);
+                let new = if prot.accessible {
+                    // WRITE survives only on a page that had it and still may.
+                    let write = if old & PRESENT != 0 && old & WRITE != 0 && prot.write {
+                        WRITE
+                    } else {
+                        0
+                    };
+                    keep | PRESENT | write | if prot.exec { 0 } else { NX }
+                } else {
+                    keep | PROTNONE | NX
+                };
+                match entry.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => break,
+                    Err(current) => old = current,
+                }
+            }
+            // Tightening needs the invalidation; loosening of a cached entry
+            // is harmless. One `invlpg` per previously present page. SMP needs
+            // a shootdown.
+            if old & PRESENT != 0 {
+                tlb::flush(VirtAddr::new(address));
+            }
+        });
+    }
+}
+
+/// Where the model's frame operations get their allocator: the `FRAMES`
+/// service after publication, the loader's own allocator before it.
+trait Backing {
+    fn tables(&self) -> &Tables;
+    fn parts<R>(&mut self, f: impl FnOnce(&mut Tables, &mut Allocator<'_>) -> R) -> R;
+}
+
+impl Backing for UserSpace<'_> {
+    fn tables(&self) -> &Tables {
+        self.tables
+    }
+    fn parts<R>(&mut self, f: impl FnOnce(&mut Tables, &mut Allocator<'_>) -> R) -> R {
+        // Lock order `PROCESS` -> `TABLES` -> heap -> `FRAMES`: the caller holds
+        // `TABLES` (this view borrows it) and the model reserved its heap
+        // storage before calling; `FRAMES` is a leaf.
+        let mut frames = crate::services::FRAMES.lock();
+        f(self.tables, &mut frames)
+    }
+}
+
+/// The loader's view of the tables before publication: the same operations on
+/// the boot allocator. Used by `userspace::load`.
+pub struct LoadSpace<'a, 'b> {
+    pub tables: &'a mut Tables,
+    pub allocator: &'a mut Allocator<'b>,
+}
+
+impl Backing for LoadSpace<'_, '_> {
+    fn tables(&self) -> &Tables {
+        self.tables
+    }
+    fn parts<R>(&mut self, f: impl FnOnce(&mut Tables, &mut Allocator<'_>) -> R) -> R {
+        f(self.tables, self.allocator)
+    }
+}
+
+fn out_of_memory(error: Error) -> kernel::mm::OutOfMemory {
+    // Only exhaustion is a legitimate failure. Anything else means the model
+    // asked for a page it had not checked, a kernel bug: stop loudly.
+    match error {
+        Error::Memory(_) => kernel::mm::OutOfMemory,
+        other => panic!("mm page-table backend: {other:?}"),
+    }
+}
+
+macro_rules! mm_pages {
+    ([$($generics:tt)*] $ty:ty) => {
+        impl<$($generics)*> kernel::mm::UserPages for $ty {
+            fn lookup(&self, page: u64) -> kernel::mm::Pte {
+                Backing::tables(self).mm_lookup(page)
+            }
+            fn map_zero_page(
+                &mut self,
+                page: u64,
+                prot: kernel::mm::PageProt,
+            ) -> Result<(), kernel::mm::OutOfMemory> {
+                self.parts(|tables, frames| tables.mm_map_zero(frames, page, prot.exec))
+                    .map_err(out_of_memory)
+            }
+            fn map_anon_page(
+                &mut self,
+                page: u64,
+                prot: kernel::mm::PageProt,
+            ) -> Result<(), kernel::mm::OutOfMemory> {
+                self.parts(|tables, frames| tables.mm_map_anon(frames, page, prot.write, prot.exec))
+                    .map_err(out_of_memory)
+            }
+            fn make_writable(&mut self, page: u64) {
+                self.parts(|tables, _| tables.mm_make_writable(page));
+            }
+            fn unmap(&mut self, start: u64, pages: u64) -> u64 {
+                self.parts(|tables, frames| tables.mm_unmap(frames, start, pages))
+            }
+            fn protect(&mut self, start: u64, pages: u64, prot: kernel::mm::PageProt) {
+                self.parts(|tables, _| tables.mm_protect(start, pages, prot));
+            }
+        }
+    };
+}
+mm_pages!(['a] UserSpace<'a>);
+mm_pages!(['a, 'b] LoadSpace<'a, 'b>);
+
+impl kernel::exec::load::Pager for LoadSpace<'_, '_> {
+    fn install(
+        &mut self,
+        page: u64,
+        prot: kernel::mm::PageProt,
+        bytes: &[u8; PAGE_BYTES],
+    ) -> Result<(), kernel::mm::OutOfMemory> {
+        self.parts(|tables, frames| tables.mm_install_page(frames, page, prot, bytes))
+            .map_err(out_of_memory)
+    }
+}
+
 /// Resolves user pages by walking the tree in software and aliasing the frame
 /// through the direct map, so no user virtual address is ever dereferenced.
 ///
@@ -803,6 +1180,13 @@ pub struct UserSpace<'a> {
 }
 
 impl UserSpace<'_> {
+    /// Whether the kernel can access the page now (present and user at every
+    /// level, writable at every level when `write`): no fault would be needed.
+    #[must_use]
+    pub fn resident(&self, page: u64, write: bool) -> bool {
+        self.translate(page, write).is_some()
+    }
+
     /// The frame of the user page at page-aligned `address`; present, user at
     /// every level, and writable at every level when `write`.
     fn translate(&self, address: u64, write: bool) -> Option<Physical> {

@@ -31,22 +31,54 @@
 
 use crate::services::{self, FRAMES, IrqMutex};
 use alloc::alloc::{GlobalAlloc, Layout};
-use core::ptr::{self, NonNull};
+use core::{
+    cell::UnsafeCell,
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicBool, Ordering},
+};
 use kernel::{
     heap::{ChunkSource, KernelHeap},
     memory::{MAX_ORDER, PAGE_BYTES},
 };
 
-/// Chunks are whole buddy frame blocks seen through the direct map.
+/// Size of the boot arena: the heap's minimum chunk (`kernel::heap::MIN_CHUNK`).
+const ARENA_BYTES: usize = 64 * 1024;
+
+/// Memory for the allocations made *before* `services::FRAMES` exists (the
+/// loader's `Mm` vector is built before the tables are published). Natural
+/// alignment of its length, as `ChunkSource` asks.
+#[repr(C, align(65536))]
+struct BootArena(UnsafeCell<[u8; ARENA_BYTES]>);
+// SAFETY: the bytes are reached only through the one `(start, length)` handed
+// to the heap by `grow` (guarded by `ARENA_TAKEN`), never as a Rust reference.
+unsafe impl Sync for BootArena {}
+static BOOT_ARENA: BootArena = BootArena(UnsafeCell::new([0; ARENA_BYTES]));
+static ARENA_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// Chunks are whole buddy frame blocks seen through the direct map; before
+/// `FRAMES` is installed the single chunk is the static [`BootArena`].
 struct FrameChunks;
 
-// SAFETY: `allocate_order` yields a zeroed, exclusively owned, naturally
-// aligned run of usable RAM; the direct map covers it read-write (checked by
-// `Allocator::new`); `into_reserved` ends the token without freeing, so the
-// heap owns the run for good and nothing else can allocate or map it. Runs
-// are disjoint because the allocator never issues a live frame twice.
+// SAFETY: the boot arena is a static, writable, 64 KiB aligned, zero-initialised
+// byte array that nothing else references, handed out at most once
+// (`ARENA_TAKEN`) and kept by the heap for good. Otherwise `allocate_order`
+// yields a zeroed, exclusively owned, naturally aligned run of usable RAM; the
+// direct map covers it read-write (checked by `Allocator::new`);
+// `into_reserved` ends the token without freeing, so the heap owns the run for
+// good and nothing else can allocate or map it. Runs are disjoint because the
+// allocator never issues a live frame twice.
 unsafe impl ChunkSource for FrameChunks {
     fn grow(&mut self, min_bytes: usize) -> Option<(usize, usize)> {
+        if !FRAMES.is_installed() {
+            // Boot arena: exactly one chunk, never returned. A request that
+            // does not fit, or a second one, fails like exhaustion (callers
+            // use fallible APIs). shortcut: 64 KiB until frames exist; the
+            // boot sequence allocates only the loader's VMA vector here.
+            if min_bytes > ARENA_BYTES || ARENA_TAKEN.swap(true, Ordering::AcqRel) {
+                return None;
+            }
+            return Some((BOOT_ARENA.0.get() as usize, ARENA_BYTES));
+        }
         let pages = min_bytes.div_ceil(PAGE_BYTES).checked_next_power_of_two()?;
         let order = pages.ilog2();
         if order > MAX_ORDER {

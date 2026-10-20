@@ -145,6 +145,12 @@ impl<T: Send> Service<T> {
         ServiceGuard(guard)
     }
 
+    /// Whether a value was installed. A held lock means it was (the holder
+    /// found it installed), so this never spins and never panics.
+    pub fn is_installed(&self) -> bool {
+        self.0.try_lock().is_none_or(|slot| slot.is_some())
+    }
+
     /// Like [`Service::lock`] but `None` when the service is locked. On this
     /// single-CPU cell, with interrupts masked inside every critical section,
     /// `None` can only mean the caller already holds it: a lock-order bug.
