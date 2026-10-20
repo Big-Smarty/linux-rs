@@ -188,4 +188,3 @@ impl<P, C> Clocks for Task<P, C> {
         self.clocks.rtc
     }
 }
-
