@@ -60,7 +60,7 @@ use kernel::{
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     ratelimit::RateLimit,
     signal::{
-        self, State,
+        self, Ids, State, TaskSignals,
         deliver::{self, Outcome as SignalOutcome},
         frame::Sigreturn,
         info,
@@ -519,7 +519,7 @@ pub struct Process {
     pub fdt: FdTable,
     /// `sighand` + `signal_struct` + the task's signal fields (the pure model
     /// in `kernel::signal`), boxed because the two pending queues are ~16 KiB.
-    pub signal: Box<State>,
+    pub signal: Box<TaskSignals>,
     /// `printk_ratelimit_state`: the limiter of the `show_unhandled_signals`
     /// lines (global in Linux; one process here).
     printk_ratelimit: RateLimit,
@@ -652,10 +652,28 @@ struct FaultPages<'a, 'b> {
     space: &'a mut UserSpace<'b>,
 }
 
+/// The `State` view of the one process's signal objects.
+fn signal_state(process: &mut Process) -> State<'_> {
+    let ids = signal_ids(process);
+    process.signal.view(ids)
+}
+
+/// What the signal view derives from the process (not stored twice).
+fn signal_ids(process: &Process) -> Ids {
+    Ids {
+        // Pids are below `pid_max` (32768), far inside `i32`.
+        pid: process.pid.cast_signed(),
+        tgid: process.tgid.cast_signed(),
+        uid: process.attrs.cred.uid,
+        global_init: process.tgid == 1,
+    }
+}
+
 impl<'a, 'b> FaultPages<'a, 'b> {
-    fn of(process: &'a mut Process, space: &'a mut UserSpace<'b>) -> (&'a mut State, Self) {
+    fn of(process: &'a mut Process, space: &'a mut UserSpace<'b>) -> (State<'a>, Self) {
+        let ids = signal_ids(process);
         (
-            &mut *process.signal,
+            process.signal.view(ids),
             Self {
                 mm: &mut process.space,
                 env: &process.env,
@@ -804,10 +822,10 @@ impl<'a> signal::Task for Syscall<'a> {
         = FaultPages<'b, 'a>
     where
         Self: 'b;
-    fn state(&mut self) -> &mut State {
-        &mut self.process.signal
+    fn state(&mut self) -> State<'_> {
+        signal_state(&mut *self.process)
     }
-    fn parts(&mut self) -> (&mut State, FaultPages<'_, 'a>) {
+    fn parts(&mut self) -> (State<'_>, FaultPages<'_, 'a>) {
         FaultPages::of(self.process, &mut self.space)
     }
     fn now_ns(&self) -> u64 {
@@ -818,7 +836,7 @@ impl<'a> signal::Task for Syscall<'a> {
         // idle time, not the task's.
         CPUTIME.sleep_begin(timer::ktime_get_ns());
         // The interval timer is a wake-up source of every sleep.
-        timer::set_itimer_ns(self.process.signal.itimer.next_event());
+        timer::set_itimer_ns(self.process.signal.signal.itimer.next_event());
         timer::wait_event(deadline_ns);
         CPUTIME.sleep_end(timer::ktime_get_ns());
     }
@@ -826,9 +844,13 @@ impl<'a> signal::Task for Syscall<'a> {
         self.regs.sp
     }
     fn rt_sigreturn(&mut self) -> Sigreturn {
-        let (state, mut pages) = FaultPages::of(self.process, &mut self.space);
-        let result =
-            signal::frame::rt_sigreturn(state, self.regs, &mut pages, &mut cpu::UserCpu::new());
+        let (mut state, mut pages) = FaultPages::of(self.process, &mut self.space);
+        let result = signal::frame::rt_sigreturn(
+            &mut state,
+            self.regs,
+            &mut pages,
+            &mut cpu::UserCpu::new(),
+        );
         // `restore_sigcontext`'s first statement: a pending restarted system
         // call now returns -EINTR; a frame refused before it resets nothing.
         if result.reached_sigcontext {
@@ -947,16 +969,24 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
         let mut process = PROCESS.lock();
         // Nothing to expire or dequeue: skip the clock read (`now_ns` is only
         // used when a pending SIGALRM leaves the queue).
-        if process.signal.itimer.next_event().is_some() || process.signal.signal_pending() {
-            process.signal.sync_timers(timer::ktime_get_ns());
-        }
-        if process.signal.signal_pending() {
+        let pending = {
+            let mut state = signal_state(&mut process);
+            if state.sig.itimer.next_event().is_some() || state.signal_pending() {
+                state.sync_timers(timer::ktime_get_ns());
+            }
+            state.signal_pending()
+        };
+        if pending {
             let mm = process.mm;
             let mut tables = mm.lock();
             let mut space = tables.user_space();
-            let (state, mut pages) = FaultPages::of(&mut process, &mut space);
-            let outcome =
-                deliver::handle_pending_signals(state, regs, &mut pages, &mut cpu::UserCpu::new());
+            let (mut state, mut pages) = FaultPages::of(&mut process, &mut space);
+            let outcome = deliver::handle_pending_signals(
+                &mut state,
+                regs,
+                &mut pages,
+                &mut cpu::UserCpu::new(),
+            );
             drop(tables);
             match outcome {
                 // `handle_pending_signals` loops while a forced SIGSEGV is pending.
@@ -972,7 +1002,7 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
             }
         }
         // Wake the CPU for the next interval-timer expiry while ring 3 runs.
-        let expiry = process.signal.itimer.next_event();
+        let expiry = process.signal.signal.itimer.next_event();
         timer::set_itimer_ns(expiry);
         // `rearm` drops an expiry that fell between the `sync_timers` above and
         // its own clock read (or while a frame was built): nothing would wake
@@ -1065,7 +1095,7 @@ fn force(
     if vector != 14 || signo == i32::from(signal::SIGSEGV) {
         show_unhandled_signal(process, regs, vector, error, address);
     }
-    process.signal.force_fault(&fault);
+    signal_state(process).force_fault(&fault);
     true
 }
 
@@ -1756,7 +1786,7 @@ fn start(mut init: Loaded) -> ! {
     let mut attrs = Attributes::init(task::max_threads(managed_pages));
     attrs.fs = init.vfs.new_fs_struct(0o022);
     let signal = crate::unwrap(
-        Box::try_new(State::new_init(task::max_threads(managed_pages) / 2))
+        Box::try_new(TaskSignals::new_init(task::max_threads(managed_pages) / 2))
             .map_err(|_| "out of memory"),
         "signal-state",
     );

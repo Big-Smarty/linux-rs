@@ -193,7 +193,7 @@ pub fn sys_getitimer<T: Task>(task: &mut T, which: u64, value: u64) -> Option<i6
         _ => return Some(err(Errno::EINVAL)),
     }
     let (state, mut pages) = task.parts();
-    let timer = state.itimer;
+    let timer = state.sig.itimer;
     Some(
         if put_itimerval(&mut pages, value, timer.interval(), timer.remaining(now)) {
             0
@@ -223,7 +223,7 @@ pub fn sys_setitimer<T: Task>(task: &mut T, which: u64, value: u64, ovalue: u64)
         ITIMER_VIRTUAL | ITIMER_PROF => return None,
         _ => return Some(err(Errno::EINVAL)),
     }
-    let (old_value, old_interval) = state.itimer.start(now, value_ns, interval);
+    let (old_value, old_interval) = state.sig.itimer.start(now, value_ns, interval);
     Some(
         if ovalue != 0 && !put_itimerval(&mut pages, ovalue, old_interval, old_value) {
             err(Errno::EFAULT)
@@ -242,7 +242,7 @@ pub fn sys_alarm<T: Task>(task: &mut T, seconds: u64) -> i64 {
     let state = task.state();
     #[allow(clippy::cast_possible_truncation)]
     let seconds = u64::from(seconds as u32);
-    let (old, _) = state.itimer.start(now, seconds * NSEC_PER_SEC, 0);
+    let (old, _) = state.sig.itimer.start(now, seconds * NSEC_PER_SEC, 0);
     let (mut sec, nsec) = (old / NSEC_PER_SEC, old % NSEC_PER_SEC);
     if (sec == 0 && nsec != 0) || nsec >= NSEC_PER_SEC / 2 {
         sec += 1;

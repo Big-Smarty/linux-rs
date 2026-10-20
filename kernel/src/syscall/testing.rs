@@ -96,7 +96,7 @@ pub struct Task<P = Space, C = Sink> {
     pub file_pages: BTreeMap<u64, Box<[u8; 4096]>>,
     /// The signal state: a non-init process whose `SIGUSR1`, `SIGUSR2` and
     /// `SIGALRM` have handlers, so sending them queues rather than kills.
-    pub state: State,
+    pub state: State<'static>,
     /// `CLOCK_MONOTONIC` of the fake wait.
     pub now: u64,
     /// Number of `Task::wait` calls.
@@ -120,9 +120,9 @@ impl<P, C> Task<P, C> {
         vfs.console_on_rootfs(&mut fdt).expect("console");
         let mut attrs = Attributes::init(1000);
         attrs.fs = vfs.new_fs_struct(0o022);
-        let mut state = State::new(1, 0, 1000);
+        let state = State::standalone(1, 0, 1000);
         for sig in [SIGUSR1, SIGUSR2, SIGALRM] {
-            state.actions[usize::from(sig) - 1].handler = 0x4000;
+            state.hand.actions[usize::from(sig) - 1].handler = 0x4000;
         }
         Self {
             pages,
@@ -281,11 +281,11 @@ impl<P: UserPages, C> signal::Task for Task<P, C> {
         = &'a mut P
     where
         Self: 'a;
-    fn state(&mut self) -> &mut State {
-        &mut self.state
+    fn state(&mut self) -> State<'_> {
+        self.state.reborrow()
     }
-    fn parts(&mut self) -> (&mut State, &mut P) {
-        (&mut self.state, &mut self.pages)
+    fn parts(&mut self) -> (State<'_>, &mut P) {
+        (self.state.reborrow(), &mut self.pages)
     }
     fn now_ns(&self) -> u64 {
         self.now
@@ -296,7 +296,7 @@ impl<P: UserPages, C> signal::Task for Task<P, C> {
         self.waits += 1;
         let next = deadline_ns
             .into_iter()
-            .chain(self.state.itimer.next_event())
+            .chain(self.state.sig.itimer.next_event())
             .chain(self.script.iter().map(|&(at, _)| at))
             .min()
             .expect("a wait with no wake-up source would hang the kernel");

@@ -33,32 +33,32 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         |value: Option<i64>| Some(value.map_or(Outcome::Unimplemented(number), Outcome::Return));
     let value = match sysno {
         Sysno::rt_sigaction => {
-            let (state, mut pages) = ctx.parts();
-            sys_rt_sigaction(state, &mut pages, a[0], a[1], a[2], a[3])
+            let (mut state, mut pages) = ctx.parts();
+            sys_rt_sigaction(&mut state, &mut pages, a[0], a[1], a[2], a[3])
         }
         Sysno::rt_sigprocmask => {
-            let (state, mut pages) = ctx.parts();
-            sys_rt_sigprocmask(state, &mut pages, a[0], a[1], a[2], a[3])
+            let (mut state, mut pages) = ctx.parts();
+            sys_rt_sigprocmask(&mut state, &mut pages, a[0], a[1], a[2], a[3])
         }
         Sysno::rt_sigpending => {
             let (state, mut pages) = ctx.parts();
-            sys_rt_sigpending(state, &mut pages, a[0], a[1])
+            sys_rt_sigpending(&state, &mut pages, a[0], a[1])
         }
         Sysno::sigaltstack => {
             let sp = ctx.user_sp();
-            let (state, mut pages) = ctx.parts();
-            sys_sigaltstack(state, &mut pages, a[0], a[1], sp)
+            let (mut state, mut pages) = ctx.parts();
+            sys_sigaltstack(&mut state, &mut pages, a[0], a[1], sp)
         }
-        Sysno::kill => return unimplemented(sys_kill(ctx.state(), a[0], a[1])),
-        Sysno::tkill => sys_tkill(ctx.state(), a[0], a[1]),
-        Sysno::tgkill => sys_tgkill(ctx.state(), a[0], a[1], a[2]),
+        Sysno::kill => return unimplemented(sys_kill(&mut ctx.state(), a[0], a[1])),
+        Sysno::tkill => sys_tkill(&mut ctx.state(), a[0], a[1]),
+        Sysno::tgkill => sys_tgkill(&mut ctx.state(), a[0], a[1], a[2]),
         Sysno::rt_sigqueueinfo => {
-            let (state, mut pages) = ctx.parts();
-            sys_rt_sigqueueinfo(state, &mut pages, a[0], a[1], a[2])
+            let (mut state, mut pages) = ctx.parts();
+            sys_rt_sigqueueinfo(&mut state, &mut pages, a[0], a[1], a[2])
         }
         Sysno::rt_tgsigqueueinfo => {
-            let (state, mut pages) = ctx.parts();
-            sys_rt_tgsigqueueinfo(state, &mut pages, a[0], a[1], a[2], a[3])
+            let (mut state, mut pages) = ctx.parts();
+            sys_rt_tgsigqueueinfo(&mut state, &mut pages, a[0], a[1], a[2], a[3])
         }
         // The syscall's value is the restored `rax` (0 after a bad frame).
         #[allow(clippy::cast_possible_wrap)]
@@ -171,7 +171,7 @@ mod tests {
             call(&mut t, Sysno::rt_sigaction, &[sig, PAGE, 0, 8]),
             Outcome::Return(0)
         );
-        assert_eq!(t.state.actions[usize::from(SIGUSR1) - 1], act);
+        assert_eq!(t.state.hand.actions[usize::from(SIGUSR1) - 1], act);
         // Block it, send it to ourselves, see it pending, unblock.
         put(&mut t, PAGE + 64, &SigSet::bit(SIGUSR1).to_le_bytes());
         assert_eq!(
@@ -215,13 +215,13 @@ mod tests {
             call(&mut t, Sysno::rt_sigsuspend, &[PAGE, 8]),
             Outcome::Return(-514)
         );
-        assert_eq!(t.state.blocked, SigSet::EMPTY);
+        assert_eq!(t.state.me.blocked, SigSet::EMPTY);
         assert_eq!(
-            t.state.saved_sigmask,
+            t.state.me.saved_sigmask,
             Some(SigSet(SigSet::bit(SIGUSR1) | SigSet::bit(SIGUSR2)))
         );
         // Order: size, then the fault, before anything changes.
-        let before = t.state.blocked;
+        let before = t.state.me.blocked;
         assert_eq!(
             call(&mut t, Sysno::rt_sigsuspend, &[PAGE, 4]),
             neg(Errno::EINVAL)
@@ -230,7 +230,7 @@ mod tests {
             call(&mut t, Sysno::rt_sigsuspend, &[0x9000, 8]),
             neg(Errno::EFAULT)
         );
-        assert_eq!(t.state.blocked, before);
+        assert_eq!(t.state.me.blocked, before);
     }
 
     #[test]
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(wait_event_interruptible(&mut t, |_| true), Ok(()));
         // send_sig is the kernel's SI_USER from this process (SIGPIPE).
         let mut t = mapped();
-        t.state.actions[12].handler = 0x4000;
+        t.state.hand.actions[12].handler = 0x4000;
         t.state.send_sig(13);
         let (sig, info) = t.state.dequeue_signal().unwrap();
         assert_eq!((sig, info), (13, SigInfo::kill(13, 0, 1, 0)));
@@ -358,7 +358,7 @@ mod tests {
         let start = t.now;
         assert_eq!(wait(&mut t, 0, PAGE + 256), neg(Errno::EAGAIN));
         assert_eq!(t.now - start, 10_000_000);
-        assert_eq!(t.state.blocked, SigSet::EMPTY, "mask restored");
+        assert_eq!(t.state.me.blocked, SigSet::EMPTY, "mask restored");
         // A signal arriving during the wait is taken without running a handler.
         t.state.set_blocked(set);
         timeout(&mut t, 5, 0);
@@ -366,7 +366,7 @@ mod tests {
         let start = t.now;
         assert_eq!(wait(&mut t, PAGE + 512, PAGE + 256), Outcome::Return(10));
         assert_eq!(t.now - start, 20_000_000);
-        assert_eq!(t.state.blocked, set, "blocked again afterwards");
+        assert_eq!(t.state.me.blocked, set, "blocked again afterwards");
         assert_eq!(t.state.pending_set(), SigSet::EMPTY, "consumed");
         let info = get::<128>(&mut t, PAGE + 512);
         assert_eq!(info[0..4], 10i32.to_le_bytes());
@@ -396,7 +396,7 @@ mod tests {
         for init in [false, true] {
             let mut t = mapped();
             if init {
-                t.state = crate::signal::State::new_init(1000);
+                t.state = crate::signal::State::standalone_init(1000);
             }
             let term = SigSet::bit(15);
             t.state.set_blocked(SigSet(term));
@@ -407,9 +407,9 @@ mod tests {
                 Outcome::Return(15),
                 "init={init}"
             );
-            assert_eq!(t.state.group_exit, None, "init={init}");
-            assert_eq!(t.state.blocked, SigSet(term));
-            assert_eq!(t.state.real_blocked, SigSet::EMPTY);
+            assert_eq!(t.state.sig.group_exit, None, "init={init}");
+            assert_eq!(t.state.me.blocked, SigSet(term));
+            assert_eq!(t.state.me.real_blocked, SigSet::EMPTY);
         }
     }
 
@@ -441,7 +441,7 @@ mod tests {
         let (sig, info) = t.state.dequeue_signal().expect("SIGALRM pending");
         assert_eq!((sig, info), (SIGALRM, SigInfo::kernel(SIGALRM)));
         // Dequeue re-armed the interval timer on its grid: 20 + 30 ms.
-        assert_eq!(t.state.itimer.next_event(), Some(50_000_000));
+        assert_eq!(t.state.sig.itimer.next_event(), Some(50_000_000));
         assert_eq!(
             call(&mut t, Sysno::getitimer, &[0, PAGE + 128]),
             Outcome::Return(0)
@@ -454,7 +454,7 @@ mod tests {
         // zero-second alarm cancels.
         assert_eq!(call(&mut t, Sysno::alarm, &[2]), Outcome::Return(1));
         assert_eq!(call(&mut t, Sysno::alarm, &[0]), Outcome::Return(2));
-        assert_eq!(t.state.itimer.next_event(), None);
+        assert_eq!(t.state.sig.itimer.next_event(), None);
         assert_eq!(call(&mut t, Sysno::alarm, &[0]), Outcome::Return(0));
     }
 
@@ -481,19 +481,23 @@ mod tests {
             call(&mut t, Sysno::setitimer, &[7, PAGE, 0]),
             neg(Errno::EINVAL)
         );
-        assert_eq!(t.state.itimer.next_event(), None, "nothing armed by errors");
+        assert_eq!(
+            t.state.sig.itimer.next_event(),
+            None,
+            "nothing armed by errors"
+        );
         // A bad `ovalue` is reported after the timer is armed.
         assert_eq!(
             call(&mut t, Sysno::setitimer, &[0, PAGE, 0x9000]),
             neg(Errno::EFAULT)
         );
-        assert!(t.state.itimer.next_event().is_some());
+        assert!(t.state.sig.itimer.next_event().is_some());
         // NULL value disarms.
         assert_eq!(
             call(&mut t, Sysno::setitimer, &[0, 0, 0]),
             Outcome::Return(0)
         );
-        assert_eq!(t.state.itimer.next_event(), None);
+        assert_eq!(t.state.sig.itimer.next_event(), None);
     }
 
     #[test]

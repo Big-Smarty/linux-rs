@@ -149,11 +149,33 @@ pub struct ArchInfo {
     pub cr2: u64,
 }
 
-/// `sighand` + `signal_struct` + the task's signal fields.
+/// `struct sighand_struct`: the dispositions.
 #[derive(Clone, Debug)]
-pub struct State {
+pub struct SigHand {
     /// `sighand->action[]`, index `sig - 1`.
     pub actions: [SigAction; NSIG as usize],
+}
+
+/// `struct signal_struct`: what a thread group shares.
+#[derive(Clone, Debug)]
+pub struct SignalStruct {
+    /// `signal->group_exit_code` while `SIGNAL_GROUP_EXIT` is set.
+    pub group_exit: Option<u32>,
+    /// `SIGNAL_UNKILLABLE`.
+    pub unkillable: bool,
+    /// `RLIMIT_SIGPENDING` (`signal->rlim`).
+    pub rlimit_sigpending: u64,
+    /// `signal->real_timer` / `it_real_incr` (`ITIMER_REAL`).
+    pub itimer: RealTimer,
+    /// `CLOCK_MONOTONIC` as of the last [`State::sync_timers`]: the `now` of
+    /// the interval-timer re-arm that `dequeue_signal` performs.
+    pub now_ns: u64,
+    shared: Pending,
+}
+
+/// The signal fields of one `struct task_struct`.
+#[derive(Clone, Debug)]
+pub struct ThreadSignal {
     /// `current->blocked`; never contains SIGKILL or SIGSTOP.
     pub blocked: SigSet,
     /// `current->real_blocked`: the mask `rt_sigtimedwait` temporarily
@@ -166,54 +188,154 @@ pub struct State {
     pub altstack: AltStack,
     /// `thread.trap_nr/error_code/cr2`.
     pub arch: ArchInfo,
-    /// `signal->group_exit_code` while `SIGNAL_GROUP_EXIT` is set.
-    pub group_exit: Option<u32>,
-    /// `is_global_init(current)`.
+    private: Pending,
+}
+
+/// The three signal objects of one task, owned together. shortcut: a task has
+/// exactly one thread, so `sighand` and `signal_struct` are 1:1 with it and
+/// live inline; with `CLONE_SIGHAND`/`CLONE_THREAD` they become counted shared
+/// slots and only [`TaskSignals::view`] changes, not its users.
+#[derive(Clone, Debug)]
+pub struct TaskSignals {
+    pub hand: SigHand,
+    pub signal: SignalStruct,
+    pub thread: ThreadSignal,
+}
+
+impl TaskSignals {
+    /// The signal state of a newly created process (a forked child before it
+    /// inherits, init at boot): default actions, nothing blocked or pending,
+    /// altstack disabled (`sas_ss_reset`). `execve` is [`State::flush_on_exec`],
+    /// not this.
+    #[must_use]
+    pub fn new(rlimit_sigpending: u64) -> Self {
+        Self {
+            hand: SigHand {
+                actions: [SigAction::default(); NSIG as usize],
+            },
+            signal: SignalStruct {
+                group_exit: None,
+                unkillable: false,
+                rlimit_sigpending,
+                itimer: RealTimer::default(),
+                now_ns: 0,
+                shared: Pending::new(),
+            },
+            thread: ThreadSignal {
+                blocked: SigSet::EMPTY,
+                real_blocked: SigSet::EMPTY,
+                saved_sigmask: None,
+                altstack: AltStack::RESET,
+                arch: ArchInfo::default(),
+                private: Pending::new(),
+            },
+        }
+    }
+
+    /// The global init's: `SIGNAL_UNKILLABLE` (`copy_process`, child reaper).
+    #[must_use]
+    pub fn new_init(rlimit_sigpending: u64) -> Self {
+        let mut signals = Self::new(rlimit_sigpending);
+        signals.signal.unkillable = true;
+        signals
+    }
+
+    /// The `State` view for the task with these ids. `pid`/`tgid`/`uid` and
+    /// `global_init` are derived by the owner of the task (the `Tasklist`),
+    /// not stored twice.
+    pub fn view(&mut self, ids: Ids) -> State<'_> {
+        State {
+            hand: &mut self.hand,
+            sig: &mut self.signal,
+            me: &mut self.thread,
+            pid: ids.pid,
+            tgid: ids.tgid,
+            uid: ids.uid,
+            global_init: ids.global_init,
+        }
+    }
+}
+
+/// What a [`State`] view derives from its task rather than stores: the ids a
+/// sent signal carries and `is_global_init`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ids {
+    /// `task_pid_vnr`.
+    pub pid: i32,
+    /// `task_tgid_vnr`: `si_pid` of what this process sends.
+    pub tgid: i32,
+    /// `current_uid()`: `si_uid` of what this process sends.
+    pub uid: u32,
+    /// `is_global_init(task)`.
     pub global_init: bool,
-    /// `SIGNAL_UNKILLABLE`.
-    pub unkillable: bool,
+}
+
+/// `sighand` + `signal_struct` + the task's signal fields, as the signal code
+/// sees them: a view over the three objects ([`TaskSignals`] owns them for a
+/// task with one thread).
+pub struct State<'a> {
+    pub hand: &'a mut SigHand,
+    pub sig: &'a mut SignalStruct,
+    pub me: &'a mut ThreadSignal,
     /// `task_pid_vnr`; equal to `tgid` for the one thread.
     pub pid: i32,
     /// `task_tgid_vnr`: `si_pid` of what this process sends.
     pub tgid: i32,
     /// `current_uid()`: `si_uid` of what this process sends.
     pub uid: u32,
-    /// `RLIMIT_SIGPENDING` of the owner.
-    pub rlimit_sigpending: u64,
-    /// `signal->real_timer` / `it_real_incr` (`ITIMER_REAL`).
-    pub itimer: RealTimer,
-    /// `CLOCK_MONOTONIC` as of the last [`State::sync_timers`]: the `now` of
-    /// the interval-timer re-arm that `dequeue_signal` performs.
-    pub now_ns: u64,
-    private: Pending,
-    shared: Pending,
+    /// `is_global_init(current)`.
+    pub global_init: bool,
 }
 
-impl State {
-    /// The signal state of a newly created process (init at boot, a forked
-    /// child before it inherits): default actions, nothing blocked or pending,
-    /// altstack disabled (`sas_ss_reset`). `execve` is [`State::flush_on_exec`],
-    /// not this.
+#[cfg(test)]
+impl State<'static> {
+    /// A self-contained state for host tests: owns its objects for the life
+    /// of the test process (leaked; the tests are short-lived).
     #[must_use]
-    pub fn new(pid: i32, uid: u32, rlimit_sigpending: u64) -> Self {
-        Self {
-            actions: [SigAction::default(); NSIG as usize],
-            blocked: SigSet::EMPTY,
-            real_blocked: SigSet::EMPTY,
-            saved_sigmask: None,
-            altstack: AltStack::RESET,
-            arch: ArchInfo::default(),
-            group_exit: None,
-            global_init: false,
-            unkillable: false,
-            pid,
-            tgid: pid,
-            uid,
-            rlimit_sigpending,
-            itimer: RealTimer::default(),
-            now_ns: 0,
-            private: Pending::new(),
-            shared: Pending::new(),
+    pub fn standalone(pid: i32, uid: u32, rlimit_sigpending: u64) -> Self {
+        Self::leak(
+            TaskSignals::new(rlimit_sigpending),
+            Ids {
+                pid,
+                tgid: pid,
+                uid,
+                global_init: false,
+            },
+        )
+    }
+
+    /// [`State::standalone`] for the global init (pid 1, `SIGNAL_UNKILLABLE`).
+    #[must_use]
+    pub fn standalone_init(rlimit_sigpending: u64) -> Self {
+        Self::leak(
+            TaskSignals::new_init(rlimit_sigpending),
+            Ids {
+                pid: 1,
+                tgid: 1,
+                uid: 0,
+                global_init: true,
+            },
+        )
+    }
+
+    fn leak(signals: TaskSignals, ids: Ids) -> Self {
+        extern crate std;
+        std::boxed::Box::leak(std::boxed::Box::new(signals)).view(ids)
+    }
+}
+
+impl State<'_> {
+    /// The same view for a shorter borrow, so a `State<'static>` held by a
+    /// fake can be handed out by `&mut self`.
+    pub fn reborrow(&mut self) -> State<'_> {
+        State {
+            hand: &mut *self.hand,
+            sig: &mut *self.sig,
+            me: &mut *self.me,
+            pid: self.pid,
+            tgid: self.tgid,
+            uid: self.uid,
+            global_init: self.global_init,
         }
     }
 
@@ -223,7 +345,7 @@ impl State {
     /// cleared; the altstack address and size are zeroed (its flags are not).
     /// The blocked mask, `saved_sigmask` and all pending signals are kept.
     pub fn flush_on_exec(&mut self) {
-        for action in &mut self.actions {
+        for action in &mut self.hand.actions {
             if action.handler != SIG_IGN {
                 action.handler = SIG_DFL;
             }
@@ -231,63 +353,54 @@ impl State {
             action.restorer = 0;
             action.mask = SigSet::EMPTY;
         }
-        self.altstack.sp = 0;
-        self.altstack.size = 0;
-    }
-
-    /// The global init: pid 1, `SIGNAL_UNKILLABLE` (`copy_process`, child reaper).
-    #[must_use]
-    pub fn new_init(rlimit_sigpending: u64) -> Self {
-        let mut state = Self::new(1, 0, rlimit_sigpending);
-        state.global_init = true;
-        state.unkillable = true;
-        state
+        self.me.altstack.sp = 0;
+        self.me.altstack.size = 0;
     }
 
     fn pending(&self, target: Target) -> &Pending {
         match target {
-            Target::Thread => &self.private,
-            Target::Process => &self.shared,
+            Target::Thread => &self.me.private,
+            Target::Process => &self.sig.shared,
         }
     }
     fn pending_mut(&mut self, target: Target) -> &mut Pending {
         match target {
-            Target::Thread => &mut self.private,
-            Target::Process => &mut self.shared,
+            Target::Thread => &mut self.me.private,
+            Target::Process => &mut self.sig.shared,
         }
     }
 
     /// `rt_sigpending`'s source: signals pending in either queue.
     #[must_use]
     pub const fn pending_set(&self) -> SigSet {
-        SigSet(self.private.signal.0 | self.shared.signal.0)
+        SigSet(self.me.private.signal.0 | self.sig.shared.signal.0)
     }
 
     /// `task_sigpending()` after `recalc_sigpending`: is there anything
     /// `get_signal` would act on?
     #[must_use]
     pub fn signal_pending(&self) -> bool {
-        self.group_exit.is_some() || self.pending_set().0 & !self.blocked.0 != 0
+        self.sig.group_exit.is_some() || self.pending_set().0 & !self.me.blocked.0 != 0
     }
 
     /// `set_current_blocked`: SIGKILL and SIGSTOP are never blocked.
     pub fn set_blocked(&mut self, new: SigSet) {
-        self.blocked = new.without_unblockable();
+        self.me.blocked = new.without_unblockable();
     }
 
     /// `flush_sigqueue_mask` on both queues.
     pub fn flush_signals(&mut self, mask: u64) {
-        self.private.flush(mask);
-        self.shared.flush(mask);
+        self.me.private.flush(mask);
+        self.sig.shared.flush(mask);
     }
 
     /// `sig_task_ignored`.
     fn task_ignores(&self, sig: u8, force: bool) -> bool {
-        let action = &self.actions[usize::from(sig) - 1];
+        let action = &self.hand.actions[usize::from(sig) - 1];
         if self.global_init && sig_kernel_only(sig) {
             return true;
         }
-        if self.unkillable && action.handler == SIG_DFL && !(force && sig_kernel_only(sig)) {
+        if self.sig.unkillable && action.handler == SIG_DFL && !(force && sig_kernel_only(sig)) {
             return true;
         }
         action.ignored(sig)
@@ -295,15 +408,15 @@ impl State {
 
     /// `sig_ignored`: blocked signals (also `real_blocked` ones) are never ignored.
     fn ignores(&self, sig: u8, force: bool) -> bool {
-        !self.blocked.contains(sig)
-            && !self.real_blocked.contains(sig)
+        !self.me.blocked.contains(sig)
+            && !self.me.real_blocked.contains(sig)
             && self.task_ignores(sig, force)
     }
 
     /// `prepare_signal`: stop/continue side effects at generation time, then
     /// "should this signal be queued at all".
     fn prepare_signal(&mut self, sig: u8, force: bool) -> bool {
-        if self.group_exit.is_some() {
+        if self.sig.group_exit.is_some() {
             return false; // dying: drop (no core_state modelled)
         }
         if sig_kernel_stop(sig) {
@@ -318,26 +431,26 @@ impl State {
     fn sig_fatal(&self, sig: u8) -> bool {
         // `siginmask` is false for real-time signals: a default RT signal is fatal.
         !in_mask(sig, KERNEL_IGNORE | KERNEL_STOP)
-            && self.actions[usize::from(sig) - 1].handler == SIG_DFL
+            && self.hand.actions[usize::from(sig) - 1].handler == SIG_DFL
     }
 
     /// `complete_signal` for a single thread.
     fn complete_signal(&mut self, sig: u8) {
         // shortcut: `wants_signal` is "not blocked" (task assumed running); the
         // scheduler step adds sleeping/stopped/exiting states.
-        if self.blocked.contains(sig) {
+        if self.me.blocked.contains(sig) {
             return; // does not want it; it dequeues when unblocked
         }
         // `!sigismember(&t->real_blocked, sig)`: a signal `rt_sigtimedwait` is
         // waiting for (blocked beforehand) never takes the group down.
         if self.sig_fatal(sig)
-            && self.group_exit.is_none()
-            && !self.real_blocked.contains(sig)
+            && self.sig.group_exit.is_none()
+            && !self.me.real_blocked.contains(sig)
             && !sig_kernel_coredump(sig)
         {
             // Start the group exit: the exit code is the signal itself.
-            self.group_exit = Some(u32::from(sig));
-            self.private.signal.add(SIGKILL);
+            self.sig.group_exit = Some(u32::from(sig));
+            self.me.private.signal.add(SIGKILL);
         }
     }
 
@@ -362,8 +475,8 @@ impl State {
         }
         if sig != SIGKILL {
             let override_rlimit = sig < SIGRTMIN && info.code >= 0;
-            let counted = (self.private.len + self.shared.len) as u64 + 1;
-            let allowed = override_rlimit || counted <= self.rlimit_sigpending;
+            let counted = (self.me.private.len + self.sig.shared.len) as u64 + 1;
+            let allowed = override_rlimit || counted <= self.sig.rlimit_sigpending;
             let pending = self.pending_mut(target);
             // Classic signals have at most one entry (legacy_queue above), so
             // their reserved slots never run out; only RT entries are capped.
@@ -405,8 +518,8 @@ impl State {
         if sig == 0 || sig > NSIG {
             return;
         }
-        let blocked = self.blocked.contains(sig);
-        let action = &mut self.actions[usize::from(sig) - 1];
+        let blocked = self.me.blocked.contains(sig);
+        let action = &mut self.hand.actions[usize::from(sig) - 1];
         let ignored = action.handler == SIG_IGN;
         if blocked || ignored || handler != Handler::Current {
             action.handler = SIG_DFL;
@@ -414,12 +527,12 @@ impl State {
                 action.flags |= SA_IMMUTABLE;
             }
             if blocked {
-                self.blocked.remove(sig);
+                self.me.blocked.remove(sig);
             }
         }
         // No ptrace here: a default-handled forced signal makes init killable.
-        if self.actions[usize::from(sig) - 1].handler == SIG_DFL {
-            self.unkillable = false;
+        if self.hand.actions[usize::from(sig) - 1].handler == SIG_DFL {
+            self.sig.unkillable = false;
         }
         // Forced signals use PIDTYPE_PID; an `EAGAIN` can only come from
         // user-queued real-time signals, never from this path.
@@ -454,10 +567,10 @@ impl State {
     /// the sigcontext will show, then `force_sig_info` (`do_trap`,
     /// `__bad_area_nosemaphore`, ...).
     pub fn force_fault(&mut self, fault: &Fault) {
-        self.arch.trap_nr = fault.trap_nr;
-        self.arch.error_code = fault.error_code;
+        self.me.arch.trap_nr = fault.trap_nr;
+        self.me.arch.error_code = fault.error_code;
         if let Some(cr2) = fault.cr2 {
-            self.arch.cr2 = cr2;
+            self.me.arch.cr2 = cr2;
         }
         if let Some(info) = fault.info {
             self.force_sig_info(info, Handler::Current);
@@ -468,10 +581,10 @@ impl State {
     /// the private queue, before anything else. Like Linux it does not re-check
     /// that the chosen entry's signal is unblocked.
     pub fn dequeue_synchronous(&mut self) -> Option<SigInfo> {
-        if (self.private.signal.0 & !self.blocked.0) & SYNCHRONOUS == 0 {
+        if (self.me.private.signal.0 & !self.me.blocked.0) & SYNCHRONOUS == 0 {
             return None;
         }
-        let p = &mut self.private;
+        let p = &mut self.me.private;
         let index = p.entries().iter().position(|q| {
             q.code > SI_USER
                 && (1..=i32::from(NSIG)).contains(&q.signo)
@@ -488,7 +601,7 @@ impl State {
     /// `dequeue_signal(&current->blocked, ..)`: private queue first, then the
     /// shared one.
     pub fn dequeue_signal(&mut self) -> Option<(u8, SigInfo)> {
-        self.dequeue_signal_masked(self.blocked)
+        self.dequeue_signal_masked(self.me.blocked)
     }
 
     /// `dequeue_signal(mask, ..)`: `mask` is the set to skip (`rt_sigtimedwait`
@@ -501,7 +614,7 @@ impl State {
             if let Some(sig) = pending.next_signal(mask) {
                 let info = pending.collect(sig);
                 if target == Target::Process && sig == SIGALRM {
-                    self.itimer.rearm(self.now_ns);
+                    self.sig.itimer.rearm(self.sig.now_ns);
                 }
                 return Some((sig, info));
             }
@@ -515,8 +628,8 @@ impl State {
     /// Called on every kernel exit and after every wake-up, before the pending
     /// set is examined.
     pub fn sync_timers(&mut self, now: u64) {
-        self.now_ns = now;
-        if self.itimer.expire(now) {
+        self.sig.now_ns = now;
+        if self.sig.itimer.expire(now) {
             // Only a real-time signal sent with `si_code < 0` can fail.
             let _ = self.send_signal(SIGALRM, SigInfo::kernel(SIGALRM), Target::Process);
         }
@@ -524,12 +637,12 @@ impl State {
 
     /// `sigdelset(&current->pending.signal, sig)`.
     pub fn remove_private(&mut self, sig: u8) {
-        self.private.signal.remove(sig);
+        self.me.private.signal.remove(sig);
     }
 
     /// `do_group_exit(code)`: the exit code of the dying process.
     pub fn group_exit_code(&mut self, code: u32) -> u32 {
-        *self.group_exit.get_or_insert(code)
+        *self.sig.group_exit.get_or_insert(code)
     }
 }
 
@@ -557,17 +670,17 @@ mod tests {
     fn user(sig: u8) -> SigInfo {
         SigInfo::from_kill(sig, false, 1, 0)
     }
-    fn plain() -> State {
-        State::new(5, 0, 100)
+    fn plain() -> State<'static> {
+        State::standalone(5, 0, 100)
     }
 
     #[test]
     fn standard_signals_coalesce_rt_signals_queue() {
         // legacy_queue: kernel/signal.c:1061.
         let mut s = plain();
-        s.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
-        s.actions[39].handler = 0x1000; // RT signals are fatal by default
-        s.blocked.add(SIGUSR1);
+        s.hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+        s.hand.actions[39].handler = 0x1000; // RT signals are fatal by default
+        s.me.blocked.add(SIGUSR1);
         s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
         s.send_signal(
@@ -576,13 +689,13 @@ mod tests {
             Target::Process,
         )
         .unwrap();
-        assert_eq!(s.shared.len, 1);
+        assert_eq!(s.sig.shared.len, 1);
         for v in 0..3 {
             s.send_signal(40, SigInfo::rt(40, SI_QUEUE, 1, 0, v), Target::Process)
                 .unwrap();
         }
-        assert_eq!(s.shared.len, 4);
-        s.blocked = SigSet::EMPTY;
+        assert_eq!(s.sig.shared.len, 4);
+        s.me.blocked = SigSet::EMPTY;
         // Lowest number first, then RT entries in FIFO order, bit cleared on the last.
         assert_eq!(s.dequeue_signal().unwrap().0, SIGUSR1);
         for v in 0..3u64 {
@@ -597,34 +710,34 @@ mod tests {
     #[test]
     fn rt_queue_limit_and_overflow_rules() {
         // __send_signal_locked: kernel/signal.c:1136-1180.
-        let mut s = State::new(5, 0, 2);
-        s.blocked.add(40);
-        s.blocked.add(41);
+        let mut s = State::standalone(5, 0, 2);
+        s.me.blocked.add(40);
+        s.me.blocked.add(41);
         let q = |v| SigInfo::rt(40, SI_QUEUE, 1, 0, v);
         s.send_signal(40, q(1), Target::Process).unwrap();
         s.send_signal(40, q(2), Target::Process).unwrap();
         // Third sigqueue()-style send: EAGAIN, nothing added.
         assert_eq!(s.send_signal(40, q(3), Target::Process), Err(Errno::EAGAIN));
-        assert_eq!(s.shared.len, 2);
+        assert_eq!(s.sig.shared.len, 2);
         // kill() of an RT signal (SI_USER) never fails: signal sent, info lost.
         s.send_signal(41, user(41), Target::Process).unwrap();
-        assert!(s.shared.signal.contains(41));
-        assert_eq!(s.shared.len, 2);
-        s.blocked = SigSet::EMPTY;
+        assert!(s.sig.shared.signal.contains(41));
+        assert_eq!(s.sig.shared.len, 2);
+        s.me.blocked = SigSet::EMPTY;
         s.dequeue_signal().unwrap();
         s.dequeue_signal().unwrap();
         // 41 now dequeues with synthesised SI_USER, pid 0, uid 0.
         let (sig, info) = s.dequeue_signal().unwrap();
         assert_eq!((sig, info), (41, SigInfo::kill(41, SI_USER, 0, 0)));
         // Classic signals sent with si_code >= 0 bypass the limit.
-        let mut s = State::new(5, 0, 0);
-        s.blocked.add(SIGUSR1);
+        let mut s = State::standalone(5, 0, 0);
+        s.me.blocked.add(SIGUSR1);
         s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
-        assert_eq!(s.shared.len, 1);
+        assert_eq!(s.sig.shared.len, 1);
         // SI_TKILL (< 0) does not bypass it: signal pending, info lost.
-        let mut s = State::new(5, 0, 0);
-        s.blocked.add(SIGUSR1);
+        let mut s = State::standalone(5, 0, 0);
+        s.me.blocked.add(SIGUSR1);
         s.send_signal(
             SIGUSR1,
             SigInfo::from_kill(SIGUSR1, true, 5, 0),
@@ -632,7 +745,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            (s.private.len, s.private.signal.contains(SIGUSR1)),
+            (s.me.private.len, s.me.private.signal.contains(SIGUSR1)),
             (0, true)
         );
     }
@@ -641,10 +754,10 @@ mod tests {
     fn synchronous_signals_dequeue_first() {
         // next_signal: SYNCHRONOUS_MASK wins over lower numbers (kernel/signal.c:203).
         let mut s = plain();
-        s.blocked.add(SIGHUP);
-        s.blocked.add(SIGSEGV);
-        s.actions[usize::from(SIGSEGV) - 1].handler = 0x2000;
-        s.actions[usize::from(SIGUSR1) - 1].handler = 0x2000;
+        s.me.blocked.add(SIGHUP);
+        s.me.blocked.add(SIGSEGV);
+        s.hand.actions[usize::from(SIGSEGV) - 1].handler = 0x2000;
+        s.hand.actions[usize::from(SIGUSR1) - 1].handler = 0x2000;
         s.send_signal(SIGHUP, user(SIGHUP), Target::Thread).unwrap();
         s.send_signal(SIGUSR1, user(SIGUSR1), Target::Thread)
             .unwrap();
@@ -654,15 +767,15 @@ mod tests {
             Target::Thread,
         )
         .unwrap();
-        s.blocked = SigSet::EMPTY;
-        s.actions[0].handler = 0x3000;
+        s.me.blocked = SigSet::EMPTY;
+        s.hand.actions[0].handler = 0x3000;
         assert_eq!(s.dequeue_synchronous().unwrap().signo, i32::from(SIGSEGV));
         assert!(s.dequeue_synchronous().is_none());
         assert_eq!(s.dequeue_signal().unwrap().0, SIGHUP);
         assert_eq!(s.dequeue_signal().unwrap().0, SIGUSR1);
         // Private before shared.
-        s.actions[usize::from(SIGTERM) - 1].handler = 0x4000;
-        s.actions[usize::from(SIGUSR1) - 1].handler = 0x4000;
+        s.hand.actions[usize::from(SIGTERM) - 1].handler = 0x4000;
+        s.hand.actions[usize::from(SIGUSR1) - 1].handler = 0x4000;
         s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
         s.send_signal(SIGTERM, user(SIGTERM), Target::Thread)
@@ -678,12 +791,12 @@ mod tests {
         s.send_signal(SIGCHLD, user(SIGCHLD), Target::Process)
             .unwrap();
         assert_eq!(s.pending_set(), SigSet::EMPTY);
-        s.blocked.add(SIGCHLD);
+        s.me.blocked.add(SIGCHLD);
         s.send_signal(SIGCHLD, user(SIGCHLD), Target::Process)
             .unwrap();
         assert!(s.pending_set().contains(SIGCHLD));
         // SIG_IGN explicit.
-        s.actions[usize::from(SIGUSR1) - 1].handler = SIG_IGN;
+        s.hand.actions[usize::from(SIGUSR1) - 1].handler = SIG_IGN;
         s.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
         assert!(!s.pending_set().contains(SIGUSR1));
@@ -692,14 +805,14 @@ mod tests {
     #[test]
     fn global_init_drops_default_and_kernel_only_signals() {
         // sig_task_ignored: kernel/signal.c:84-103.
-        let mut init = State::new_init(100);
+        let mut init = State::standalone_init(100);
         for sig in [SIGTERM, SIGHUP, SIGUSR1, SIGKILL, SIGSTOP, SIGTSTP] {
             init.send_signal(sig, user(sig), Target::Process).unwrap();
             assert_eq!(init.pending_set(), SigSet::EMPTY, "{sig}");
         }
-        assert_eq!(init.group_exit, None);
+        assert_eq!(init.sig.group_exit, None);
         // With a handler installed the signal is queued; SIGKILL/SIGSTOP still not.
-        init.actions[usize::from(SIGTERM) - 1].handler = 0x1000;
+        init.hand.actions[usize::from(SIGTERM) - 1].handler = 0x1000;
         init.send_signal(SIGTERM, user(SIGTERM), Target::Process)
             .unwrap();
         assert!(init.pending_set().contains(SIGTERM));
@@ -714,9 +827,9 @@ mod tests {
         let mut p = plain();
         p.send_signal(SIGTERM, user(SIGTERM), Target::Process)
             .unwrap();
-        assert_eq!(p.group_exit, Some(15));
+        assert_eq!(p.sig.group_exit, Some(15));
         // Later signals are dropped while dying.
-        p.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+        p.hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
         p.send_signal(SIGUSR1, user(SIGUSR1), Target::Process)
             .unwrap();
         assert!(!p.pending_set().contains(SIGUSR1));
@@ -725,46 +838,49 @@ mod tests {
     #[test]
     fn forced_segv_kills_init_and_unblocks() {
         // force_sig_info_to_task: kernel/signal.c:1331-1373.
-        let mut init = State::new_init(100);
-        init.blocked.add(SIGSEGV);
+        let mut init = State::standalone_init(100);
+        init.me.blocked.add(SIGSEGV);
         init.force_sig_info(SigInfo::fault(SIGSEGV, SEGV_MAPERR, 0x10), Handler::Current);
-        assert!(!init.blocked.contains(SIGSEGV));
-        assert!(!init.unkillable);
-        assert_eq!(init.actions[usize::from(SIGSEGV) - 1].handler, SIG_DFL);
+        assert!(!init.me.blocked.contains(SIGSEGV));
+        assert!(!init.sig.unkillable);
+        assert_eq!(init.hand.actions[usize::from(SIGSEGV) - 1].handler, SIG_DFL);
         assert_eq!(
             init.dequeue_synchronous().unwrap(),
             SigInfo::fault(SIGSEGV, SEGV_MAPERR, 0x10)
         );
         // A handled SIGSEGV keeps init unkillable and stays handled.
-        let mut init = State::new_init(100);
-        init.actions[usize::from(SIGSEGV) - 1].handler = 0x1000;
+        let mut init = State::standalone_init(100);
+        init.hand.actions[usize::from(SIGSEGV) - 1].handler = 0x1000;
         init.force_sig(SIGSEGV);
-        assert!(init.unkillable);
-        assert_eq!(init.actions[usize::from(SIGSEGV) - 1].handler, 0x1000);
+        assert!(init.sig.unkillable);
+        assert_eq!(init.hand.actions[usize::from(SIGSEGV) - 1].handler, 0x1000);
         // SIG_IGN is replaced by SIG_DFL.
-        let mut init = State::new_init(100);
-        init.actions[usize::from(SIGSEGV) - 1].handler = SIG_IGN;
+        let mut init = State::standalone_init(100);
+        init.hand.actions[usize::from(SIGSEGV) - 1].handler = SIG_IGN;
         init.force_sig(SIGSEGV);
-        assert_eq!(init.actions[usize::from(SIGSEGV) - 1].handler, SIG_DFL);
+        assert_eq!(init.hand.actions[usize::from(SIGSEGV) - 1].handler, SIG_DFL);
         assert!(init.pending_set().contains(SIGSEGV));
         // force_sigsegv(SIGSEGV) resets even a handler (force_fatal_sig).
-        let mut init = State::new_init(100);
-        init.actions[usize::from(SIGSEGV) - 1].handler = 0x1000;
+        let mut init = State::standalone_init(100);
+        init.hand.actions[usize::from(SIGSEGV) - 1].handler = 0x1000;
         init.force_sigsegv(SIGSEGV);
-        assert_eq!(init.actions[usize::from(SIGSEGV) - 1].handler, SIG_DFL);
-        assert!(!init.unkillable);
+        assert_eq!(init.hand.actions[usize::from(SIGSEGV) - 1].handler, SIG_DFL);
+        assert!(!init.sig.unkillable);
         // force_exit_sig marks the action immutable.
         let mut p = plain();
         p.force_exit_sig(SIGSEGV);
-        assert_ne!(p.actions[usize::from(SIGSEGV) - 1].flags & SA_IMMUTABLE, 0);
+        assert_ne!(
+            p.hand.actions[usize::from(SIGSEGV) - 1].flags & SA_IMMUTABLE,
+            0
+        );
     }
 
     #[test]
     fn stop_and_cont_flush_each_other() {
         // prepare_signal: kernel/signal.c:895-960.
         let mut s = plain();
-        s.blocked.add(SIGCONT);
-        s.blocked.add(SIGTSTP);
+        s.me.blocked.add(SIGCONT);
+        s.me.blocked.add(SIGTSTP);
         s.send_signal(SIGCONT, user(SIGCONT), Target::Process)
             .unwrap();
         s.send_signal(SIGTSTP, user(SIGTSTP), Target::Process)
@@ -775,7 +891,7 @@ mod tests {
             .unwrap();
         assert!(!s.pending_set().contains(SIGTSTP));
         assert!(s.pending_set().contains(SIGCONT));
-        assert_eq!(s.shared.len, 1);
+        assert_eq!(s.sig.shared.len, 1);
     }
 
     #[test]

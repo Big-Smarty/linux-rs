@@ -340,7 +340,7 @@ pub trait Cpu {
     fn ss_is_valid_user_data(&self, ss: u16) -> bool;
 }
 
-pub use state::State;
+pub use state::{Ids, State, TaskSignals};
 
 /// The task the signal syscalls and the blocking waits run for: the binary's
 /// process (and the host tests' fake). `parts` hands out the two disjoint
@@ -354,9 +354,9 @@ pub trait Task {
     where
         Self: 'a;
     /// The signal state alone.
-    fn state(&mut self) -> &mut State;
+    fn state(&mut self) -> State<'_>;
     /// The signal state and user memory, borrowed together.
-    fn parts(&mut self) -> (&mut State, Self::Pages<'_>);
+    fn parts(&mut self) -> (State<'_>, Self::Pages<'_>);
     /// `CLOCK_MONOTONIC` in nanoseconds (`ktime_get`).
     fn now_ns(&self) -> u64;
     /// `schedule()` for one wake-up: halt until an interrupt arrives or the

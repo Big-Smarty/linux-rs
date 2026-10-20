@@ -122,7 +122,7 @@ pub enum GetSignal {
 pub fn get_signal(state: &mut State) -> GetSignal {
     loop {
         // Has this task already been marked for death?
-        if let Some(code) = state.group_exit {
+        if let Some(code) = state.sig.group_exit {
             state.remove_private(SIGKILL);
             return GetSignal::Fatal {
                 exit_code: code,
@@ -138,13 +138,13 @@ pub fn get_signal(state: &mut State) -> GetSignal {
         } else {
             return GetSignal::None;
         };
-        let action = state.actions[usize::from(sig) - 1];
+        let action = state.hand.actions[usize::from(sig) - 1];
         if action.handler == SIG_IGN {
             continue;
         }
         if action.handler != SIG_DFL {
             if action.flags & SA_RESETHAND != 0 {
-                state.actions[usize::from(sig) - 1].handler = SIG_DFL;
+                state.hand.actions[usize::from(sig) - 1].handler = SIG_DFL;
             }
             return GetSignal::Handler(Ksig { sig, info, action });
         }
@@ -153,7 +153,7 @@ pub fn get_signal(state: &mut State) -> GetSignal {
             continue;
         }
         // Global init gets no signals it doesn't want.
-        if state.unkillable && !sig_kernel_only(sig) {
+        if state.sig.unkillable && !sig_kernel_only(sig) {
             continue;
         }
         if sig_kernel_stop(sig) {
@@ -173,14 +173,14 @@ pub fn get_signal(state: &mut State) -> GetSignal {
 /// handler's `sa_mask` and (unless `SA_NODEFER`) the signal itself; an
 /// `SS_AUTODISARM` stack is disarmed for the handler.
 fn signal_delivered(state: &mut State, ksig: &Ksig) {
-    state.saved_sigmask = None;
-    let mut blocked = SigSet(state.blocked.0 | ksig.action.mask.0);
+    state.me.saved_sigmask = None;
+    let mut blocked = SigSet(state.me.blocked.0 | ksig.action.mask.0);
     if ksig.action.flags & SA_NODEFER == 0 {
         blocked.add(ksig.sig);
     }
     state.set_blocked(blocked);
-    if state.altstack.flags & SS_AUTODISARM != 0 {
-        state.altstack = AltStack::RESET;
+    if state.me.altstack.flags & SS_AUTODISARM != 0 {
+        state.me.altstack = AltStack::RESET;
     }
 }
 
@@ -256,7 +256,7 @@ pub fn do_signal_or_restart<P: UserPages, C: Cpu>(
         GetSignal::None => {
             restart_without_handler(regs);
             // restore_saved_sigmask: no handler consumed the saved mask.
-            if let Some(mask) = state.saved_sigmask.take() {
+            if let Some(mask) = state.me.saved_sigmask.take() {
                 state.set_blocked(mask);
             }
             Outcome::Resume
