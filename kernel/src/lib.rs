@@ -8,6 +8,7 @@
 pub mod bitmap;
 pub mod boot;
 pub mod config;
+pub mod cputime;
 pub mod exec;
 pub mod fbtext;
 pub mod firmware;
