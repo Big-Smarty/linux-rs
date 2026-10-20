@@ -629,7 +629,14 @@ fn clock_nanosleep<C: Context>(
                 },
                 expires_ns: add_safe(add_safe(now.clock_of(base), request), TIMER_SLACK_NS),
             };
-            Ok(sleep_to(ctx, deadline, rem_out, abs, resume))
+            // The wait ends at the hard expiry, soft + slack.
+            Ok(sleep_to(
+                ctx,
+                add_safe(deadline, TIMER_SLACK_NS),
+                rem_out,
+                abs,
+                resume,
+            ))
         }
         Sleeper::Alarm => {
             if !ctx.alarm_rtc() {
@@ -709,7 +716,10 @@ fn nanosleep<C: Context>(ctx: &mut C, sleep_req: u64, rem_out: u64) -> i64 {
         clockid: 1,
         expires_ns: add_safe(add_safe(mono, request), TIMER_SLACK_NS),
     };
-    sleep_to(ctx, add_safe(mono, request), rem_out, false, resume)
+    // The wait ends at the hard expiry (`hrtimer_set_expires_range_ns`:
+    // soft + slack) and the remainder is measured against it, as
+    // `hrtimer_expires_remaining` does.
+    sleep_to(ctx, resume.expires_ns, rem_out, false, resume)
 }
 
 fn gettimeofday<C: Context>(ctx: &mut C, tv: u64, tz: u64) -> i64 {
@@ -781,6 +791,8 @@ mod tests {
     const BUF: u64 = 0x1000;
     const BAD: u64 = 0xdead_0000_0000;
     const MONO: i128 = 5_123_456_789;
+    /// `TIMER_SLACK_NS` as the deadlines of hrtimer sleeps carry it.
+    const SLACK: u64 = 50_000;
     const OFFSET: i128 = 1_800_000_000_000_000_000;
     /// `make_process_cpuclock(1, which)` and its per-thread form.
     const fn cpu_clock(pid: i32, which: i32, thread: bool) -> i32 {
@@ -1029,7 +1041,13 @@ mod tests {
         assert_eq!(ret(&mut t, Sysno::clock_nanosleep, [1, 1, BUF, 0]), 0);
         assert_eq!(
             t.clocks.slept,
-            [now + 1_000_000_005, 2_000_000_000, 3_000, now + 4_000, 1]
+            [
+                now + 1_000_000_005 + SLACK,
+                2_000_000_000 + SLACK,
+                3_000 + SLACK,
+                now + 4_000 + SLACK,
+                1 + SLACK
+            ]
         );
     }
 

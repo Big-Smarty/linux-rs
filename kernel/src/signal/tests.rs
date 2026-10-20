@@ -348,7 +348,8 @@ fn handler_frame_is_byte_exact_and_sigreturn_restores() {
         out,
         super::frame::Sigreturn {
             ret: 0xa5,
-            bad_frame: false
+            bad_frame: false,
+            reached_sigcontext: true
         }
     );
     let mut want_regs = before;
@@ -763,7 +764,8 @@ fn sigreturn_mask_is_applied_even_when_a_later_step_fails() {
         out,
         super::frame::Sigreturn {
             ret: 0,
-            bad_frame: true
+            bad_frame: true,
+            reached_sigcontext: true
         }
     );
     assert_eq!(st.blocked, SigSet(SigSet::bit(SIGUSR1)));
@@ -818,7 +820,8 @@ fn sigreturn_with_unreadable_frame_forces_sigsegv() {
         out,
         super::frame::Sigreturn {
             ret: 0,
-            bad_frame: true
+            bad_frame: true,
+            reached_sigcontext: false
         }
     );
     assert_eq!(r.sp, 0x30_0000, "registers untouched on a bad frame");
@@ -1210,7 +1213,8 @@ fn replay_linux_frame(frame_hex: &str, fp_hex: &str, frame_addr: u64, sig: u8, a
         out,
         super::frame::Sigreturn {
             ret: before.ax,
-            bad_frame: false
+            bad_frame: false,
+            reached_sigcontext: true
         }
     );
     assert_eq!(

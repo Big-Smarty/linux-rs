@@ -790,11 +790,11 @@ impl<'a> signal::Task for Syscall<'a> {
         let (state, mut pages) = FaultPages::of(self.process, &mut self.space);
         let result =
             signal::frame::rt_sigreturn(state, self.regs, &mut pages, &mut cpu::UserCpu::new());
-        // `restore_sigcontext`: a pending restarted system call now returns -EINTR.
-        // shortcut: reset even when the frame was unreadable before that point
-        // (Linux then resets nothing); only a hand-made `restart_syscall` after
-        // a refused frame can tell.
-        self.process.restart = RestartBlock::NONE;
+        // `restore_sigcontext`'s first statement: a pending restarted system
+        // call now returns -EINTR; a frame refused before it resets nothing.
+        if result.reached_sigcontext {
+            self.process.restart = RestartBlock::NONE;
+        }
         if result.bad_frame {
             // `signal_fault`: printed before the SIGSEGV is forced; `regs` are
             // whatever the failed `restore_sigcontext` left, as in Linux.

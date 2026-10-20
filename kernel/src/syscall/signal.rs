@@ -295,6 +295,46 @@ mod tests {
         assert_eq!(sleep_until(&mut t, 1_000_000), Some(1_000_000 - 3_000));
     }
 
+    /// `nanosleep` through the real `sleep_until`: the remainder is measured
+    /// against the hard expiry (soft + 50 us slack), as `hrtimer_expires_remaining`.
+    #[test]
+    fn nanosleep_remainder_and_wakeup_use_the_hard_expiry() {
+        const MONO: u64 = 5_123_456_789;
+        for (signal_at, left) in [(10_000, 1_040_000), (1_020_000, 30_000)] {
+            let mut t = mapped();
+            t.clocks.real_sleep = true;
+            t.now = MONO;
+            let mut ts = [0u8; 16];
+            ts[8..].copy_from_slice(&1_000_000i64.to_le_bytes());
+            put(&mut t, PAGE, &ts);
+            t.script_signal(MONO + signal_at, SIGUSR1);
+            assert_eq!(
+                call(&mut t, Sysno::nanosleep, &[PAGE, PAGE + 16]),
+                Outcome::Return(-516)
+            );
+            let rem = get::<16>(&mut t, PAGE + 16);
+            assert_eq!(i64::from_le_bytes(rem[..8].try_into().unwrap()), 0);
+            assert_eq!(i64::from_le_bytes(rem[8..].try_into().unwrap()), left);
+            assert_eq!(
+                t.clocks.restarts.last().unwrap().expires_ns,
+                (MONO + 1_050_000) as i64
+            );
+        }
+        // Uninterrupted: the sleep ends at the hard expiry, not before.
+        let mut t = mapped();
+        t.clocks.real_sleep = true;
+        t.now = MONO;
+        let mut ts = [0u8; 16];
+        ts[8..].copy_from_slice(&1_000_000i64.to_le_bytes());
+        put(&mut t, PAGE, &ts);
+        t.script_signal(MONO + 5_000_000, SIGUSR1);
+        assert_eq!(
+            call(&mut t, Sysno::nanosleep, &[PAGE, 0]),
+            Outcome::Return(0)
+        );
+        assert_eq!(t.now, MONO + 1_050_000);
+    }
+
     #[test]
     fn sigtimedwait_poll_timeout_and_wakeup() {
         let mut t = mapped();

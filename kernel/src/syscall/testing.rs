@@ -38,6 +38,9 @@ pub struct FakeClocks {
     pub capable: bool,
     /// The next sleep is interrupted with this many ns remaining.
     pub interrupt: Option<u64>,
+    /// Sleep through the real `signal::wait::sleep_until` (the fake `wait`
+    /// clock, `Task::now`) instead of the scripted `interrupt`.
+    pub real_sleep: bool,
     /// Deadlines passed to `sleep_until`.
     pub slept: Vec<u64>,
     /// Offsets passed to `set_realtime`.
@@ -64,6 +67,7 @@ impl Default for FakeClocks {
             rtc: true,
             capable: true,
             interrupt: None,
+            real_sleep: false,
             slept: Vec::new(),
             set: Vec::new(),
             restarts: Vec::new(),
@@ -229,7 +233,7 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
     }
 }
 
-impl<P, C> Clocks for Task<P, C> {
+impl<P: UserPages, C> Clocks for Task<P, C> {
     fn clock_state(&self) -> ClockState {
         self.clocks.state
     }
@@ -256,6 +260,9 @@ impl<P, C> Clocks for Task<P, C> {
     }
     fn sleep_until(&mut self, deadline_ns: u64) -> Option<u64> {
         self.clocks.slept.push(deadline_ns);
+        if self.clocks.real_sleep {
+            return signal::wait::sleep_until(self, deadline_ns);
+        }
         self.clocks.interrupt.take()
     }
     fn capable_sys_time(&self) -> bool {
@@ -310,6 +317,7 @@ impl<P: UserPages, C> signal::Task for Task<P, C> {
         Sigreturn {
             ret: self.sigreturn_ret,
             bad_frame: false,
+            reached_sigcontext: true,
         }
     }
 }

@@ -19,7 +19,7 @@ use super::{
     Outcome, dispatch, error,
     testing::{Task, task},
 };
-use crate::signal::{SIG_IGN, SIGALRM, SIGPIPE, SIGXFSZ};
+use crate::signal::{SIG_IGN, SIGALRM, SIGPIPE, SIGXFSZ, SigSet};
 use crate::vfs::{
     AT_EMPTY_PATH, AT_FDCWD, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK,
     O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, S_IFCHR, S_IFDIR, S_IFREG, mkdev, new_encode_dev,
@@ -371,6 +371,24 @@ fn blocking_pipe_and_console_waits_are_interrupted_by_a_signal() {
     // partial count instead of restarting.
     assert_eq!(call(&mut full, Sysno::read, &[3, OUT, 4096]), ok(4096));
     assert_eq!(call(&mut full, Sysno::write, &[4, BUF, 4096 + 1]), ok(4096));
+}
+
+#[test]
+fn a_wait_whose_only_wakeup_expired_into_nothing_stops_loudly() {
+    // One-shot alarm whose SIGALRM is ignored, then blocked: it fires during
+    // the wait, never becomes pending, and nothing else could wake the task.
+    for blocked in [false, true] {
+        let mut t = t();
+        assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+        if blocked {
+            t.state.blocked = SigSet(SigSet::bit(SIGALRM));
+        } else {
+            t.state.actions[usize::from(SIGALRM) - 1].handler = SIG_IGN;
+        }
+        assert_eq!(call(&mut t, Sysno::alarm, &[1]), ok(0));
+        assert_eq!(call(&mut t, Sysno::read, &[3, BUF, 1]), Outcome::Blocked(0));
+        assert_eq!(t.now, 1_000_000_000, "the timer had expired first");
+    }
 }
 
 #[test]

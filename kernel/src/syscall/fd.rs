@@ -15,8 +15,8 @@
 // `TIOCGWINSZ`, `TIOCGPGRP`, `FIONREAD`), include/uapi/asm-generic/ioctls.h,
 // fs/open.c (`do_sys_ftruncate`). All GPL-2.0 / GPL-2.0-only.
 // Transformation: the user-space iterators become `Dest`/bounce-buffer loops
-// with the same page-sized fault granularity; waits become `Stop::Blocked`
-// (one task, nobody to wake it).
+// with the same page-sized fault granularity; waits are interruptible sleeps
+// that end in `Stop::Blocked` when nothing could wake the one task.
 // x86_64 only: `usize` is 64 bits, and the narrowing/sign casts below are the
 // C types of the Linux ABI (`unsigned int` descriptors, `off_t`, `umode_t`,
 // 32-bit inode numbers) reproduced on purpose.
@@ -455,15 +455,16 @@ fn pipe_read<C: Context>(
 /// armed and no signal pending Linux would sleep forever and the kernel stops
 /// loudly ([`Stop::Blocked`]) instead of halting.
 fn interruptible_wait<C: Context>(ctx: &mut C) -> Result<(), Stop> {
-    let now = ctx.now_ns();
-    let state = ctx.state();
-    state.sync_timers(now);
-    if !state.signal_pending() && state.itimer.next_event().is_none() {
-        return Err(Stop::Blocked);
-    }
-    // The condition never holds: the only way out is a pending signal.
-    let _ = crate::signal::wait::wait_event_interruptible(ctx, |_| false);
-    Ok(())
+    // Checked on every wake-up, after the timers are brought up to date: an
+    // `ITIMER_REAL` that expired into an ignored or blocked `SIGALRM` leaves
+    // nothing that could end the wait.
+    let mut dead = false;
+    let _ = crate::signal::wait::wait_event_interruptible(ctx, |c| {
+        let state = c.state();
+        dead = !state.signal_pending() && state.itimer.next_event().is_none();
+        dead
+    });
+    if dead { Err(Stop::Blocked) } else { Ok(()) }
 }
 
 // ---- write --------------------------------------------------------------------
