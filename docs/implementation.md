@@ -470,7 +470,7 @@ The `AT_MINSIGSTKSZ` question: `sigaltstack` compares only against `MINSIGSTKSZ`
 
 ### Evidence actually produced
 
-GATE_PLACEHOLDER
+Gate run `signal-gate-006` on the branch rebased onto `main` e20bcfd (`target/gates.sh`, logs in `target/gates-signal6/`, every step `exit=0`): `cargo fmt --all --check`; host 1.88 Clippy and tests of `xtask`/`baremetal`; `cargo +nightly clippy --workspace --all-targets -D warnings`; `cargo +nightly test --workspace` (kernel library 261 tests, 62 of them `signal::*`); `xtask kernel-test` 25/25 (the binary does not call the module); target Clippy of both kernel profiles; `xtask check` and `status` (18 `in_progress` after the `ws-kernel-signal-c` route). An earlier run of the same tree (`signal-gate-005`) had `kernel-test` killed by SIGTERM (exit 143) while stray background waiters from a previous run were being cancelled; it was repeated unchanged as 006 rather than counted. Because the module is not reachable from the freestanding binary, none of this exercises the signal code in ring 3, on hardware or against Linux automatically; the Linux comparison is the byte-exact replay of the two probe frames.
 
 ### Linux sources read (6.18.57, commit `2ff600d29ee478d0a8d46ef8a58afb5e038fe692`)
 
