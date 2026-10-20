@@ -465,7 +465,7 @@ const DEBUG_CASES: [DebugCase; 18] = [
 ];
 
 /// Expected stdout lines of the oracle syscall suite (`user/init` modes `mm ids time signal fs
-/// proc`) as observed on the pinned Linux 6.18.57 (`target/linux-reference/init-reference-005`).
+/// proc`) as observed on the pinned Linux 6.18.57 (`target/linux-reference/init-reference-006`).
 /// Tab-separated `group kind name line`, `#` comments and a header row; see the file header.
 /// The `kernel-test` cases that run these modes on this kernel are added with the syscalls they
 /// need, so nothing outside the unit test reads it yet.

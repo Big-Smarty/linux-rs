@@ -1,8 +1,10 @@
 # Expected output lines of the oracle syscall suite (user/init modes mm ids time signal fs proc) on the pinned
 # Linux 6.18.57 reference kernel: QEMU q35, -cpu qemu64 (TCG), -smp 1 -m 512M, "console=ttyS0 panic=-1 vdso=0 norandmaps -- <mode>",
-# the harness-built /init and generated initramfs (target/linux-reference/init-reference-005; docs/implementation.md#oracle-syscall-test-suite).
-# Columns: group, kind (check|info|summary), name, line (the exact stdout line without the newline). Kernel printk lines
-# may interleave with console output and must be filtered by the consumer (keep lines that start with "init: test", "init: tests" or "init: info").
+# the harness-built /init and generated initramfs (target/linux-reference/init-reference-006; docs/implementation.md#oracle-syscall-test-suite).
+# Columns: group, kind (check|info|summary), name, line (the exact stdout line without the newline).
+# A consumer matches "check" and "summary" rows exactly; "info" rows are recorded observations (tmpfs d_off cookies), not requirements.
+# Kernel printk lines may interleave with console output and must be filtered by the consumer (keep lines that start with
+# "init: test", "init: tests" or "init: info").
 group	kind	name	line
 mm	check	brk-query	init: test mm.brk-query ok
 mm	check	brk-grow	init: test mm.brk-grow ok
@@ -468,7 +470,7 @@ signal	check	siginfo-kill-uid	init: test signal.siginfo-kill-uid ok
 signal	check	siginfo-rest-zero	init: test signal.siginfo-rest-zero ok
 signal	check	handler-mask-has-signal	init: test signal.handler-mask-has-signal ok
 signal	check	mask-restored-after-handler	init: test signal.mask-restored-after-handler ok
-signal	check	handler-flags-cleared-df	init: test signal.handler-flags-cleared-df ok
+signal	check	handler-uc_flags	init: test signal.handler-uc_flags ok
 signal	check	tgkill-self	init: test signal.tgkill-self ok
 signal	check	tgkill-delivered	init: test signal.tgkill-delivered ok
 signal	check	tkill-self	init: test signal.tkill-self ok
@@ -586,7 +588,7 @@ signal	check	nanosleep-remaining-restart	init: test signal.nanosleep-remaining-r
 signal	check	read-eintr-without-restart	init: test signal.read-eintr-without-restart ok
 signal	check	read-eintr-handler-ran	init: test signal.read-eintr-handler-ran ok
 signal	check	read-restarted-with-sa_restart	init: test signal.read-restarted-with-sa_restart ok
-signal	check	read-restart-handler-ran-once	init: test signal.read-restart-handler-ran-once ok
+signal	check	read-restart-handler-ran	init: test signal.read-restart-handler-ran ok
 signal	check	itimer-expired	init: test signal.itimer-expired ok
 signal	check	init-ignores-sigkill	init: test signal.init-ignores-sigkill ok
 signal	check	init-ignores-sigstop	init: test signal.init-ignores-sigstop ok
@@ -908,7 +910,7 @@ proc	check	wait4-wnohang-no-children	init: test proc.wait4-wnohang-no-children o
 proc	check	wait4-no-children	init: test proc.wait4-no-children ok
 proc	check	wait4-missing-pid	init: test proc.wait4-missing-pid ok
 proc	check	wait4-missing-pgid	init: test proc.wait4-missing-pgid ok
-proc	check	wait4-int-min	init: test proc.wait4-int-min ok
+proc	check	wait4-pid-truncated-to-int	init: test proc.wait4-pid-truncated-to-int ok
 proc	check	wait4-int-min-32	init: test proc.wait4-int-min-32 ok
 proc	check	wait4-bad-options	init: test proc.wait4-bad-options ok
 proc	check	wait4-wexited-not-allowed	init: test proc.wait4-wexited-not-allowed ok
@@ -919,7 +921,9 @@ proc	check	waitid-bad-idtype	init: test proc.waitid-bad-idtype ok
 proc	check	waitid-no-event-bits	init: test proc.waitid-no-event-bits ok
 proc	check	waitid-bad-options	init: test proc.waitid-bad-options ok
 proc	check	waitid-wnohang-only	init: test proc.waitid-wnohang-only ok
-proc	check	waitid-fault	init: test proc.waitid-fault ok
+proc	check	waitid-fault-no-children	init: test proc.waitid-fault-no-children ok
+proc	check	waitid-fault-with-zombie	init: test proc.waitid-fault-with-zombie ok
+proc	check	waitid-fault-reaped-anyway	init: test proc.waitid-fault-reaped-anyway ok
 proc	check	waitid-exited	init: test proc.waitid-exited ok
 proc	check	waitid-exited-fields	init: test proc.waitid-exited-fields ok
 proc	check	waitid-wnowait-keeps-zombie	init: test proc.waitid-wnowait-keeps-zombie ok
@@ -1013,4 +1017,4 @@ proc	check	poll-negative-fd-ignored	init: test proc.poll-negative-fd-ignored ok
 proc	check	pipe2-bad-flags	init: test proc.pipe2-bad-flags ok
 proc	check	pipe2-fault	init: test proc.pipe2-fault ok
 proc	check	pipe-legacy	init: test proc.pipe-legacy ok
-proc	summary	-	init: tests proc passed=133 failed=0
+proc	summary	-	init: tests proc passed=135 failed=0
