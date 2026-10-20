@@ -165,6 +165,15 @@ pub struct SignalStruct {
     pub unkillable: bool,
     /// `RLIMIT_SIGPENDING` (`signal->rlim`).
     pub rlimit_sigpending: u64,
+    /// The job-control bits of `signal->flags` (`SIGNAL_STOP_STOPPED`,
+    /// `SIGNAL_STOP_CONTINUED`, `SIGNAL_CLD_STOPPED`, `SIGNAL_CLD_CONTINUED`;
+    /// see [`crate::task::wait`]). Kept apart from `group_exit` (which carries
+    /// `SIGNAL_GROUP_EXIT`); a group exit clears them, as it replaces
+    /// `signal->flags`.
+    pub job_flags: u32,
+    /// `signal->group_exit_code` while the group is stopped: the stop signal
+    /// `wait` reports (`WUNTRACED`), cleared when reported.
+    pub stop_code: u32,
     /// `signal->real_timer` / `it_real_incr` (`ITIMER_REAL`).
     pub itimer: RealTimer,
     /// `CLOCK_MONOTONIC` as of the last [`State::sync_timers`]: the `now` of
@@ -217,6 +226,8 @@ impl TaskSignals {
                 group_exit: None,
                 unkillable: false,
                 rlimit_sigpending,
+                job_flags: 0,
+                stop_code: 0,
                 itimer: RealTimer::default(),
                 now_ns: 0,
                 shared: Pending::new(),

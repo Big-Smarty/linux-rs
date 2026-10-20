@@ -3,8 +3,11 @@
 // `Vec::push_within_capacity`: the only way to grow a `Vec` under the kernel's
 // `--cfg no_global_oom_handling` `alloc` (see `mm`).
 #![feature(vec_push_within_capacity)]
+// `Box::try_new`: the fallible allocation of per-task state (`task::tasklist`).
+#![feature(allocator_ext)]
 //! Shared early-kernel contracts. Host tests execute the same pure parsers and
 //! primitives as the freestanding entry; privileged code is in the gated binary.
+pub mod arena;
 pub mod bitmap;
 pub mod boot;
 pub mod config;
