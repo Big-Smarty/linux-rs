@@ -4688,6 +4688,24 @@ fn user_faults_handled(line: &str, demand: bool) -> bool {
         .is_some_and(|count| count >= u64::from(demand))
 }
 
+/// `CHECK kstack-usage max_used=N usable=M ...` (printed by the self-test kernel when init exits):
+/// the deepest kernel stack use any measured system call, exception or exit reached. A regression
+/// guard, not Linux behaviour: some use is recorded and it stays within half of the usable stack
+/// (0 would mean the measurement did not run; observed 15,408 of 65,536 bytes, deepest in `fork`).
+fn kstack_usage_ok(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("CHECK kstack-usage max_used=") else {
+        return false;
+    };
+    let Some((used, rest)) = rest.split_once(" usable=") else {
+        return false;
+    };
+    let (usable, _) = rest.split_once(' ').unwrap_or((rest, ""));
+    matches!(
+        (used.parse::<u64>(), usable.parse::<u64>()),
+        (Ok(used), Ok(usable)) if used > 0 && used * 2 <= usable
+    )
+}
+
 /// The records after the summary line, by what init did.
 fn user_tail(
     find: &Finder<'_>,
@@ -4711,6 +4729,7 @@ fn user_tail(
                     &|line| user_faults_handled(line, demand),
                     "handled ring-3 page faults record",
                 )?,
+                find.at(&kstack_usage_ok, "kernel stack usage record")?,
                 find.exact(&format!("{DEATH}0x00000000"), "init death panic")?,
                 find.exact("RESULT success", "RESULT success")?,
             ]);
@@ -6945,6 +6964,21 @@ mod tests {
                 serial.replace("handled=7", "handled=many"),
             ),
             (
+                "no kernel stack usage record",
+                serial.replace(
+                    "CHECK kstack-usage max_used=7432",
+                    "CHECK kstack-usage-x max_used=7432",
+                ),
+            ),
+            (
+                "kernel stack use beyond half the stack",
+                serial.replace("max_used=7432", "max_used=40000"),
+            ),
+            (
+                "kernel stack use of zero",
+                serial.replace("max_used=7432", "max_used=0"),
+            ),
+            (
                 "duplicate init: ok",
                 serial.replace("init: ok", "init: ok\ninit: ok"),
             ),
@@ -7009,7 +7043,7 @@ mod tests {
             .unwrap()
             .replace("argc=1", "argc=2")
             .replace(
-                "\ninit: ok\nCHECK user-faults ok handled=7\nKernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
+                "\ninit: ok\nCHECK user-faults ok handled=7\nCHECK kstack-usage max_used=7432 usable=65536 slot=0 syscall=1 measured=244 exec=0 signal=0 fault=0 fork=0 syscall=7432 exception=0 between=880 exit=4616\nKernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
                 "",
             );
         let segfault = format!(
@@ -7169,6 +7203,7 @@ mod tests {
             &fixture::init_summary(&expected().init, 1),
             "init: ok",
             "CHECK user-faults ok handled=7",
+            "CHECK kstack-usage max_used=7432 usable=65536 slot=0 syscall=1 measured=244 exec=0 signal=0 fault=0 fork=0 syscall=7432 exception=0 between=880 exit=4616",
             "Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000",
             "RESULT success",
         ]

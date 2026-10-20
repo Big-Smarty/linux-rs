@@ -4,8 +4,9 @@
 //! `sched-switch` and `kstack-overflow` use kernel threads only: the register
 //! switch, the run queue, keyed and signal wake-ups, the timer queue, the stack
 //! pool and its guard pages, with the same code paths the user task runs on.
-//! `sched-preempt` keeps one kernel thread runnable beside `/init`. Nothing
-//! here is built outside `qemu-self-test`.
+//! `sched-preempt` keeps one kernel thread runnable beside `/init`. The
+//! kernel-stack watermark at the end measures every case. Nothing here is
+//! built outside `qemu-self-test`.
 
 use super::{
     Ordering, RQ, SLOTS, SWITCHES, SchedId, TaskState, WaitKey, current, idle_loop, schedule,
@@ -18,7 +19,8 @@ use crate::{
 use core::{
     arch::naked_asm,
     hint::black_box,
-    sync::atomic::{AtomicBool, AtomicU64},
+    ptr,
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU64},
 };
 use kernel::{
     memory::Virtual,
@@ -433,4 +435,227 @@ pub fn preempt_report() {
     crate::log!(
         "CHECK sched-preempt ok kthread=ran user_return_preemption=interrupt init=resumed\n"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Kernel-stack watermark (`CONFIG_DEBUG_STACK_USAGE`, `kernel/exit.c`
+// `check_stack_usage` and `stack_not_used`). Linux zeroes a fresh stack and
+// counts the untouched words above the end marker when the task exits; here
+// the unused part is painted with a non-zero pattern (a zero word can be live
+// data, which makes Linux's count an under-estimate of the depth), and the
+// depth is measured per entry from ring 3: every system call and exception
+// starts on an empty stack, so the lowest overwritten word after it is the
+// depth of that path, and the stack is painted again before the next one.
+// Test profile only: the paint and the scans cost a few thousand word
+// accesses per entry and the production kernels do not carry them.
+
+/// The fill of an untouched stack word.
+const STACK_PAINT: u64 = 0x5AFE_57AC_0DD5_C0DE;
+/// Distance kept below the live frame when painting again (the repaint
+/// routine's own frame and any spill lie above it).
+const PAINT_MARGIN: u64 = 512;
+/// Stacks painted and still running (not yet counted at their exit).
+static PAINTED: [AtomicBool; cpu::KSTACK_SLOTS] =
+    [const { AtomicBool::new(false) }; cpu::KSTACK_SLOTS];
+
+/// What a measured stretch of kernel stack use was doing.
+#[derive(Clone, Copy)]
+pub enum Path {
+    /// `execve`, `execveat`.
+    Exec,
+    /// `rt_sigreturn`, or any entry in which a signal handler frame was built.
+    Signal,
+    /// A page fault taken in ring 3 (demand paging, copy-on-nothing, `SIGSEGV`).
+    Fault,
+    /// `fork`, `vfork`, `clone`, `clone3`.
+    Fork,
+    /// Any other system call.
+    Syscall,
+    /// Any other exception from ring 3.
+    Exception,
+    /// Between entries: interrupts that hit ring 3, a child's first return.
+    Between,
+    /// A task's exit and kernel threads.
+    Exit,
+}
+const PATHS: usize = 8;
+#[cfg(not(feature = "baremetal-suite"))]
+const PATH_NAMES: [&str; PATHS] = [
+    "exec",
+    "signal",
+    "fault",
+    "fork",
+    "syscall",
+    "exception",
+    "between",
+    "exit",
+];
+/// The deepest stack use seen per [`Path`], bytes from the top of the stack.
+static PATH_MAX: [AtomicU64; PATHS] = [const { AtomicU64::new(0) }; PATHS];
+/// The deepest stack overall, its pool slot and the system call (plus one)
+/// that was running on it, -1 when not a system call.
+static MAX_USED: AtomicU64 = AtomicU64::new(0);
+static MAX_SLOT: AtomicU64 = AtomicU64::new(0);
+static MAX_NR: AtomicI64 = AtomicI64::new(-1);
+/// Measured stretches.
+static MEASURED: AtomicU64 = AtomicU64::new(0);
+/// Handler frames built since boot (an entry that saw it grow is a signal path).
+static SIGNAL_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Fill pool stack `pool` below its first live address `frame` with
+/// [`STACK_PAINT`], keeping the end-marker word at its lowest address.
+///
+/// # Safety
+/// Pool stack `pool` belongs exclusively to the caller (a task being built
+/// that has not run), `frame` is the address of its finished `ForkFrame`
+/// (8-aligned, inside the usable part).
+pub(super) unsafe fn paint_stack(pool: usize, frame: u64) {
+    // SAFETY: the caller's contract is `paint`'s: the words from the lowest
+    // usable one to `frame` are owned and unused.
+    unsafe { paint(cpu::kstack_lowest(pool) + 8, frame) };
+    PAINTED[pool].store(true, Ordering::Relaxed);
+}
+
+/// Write [`STACK_PAINT`] to every word of `[from, to)`.
+///
+/// # Safety
+/// Both are 8-aligned addresses of one pool stack's usable part and no live
+/// data (frame, local, interrupt frame) is in the range.
+unsafe fn paint(from: u64, to: u64) {
+    let mut word = from;
+    while word < to {
+        // SAFETY: in the range the caller vouches for.
+        unsafe { ptr::write_volatile(word as *mut u64, STACK_PAINT) };
+        word += 8;
+    }
+}
+
+/// The lowest address of pool stack `pool` that is no longer paint (its top
+/// when untouched).
+fn lowest_dirty(pool: usize) -> u64 {
+    let mut word = cpu::kstack_lowest(pool) + 8;
+    let top = cpu::kstack_top(pool);
+    // SAFETY: every word read is an 8-aligned address of the static, mapped
+    // pool stack, below `top`; a plain volatile read of initialised memory.
+    while word < top && unsafe { ptr::read_volatile(word as *const u64) } == STACK_PAINT {
+        word += 8;
+    }
+    word
+}
+
+fn record(pool: usize, path: Path, used: u64, nr: Option<u64>) {
+    MEASURED.fetch_add(1, Ordering::Relaxed);
+    PATH_MAX[path as usize].fetch_max(used, Ordering::Relaxed);
+    if used > MAX_USED.fetch_max(used, Ordering::Relaxed) {
+        MAX_SLOT.store(pool as u64, Ordering::Relaxed);
+        MAX_NR.store(
+            nr.and_then(|nr| i64::try_from(nr).ok()).unwrap_or(-1),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Measure the current task's stack since it was last painted, count it as
+/// `path`, and paint the unused part below the caller's frame again.
+fn measure(pool: usize, path: Path, nr: Option<u64>) {
+    let low = lowest_dirty(pool);
+    record(pool, path, cpu::kstack_top(pool) - low, nr);
+    let here = 0u64;
+    let live = (ptr::addr_of!(here) as u64 & !7).saturating_sub(PAINT_MARGIN);
+    if low < live {
+        // SAFETY: `[low, live)` is on the running task's own stack, below the
+        // frame of this function (the margin covers its spills) where nothing
+        // live exists: the kernel is built without a red zone, interrupts
+        // complete before they return here, and the words above `low` that
+        // were unpainted are dead stack of finished calls.
+        unsafe { paint(low, live) };
+    }
+}
+
+fn current_pool() -> Option<usize> {
+    RQ.lock().curr().index().checked_sub(1)
+}
+
+/// A system call or exception from ring 3 starts: count what ran since the
+/// last entry ended (interrupts, a child's first return) and paint again.
+/// Returns the pool slot to give [`entry_end`].
+pub fn entry_begin() -> Option<usize> {
+    let pool = current_pool()?;
+    measure(pool, Path::Between, None);
+    Some(pool)
+}
+
+/// The entry ends, back at its outermost frame: count its depth.
+/// `syscall` is the system call number, `None` for an exception, whose vector
+/// is `vector`.
+pub fn entry_end(pool: Option<usize>, signals_before: u64, syscall: Option<u64>, vector: u64) {
+    let Some(pool) = pool else { return };
+    let signalled = SIGNAL_FRAMES.load(Ordering::Relaxed) != signals_before;
+    let path = match (syscall, vector) {
+        (Some(59 | 322), _) => Path::Exec,
+        (Some(15), _) => Path::Signal,
+        (Some(56..=58 | 435), _) => Path::Fork,
+        (Some(_), _) => Path::Syscall,
+        (None, 14) => Path::Fault,
+        (None, _) => Path::Exception,
+    };
+    let low = lowest_dirty(pool);
+    if signalled {
+        record(pool, Path::Signal, cpu::kstack_top(pool) - low, syscall);
+    }
+    measure(pool, path, syscall);
+}
+
+/// The handler frame counter read before an entry.
+pub fn signal_frames() -> u64 {
+    SIGNAL_FRAMES.load(Ordering::Relaxed)
+}
+
+/// A signal handler frame was just built for the running task.
+pub fn note_signal_frame() {
+    SIGNAL_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A task is exiting on its own stack: count its depth.
+pub(super) fn note_stack_depth(id: SchedId) {
+    if let Some(pool) = id.index().checked_sub(1)
+        && PAINTED[pool].swap(false, Ordering::Relaxed)
+    {
+        record(
+            pool,
+            Path::Exit,
+            cpu::kstack_top(pool) - lowest_dirty(pool),
+            None,
+        );
+    }
+}
+
+/// `CHECK kstack-usage` at the end of a run: the deepest stack of every
+/// measured stretch, overall and per path, against the 64 KiB usable. A path
+/// the run never took reads 0. This is the record the stack-depth table of
+/// `docs/implementation.md` is read from.
+#[cfg(not(feature = "baremetal-suite"))]
+pub fn stack_report() {
+    for (pool, painted) in PAINTED.iter().enumerate() {
+        if painted.swap(false, Ordering::Relaxed) {
+            record(
+                pool,
+                Path::Exit,
+                cpu::kstack_top(pool) - lowest_dirty(pool),
+                None,
+            );
+        }
+    }
+    crate::log!(
+        "CHECK kstack-usage max_used={} usable={} slot={} syscall={} measured={}",
+        MAX_USED.load(Ordering::Relaxed),
+        cpu::kstack_top(0) - cpu::kstack_lowest(0),
+        MAX_SLOT.load(Ordering::Relaxed),
+        MAX_NR.load(Ordering::Relaxed),
+        MEASURED.load(Ordering::Relaxed)
+    );
+    for (name, max) in PATH_NAMES.iter().zip(&PATH_MAX) {
+        crate::log!(" {}={}", name, max.load(Ordering::Relaxed));
+    }
+    crate::log!("\n");
 }

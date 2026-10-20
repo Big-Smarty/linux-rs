@@ -354,6 +354,10 @@ fn prepare(
             },
         );
         ptr::write_volatile(cpu::kstack_lowest(pool) as *mut u64, STACK_END_MAGIC);
+        // SAFETY: the same exclusive, never-run pool stack; `frame` is its
+        // first live address (`selftest::paint_stack`'s contract).
+        #[cfg(feature = "qemu-self-test")]
+        selftest::paint_stack(pool, frame as u64);
         let thread = thread(slot);
         *thread = Thread {
             sp: frame as u64,
@@ -728,6 +732,8 @@ pub(crate) extern "C" fn ret_from_fork(
 /// `do_task_dead`: the current task is finished. It leaves the CPU for good;
 /// the next task releases its slot and stack ([`finish_task_switch`]).
 pub fn exit_current() -> ! {
+    #[cfg(feature = "qemu-self-test")]
+    selftest::note_stack_depth(RQ.lock().curr());
     RQ.lock().exit_current();
     schedule();
     // A dead task is never queued, so `schedule` cannot return here.

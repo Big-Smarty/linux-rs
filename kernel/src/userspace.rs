@@ -1451,6 +1451,7 @@ fn init_died(code: u32) -> ! {
             USER_FAULTS_HANDLED.load(core::sync::atomic::Ordering::Relaxed)
         );
         ktask::selftest::preempt_report();
+        ktask::selftest::stack_report();
     }
     crate::log!("{}\n", InitDeath(code));
     #[cfg(feature = "qemu-self-test")]
@@ -1470,6 +1471,11 @@ fn init_died(code: u32) -> ! {
 /// `regs.ax`, then runs the exit-to-user work (pending signals). Interrupts are
 /// off and the CPU is on the running task's kernel stack.
 pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
+    #[cfg(feature = "qemu-self-test")]
+    let (stack, frames) = (
+        ktask::selftest::entry_begin(),
+        ktask::selftest::signal_frames(),
+    );
     let args = [regs.di, regs.si, regs.dx, regs.r10, regs.r8, regs.r9];
     let number = regs.orig_ax;
     let outcome = {
@@ -1497,6 +1503,8 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
         }
     }
     exit_to_user(regs);
+    #[cfg(feature = "qemu-self-test")]
+    ktask::selftest::entry_end(stack, frames, Some(number), 0);
 }
 
 /// `exit_to_user_mode_loop` + `arch_do_signal_or_restart`: before every return
@@ -1554,7 +1562,12 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
             };
             match outcome {
                 // `handle_pending_signals` loops while a forced SIGSEGV is pending.
-                SignalOutcome::Resume | SignalOutcome::Handled | SignalOutcome::FrameFailed => {}
+                SignalOutcome::Resume | SignalOutcome::Handled | SignalOutcome::FrameFailed => {
+                    #[cfg(feature = "qemu-self-test")]
+                    if matches!(outcome, SignalOutcome::Handled) {
+                        ktask::selftest::note_signal_frame();
+                    }
+                }
                 SignalOutcome::Exit { exit_code, .. } => {
                     drop(process);
                     drop(local);
@@ -1748,6 +1761,11 @@ fn raise_fault(
 /// return to ring 3 then delivers it. A vector that is not a plain user fault
 /// (NMI, #DF, #MC, #NM, ...) is a kernel failure, never a user death.
 pub fn exception(regs: &mut cpu::PtRegs, vector: u64, error: u64, address: u64) {
+    #[cfg(feature = "qemu-self-test")]
+    let (stack, frames) = (
+        ktask::selftest::entry_begin(),
+        ktask::selftest::signal_frames(),
+    );
     let raised = {
         let mut local = current_local();
         let TaskLocal { tables, own } = &mut *local;
@@ -1768,6 +1786,8 @@ pub fn exception(regs: &mut cpu::PtRegs, vector: u64, error: u64, address: u64) 
         crate::fail();
     }
     exit_to_user(regs);
+    #[cfg(feature = "qemu-self-test")]
+    ktask::selftest::entry_end(stack, frames, None, vector);
 }
 
 /// `print_vma_addr`'s file part for `ip`: Linux prints the basename of the
