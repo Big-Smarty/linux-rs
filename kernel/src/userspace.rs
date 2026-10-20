@@ -23,13 +23,12 @@
 use crate::{
     boot::{BootError, BootInfo},
     console, cpu,
-    memory::{Allocator, Error as MemoryError, PAGE, Physical},
+    memory::{Allocator, Error as MemoryError, PAGE, PAGE_BYTES, Physical},
     paging::{self, Tables, UserSpace},
-    services,
+    services::{self, Service},
 };
 use core::{
     arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
-    cell::UnsafeCell,
     iter,
 };
 use kernel::{
@@ -44,9 +43,8 @@ use kernel::{
         stack::{self, ARG_PAGES, Aux, ENVP, EXPAND_PAGES, STACK_START, STACK_TOP, StackError},
     },
     image::{cpio::FileType, elf::Elf},
-    sync::RawSpinLock,
-    syscall::{self, Console, Outcome},
-    usercopy,
+    syscall::{self, Console, Context, Outcome},
+    usercopy::{self, UserPages},
 };
 use syscalls::Errno;
 
@@ -353,32 +351,54 @@ fn load_init(
     })
 }
 
-/// What the syscall and fault paths need once init runs (the frames, tables
-/// and boot info are in `services`).
-struct State {
-    vmas: Vmas,
+/// The one process: what the syscall and fault paths need once init runs
+/// (frames, boot info and the heap are in `services`/`kalloc`). Later syscall
+/// groups extend it (file table, credentials, signals, ...); exactly one is
+/// reachable until tasks exist.
+///
+/// Lock order: `PROCESS` -> `TABLES` -> heap -> `FRAMES` (`services`). The
+/// handler holds `PROCESS` for the whole syscall (a single task cannot
+/// re-enter), so a field needs no lock of its own.
+pub struct Process {
+    /// Task id; `pid == tgid` for the single-threaded init.
+    #[allow(dead_code, reason = "read by gettid and the identity group")]
+    pub pid: u32,
+    /// Thread-group id: what `getpid` reports.
+    pub tgid: u32,
+    /// The address space (`mm`): the published page tables.
+    pub mm: &'static Service<Tables>,
+    /// File-backed VMAs from the exec plan (segfault report).
+    /// shortcut: fixed array, no anonymous VMAs yet; the mm group replaces it
+    /// with a sorted `Vec` grown by `try_reserve`.
+    pub vmas: Vmas,
+    /// `mm->start_brk`, and the initial `mm->brk`.
+    #[allow(dead_code, reason = "read by the brk syscall (mm group)")]
+    pub brk: u64,
 }
 
-/// A `State` shared with entry code. Single CPU: the only accessors are the
-/// syscall handler and the fatal exception handler, which cannot interleave
-/// (a syscall runs with IF/TF cleared and ring 0 takes no user exception);
-/// `LOCK` makes that explicit and keeps the access sound if that changes.
-struct Shared(UnsafeCell<Option<State>>);
-// SAFETY: every access goes through `with`/`install`, which hold `LOCK`.
-unsafe impl Sync for Shared {}
-static LOCK: RawSpinLock = RawSpinLock::new();
-static STATE: Shared = Shared(UnsafeCell::new(None));
+static PROCESS: Service<Process> = Service::new();
 
-fn install(state: State) {
-    let _owner = LOCK.lock();
-    // SAFETY: `LOCK` is held, so this is the only access to the cell.
-    unsafe { *STATE.0.get() = Some(state) };
+/// Syscall context: the process plus its user-memory view (a borrow of the
+/// locked tables, so no map/unmap can run mid-syscall) and the console.
+struct Syscall<'a> {
+    process: &'a mut Process,
+    space: UserSpace<'a>,
+    tty: Tty,
 }
 
-fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
-    let _owner = LOCK.lock();
-    // SAFETY: `LOCK` is held, so this is the only access to the cell.
-    unsafe { (*STATE.0.get()).as_mut().map(f) }
+impl UserPages for Syscall<'_> {
+    fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+        self.space.page(page, write)
+    }
+}
+
+impl Context for Syscall<'_> {
+    fn console(&mut self) -> &mut dyn Console {
+        &mut self.tty
+    }
+    fn tgid(&self) -> u32 {
+        self.process.tgid
+    }
 }
 
 /// init's `/dev/console`: the same sinks as `log!`.
@@ -410,15 +430,17 @@ fn init_died(code: u32) -> ! {
 /// `regs.ax`. Interrupts are off and the CPU is on the `BOOT_STACK` top.
 pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
     let args = [regs.di, regs.si, regs.dx, regs.r10, regs.r8, regs.r9];
-    // Lock order: STATE (process) -> TABLES (services). The user-memory view
-    // borrows the guard, so nothing can edit the tables mid-syscall.
-    let Some(outcome) = with(|_state| {
-        let mut tables = services::TABLES.lock();
-        syscall::dispatch(&mut tables.user_space(), &mut Tty, regs.orig_ax, args)
-    }) else {
-        crate::log!("FAIL syscall before init state\n");
-        crate::fail();
+    let mut process = PROCESS.lock();
+    let mm = process.mm;
+    let mut tables = mm.lock();
+    let mut context = Syscall {
+        space: tables.user_space(),
+        process: &mut process,
+        tty: Tty,
     };
+    let outcome = syscall::dispatch(&mut context, regs.orig_ax, args);
+    drop(tables);
+    drop(process);
     match outcome {
         Outcome::Return(value) => regs.ax = value.cast_unsigned(),
         Outcome::Exit(code) => init_died(code),
@@ -433,10 +455,7 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
 /// no signal handler can exist yet, so the signal's default action (terminate)
 /// runs, the exit code is the signal number, and init's death panics.
 pub fn exception(vector: u64, error: u64, ip: u64, sp: u64, address: u64) -> ! {
-    let Some(vmas) = with(|state| state.vmas) else {
-        crate::log!("FAIL user exception before init state vector={}\n", vector);
-        crate::fail();
-    };
+    let vmas = PROCESS.lock().vmas;
     if vector == 14 {
         let line = Segfault {
             address,
@@ -604,7 +623,13 @@ fn start(init: &Loaded) -> ! {
         protection.smap
     );
     let (entry, sp) = (init.entry, init.sp);
-    install(State { vmas: init.vmas });
+    PROCESS.install(Process {
+        pid: 1,
+        tgid: 1,
+        mm: &services::TABLES,
+        vmas: init.vmas,
+        brk: init.brk,
+    });
     // SAFETY: descriptors and syscall MSRs are installed above; the owned tree
     // is active and maps `entry` (executable) and `sp` (writable, user); all
     // state used by the syscall/fault paths is in `STATE`; `kernel_main`'s
