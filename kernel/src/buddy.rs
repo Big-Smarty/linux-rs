@@ -768,9 +768,8 @@ mod tests {
     #[test]
     fn split_reserved_refines_ownership_to_pages() {
         with_buddy(&[(1024, 1040)], 0..0, |buddy| {
-            let block = buddy.allocate(2, 1).expect("order two");
-            let pfn = block.pfn();
-            core::mem::forget(block); // the reservation outlives its token
+            // Dropping the token keeps the reservation (it is just a handle).
+            let pfn = buddy.allocate(2, 1).expect("order two").pfn();
             // SAFETY: the test owns the live order-two head it just made.
             unsafe { buddy.split_reserved(pfn, 2).expect("split") };
             check_partition(buddy);

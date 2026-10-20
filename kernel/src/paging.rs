@@ -364,6 +364,10 @@ impl Tables {
 
     /// The PTE slot of the user page at `address`, if every table above it is
     /// present (the PTE itself may be absent). Never creates tables.
+    #[allow(
+        dead_code,
+        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
+    )]
     fn user_slot(&self, address: u64) -> Result<Option<*mut u64>, Error> {
         if address & (PAGE - 1) != 0 || address >= TASK_SIZE_MAX {
             return Err(Error::Address);
@@ -389,6 +393,10 @@ impl Tables {
     ///
     /// # Errors
     /// Rejects an unaligned or out-of-range address, or a non-user entry.
+    #[allow(
+        dead_code,
+        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
+    )]
     pub fn unmap_user(&mut self, address: u64) -> Result<Option<Physical>, Error> {
         let Some(slot) = self.user_slot(address)? else {
             return Ok(None);
@@ -416,6 +424,10 @@ impl Tables {
     ///
     /// # Errors
     /// Rejects an unaligned or out-of-range address, or a non-user entry.
+    #[allow(
+        dead_code,
+        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
+    )]
     pub fn protect_user(
         &mut self,
         address: u64,
@@ -457,6 +469,10 @@ impl Tables {
     ///
     /// # Errors
     /// As [`Tables::map_user`], plus frame exhaustion.
+    #[allow(
+        dead_code,
+        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
+    )]
     pub fn map_user_anon(
         &mut self,
         allocator: &mut Allocator<'_>,
@@ -497,6 +513,10 @@ impl Tables {
     /// # Errors
     /// Address errors as [`Tables::unmap_user`]; the allocator rejecting a
     /// frame (a mapped frame that was not an order-zero reservation).
+    #[allow(
+        dead_code,
+        reason = "used by the self-test now and by the mm syscalls (brk/mmap/munmap/mprotect) next"
+    )]
     pub fn unmap_user_free(
         &mut self,
         allocator: &mut Allocator<'_>,
@@ -585,7 +605,8 @@ impl Tables {
         // page of the active tree; SMAP is not enabled yet (it is turned on in
         // `userspace::start`), so ring 0 may touch it. This also loads the
         // writable translation into the TLB.
-        let pointer = ptr::with_exposed_provenance_mut::<u8>(base as usize);
+        let pointer =
+            ptr::with_exposed_provenance_mut::<u8>(usize::try_from(base).map_err(|_| fail())?);
         unsafe { pointer.write_volatile(0x5a) };
         if self.protect_user(base, false, false)? != Some((true, false))
             // SAFETY: IF clear, test recovery installed, readonly user page.

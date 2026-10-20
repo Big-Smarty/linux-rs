@@ -41,6 +41,12 @@ const VENDOR_PROC_MACROS: [&str; 3] = [
     "rustversion-1.0.23",
     "serde_derive-1.0.229",
 ];
+/// Rust-for-Linux's switch: removes every `alloc` API that can abort on
+/// allocation failure, so kernel allocation can only be fallible. It must be in
+/// the rustflags of the `-Zbuild-std` build of `alloc` (hence of every crate),
+/// and in the target Clippy command (`docs/kernel-tooling.md`).
+const NO_GLOBAL_OOM_HANDLING: &str = "--cfg=no_global_oom_handling";
+
 /// What the isolated Cargo build compiles: the kernel (two feature profiles) or the user `/init`.
 #[derive(Clone, Copy)]
 enum Target {
@@ -72,6 +78,16 @@ impl Target {
         match self {
             Self::Kernel { .. } => "kernel",
             Self::Init => "init",
+        }
+    }
+
+    /// The `-Zbuild-std` crate list. Only the kernel has `alloc`, and its `alloc`
+    /// is built with [`NO_GLOBAL_OOM_HANDLING`]: infallible allocation APIs do
+    /// not exist in the kernel (`Box::new`, `Vec::push`, ... fail to compile).
+    fn build_std(self) -> &'static str {
+        match self {
+            Self::Kernel { .. } => "-Zbuild-std=core,alloc,compiler_builtins",
+            Self::Init => "-Zbuild-std=core,compiler_builtins",
         }
     }
 
@@ -195,6 +211,7 @@ const INIT_OK: User = User::Ok {
 
 const BUDDY_ORDER_RECORD: &str = "CHECK buddy-orders ok max_order=10 contiguous=true zeroed=true split=true coalesced=true fragmented=true aligned=131072 rollback=true";
 const USER_MM_RECORD: &str = "CHECK user-mm ok pages=3 rollback_points=3 tlb=invlpg protect=ro unmap=3 conflict=rolled-back accounting=restored";
+const HEAP_RECORD: &str = "CHECK heap ok vec=1000 box=4096 align=4096 growth=buddy-frames oom=failed-cleanly recovered=true over_cap=rejected accounting=restored";
 const IRQ_GUARD_RECORD: &str = "CHECK irq-guard ok nested=2 out_of_order=true saved_on=true saved_off=true exclusive=true blocked_wraps=2 blocked_delta=0 resumed=true";
 const PF_GPR_RECORD: &str = "CHECK page-fault-gprs ok gprs=15";
 const MEMORY_RUNTIME_RECORD: &str = "CHECK memory-runtime ok memset_cases=272 memcpy_cases=4224 zero_length=true boundaries=true padding_fields=true same_allocation=true";
@@ -214,6 +231,7 @@ const SUCCESS_MARKERS: &[&str] = &[
     "CHECK exhaustion ok",
     BUDDY_ORDER_RECORD,
     USER_MM_RECORD,
+    HEAP_RECORD,
     IRQ_GUARD_RECORD,
     "CHECK timer ok",
     "TIMER mask observation pit_wraps=2 irq_delta=0",
@@ -2118,8 +2136,7 @@ fn write_target_spec(root: &Path, output: &Path, rustc: &Path) -> io::Result<Pat
 fn collect_runtime_archives(
     directory: &Path,
     artifacts: &mut Vec<PathBuf>,
-    has_core: &mut bool,
-    has_builtins: &mut bool,
+    found: &mut RuntimeArchives,
 ) -> io::Result<()> {
     let mut entries = fs::read_dir(directory)
         .map_err(|error| contextual(directory, &error))?
@@ -2135,7 +2152,7 @@ fn collect_runtime_archives(
             )));
         }
         if metadata.is_dir() {
-            collect_runtime_archives(&path, artifacts, has_core, has_builtins)?;
+            collect_runtime_archives(&path, artifacts, found)?;
             continue;
         }
         if !metadata.is_file() {
@@ -2152,26 +2169,41 @@ fn collect_runtime_archives(
             .and_then(OsStr::to_str)
             .ok_or_else(|| invalid("non-UTF-8 compiler runtime artifact name"))?;
         if name.starts_with("libcore-") {
-            *has_core = true;
+            found.core = true;
             artifacts.push(path);
         } else if name.starts_with("libcompiler_builtins-") {
-            *has_builtins = true;
+            found.builtins = true;
+            artifacts.push(path);
+        } else if name.starts_with("liballoc-") {
+            found.alloc = true;
             artifacts.push(path);
         }
     }
     Ok(())
 }
 
-fn compiler_runtime_artifacts(target_dir: &Path) -> io::Result<Vec<PathBuf>> {
+/// Which rebuilt standard-library archives the target output contains.
+#[derive(Default)]
+struct RuntimeArchives {
+    core: bool,
+    builtins: bool,
+    alloc: bool,
+}
+
+/// The rebuilt `core`/`compiler_builtins` (and, for the kernel, `alloc`)
+/// archives of a fresh target directory; each required one must be present.
+fn compiler_runtime_artifacts(target_dir: &Path, need_alloc: bool) -> io::Result<Vec<PathBuf>> {
     let output = target_dir.join(TARGET).join("release");
     let mut artifacts = Vec::new();
-    let mut has_core = false;
-    let mut has_builtins = false;
-    collect_runtime_archives(&output, &mut artifacts, &mut has_core, &mut has_builtins)?;
+    let mut found = RuntimeArchives::default();
+    collect_runtime_archives(&output, &mut artifacts, &mut found)?;
     artifacts.sort();
-    if !has_core || !has_builtins {
+    if !found.core || !found.builtins || found.alloc != need_alloc {
         return Err(invalid(format!(
-            "Cargo target output lacks core ({has_core}) or compiler_builtins ({has_builtins}) archives under {}",
+            "Cargo target output has core ({}), compiler_builtins ({}), alloc ({}; required: {need_alloc}) archives under {}",
+            found.core,
+            found.builtins,
+            found.alloc,
             output.display()
         )));
     }
@@ -2200,7 +2232,7 @@ fn build_command(
     let mut command = supervised(&cargo.path);
     command
         .args([
-            "-Zbuild-std=core,compiler_builtins",
+            target.build_std(),
             "-Zbuild-std-features=compiler-builtins-mem",
             "rustc",
             "--offline",
@@ -2232,7 +2264,10 @@ fn build_command(
         // Applies to every crate of the target build (std, deps, project), so no checkout, run
         // or toolchain path is embedded in panic locations or debug info. The later, more
         // specific output prefix wins over the checkout prefix it lives under.
-        .env("CARGO_ENCODED_RUSTFLAGS", remap_flags(root, output, rustc)?)
+        .env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            remap_flags(root, output, rustc, target)?,
+        )
         .env("CARGO_TARGET_X86_64_UNKNOWN_NONE_LINKER", &lld.path)
         .args(["--", "-Crelocation-model=static", "-Clinker-flavor=gnu-lld"])
         .args(["-Clink-arg=--no-pie", "-Clink-arg=--no-undefined"])
@@ -2250,13 +2285,15 @@ fn build_command(
 }
 
 /// `CARGO_ENCODED_RUSTFLAGS` (unit-separator joined) mapping the checkout, run
-/// directory and toolchain sysroot to fixed names.
-fn remap_flags(root: &Path, output: &Path, rustc: &Tool) -> io::Result<String> {
+/// directory and toolchain sysroot to fixed names, plus [`NO_GLOBAL_OOM_HANDLING`]
+/// for the kernel (whose `alloc` is fallible-only).
+fn remap_flags(root: &Path, output: &Path, rustc: &Tool, target: Target) -> io::Result<String> {
     let sysroot = rustc
         .path
         .ancestors()
         .nth(2)
         .ok_or_else(|| invalid("rustc has no sysroot"))?;
+    let cfgs = (!target.is_init()).then(|| Ok(NO_GLOBAL_OOM_HANDLING.to_owned()));
     Ok([(root, "/src"), (output, "/out"), (sysroot, "/toolchain")]
         .into_iter()
         .map(|(path, to)| {
@@ -2268,6 +2305,7 @@ fn remap_flags(root: &Path, output: &Path, rustc: &Tool) -> io::Result<String> {
             }
             Ok(format!("--remap-path-prefix={text}={to}"))
         })
+        .chain(cfgs)
         .collect::<io::Result<Vec<_>>>()?
         .join("\x1f"))
 }
@@ -2514,7 +2552,7 @@ fn prepare_build(root: &Path, output: &Path, target: Target) -> io::Result<Prepa
     manifest_value(
         &mut manifest,
         "cargo_encoded_rustflags",
-        remap_flags(root, output, &rustc)?.replace('\x1f', " | "),
+        remap_flags(root, output, &rustc, target)?.replace('\x1f', " | "),
     );
     record_build_sources(root, &mut manifest, &sources)?;
     Ok(PreparedBuild {
@@ -2615,7 +2653,7 @@ fn finish_build(
             "Cargo ELF changed while taking the immutable snapshot",
         ));
     }
-    let runtimes = compiler_runtime_artifacts(&target_dir)?;
+    let runtimes = compiler_runtime_artifacts(&target_dir, !target.is_init())?;
     manifest_value(
         &mut manifest,
         "runtime_archive_count",
@@ -3869,6 +3907,9 @@ fn validate_success_serial(
     if !unique_exact_record(lines, "CHECK user-mm", USER_MM_RECORD) {
         return Err("positive case must report the exact post-activation user-mm proof".to_owned());
     }
+    if !unique_exact_record(lines, "CHECK heap", HEAP_RECORD) {
+        return Err("positive case must report the exact fallible-heap proof".to_owned());
+    }
     if !unique_exact_record(lines, "CHECK irq-guard", IRQ_GUARD_RECORD)
         || !observed_irq_restore(lines, true)
     {
@@ -4947,19 +4988,49 @@ mod tests {
             path: PathBuf::from(path),
             version: String::new(),
         };
+        let kernel = Target::Kernel {
+            qemu_self_test: false,
+        };
         let flags = remap_flags(
             Path::new("/work/root"),
             Path::new("/work/root/out"),
             &rustc("/tc/bin/rustc"),
+            kernel,
         )
         .unwrap();
-        assert_eq!(flags.split('\x1f').count(), 3);
+        // Three path remaps, then the fallible-allocation-only switch.
+        assert_eq!(flags.split('\x1f').count(), 4);
         assert!(flags.starts_with("--remap-path-prefix=/work/root=/src\x1f"));
+        assert!(flags.ends_with("\x1f--cfg=no_global_oom_handling"));
+        // The init has no `alloc` and keeps its flags (and bytes) unchanged.
+        let init = remap_flags(
+            Path::new("/work/root"),
+            Path::new("/work/root/out"),
+            &rustc("/tc/bin/rustc"),
+            Target::Init,
+        )
+        .unwrap();
+        assert_eq!(init.split('\x1f').count(), 3);
+        assert!(!init.contains("oom"));
+        assert_eq!(
+            kernel.build_std(),
+            "-Zbuild-std=core,alloc,compiler_builtins"
+        );
+        assert_eq!(
+            Target::Init.build_std(),
+            "-Zbuild-std=core,compiler_builtins"
+        );
         for bad in ["/w/a\x1fb", "/w/a\nb", "/w/a\x7fb"] {
             let (root, output) = (Path::new(bad), Path::new("/w/out"));
-            assert!(remap_flags(root, output, &rustc("/tc/bin/rustc")).is_err());
+            assert!(remap_flags(root, output, &rustc("/tc/bin/rustc"), kernel).is_err());
             assert!(
-                remap_flags(Path::new("/w"), output, &rustc(&format!("{bad}/bin/rustc"))).is_err()
+                remap_flags(
+                    Path::new("/w"),
+                    output,
+                    &rustc(&format!("{bad}/bin/rustc")),
+                    kernel
+                )
+                .is_err()
             );
         }
     }
@@ -5415,9 +5486,15 @@ mod tests {
             builtins.join("libcompiler_builtins-qualified.rlib"),
             b"archive fixture",
         )?;
-        assert_eq!(compiler_runtime_artifacts(&scratch.0)?.len(), 2);
+        assert_eq!(compiler_runtime_artifacts(&scratch.0, false)?.len(), 2);
+        // The kernel's build-std includes `alloc`; its absence is a failure,
+        // and an unexpected one in the init build is too.
+        assert!(compiler_runtime_artifacts(&scratch.0, true).is_err());
+        fs::write(builtins.join("liballoc-qualified.rlib"), b"archive fixture")?;
+        assert_eq!(compiler_runtime_artifacts(&scratch.0, true)?.len(), 3);
+        assert!(compiler_runtime_artifacts(&scratch.0, false).is_err());
         std::os::unix::fs::symlink(&core, release.join("symlink"))?;
-        assert!(compiler_runtime_artifacts(&scratch.0).is_err());
+        assert!(compiler_runtime_artifacts(&scratch.0, true).is_err());
         Ok(())
     }
 
@@ -5832,6 +5909,7 @@ mod tests {
             "CHECK exhaustion ok",
             BUDDY_ORDER_RECORD,
             USER_MM_RECORD,
+            HEAP_RECORD,
             IRQ_GUARD_RECORD,
             "IRQ restore observation pit_wraps=2 irq_delta=2 lock_acquired=true",
             "CHECK timer ok pit_wraps=2 gprs=15",
@@ -5966,6 +6044,35 @@ mod tests {
                 )
                 .0,
                 "accepted invalid multi-order proof: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn heap_proof_rejects_missing_changed_and_duplicate_records() {
+        let success = ProcessResult {
+            exit_code: Some(33),
+            timed_out: false,
+        };
+        let serial = success_serial();
+        for invalid in [
+            String::new(),
+            HEAP_RECORD.replace("oom=failed-cleanly", "oom=none"),
+            HEAP_RECORD.replace("recovered=true", "recovered=false"),
+            HEAP_RECORD.replace("over_cap=rejected", "over_cap=accepted"),
+            HEAP_RECORD.replace("growth=buddy-frames", "growth=none"),
+            format!("{HEAP_RECORD} extra=true"),
+            format!("{HEAP_RECORD}\n{HEAP_RECORD}"),
+            "CHECK heap".to_owned(),
+        ] {
+            assert!(
+                !validate(
+                    DEBUG_CASES[0],
+                    &success,
+                    &serial.replace(HEAP_RECORD, &invalid),
+                )
+                .0,
+                "accepted invalid heap proof: {invalid}"
             );
         }
     }

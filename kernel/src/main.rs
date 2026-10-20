@@ -2,11 +2,20 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+// Fallible allocation API (`Box::try_new`, `Vec::push_within_capacity`); the
+// infallible one does not exist in target builds, see `kalloc`. Only the
+// self-test uses them so far.
+#![cfg_attr(
+    feature = "qemu-self-test",
+    feature(allocator_ext, vec_push_within_capacity)
+)]
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 compile_error!(
     "the kernel requires --target x86_64-unknown-none; host tools/tests do not enable freestanding"
 );
+
+extern crate alloc;
 
 // Links the scalar `memset`/`memcpy` providers the compiler emits calls to.
 use kernel::{boot, firmware, image, memory};
@@ -14,6 +23,7 @@ use linux_rs_runtime as _;
 
 mod console;
 mod cpu;
+mod kalloc;
 mod paging;
 mod services;
 mod userspace;
@@ -186,14 +196,7 @@ extern "C" fn kernel_main() -> ! {
     #[cfg(feature = "qemu-self-test")]
     check_allocator_recovery(&mut allocator);
     #[cfg(feature = "qemu-self-test")]
-    unwrap(
-        paging::Tables::user_mm_tests(&mut tables, &mut allocator),
-        "user-mm",
-    );
-    #[cfg(feature = "qemu-self-test")]
-    log!(
-        "CHECK user-mm ok pages=3 rollback_points=3 tlb=invlpg protect=ro unmap=3 conflict=rolled-back accounting=restored\n"
-    );
+    check_user_mm(&mut tables, &mut allocator);
     unwrap(cpu::start_timer(acpi.legacy_pic), "timer-init");
     unwrap(
         cpu::irq_guard_test(
@@ -234,13 +237,25 @@ extern "C" fn kernel_main() -> ! {
         allocator.available(),
         tables.pages
     );
-    // The boot-phase locals end here: the frame allocator and the published
-    // tables move into their statics, since this frame becomes init's kernel
-    // stack and the syscall/fault paths allocate and edit tables from there.
-    services::FRAMES.install(allocator);
-    services::TABLES.install(tables);
+    publish_services(allocator, tables);
     // Diverges: init runs and its death ends the boot, or Linux's failure text.
     userspace::run(user)
+}
+
+/// The boot-phase locals end here: the frame allocator and the published tables
+/// move into their statics, since `kernel_main`'s frame becomes init's kernel
+/// stack and the syscall/fault paths allocate and edit tables from there.
+fn publish_services(allocator: Allocator<'static>, tables: paging::Tables) {
+    services::FRAMES.install(allocator);
+    services::TABLES.install(tables);
+    // The heap is usable from here on (it grows from `FRAMES`).
+    #[cfg(feature = "qemu-self-test")]
+    {
+        unwrap(kalloc::self_test(), "heap");
+        log!(
+            "CHECK heap ok vec=1000 box=4096 align=4096 growth=buddy-frames oom=failed-cleanly recovered=true over_cap=rejected accounting=restored\n"
+        );
+    }
 }
 
 fn loader_handoff(framebuffer: bool) -> (boot::BootInfo, firmware::Acpi) {
@@ -378,6 +393,14 @@ fn check_exceptions(boot: &boot::BootInfo, allocator: &mut Allocator<'_>) {
         cpu::unexpected_interrupt();
     }
     assert!(boot.test != TestMode::Panic, "controlled panic case");
+}
+
+#[cfg(feature = "qemu-self-test")]
+fn check_user_mm(tables: &mut paging::Tables, allocator: &mut Allocator<'_>) {
+    unwrap(tables.user_mm_tests(allocator), "user-mm");
+    log!(
+        "CHECK user-mm ok pages=3 rollback_points=3 tlb=invlpg protect=ro unmap=3 conflict=rolled-back accounting=restored\n"
+    );
 }
 
 fn fail() -> ! {

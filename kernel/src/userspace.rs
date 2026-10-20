@@ -541,7 +541,7 @@ const FALLBACK_NAMES: [&str; 4] = ["/sbin/init", "/etc/init", "/bin/init", "/bin
 /// Start init, or end the boot the way Linux does when it cannot.
 pub fn run(user: Result<Loaded, Error>) -> ! {
     match user {
-        Ok(init) => start(init),
+        Ok(init) => start(&init),
         Err(Error::NoInit) => {
             // Linux: `init_eaccess("/init")` fails, `prepare_namespace` finds no
             // root device and panics (init/do_mounts.c:236).
@@ -581,8 +581,8 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
     }
 }
 
-fn start(init: Loaded) -> ! {
-    check_user_image(&init, &mut services::TABLES.lock().user_space());
+fn start(init: &Loaded) -> ! {
+    check_user_image(init, &mut services::TABLES.lock().user_space());
     crate::log!("Run /init as init process\n");
     // SAFETY: BSP, CPL0, IF clear (nothing since the timer test re-enabled it
     // except the guarded sections, which restore it off), descriptors installed
