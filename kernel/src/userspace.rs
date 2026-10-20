@@ -76,6 +76,11 @@ const _: () = assert!(ARG_PAGES == 4);
 pub enum Error {
     /// The rootfs has no `/init`: Linux ends in `NO_INIT`.
     NoInit,
+    /// No `/init`, and boot module `module` is compressed: Linux (gzip and the
+    /// other `RD_*` decompressors are configured) would have unpacked it and
+    /// possibly found an `/init`, but no decompressor is ported. Not Linux's
+    /// `NO_INIT`: the boot stops loudly instead of imitating a Linux failure.
+    CompressedModule(usize),
     /// The rootfs itself could not be built (`default_rootfs` failed or no memory).
     Vfs(Errno),
     /// Linux `execve` failure; the errno is what `Failed to execute` prints.
@@ -98,6 +103,9 @@ impl core::fmt::Debug for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NoInit => f.write_str("NoInit"),
+            Self::CompressedModule(module) => {
+                f.debug_tuple("CompressedModule").field(module).finish()
+            }
             Self::Vfs(errno) => f.debug_tuple("Vfs").field(errno).finish(),
             Self::Exec(errno) => f.debug_tuple("Exec").field(errno).finish(),
             Self::Fallback { errno, path } => f
@@ -193,10 +201,13 @@ fn random_bytes() -> [u8; 16] {
 /// [`Error::NoInit`] when absent (the caller reproduces Linux's panic), the
 /// Linux `execve` errno or an explicit unsupported case otherwise.
 pub fn load(boot: &BootInfo, tables: &mut Tables) -> Result<Loaded, Error> {
-    let vfs = build_rootfs(boot)?;
+    let (vfs, compressed) = build_rootfs(boot)?;
     let fallback = first_fallback(&vfs);
     match load_init(boot, vfs, tables) {
         Ok(loaded) => Ok(loaded),
+        Err(Error::NoInit) if compressed.is_some() => {
+            Err(Error::CompressedModule(compressed.unwrap_or_default()))
+        }
         Err(Error::Exec(errno) | Error::Load(LoadError::Errno(errno))) if fallback.is_some() => {
             Err(Error::Fallback {
                 errno: errno.into_raw(),
@@ -221,10 +232,12 @@ fn early_clock() -> Timespec {
 /// boot module unpacked in order (`populate_rootfs`). A module the unpacker
 /// stops on keeps the entries before the stop, as in Linux; compressed modules
 /// are skipped (decompression is not ported; the boot log already warned).
-fn build_rootfs(boot: &BootInfo) -> Result<Vfs, Error> {
-    // shmem_default_max_blocks / _max_inodes: half the RAM and all of it.
+fn build_rootfs(boot: &BootInfo) -> Result<(Vfs, Option<usize>), Error> {
+    // shmem_default_max_blocks / _max_inodes: both half the RAM's pages
+    // (`min3(nr_pages - totalhigh, nr_pages / 2, ...)` for the inodes).
     let pages = services::FRAMES.lock().total() as u64;
-    let mut vfs = Vfs::new(pages / 2, pages, early_clock).map_err(Error::Vfs)?;
+    let mut vfs = Vfs::new(pages / 2, pages / 2, early_clock).map_err(Error::Vfs)?;
+    let mut compressed = None;
     vfs.default_rootfs().map_err(Error::Vfs)?;
     let mut unpacker = Unpacker::new();
     for index in 0..boot.module_count() {
@@ -237,10 +250,15 @@ fn build_rootfs(boot: &BootInfo) -> Result<Vfs, Error> {
         if let Some(message) = unpacker.unpack(&mut vfs, bytes) {
             // CONFIG_BLK_DEV_RAM=n (`do_populate_rootfs`): the unpacker's own
             // message; the entries before the failure stay in the tree.
-            crate::log!("Initramfs unpacking failed: {}\n", message);
+            if message == vfs::initramfs::NOT_PORTED {
+                compressed.get_or_insert(index);
+                crate::log!("WARN module={}: {}\n", index, message);
+            } else {
+                crate::log!("Initramfs unpacking failed: {}\n", message);
+            }
         }
     }
-    Ok(vfs)
+    Ok((vfs, compressed))
 }
 
 /// The kernel thread's view of the rootfs for `init_*` and `kernel_execve`.
@@ -1164,6 +1182,13 @@ pub fn run(user: Result<Loaded, Error>) -> ! {
             }
             crate::log!("{}\n", NO_ROOT_PANIC);
             stop("no-root");
+        }
+        Err(Error::CompressedModule(module)) => {
+            crate::log!(
+                "FAIL initramfs module={} is compressed and no /init was unpacked: decompressor not ported\n",
+                module
+            );
+            crate::fail();
         }
         Err(Error::Exec(errno) | Error::Load(LoadError::Errno(errno))) => {
             // `kernel_init`: `Failed to execute`, then every fallback fails

@@ -37,12 +37,13 @@ use syscalls::{Errno, Sysno};
 
 use super::{Context, MAX_RW_COUNT, Outcome, Stop, Sys, io, outcome};
 use crate::{
+    task::RLIM_INFINITY,
     usercopy::{access_ok, copy_from_user, copy_to_user},
     vfs::{
         FASYNC, FMODE_CAN_READ, FMODE_CAN_WRITE, FMODE_LSEEK, FMODE_PATH, FMODE_PREAD,
         FMODE_PWRITE, FMODE_READ, FMODE_WRITE, FileId, InodeId, MAX_LFS_FILESIZE, O_APPEND,
         O_CLOEXEC, O_DIRECT, O_EXCL, O_LARGEFILE, O_NOATIME, O_NONBLOCK, PAGE_SIZE, S_IFMT,
-        S_ISGID, S_ISUID, S_IXGRP, SETFL_MASK,
+        SETFL_MASK,
         file::{CharDev, FileKind},
         tmpfs::DIR_OFFSET_EOD,
         try_push,
@@ -303,7 +304,12 @@ fn read_kind<C: Context>(ctx: &mut C, view: &View, dest: &mut Dest, pos: Option<
             let (Some(pos), Some(inode)) = (pos, view.inode) else {
                 return Err(Errno::EINVAL.into());
             };
-            read_regular(ctx, inode, dest, pos)
+            let result = read_regular(ctx, inode, dest, pos);
+            // shmem_file_read_iter ends in file_accessed(), whatever the result.
+            if view.flags & O_NOATIME == 0 {
+                ctx.files().vfs.fs.touch_atime(inode);
+            }
+            result
         }
         FileKind::Directory => Err(Errno::EISDIR.into()), // generic_read_dir
         FileKind::Char(CharDev::Null) => Ok(0),           // read_null
@@ -512,7 +518,16 @@ fn write_regular<C: Context>(
     if view.flags & O_APPEND != 0 {
         at = i64::try_from(ctx.files().vfs.fs.inode(inode).size).unwrap_or(i64::MAX);
     }
-    // generic_write_check_limits (RLIMIT_FSIZE is infinity here)
+    // generic_write_check_limits: `loff_t limit = rlimit(RLIMIT_FSIZE)`.
+    let mut count = count;
+    let limit = ctx.rlimit_fsize();
+    if limit != RLIM_INFINITY {
+        let limit = limit as i64;
+        if at >= limit {
+            return Err(Stop::SigXfsz); // send_sig(SIGXFSZ) + -EFBIG
+        }
+        count = count.min((limit - at) as u64);
+    }
     let max_size = if view.flags & O_LARGEFILE == 0 {
         MAX_NON_LFS
     } else {
@@ -523,16 +538,11 @@ fn write_regular<C: Context>(
     }
     #[allow(clippy::cast_sign_loss)]
     let count = count.min((max_size - at) as u64);
-    // file_remove_privs: without CAP_FSETID a write clears set-id bits.
-    if !cred.fsetid {
-        let node = ctx.files().vfs.fs.inode_mut(inode);
-        if node.mode & S_ISUID != 0 {
-            node.mode &= !S_ISUID;
-        }
-        if node.mode & (S_ISGID | S_IXGRP) == (S_ISGID | S_IXGRP) {
-            node.mode &= !S_ISGID;
-        }
-    }
+    // file_remove_privs, then file_update_time: both precede the copy, so a
+    // write that then fails still updates the timestamps.
+    let files = ctx.files();
+    files.vfs.remove_privs(&cred, inode);
+    files.vfs.fs.touch(inode);
     let mut bounce = [0u8; PAGE_SIZE];
     let mut written: u64 = 0;
     let mut status = None;
@@ -561,8 +571,9 @@ fn write_regular<C: Context>(
             }
         }
     }
-    *pos = at + i64::try_from(written).unwrap_or(0);
     if written > 0 {
+        // new_sync_write stores the position only for a positive result.
+        *pos = at + i64::try_from(written).unwrap_or(0);
         Ok(i64::try_from(written).unwrap_or(i64::MAX))
     } else {
         Err(status.unwrap_or(Errno::EIO).into())
@@ -702,6 +713,10 @@ fn lseek<C: Context>(ctx: &mut C, fd: u64, offset: u64, whence: u64) -> Sys {
         }
         // null_lseek / zero_lseek / full_lseek
         FileKind::Char(CharDev::Null | CharDev::Zero | CharDev::Full) => 0,
+        // A driver this kernel lacks that Linux leaves seekable (the stream
+        // kinds were refused above through the cleared FMODE_LSEEK): its
+        // llseek is not ported.
+        FileKind::Unsupported => return Err(Stop::Unimplemented),
         _ => return Err(Errno::ESPIPE.into()),
     };
     set_pos(ctx, &view, new);
@@ -882,9 +897,26 @@ fn f_dupfd<C: Context>(ctx: &mut C, from: u32, view: &View, cloexec: bool) -> Sy
     Ok(i64::from(new))
 }
 
+/// `inode_owner_or_capable` for an open file: the caller owns the inode (a
+/// pipe's inode is its creator's) or has `CAP_FOWNER`.
+fn owner_or_capable<C: Context>(ctx: &mut C, view: &View) -> bool {
+    let cred = ctx.cred();
+    let vfs = &ctx.files().vfs;
+    let owner = match (view.inode, view.kind) {
+        (Some(inode), _) => vfs.fs.inode(inode).uid,
+        (None, FileKind::Pipe { pipe, .. }) => vfs.pipe_ref(pipe).uid,
+        (None, _) => return cred.fowner,
+    };
+    owner == cred.fsuid || cred.fowner
+}
+
 /// `setfl`.
 fn setfl<C: Context>(ctx: &mut C, view: &View, arg: u32) -> Sys {
     let mut arg = arg;
+    // O_NOATIME can only be set by the owner or superuser.
+    if arg & O_NOATIME != 0 && view.flags & O_NOATIME == 0 && !owner_or_capable(ctx, view) {
+        return Err(Errno::EPERM.into());
+    }
     // O_NDELAY == O_NONBLOCK on x86.
     let is_fifo = matches!(view.kind, FileKind::Pipe { .. });
     if !is_fifo && arg & O_DIRECT != 0 {
@@ -893,11 +925,15 @@ fn setfl<C: Context>(ctx: &mut C, view: &View, arg: u32) -> Sys {
     if is_fifo && arg & O_DIRECT != 0 {
         return Err(Stop::Unimplemented); // packet mode
     }
-    if arg & FASYNC != view.flags & FASYNC {
-        return Err(Stop::Unimplemented); // ->fasync / SIGIO
-    }
-    if arg & O_NOATIME != 0 && view.flags & O_NOATIME == 0 {
-        // inode_owner_or_capable: init is root.
+    // ->fasync() sets FASYNC; tmpfs files, directories and the memory devices
+    // have none, so the bit is ignored there (SETFL_MASK excludes it).
+    if arg & FASYNC != view.flags & FASYNC
+        && matches!(
+            view.kind,
+            FileKind::Pipe { .. } | FileKind::Char(CharDev::Console) | FileKind::Unsupported
+        )
+    {
+        return Err(Stop::Unimplemented); // fasync_helper / SIGIO
     }
     arg &= SETFL_MASK;
     let file = ctx.files().vfs.files.get_mut(view.id);
@@ -919,6 +955,26 @@ const TIOCGWINSZ: u32 = 0x5413;
 const FIFREEZE: u32 = 0xc004_5877;
 const FITHAW: u32 = 0xc004_5878;
 const FIGETBSZ: u32 = 2;
+const FIBMAP: u32 = 1;
+const FICLONE: u32 = 0x4004_9409;
+const FICLONERANGE: u32 = 0x4020_940d;
+const FIDEDUPERANGE: u32 = 0xc018_9436;
+const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+const FS_IOC_FIEMAP: u32 = 0xc020_660b;
+const FS_IOC_FSGETXATTR: u32 = 0x801c_581f;
+const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
+const FS_IOC_GETFSUUID: u32 = 0x8011_1500;
+const FS_IOC_GETFSSYSFSPATH: u32 = 0x8081_1501;
+/// `FS_IOC_RESVSP`, `_UNRESVSP`, `_RESVSP64`, `_UNRESVSP64`, `_ZERO_RANGE`
+/// (`_IOW('X', 40/41/42/43/57, struct space_resv)`), reached through `file_ioctl`.
+const FS_IOC_PREALLOCATE: [u32; 5] = [
+    0x4030_5828,
+    0x4030_5829,
+    0x4030_582a,
+    0x4030_582b,
+    0x4030_5839,
+];
 
 /// The tty ioctl numbers `include/uapi/asm-generic/ioctls.h` defines: Linux
 /// routes all of them through `tty_ioctl`, so an unimplemented one stops the
@@ -976,19 +1032,49 @@ fn ioctl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
                     node.mode & S_IFMT,
                     crate::vfs::S_IFREG | crate::vfs::S_IFDIR | crate::vfs::S_IFLNK
                 ) {
-                    let size = node.size.to_le_bytes();
-                    return put(ctx, arg, &size);
+                    // inode_get_bytes: the allocated bytes, `i_blocks << 9`.
+                    let bytes = node.blocks() << 9;
+                    return put(ctx, arg, &bytes.to_le_bytes());
                 }
             }
             return Err(Errno::ENOTTY.into());
         }
-        FIFREEZE | FITHAW => return Err(Errno::EOPNOTSUPP.into()),
-        FIGETBSZ => {
-            return if view.inode.is_some() {
-                put(ctx, arg, &(PAGE_SIZE as u32).to_le_bytes())
+        FIFREEZE | FITHAW => {
+            // ioctl_fsfreeze / ioctl_fsthaw: the capability check comes first,
+            // then tmpfs has no freeze_fs/freeze_super.
+            return Err(if ctx.cred().sys_admin {
+                Errno::EOPNOTSUPP
             } else {
-                Err(Errno::ENOTTY.into())
-            };
+                Errno::EPERM
+            }
+            .into());
+        }
+        // The superblock's s_blocksize: tmpfs and pipefs are both PAGE_SIZE.
+        FIGETBSZ => return put(ctx, arg, &(PAGE_SIZE as u32).to_le_bytes()),
+        // shmem_fileattr_get (CONFIG_TMPFS_XATTR=y) exists for regular files
+        // and directories, and no attribute flag can be set here: flags 0.
+        FS_IOC_GETFLAGS | FS_IOC_FSGETXATTR
+            if matches!(view.kind, FileKind::Regular | FileKind::Directory) =>
+        {
+            let len = if cmd == FS_IOC_GETFLAGS { 4 } else { 28 };
+            return put(ctx, arg, &[0u8; 28][..len]);
+        }
+        // ->fileattr_set, FIEMAP, reflink and dedupe, filesystem UUID and sysfs
+        // path have answers other than ENOTTY on tmpfs that are not ported.
+        FS_IOC_SETFLAGS
+        | FS_IOC_FSSETXATTR
+        | FS_IOC_FIEMAP
+        | FICLONE
+        | FICLONERANGE
+        | FIDEDUPERANGE
+        | FS_IOC_GETFSUUID
+        | FS_IOC_GETFSSYSFSPATH => {
+            return Err(Stop::Unimplemented);
+        }
+        // file_ioctl, for regular files only.
+        FIBMAP if matches!(view.kind, FileKind::Regular) => return Err(Stop::Unimplemented),
+        c if matches!(view.kind, FileKind::Regular) && FS_IOC_PREALLOCATE.contains(&c) => {
+            return Err(Stop::Unimplemented);
         }
         FIONREAD if matches!(view.kind, FileKind::Regular) => {
             let Some(inode) = view.inode else {
@@ -1094,6 +1180,9 @@ fn getdents64<C: Context>(ctx: &mut C, fd: u64, dirent: u64, count: u64) -> Sys 
     let Some(dir) = view.inode else {
         return Err(Errno::ENOTDIR.into());
     };
+    if ctx.files().vfs.fs.is_dead(dir) {
+        return Err(Errno::ENOENT.into()); // iterate_dir: IS_DEADDIR
+    }
     // iterate_dir -> offset_readdir, collecting the filldir64 records.
     let mut out: Vec<u8> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
@@ -1137,6 +1226,10 @@ fn getdents64<C: Context>(ctx: &mut C, fd: u64, dirent: u64, count: u64) -> Sys 
             true
         };
         tmpfs.readdir(dir, &mut pos, &mut actor);
+    }
+    // iterate_dir: file_accessed() follows the iteration, whatever it gave.
+    if view.flags & O_NOATIME == 0 {
+        ctx.files().vfs.fs.touch_atime(dir);
     }
     if starts.is_empty() {
         // Nothing emitted: `buf.error` (EINVAL when the first record did not
@@ -1193,8 +1286,19 @@ fn ftruncate<C: Context>(ctx: &mut C, fd: u64, length: u64) -> Sys {
         return Err(Errno::EINVAL.into());
     }
     // `small` is false on 64-bit (the syscall passes 0), so MAX_NON_LFS never
-    // applies; inode_newsize_ok rejects sizes beyond s_maxbytes.
+    // applies. inode_newsize_ok (from notify_change): growing past
+    // RLIMIT_FSIZE raises SIGXFSZ with -EFBIG, and s_maxbytes is
+    // MAX_LFS_FILESIZE, which a non-negative length cannot exceed.
+    let size = ctx.files().vfs.fs.inode(inode).size;
     #[allow(clippy::cast_sign_loss)]
-    ctx.files().vfs.fs.set_size(inode, length as u64);
+    if size < length as u64 {
+        let limit = ctx.rlimit_fsize();
+        if limit != RLIM_INFINITY && length as u64 > limit {
+            return Err(Stop::SigXfsz);
+        }
+    }
+    let cred = ctx.cred();
+    #[allow(clippy::cast_sign_loss)]
+    ctx.files().vfs.do_truncate(&cred, inode, length as u64);
     Ok(0)
 }

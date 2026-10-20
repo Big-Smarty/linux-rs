@@ -13,8 +13,8 @@
 // Transformation: the finite-state machine runs over one borrowed buffer; the
 // `init_*` kernel syscalls are `Vfs` operations as the kernel thread; `pr_err`
 // lines are not emitted (no console at this layer); decompression is a named
-// blocker (`image::cpio::compression`), reported as Linux's "decompressor
-// failed".
+// blocker (`image::cpio::compression`), reported as [`NOT_PORTED`] (a kernel
+// limitation, not a Linux error text: the pinned configuration unpacks gzip).
 #![forbid(unsafe_code)]
 //! The initramfs unpacker, state for state, so a damaged archive leaves
 //! exactly the tree Linux leaves.
@@ -88,6 +88,13 @@ struct Header {
 
 /// What the archive walk stopped on.
 pub type Message = &'static str;
+
+/// The message for a compressed module: `CONFIG_RD_GZIP=y` (and the other
+/// `RD_*` decompressors of the reference configuration) would unpack it, but
+/// no decompressor is ported. Deliberately not a Linux text; callers treat it
+/// as a loud "not ported" condition.
+pub const NOT_PORTED: Message =
+    "compressed initramfs module skipped: decompressor not ported (Linux would unpack it)";
 
 pub struct Unpacker {
     next_state: State,
@@ -176,7 +183,7 @@ impl Unpacker {
             run.this_header = 0;
             // decompress_method: no decompressor is ported (named blocker).
             if compression(&buf[at..]).is_some() {
-                run.error("decompressor failed");
+                run.error(NOT_PORTED);
             } else {
                 run.error("invalid magic at start of compressed archive");
             }
@@ -537,6 +544,8 @@ impl Run<'_, '_> {
         let Some(inode) = self.vfs.files.get(file).inode else {
             return 0;
         };
+        // kernel_write -> shmem_file_write_iter: `file_update_time` first.
+        self.vfs.fs.touch(inode);
         let mut out = 0usize;
         while out < data.len() {
             match self.vfs.fs.write(inode, pos + out as u64, &data[out..]) {

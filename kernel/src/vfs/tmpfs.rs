@@ -71,6 +71,9 @@ pub struct Dir {
     pub parent: InodeId,
     /// `octx->next_offset`.
     next_offset: u32,
+    /// `IS_DEADDIR` (`S_DEAD`, set by `vfs_rmdir`): the directory was removed
+    /// but is still pinned by a working directory or an open file.
+    dead: bool,
 }
 
 /// A present page of a regular file.
@@ -296,6 +299,7 @@ impl Tmpfs {
                     children: Vec::new(),
                     parent: dir.unwrap_or(InodeId(0)),
                     next_offset: DIR_OFFSET_MIN,
+                    dead: false,
                 }),
                 2,
                 2 * BOGO_DIRENT_SIZE,
@@ -360,6 +364,13 @@ impl Tmpfs {
     #[must_use]
     pub fn parent(&self, dir: InodeId) -> InodeId {
         self.inode(dir).dir().map_or(dir, |dir| dir.parent)
+    }
+
+    /// `IS_DEADDIR`: `dir` was removed by `rmdir` and can no longer be
+    /// searched, listed or given entries (`ENOENT`).
+    #[must_use]
+    pub fn is_dead(&self, dir: InodeId) -> bool {
+        self.inode(dir).dir().is_some_and(|dir| dir.dead)
     }
 
     /// The name under which `child` is linked in `dir`.
@@ -509,10 +520,21 @@ impl Tmpfs {
     /// # Errors
     /// `ENOSPC` (inode limit), `ENOMEM`.
     pub fn link(&mut self, old: InodeId, dir: InodeId, name: &[u8]) -> KResult<()> {
-        if self.inode(old).nlink != 0 && self.max_inodes != 0 && self.nr_inodes >= self.max_inodes {
-            return Err(Errno::ENOSPC);
+        // Each extra name pins a dentry: it is charged as an inode, except the
+        // first name of an `O_TMPFILE` file (`inode->i_nlink` is zero).
+        let charged = self.inode(old).nlink != 0;
+        if charged {
+            if self.max_inodes != 0 && self.nr_inodes >= self.max_inodes {
+                return Err(Errno::ENOSPC);
+            }
+            self.nr_inodes += 1;
         }
-        self.add_entry(dir, name, old)?;
+        if let Err(error) = self.add_entry(dir, name, old) {
+            if charged {
+                self.nr_inodes -= 1;
+            }
+            return Err(error);
+        }
         let now = self.now();
         let inode = self.inode_mut(old);
         inode.nlink += 1;
@@ -528,6 +550,7 @@ impl Tmpfs {
     ///
     /// # Errors
     /// `ENOENT` if there is no such entry, `ENOTEMPTY` for a non-empty `rmdir`.
+    /// A removed directory is marked dead (`vfs_rmdir`: `S_DEAD`).
     pub fn unlink(&mut self, dir: InodeId, name: &[u8], rmdir: bool) -> KResult<()> {
         let Some(Body::Dir(d)) = self.inodes[dir.0 as usize].as_ref().map(|i| &i.body) else {
             return Err(Errno::ENOTDIR);
@@ -547,6 +570,10 @@ impl Tmpfs {
             return Err(Errno::ENOTEMPTY);
         }
         let now = self.now();
+        // shmem_unlink: the extra names of a file were charged as inodes.
+        if !rmdir && self.inode(victim).nlink > 1 && !self.inode(victim).is_dir() {
+            self.nr_inodes -= 1;
+        }
         let parent = self.inode_mut(dir);
         if let Body::Dir(d) = &mut parent.body {
             d.children.remove(at);
@@ -556,7 +583,11 @@ impl Tmpfs {
         parent.ctime = now;
         if rmdir {
             parent.nlink -= 1;
-            self.inode_mut(victim).nlink -= 1;
+            let removed = self.inode_mut(victim);
+            removed.nlink -= 1;
+            if let Body::Dir(d) = &mut removed.body {
+                d.dead = true;
+            }
         }
         let inode = self.inode_mut(victim);
         inode.nlink -= 1;
@@ -690,6 +721,10 @@ impl Tmpfs {
     ///
     /// # Errors
     /// `ENOSPC` past the block limit, `ENOMEM`, and only when nothing was stored.
+    ///
+    /// The timestamps are the caller's (`file_update_time` runs before the
+    /// copy, so a write that stores nothing still updates them): see
+    /// [`Tmpfs::touch`].
     pub fn write(&mut self, id: InodeId, pos: u64, data: &[u8]) -> KResult<usize> {
         let mut done = 0;
         let mut failure = None;
@@ -707,12 +742,6 @@ impl Tmpfs {
             if end > inode.size {
                 inode.size = end;
             }
-        }
-        if done > 0 {
-            let now = self.now();
-            let inode = self.inode_mut(id);
-            inode.mtime = now;
-            inode.ctime = now;
         }
         match failure {
             Some(error) if done == 0 => Err(error),
@@ -758,6 +787,21 @@ impl Tmpfs {
         };
         pages.0[at].data[offset..offset + data.len()].copy_from_slice(data);
         Ok(())
+    }
+
+    /// `file_update_time`: `mtime` and `ctime` become the current time.
+    pub fn touch(&mut self, id: InodeId) {
+        let now = self.now();
+        let inode = self.inode_mut(id);
+        inode.mtime = now;
+        inode.ctime = now;
+    }
+
+    /// `touch_atime` on a mount without `MNT_RELATIME` (the rootfs: `init_mount_tree`
+    /// passes no flags): `atime` becomes the current time on every access.
+    pub fn touch_atime(&mut self, id: InodeId) {
+        let now = self.now();
+        self.inode_mut(id).atime = now;
     }
 
     /// `shmem_setattr` with `ATTR_SIZE` (`truncate_setsize` +

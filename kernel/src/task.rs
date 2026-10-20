@@ -28,6 +28,8 @@ pub const RLIM_NLIMITS: usize = 16;
 pub const RLIM_INFINITY: u64 = u64::MAX;
 /// `RLIMIT_CPU`.
 pub const RLIMIT_CPU: usize = 0;
+/// `RLIMIT_FSIZE`.
+pub const RLIMIT_FSIZE: usize = 1;
 /// `RLIMIT_NOFILE`.
 pub const RLIMIT_NOFILE: usize = 7;
 /// `sysctl_nr_open` (fs/file.c:96), the ceiling `RLIMIT_NOFILE`'s hard limit may reach.

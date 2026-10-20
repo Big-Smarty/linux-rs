@@ -26,9 +26,9 @@ use super::{
     __O_TMPFILE, AT_SYMLINK_NOFOLLOW, Cred, FMODE_CAN_READ, FMODE_CAN_WRITE, FMODE_LSEEK,
     FMODE_PATH, FMODE_PREAD, FMODE_PWRITE, FMODE_READ, FMODE_WRITE, FileId, FsStruct, InodeId,
     KResult, Kstat, MAY_APPEND, MAY_EXEC, MAY_READ, MAY_WRITE, NAME_MAX, O_ACCMODE, O_APPEND,
-    O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_DSYNC, O_EXCL, O_NOCTTY, O_NOFOLLOW, O_PATH,
-    O_TRUNC, S_IALLUGO, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
-    S_IRWXUGO, S_ISVTX, Timespec, VALID_OPEN_FLAGS, Vfs,
+    O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_DSYNC, O_EXCL, O_NOATIME, O_NOCTTY, O_NOFOLLOW,
+    O_PATH, O_TRUNC, S_IALLUGO, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
+    S_IFSOCK, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, S_IXGRP, Timespec, VALID_OPEN_FLAGS, Vfs,
     file::{CharDev, File, FileKind},
     mkdev, new_decode_dev,
     path::{self, LOOKUP_DIRECTORY, LOOKUP_FOLLOW, LastKind, WALK_TRAILING, Walk, permission},
@@ -146,30 +146,35 @@ pub fn build_open_flags(raw_flags: u32, mode: u32) -> KResult<OpenFlags> {
 /// What `chrdev_open` finds for a device number.
 enum Chr {
     Driver(CharDev),
-    /// Registered in Linux, no Rust driver yet.
-    Unported,
-    /// `-ENXIO`: nothing is registered (or the open itself fails that way).
+    /// Registered in Linux (or possibly registered: the number is not one the
+    /// reference configuration provably lacks), no Rust driver yet. `stream`
+    /// is `nonseekable_open`: a terminal clears the seek bits, other drivers
+    /// keep them and `lseek` stops loudly.
+    Unported {
+        stream: bool,
+    },
+    /// `-ENXIO`: nothing is registered, or the open itself fails that way.
     Absent,
 }
 
 /// The character devices of the reference configuration that matter here
 /// (`drivers/char/mem.c` `devlist`, `drivers/tty/tty_io.c`).
 ///
-/// shortcut: majors with no entry below answer `ENXIO` as if no driver were
-/// registered; the driver workstreams register theirs (a missing registration
-/// is indistinguishable from an absent device).
+/// Only `0:*` (no driver can register major 0 through `cdev_add`) and `5:0`
+/// (`/dev/tty` without a controlling terminal, `tty_open_current_tty`) answer
+/// `ENXIO`; every other number may belong to a driver of the reference
+/// configuration (misc 10, input 13, fb 29, ...), so opening it succeeds and
+/// each later operation stops the kernel loudly.
 fn chrdev(rdev: u32) -> Chr {
     match (super::major(rdev), super::minor(rdev)) {
         (1, 3) => Chr::Driver(CharDev::Null),
         (1, 5) => Chr::Driver(CharDev::Zero),
         (1, 7) => Chr::Driver(CharDev::Full),
-        // mem, kmem, port, random, urandom, kmsg; ptmx, the vt and serial ttys and
-        // the unix98 pty slaves: registered in Linux, no Rust driver yet.
-        (1, 1 | 2 | 4 | 8 | 9 | 11) | (5, 2) | (4 | 136..=143, _) => Chr::Unported,
         (5, 1) => Chr::Driver(CharDev::Console),
-        // /dev/tty without a controlling terminal (`tty_open_current_tty`) and
-        // every unregistered major: ENXIO.
-        _ => Chr::Absent,
+        (0, _) | (5, 0) => Chr::Absent,
+        // ptmx, the vt and serial ttys and the unix98 pty slaves: tty_open.
+        (5, 2) | (4 | 136..=143, _) => Chr::Unported { stream: true },
+        _ => Chr::Unported { stream: false },
     }
 }
 
@@ -271,6 +276,9 @@ impl Vfs {
     // ---- permission helpers (fs/namei.c) -------------------------------------
 
     fn may_create(&self, env: &Env, dir: InodeId) -> KResult<()> {
+        if self.fs.is_dead(dir) {
+            return Err(Errno::ENOENT); // IS_DEADDIR
+        }
         permission(self.fs.inode(dir), &env.cred, MAY_WRITE | MAY_EXEC)
     }
 
@@ -300,6 +308,9 @@ impl Vfs {
         } else if victim_is_dir {
             return Err(Errno::EISDIR);
         }
+        if self.fs.is_dead(dir) {
+            return Err(Errno::ENOENT); // IS_DEADDIR
+        }
         Ok(())
     }
 
@@ -313,6 +324,9 @@ impl Vfs {
         let parent = path::parent_of(&self.fs, env, path)?;
         if parent.kind != LastKind::Norm {
             return Err(Errno::EEXIST);
+        }
+        if self.fs.is_dead(parent.dir) {
+            return Err(Errno::ENOENT); // lookup_one_qstr_excl: no dentry in a dead dir
         }
         if self.fs.lookup(parent.dir, &parent.name).is_some() {
             return Err(Errno::EEXIST); // LOOKUP_EXCL
@@ -507,8 +521,32 @@ impl Vfs {
             return Err(Errno::EINVAL);
         }
         permission(node, &env.cred, MAY_WRITE)?;
-        self.fs.set_size(inode, length);
+        self.do_truncate(&env.cred, inode, length);
         Ok(())
+    }
+
+    /// `do_truncate` after `inode_newsize_ok`: `dentry_needs_remove_privs`
+    /// adds `ATTR_KILL_SUID`/`SGID` (forced), then `shmem_setattr` sets the
+    /// size and both times.
+    pub fn do_truncate(&mut self, cred: &Cred, inode: InodeId, length: u64) {
+        self.remove_privs(cred, inode);
+        self.fs.set_size(inode, length);
+    }
+
+    /// `file_remove_privs` / the `ATTR_KILL_*` part of `do_truncate`
+    /// (`setattr_should_drop_suidgid`): a write or truncate by a caller without
+    /// `CAP_FSETID` clears `S_ISUID`, and `S_ISGID` when the group-execute bit
+    /// is set or the caller is not in the file's group (no supplementary
+    /// groups exist yet).
+    pub fn remove_privs(&mut self, cred: &Cred, inode: InodeId) {
+        let node = self.fs.inode_mut(inode);
+        if cred.fsetid || !node.is_reg() {
+            return;
+        }
+        node.mode &= !S_ISUID;
+        if node.mode & S_ISGID != 0 && (node.mode & S_IXGRP != 0 || cred.fsgid != node.gid) {
+            node.mode &= !S_ISGID;
+        }
     }
 
     /// `do_faccessat` after the path was resolved.
@@ -606,6 +644,9 @@ impl Vfs {
                     directory = true;
                 }
                 if create && walk.fs.lookup(walk.cur, last.name).is_none() {
+                    if walk.fs.is_dead(walk.cur) {
+                        return Err(Errno::ENOENT); // lookup_open: IS_DEADDIR
+                    }
                     if last.name.len() > NAME_MAX {
                         return Err(Errno::ENAMETOOLONG);
                     }
@@ -666,16 +707,16 @@ impl Vfs {
         } else if self.fs.inode(inode).is_reg() && open_flag & O_TRUNC != 0 {
             do_truncate = true;
         }
-        self.may_open(env, inode, acc_mode)?;
+        self.may_open(env, inode, acc_mode, open_flag)?;
         let file = self.vfs_open(inode, open_flag)?;
         if do_truncate {
-            self.fs.set_size(inode, 0);
+            self.do_truncate(&env.cred, inode, 0); // handle_truncate (0 is always within RLIMIT_FSIZE)
         }
         Ok(file)
     }
 
     /// `may_open`.
-    fn may_open(&self, env: &Env, inode: InodeId, acc_mode: u32) -> KResult<()> {
+    fn may_open(&self, env: &Env, inode: InodeId, acc_mode: u32, flag: u32) -> KResult<()> {
         let node = self.fs.inode(inode);
         match node.mode & S_IFMT {
             S_IFLNK => return Err(Errno::ELOOP),
@@ -692,7 +733,12 @@ impl Vfs {
             }
             _ => {}
         }
-        permission(node, &env.cred, acc_mode)
+        permission(node, &env.cred, acc_mode)?;
+        // O_NOATIME can only be set by the owner or superuser.
+        if flag & O_NOATIME != 0 && node.uid != env.cred.fsuid && !env.cred.fowner {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
     }
 
     /// `vfs_open`/`do_dentry_open` for a resolved inode.
@@ -700,23 +746,38 @@ impl Vfs {
         let mode = self.fs.inode(inode).mode;
         let rdev = self.fs.inode(inode).rdev;
         let mut fmode = (open_flag & O_ACCMODE).wrapping_add(1) & O_ACCMODE;
+        let mut unported_stream = false;
         let kind = match mode & S_IFMT {
             S_IFREG => FileKind::Regular,
             S_IFDIR => FileKind::Directory,
             S_IFCHR => match chrdev(rdev) {
                 Chr::Driver(dev) => FileKind::Char(dev),
-                Chr::Unported => FileKind::Unsupported,
+                Chr::Unported { stream } => {
+                    unported_stream = stream;
+                    FileKind::Unsupported
+                }
                 Chr::Absent => return Err(Errno::ENXIO),
             },
-            // blkdev_open finds no block device; sock_no_open
-            S_IFBLK | S_IFSOCK => return Err(Errno::ENXIO),
-            // fifo_open: named pipes are not ported.
-            _ => FileKind::Unsupported,
+            // blkdev_get_no_open finds no device for major 0 and the reference
+            // configuration registers others (loop, ram, ...): no block driver is
+            // ported, so any other number stops loudly on use.
+            S_IFBLK if super::major(rdev) == 0 => return Err(Errno::ENXIO),
+            S_IFBLK => FileKind::Unsupported,
+            // sock_no_open
+            S_IFSOCK => return Err(Errno::ENXIO),
+            // fifo_open: named pipes are not ported (`stream_open`: nonseekable).
+            _ => {
+                unported_stream = true;
+                FileKind::Unsupported
+            }
         };
         fmode |= FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE;
         match kind {
             // tty_open: nonseekable_open
-            FileKind::Char(CharDev::Console) | FileKind::Unsupported => {
+            FileKind::Char(CharDev::Console) => {
+                fmode &= !(FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE);
+            }
+            FileKind::Unsupported if unported_stream => {
                 fmode &= !(FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE);
             }
             _ => {}

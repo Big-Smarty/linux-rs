@@ -824,8 +824,251 @@ fn unported_behaviour_stops_instead_of_answering() {
         call(&mut t, Sysno::ioctl, &[0, 0x5402, 0]),
         Outcome::Unimplemented(16)
     );
+    // FASYNC: a regular file has no ->fasync, so the bit is ignored; the
+    // console has one (SIGIO), which is a loud stop.
+    assert_eq!(call(&mut t, Sysno::fcntl, &[f, 4, 0o20000]), ok(0));
     assert_eq!(
-        call(&mut t, Sysno::fcntl, &[f, 4, 0o20000]),
+        call(&mut t, Sysno::fcntl, &[f, 3, 0]),
+        ok(0o100_002),
+        "FASYNC not stored"
+    );
+    assert_eq!(
+        call(&mut t, Sysno::fcntl, &[0, 4, 0o20000]),
         Outcome::Unimplemented(72)
     );
+}
+
+// ---- review round 1 -----------------------------------------------------------------
+
+fn limit_fsize(t: &mut Task, cur: u64) {
+    t.attrs
+        .rlimits
+        .prlimit(1, Some(crate::task::Rlimit { cur, max: cur }))
+        .unwrap();
+}
+
+#[test]
+fn rlimit_fsize_clamps_writes_and_stops_where_sigxfsz_would_be_sent() {
+    let mut t = t();
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    let app = fd(open(&mut t, "/f", O_WRONLY | O_APPEND, 0));
+    limit_fsize(&mut t, 4);
+    put(&mut t, BUF, b"0123456789");
+    // generic_write_check_limits: a write that starts below the limit is cut.
+    assert_eq!(call(&mut t, Sysno::write, &[f, BUF, 10]), ok(4));
+    // At the limit: -EFBIG with SIGXFSZ, which is a loud stop until signals land.
+    assert_eq!(
+        call(&mut t, Sysno::write, &[f, BUF, 10]),
+        Outcome::Unimplemented(1)
+    );
+    assert_eq!(
+        call(&mut t, Sysno::write, &[app, BUF, 1]),
+        Outcome::Unimplemented(1),
+        "O_APPEND starts at the size"
+    );
+    assert_eq!(call(&mut t, Sysno::pwrite64, &[f, BUF, 10, 2]), ok(2));
+    assert_eq!(
+        call(&mut t, Sysno::pwrite64, &[f, BUF, 1, 5]),
+        Outcome::Unimplemented(18)
+    );
+    // inode_newsize_ok only guards growth.
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 4]), ok(0));
+    assert_eq!(
+        call(&mut t, Sysno::ftruncate, &[f, 5]),
+        Outcome::Unimplemented(77)
+    );
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 1]), ok(0));
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 4]), ok(0));
+    // Unlimited again.
+    limit_fsize(&mut t, u64::MAX);
+    assert_eq!(call(&mut t, Sysno::write, &[f, BUF, 10]), ok(10));
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[f, 1 << 20]), ok(0));
+}
+
+#[test]
+fn vfs_ioctls_answer_as_tmpfs_does() {
+    let mut t = t();
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    put(&mut t, BUF, b"hello");
+    assert_eq!(call(&mut t, Sysno::write, &[f, BUF, 5]), ok(5));
+    // FIOQSIZE is inode_get_bytes(): allocated bytes, not the size.
+    assert_eq!(call(&mut t, Sysno::ioctl, &[f, 0x5460, OUT]), ok(0));
+    assert_eq!(u64_at(&mut t, OUT), 4096);
+    let dir = fd(open(&mut t, "/dev", O_RDONLY | O_DIRECTORY, 0));
+    put(&mut t, OUT, &[0xff; 8]);
+    assert_eq!(call(&mut t, Sysno::ioctl, &[dir, 0x5460, OUT]), ok(0));
+    assert_eq!(u64_at(&mut t, OUT), 0);
+    // FS_IOC_GETFLAGS / FS_IOC_FSGETXATTR: shmem_fileattr_get, flags 0.
+    put(&mut t, OUT, &[0xff; 32]);
+    assert_eq!(call(&mut t, Sysno::ioctl, &[f, 0x8008_6601, OUT]), ok(0));
+    assert_eq!(get(&mut t, OUT, 8), [0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+    assert_eq!(call(&mut t, Sysno::ioctl, &[dir, 0x801c_581f, OUT]), ok(0));
+    assert_eq!(
+        get(&mut t, OUT, 32),
+        [[0u8; 28].as_slice(), &[0xff; 4]].concat()
+    );
+    let null = fd(open(&mut t, "/dev/console", O_RDWR, 0));
+    assert_eq!(
+        call(&mut t, Sysno::ioctl, &[null, 0x8008_6601, OUT]),
+        err(Errno::ENOTTY),
+        "no ->fileattr_get on a device node"
+    );
+    // The commands tmpfs answers other than with ENOTTY stop loudly.
+    for cmd in [
+        0x4008_6602u64,
+        0x401c_5820,
+        0xc020_660b,
+        0x4004_9409,
+        0x4020_940d,
+        0xc018_9436,
+        0x8011_1500,
+        0x8081_1501,
+        1,
+        0x4030_5828,
+        0x4030_5839,
+    ] {
+        assert_eq!(
+            call(&mut t, Sysno::ioctl, &[f, cmd, OUT]),
+            Outcome::Unimplemented(16),
+            "{cmd:#x}"
+        );
+    }
+    // FIGETBSZ is the superblock's block size, pipefs included.
+    let mut pair = [0u8; 8];
+    put(&mut t, OUT, &pair);
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    pair.copy_from_slice(&get(&mut t, OUT, 8));
+    let read_end = u64::from(u32::from_le_bytes(pair[..4].try_into().unwrap()));
+    assert_eq!(call(&mut t, Sysno::ioctl, &[read_end, 2, BUF]), ok(0));
+    assert_eq!(u32_at(&mut t, BUF), 4096);
+    // ioctl_fsfreeze checks CAP_SYS_ADMIN before asking tmpfs.
+    assert_eq!(
+        call(&mut t, Sysno::ioctl, &[f, 0xc004_5877, 0]),
+        err(Errno::EOPNOTSUPP)
+    );
+    t.attrs.cred.euid = 1000;
+    assert_eq!(
+        call(&mut t, Sysno::ioctl, &[f, 0xc004_5878, 0]),
+        err(Errno::EPERM)
+    );
+}
+
+#[test]
+fn a_removed_directory_is_dead_for_a_process_still_inside_it() {
+    let mut t = t();
+    let env = t.vfs.kernel_env();
+    t.vfs.mkdir(&env, b"/sub", 0o755).unwrap();
+    let at = cstr(&mut t, PATH, "/sub");
+    assert_eq!(call(&mut t, Sysno::chdir, &[at]), ok(0));
+    let dot = fd(open(&mut t, ".", O_RDONLY | O_DIRECTORY, 0));
+    t.vfs.rmdir(&env, b"/sub").unwrap();
+    assert_eq!(
+        open(&mut t, "x", O_CREAT | O_RDWR, 0o600),
+        err(Errno::ENOENT)
+    );
+    assert_eq!(open(&mut t, "x", O_RDONLY, 0), err(Errno::ENOENT));
+    assert_eq!(
+        call(&mut t, Sysno::getdents64, &[dot, BUF, 4096]),
+        err(Errno::ENOENT)
+    );
+    let env = crate::vfs::ops::Env {
+        start: t.attrs.fs.pwd,
+        ..env
+    };
+    assert_eq!(
+        t.vfs.mknod(&env, b"y", S_IFREG | 0o600, 0),
+        Err(Errno::ENOENT)
+    );
+    assert_eq!(t.vfs.mkdir(&env, b"z", 0o700), Err(Errno::ENOENT));
+    assert_eq!(t.vfs.symlink(&env, b"t", b"l"), Err(Errno::ENOENT));
+}
+
+#[test]
+fn truncation_and_noatime_depend_on_the_caller_credentials() {
+    let mut t = t();
+    let env = t.vfs.kernel_env();
+    let inode = t.vfs.mknod(&env, b"/s", S_IFREG | 0o644, 0).unwrap();
+    t.vfs.chmod(&env, inode, 0o6777).unwrap();
+    let mode = |t: &mut Task| t.vfs.fs.inode(inode).mode & 0o7777;
+    assert_eq!(mode(&mut t), 0o6777);
+    // root (CAP_FSETID) keeps the set-id bits through O_TRUNC and ftruncate.
+    let root = fd(open(&mut t, "/s", O_WRONLY | O_TRUNC, 0));
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[root, 0]), ok(0));
+    assert_eq!(mode(&mut t), 0o6777);
+    // O_NOATIME needs the owner or CAP_FOWNER.
+    t.attrs.cred.euid = 1000;
+    t.attrs.cred.egid = 1000;
+    assert_eq!(
+        open(&mut t, "/s", O_RDONLY | 0o1_000_000, 0),
+        err(Errno::EPERM)
+    );
+    let plain = fd(open(&mut t, "/s", O_RDONLY, 0));
+    assert_eq!(
+        call(&mut t, Sysno::fcntl, &[plain, 4, 0o1_000_000]),
+        err(Errno::EPERM)
+    );
+    // ftruncate by an unprivileged writer clears both bits (setattr_should_drop_suidgid).
+    let user = fd(open(&mut t, "/s", O_WRONLY, 0));
+    assert_eq!(call(&mut t, Sysno::ftruncate, &[user, 0]), ok(0));
+    assert_eq!(mode(&mut t), 0o0777);
+    t.vfs.chmod(&env, inode, 0o6777).unwrap();
+    let again = fd(open(&mut t, "/s", O_WRONLY | O_TRUNC, 0));
+    assert_eq!(mode(&mut t), 0o0777, "O_TRUNC drops them too ({again})");
+    // A set-gid file without group execute is dropped only for a non-member.
+    t.vfs.chmod(&env, inode, 0o2606).unwrap();
+    put(&mut t, BUF, b"x");
+    assert_eq!(call(&mut t, Sysno::write, &[user, BUF, 1]), ok(1));
+    assert_eq!(mode(&mut t), 0o0606);
+}
+
+static TICKS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+fn ticking_clock() -> crate::vfs::Timespec {
+    crate::vfs::Timespec {
+        sec: 7,
+        nsec: TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32,
+    }
+}
+
+#[test]
+fn timestamps_follow_linux_for_failed_writes_and_for_reads() {
+    let mut t = t();
+    t.vfs
+        .start_timekeeping(ticking_clock, crate::vfs::Timespec { sec: 7, nsec: 0 });
+    let f = fd(open(&mut t, "/f", O_CREAT | O_RDWR, 0o644));
+    let stamp = |t: &mut Task, fd: u64| {
+        assert_eq!(call(t, Sysno::fstat, &[fd, OUT]), ok(0));
+        (
+            u64_at(t, OUT + 80),
+            u64_at(t, OUT + 96),
+            u64_at(t, OUT + 112),
+        )
+    };
+    let (a0, m0, c0) = stamp(&mut t, f);
+    // file_update_time runs before the copy: a write that then faults still
+    // updates mtime and ctime, and leaves atime alone.
+    assert_eq!(call(&mut t, Sysno::write, &[f, BAD, 4]), err(Errno::EFAULT));
+    let (a1, m1, c1) = stamp(&mut t, f);
+    assert_eq!(a1, a0);
+    assert!(m1 > m0 && c1 > c0, "{m0} {m1} {c0} {c1}");
+    // Every read (even at EOF) updates atime, as without MNT_RELATIME.
+    assert_eq!(call(&mut t, Sysno::read, &[f, OUT, 1]), ok(0));
+    let (a2, m2, _) = stamp(&mut t, f);
+    assert!(a2 > a1);
+    assert_eq!(m2, m1);
+    // getdents64 and readlink touch the directory and the link.
+    let env = t.vfs.kernel_env();
+    t.vfs.symlink(&env, b"/f", b"/l").unwrap();
+    let dir = fd(open(&mut t, "/", O_RDONLY | O_DIRECTORY, 0));
+    let (d0, _, _) = stamp(&mut t, dir);
+    assert!(matches!(
+        call(&mut t, Sysno::getdents64, &[dir, BUF, 4096]),
+        Outcome::Return(n) if n > 0
+    ));
+    assert!(stamp(&mut t, dir).0 > d0);
+    let link = t.vfs.lookup(&env, b"/l", 0).unwrap();
+    let before = t.vfs.fs.inode(link).atime;
+    let l = cstr(&mut t, PATH2, "/l");
+    assert_eq!(call(&mut t, Sysno::readlink, &[l, OUT, 100]), ok(2));
+    assert_ne!(t.vfs.fs.inode(link).atime, before);
 }

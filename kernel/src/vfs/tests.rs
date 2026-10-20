@@ -48,6 +48,7 @@ fn user(uid: u32) -> Cred {
         mknod: false,
         chown: false,
         fsetid: false,
+        sys_admin: false,
     }
 }
 
@@ -175,6 +176,51 @@ fn inode_limit_is_enospc_and_leaves_no_entry() {
     );
     assert_eq!(vfs.lookup(&env, b"/d", 0), Err(Errno::ENOENT));
     assert_eq!(vfs.fs.inode_count(), 4);
+}
+
+#[test]
+fn extra_hard_links_are_charged_as_inodes_and_freed_by_unlink() {
+    // shmem_link reserves an inode for every link beyond the first name and
+    // shmem_unlink frees it while another name remains.
+    let mut vfs = Vfs::new(16, 4, clock).unwrap();
+    let env = vfs.kernel_env();
+    vfs.mknod(&env, b"/a", S_IFREG | 0o600, 0).unwrap();
+    vfs.link(&env, b"/a", 0, b"/b").unwrap();
+    vfs.link(&env, b"/a", 0, b"/c").unwrap();
+    assert_eq!(vfs.fs.inode_count(), 4);
+    assert_eq!(vfs.link(&env, b"/a", 0, b"/d"), Err(Errno::ENOSPC));
+    assert_eq!(vfs.lookup(&env, b"/d", 0), Err(Errno::ENOENT));
+    vfs.unlink(&env, b"/b").unwrap();
+    assert_eq!(vfs.fs.inode_count(), 3);
+    vfs.link(&env, b"/a", 0, b"/d").unwrap();
+    // Removing the last names frees the inode itself exactly once.
+    for name in [&b"/a"[..], b"/c", b"/d"] {
+        vfs.unlink(&env, name).unwrap();
+    }
+    assert_eq!(vfs.fs.inode_count(), 1, "only the root remains");
+}
+
+#[test]
+fn a_removed_directory_stays_dead_while_pinned() {
+    let (mut vfs, env) = rootfs(1 << 10);
+    let dir = vfs.mkdir(&env, b"/d", 0o755).unwrap();
+    vfs.fs.iget(dir);
+    assert!(!vfs.fs.is_dead(dir));
+    vfs.rmdir(&env, b"/d").unwrap();
+    assert!(vfs.fs.is_dead(dir));
+    let inside = Env { start: dir, ..env };
+    assert_eq!(
+        vfs.mknod(&inside, b"x", S_IFREG | 0o600, 0),
+        Err(Errno::ENOENT)
+    );
+    let op = build_open_flags(O_CREAT | O_RDWR, 0o600).unwrap();
+    assert_eq!(vfs.open(&inside, b"x", &op), Err(Errno::ENOENT));
+    // A name that would be too long is still ENOENT: the dead check comes first.
+    let long = [b'n'; 300];
+    assert_eq!(vfs.open(&inside, &long, &op), Err(Errno::ENOENT));
+    let before = vfs.fs.inode_count();
+    vfs.fs.iput(dir);
+    assert_eq!(vfs.fs.inode_count(), before - 1, "freed with the last pin");
 }
 
 // ---- directories ------------------------------------------------------------
@@ -489,7 +535,21 @@ fn opening_device_nodes_picks_the_driver_or_says_enxio() {
         &env,
         b"/none",
         S_IFCHR | 0o666,
-        super::new_encode_dev(super::mkdev(99, 0)),
+        super::new_encode_dev(super::mkdev(0, 0)),
+    )
+    .unwrap();
+    vfs.mknod(
+        &env,
+        b"/misc",
+        S_IFCHR | 0o666,
+        super::new_encode_dev(super::mkdev(10, 144)),
+    )
+    .unwrap();
+    vfs.mknod(
+        &env,
+        b"/tty",
+        S_IFCHR | 0o666,
+        super::new_encode_dev(super::mkdev(4, 1)),
     )
     .unwrap();
     let null = open(&mut vfs, &env, b"/null", O_RDWR, 0).unwrap();
@@ -497,7 +557,16 @@ fn opening_device_nodes_picks_the_driver_or_says_enxio() {
         vfs.files.get(null).kind,
         super::file::FileKind::Char(super::file::CharDev::Null)
     );
+    // Major 0 has no driver; a number the reference configuration may register
+    // opens as an unported device (every use stops) and stays seekable, while a
+    // tty is `nonseekable_open`.
     assert_eq!(open(&mut vfs, &env, b"/none", O_RDWR, 0), Err(Errno::ENXIO));
+    let misc = open(&mut vfs, &env, b"/misc", O_RDWR, 0).unwrap();
+    let misc = vfs.files.get(misc);
+    assert_eq!(misc.kind, super::file::FileKind::Unsupported);
+    assert_ne!(misc.mode & super::FMODE_LSEEK, 0);
+    let tty = open(&mut vfs, &env, b"/tty", O_RDWR, 0).unwrap();
+    assert_eq!(vfs.files.get(tty).mode & super::FMODE_LSEEK, 0);
 }
 
 // ---- descriptor table ------------------------------------------------------------
@@ -781,7 +850,7 @@ fn damaged_archives_report_linux_messages() {
     let (_, _, message) = unpacked(&junk);
     assert_eq!(message, Some("no cpio magic"));
     let (_, _, message) = unpacked(&[0x1f, 0x8b, 8, 0, 0, 0]);
-    assert_eq!(message, Some("decompressor failed"));
+    assert_eq!(message, Some(crate::vfs::initramfs::NOT_PORTED));
     let (_, _, message) = unpacked(b"garbage that is not an archive");
     assert_eq!(
         message,

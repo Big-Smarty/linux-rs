@@ -42,7 +42,7 @@ mod vfs_tests;
 use crate::{
     config,
     mm::{Env, FileInfo, Mm, UserPages as PageTables},
-    task::{Attributes, RLIMIT_NOFILE},
+    task::{Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE},
     usercopy::UserPages,
     vfs::{Cred, FdTable, FsStruct, Vfs},
 };
@@ -119,6 +119,10 @@ pub trait Context: UserPages + Clocks {
     fn cred(&mut self) -> Cred {
         Cred::of_task(&self.attrs().cred)
     }
+    /// `rlimit(RLIMIT_FSIZE)`: the soft limit (`RLIM_INFINITY` when unlimited).
+    fn rlimit_fsize(&mut self) -> u64 {
+        self.attrs().rlimits.get(RLIMIT_FSIZE).cur
+    }
     /// `rlimit(RLIMIT_NOFILE)`: the soft limit.
     fn rlimit_nofile(&mut self) -> u64 {
         self.attrs().rlimits.get(RLIMIT_NOFILE).cur
@@ -171,6 +175,9 @@ pub(crate) enum Stop {
     Unimplemented,
     /// `send_sig(SIGPIPE)` with `-EPIPE`: signal delivery is not wired yet.
     SigPipe,
+    /// `send_sig(SIGXFSZ)` with `-EFBIG` (`RLIMIT_FSIZE` exceeded): signal
+    /// delivery is not wired yet.
+    SigXfsz,
 }
 
 impl From<Errno> for Stop {
@@ -188,7 +195,7 @@ pub(crate) fn outcome(number: u32, result: Sys) -> Outcome {
         Ok(value) => Outcome::Return(value),
         Err(Stop::Errno(errno)) => Outcome::Return(error(errno)),
         Err(Stop::Blocked) => Outcome::Blocked(number),
-        Err(Stop::Unimplemented | Stop::SigPipe) => Outcome::Unimplemented(number),
+        Err(Stop::Unimplemented | Stop::SigPipe | Stop::SigXfsz) => Outcome::Unimplemented(number),
     }
 }
 

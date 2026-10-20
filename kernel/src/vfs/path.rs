@@ -182,6 +182,10 @@ impl<'a> Walk<'a> {
             LastKind::Norm => {}
         }
         let Some(child) = self.fs.lookup(self.cur, last.name) else {
+            // __lookup_slow: no dentry is created in a removed directory.
+            if self.fs.is_dead(self.cur) {
+                return Err(Errno::ENOENT);
+            }
             // simple_lookup rejects an over-long name only when it must create
             // the negative dentry, i.e. when no entry of that name exists.
             return Err(if last.name.len() > NAME_MAX {

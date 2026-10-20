@@ -259,17 +259,20 @@ fn readlinkat<C: Context>(ctx: &mut C, dfd: i32, path: u64, buf: u64, bufsiz: u6
     let env = env_for(ctx, dfd, &name)?;
     let vfs = ctx.files().vfs;
     let inode = vfs.lookup(&env, &name, 0)?;
-    let target = match &vfs.fs.inode(inode).body {
-        crate::vfs::tmpfs::Body::Link(target) => try_copy(target)?,
-        _ => {
-            return Err(if name.is_empty() {
-                Errno::ENOENT
-            } else {
-                Errno::EINVAL
-            }
-            .into());
+    if !vfs.fs.inode(inode).is_symlink() {
+        return Err(if name.is_empty() {
+            Errno::ENOENT
+        } else {
+            Errno::EINVAL
         }
+        .into());
+    }
+    // do_readlinkat: touch_atime() precedes vfs_readlink().
+    vfs.fs.touch_atime(inode);
+    let crate::vfs::tmpfs::Body::Link(target) = &vfs.fs.inode(inode).body else {
+        return Err(Errno::EINVAL.into());
     };
+    let target = try_copy(target)?;
     #[allow(clippy::cast_sign_loss)]
     let n = target.len().min(bufsiz as usize);
     if copy_to_user(ctx, buf, &target[..n]) != 0 {

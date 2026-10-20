@@ -47,10 +47,15 @@
 //!
 //! shortcut: directory lookup is a linear scan of the entries; replace the
 //! entry vector by a hash index when a directory with thousands of names matters.
-//! shortcut: `atime` is never updated by reads (Linux's `relatime` rules);
-//! `mtime`/`ctime` updates are performed. Every timestamp comes from the
-//! [`Vfs::new`] clock, which the binary points at `timer::ktime_get_real`
-//! (Linux's `current_time` without multigrain granularity).
+//! The rootfs is mounted with no `MNT_RELATIME` (`init_mount_tree` passes no
+//! flags), so Linux updates `atime` on every read, `getdents64` and `readlink`
+//! (`relatime_need_update` is true without the flag); [`Tmpfs::touch_atime`]
+//! does the same at those three sites. shortcut: `atime` is not updated by
+//! following a symlink during a walk (`get_link`) or by a pipe read (the pipe
+//! inode keeps one creation stamp); upgrade with a mutable walk. Every
+//! timestamp comes from the [`Vfs::new`] clock, which the binary points at
+//! `timer::ktime_get_real` (Linux's `current_time` without multigrain
+//! granularity).
 
 pub mod file;
 pub mod initramfs;
@@ -152,8 +157,9 @@ pub const VALID_OPEN_FLAGS: u32 = O_RDONLY
     | O_SYNC
     | O_PATH
     | __O_TMPFILE;
-/// `SETFL_MASK`: the flags `F_SETFL` can change.
-pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK | O_DIRECT | O_NOATIME | FASYNC;
+/// `SETFL_MASK`: the flags `F_SETFL` can change (`FASYNC` is set only by
+/// `->fasync`, never by the mask).
+pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK | O_DIRECT | O_NOATIME;
 
 // ---- statx attributes (include/uapi/linux/stat.h) --------------------------
 pub const STATX_ATTR_IMMUTABLE: u64 = 0x10;
@@ -253,7 +259,7 @@ pub fn dtype(mode: u32) -> u8 {
 /// consults. The kernel starts init as root with every capability.
 ///
 /// shortcut: no supplementary groups and no capability machinery beyond the
-/// four bits `fs/` asks for; the ids workstream replaces this with the real
+/// bits `fs/` asks for; the ids workstream replaces this with the real
 /// `struct cred` and `capable()`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
@@ -275,6 +281,8 @@ pub struct Cred {
     pub chown: bool,
     /// `CAP_FSETID`.
     pub fsetid: bool,
+    /// `CAP_SYS_ADMIN`.
+    pub sys_admin: bool,
 }
 
 impl Cred {
@@ -295,6 +303,7 @@ impl Cred {
             mknod: root,
             chown: root,
             fsetid: root,
+            sys_admin: root,
         }
     }
 
@@ -310,6 +319,7 @@ impl Cred {
             mknod: true,
             chown: true,
             fsetid: true,
+            sys_admin: true,
         }
     }
 }
@@ -346,7 +356,8 @@ pub struct Vfs {
 
 impl Vfs {
     /// A fresh rootfs (tmpfs) with room for `max_blocks` pages and `max_inodes`
-    /// inodes (Linux: half the RAM and the RAM's page count).
+    /// inodes (Linux: `shmem_default_max_blocks` and `_max_inodes` are both
+    /// half the RAM's page count).
     ///
     /// # Errors
     /// `ENOMEM` when the root inode cannot be allocated.
