@@ -7,7 +7,7 @@
 // `getsid`, `setsid`). GPL-2.0-only.
 // Transformation: the process tree is the task list (`crate::task`), not
 // per-task fields; `do_wait`'s sleep is `wait_event_interruptible` on the
-// wake-ups of `Waker::child_event`; `struct rusage` carries only the two CPU
+// parent's `wait_chldexit` key (`chldexit_key`), woken by `Waker::child_event`; `struct rusage` carries only the two CPU
 // times (everything else is zero until the scheduler counts it).
 //! Process syscalls: `getpid`, `getppid`, `exit`, `exit_group`, `wait4`,
 //! `waitid`, process groups and sessions.
@@ -15,7 +15,10 @@
 use super::{Context, Outcome, error};
 use crate::{
     signal::{SIGCHLD, deliver::ERESTARTSYS, wait::wait_event_interruptible},
-    task::wait::{WNOHANG, WaitInfo, WaitOpts},
+    task::{
+        exit::chldexit_key,
+        wait::{WNOHANG, WaitInfo, WaitOpts},
+    },
     usercopy::{access_ok, copy_to_user, put_user},
 };
 use syscalls::{Errno, Sysno};
@@ -90,7 +93,8 @@ pub fn exit_code(status: u64) -> u32 {
 /// signal pending (the return path turns it into `-EINTR` or restarts).
 fn do_wait<C: Context>(ctx: &mut C, wo: &mut WaitOpts) -> i64 {
     let mut result = 0;
-    let waited = wait_event_interruptible(ctx, |c| {
+    let key = chldexit_key(ctx.tasks().current);
+    let waited = wait_event_interruptible(ctx, key, |c| {
         let t = c.tasks();
         result = t.list.do_wait_once(t.current, wo);
         result != -ERESTARTSYS

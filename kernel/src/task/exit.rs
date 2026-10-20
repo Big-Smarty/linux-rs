@@ -23,8 +23,11 @@ use super::{
     pid::PidType,
     tasklist::{ExitState, PF_EXITING, PF_SIGNALED, TaskId, Tasklist},
 };
-use crate::signal::{
-    SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, info::SigInfo, state::Target,
+use crate::{
+    sched::{CLASS_CHLDEXIT, WaitKey},
+    signal::{
+        SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, info::SigInfo, state::Target,
+    },
 };
 
 /// `SIGNAL_STOP_STOPPED`: a job-control stop is in effect.
@@ -55,6 +58,15 @@ pub trait Waker {
     fn child_event(&mut self, parent: TaskId);
     /// `signal_wake_up`: `task` has a signal queued.
     fn signal_wake(&mut self, task: TaskId);
+}
+
+/// The wait queue `signal_struct::wait_chldexit` of `parent`'s thread group:
+/// `do_wait` sleeps on it and `child_event` wakes it. One thread per group, so
+/// the group is its task; a slot reused by a later task only costs a spurious
+/// wake-up, which every sleeper re-checks.
+#[must_use]
+pub fn chldexit_key(parent: TaskId) -> WaitKey {
+    WaitKey::new(CLASS_CHLDEXIT, parent.slot())
 }
 
 /// For callers with no other task to wake (the single-task kernel).

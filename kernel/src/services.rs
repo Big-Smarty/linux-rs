@@ -56,6 +56,9 @@
 //! in the task model calls out under it, so the promotion only splits the
 //! lock. [`kernel::task::exit::Waker`] is the seam through which the model
 //! asks for wake-ups: an implementation may take `RQ` and nothing else.
+//! The binary's implementation is `userspace::SchedWaker`: `child_event` wakes
+//! the parent's `wait_chldexit` key and `signal_wake` wakes the task, both
+//! through `ktask` (`RQ` only).
 //!
 //! One exception, the blocking system calls (`pause`, `rt_sigsuspend`,
 //! `rt_sigtimedwait`, `nanosleep`, later blocking `read`): `Task::wait` calls

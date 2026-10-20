@@ -59,7 +59,7 @@ use kernel::{
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     ratelimit::RateLimit,
-    sched::WaitKey,
+    sched::{SchedId, WaitKey, WakeMode},
     signal::{
         self, State,
         deliver::{self, Outcome as SignalOutcome},
@@ -72,7 +72,7 @@ use kernel::{
     },
     task::{
         self, Attributes, TaskId, Tasklist,
-        exit::{ExitPrep, NoWake},
+        exit::{ExitPrep, Waker, chldexit_key},
     },
     usercopy::{self, UserPages},
     vfs::{
@@ -479,6 +479,30 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
     })
 }
 
+/// The task model's [`Waker`] on the scheduler's wait queues: `child_event` is
+/// `__wake_up_parent` (`__wake_up_sync_key` on the parent's `wait_chldexit`,
+/// `TASK_INTERRUPTIBLE`, one exclusive waiter), `signal_wake` is
+/// `signal_wake_up` on the task's scheduling handle. Both take `RQ`, a leaf
+/// that any lock may precede (`services`).
+/// shortcut: a table of one entry, because init is the only task (no `fork`
+/// yet); upgrade by storing the [`SchedId`] in the task model's per-task
+/// record when `copy_process` can create tasks.
+#[derive(Default)]
+struct SchedWaker {
+    init: Option<(TaskId, SchedId)>,
+}
+
+impl Waker for SchedWaker {
+    fn child_event(&mut self, parent: TaskId) {
+        ktask::wake_up_key(chldexit_key(parent), WakeMode::Interruptible, 1);
+    }
+    fn signal_wake(&mut self, task: TaskId) {
+        if let Some((_, sched)) = self.init.filter(|&(id, _)| id == task) {
+            ktask::signal_wake_up(sched);
+        }
+    }
+}
+
 /// The one process: what the syscall and fault paths need once init runs
 /// (frames, boot info and the heap are in `services`/`kalloc`). Later syscall
 /// groups extend it (file table, credentials, signals, ...); exactly one is
@@ -495,8 +519,8 @@ pub struct Process {
     pub tasks: Tasklist,
     /// `current`: init, the only task.
     pub current: TaskId,
-    /// Wake-ups of other tasks' sleepers: there are none yet.
-    wake: NoWake,
+    /// Wake-ups of other tasks' sleepers, through the scheduler.
+    wake: SchedWaker,
     /// `mm->exe_file`: the open description the image was loaded from (its
     /// `FileInfo::id` is `exec`).
     exe_file: FileId,
@@ -1896,7 +1920,7 @@ fn start(mut init: Loaded) {
     PROCESS.install(Process {
         tasks,
         current,
-        wake: NoWake,
+        wake: SchedWaker::default(),
         exe_file: init.exec,
         mm: &services::TABLES,
         attrs,
@@ -1925,5 +1949,11 @@ fn start(mut init: Loaded) {
     // is active and maps `entry` (executable) and `sp` (writable, user); all
     // state used by the syscall/fault paths is in `PROCESS` and `services`;
     // `kernel_main`'s frame stays on the boot stack, which is idle's from here on.
-    unsafe { ktask::start_init(entry, sp) }
+    unsafe {
+        ktask::start_init(entry, sp, |sched| {
+            let mut process = PROCESS.lock();
+            let init = process.current;
+            process.wake.init = Some((init, sched));
+        });
+    }
 }

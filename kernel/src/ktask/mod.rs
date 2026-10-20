@@ -307,7 +307,9 @@ pub fn spawn_user(regs: PtRegs) -> Result<SchedId, NoSlot> {
 /// `cpu_startup_entry`). Returns when that task is gone and nothing else is
 /// runnable: never in a normal boot (the death of init ends it), once per group
 /// in the bare-metal suite, whose group end leaves the CPU for good with
-/// [`exit_current`].
+/// [`exit_current`]. `bound` receives the init task's handle before the first
+/// switch (the task model's [`Waker`](kernel::task::exit::Waker) learns which
+/// scheduling handle is init); it runs with IF clear and no scheduler lock held.
 ///
 /// # Safety
 /// BSP at CPL0, IF clear, after `cpu::install_descriptors`,
@@ -315,7 +317,7 @@ pub fn spawn_user(regs: PtRegs) -> Result<SchedId, NoSlot> {
 /// (executable) and `sp` (writable) for the user; everything the syscall and
 /// fault paths use is in statics (`PROCESS`, `services`); the caller's frame
 /// stays on the boot stack, which only idle uses from here on.
-pub unsafe fn start_init(entry: u64, sp: u64) {
+pub unsafe fn start_init(entry: u64, sp: u64, bound: impl FnOnce(SchedId)) {
     // SAFETY: forwarded caller contract (BSP, CPL0, no ring-3 task yet).
     unsafe { cpu::prepare_user_segments() };
     let regs = PtRegs {
@@ -330,6 +332,7 @@ pub unsafe fn start_init(entry: u64, sp: u64) {
         ..PtRegs::default()
     };
     let init = crate::unwrap(spawn_user(regs).map_err(|_| "no task slot"), "spawn-init");
+    bound(init);
     idle_loop(|| state(init).is_none());
 }
 
@@ -362,26 +365,12 @@ pub fn state(id: SchedId) -> Option<TaskState> {
 
 /// `__wake_up(key, mode, nr_exclusive)`: see [`Rq::wake_up_key`] for the order
 /// and the counting; how many woke.
-#[cfg_attr(
-    not(feature = "qemu-self-test"),
-    allow(
-        dead_code,
-        reason = "seam for the pipe/wait lanes; exercised by the self-test"
-    )
-)]
 pub fn wake_up_key(key: WaitKey, mode: WakeMode, nr_exclusive: usize) -> usize {
     RQ.lock().wake_up_key(key, mode, nr_exclusive)
 }
 
 /// `signal_wake_up`: wake an interruptible sleeper (the signal sender calls it
 /// after queueing the signal). Whether it was asleep.
-#[cfg_attr(
-    not(feature = "qemu-self-test"),
-    allow(
-        dead_code,
-        reason = "seam for the signal sender of the task-model lane"
-    )
-)]
 pub fn signal_wake_up(id: SchedId) -> bool {
     RQ.lock().wake_interruptible(id)
 }

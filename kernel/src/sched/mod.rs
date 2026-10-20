@@ -61,6 +61,10 @@ pub const SLICE_TICKS: u32 = 1;
 /// here so two owners cannot collide.
 pub const CLASS_TEST: u32 = u32::MAX;
 
+/// Wait-key class of `signal_struct::wait_chldexit`: the id is the slot of the
+/// waiting thread group's leader (`task::exit::chldexit_key`).
+pub const CLASS_CHLDEXIT: u32 = 1;
+
 /// A task handle: slot index plus the slot's generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedId {
