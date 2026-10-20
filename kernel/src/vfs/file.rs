@@ -152,6 +152,18 @@ impl FileTable {
     pub fn open_count(&self) -> usize {
         self.files.iter().flatten().count()
     }
+
+    /// The references held on all open descriptions together (descriptors,
+    /// mappings, a running `read`): a leak check sees a description kept alive
+    /// by one reference too many, which [`FileTable::open_count`] does not.
+    #[must_use]
+    pub fn total_refs(&self) -> u64 {
+        self.files
+            .iter()
+            .flatten()
+            .map(|file| u64::from(file.refs))
+            .sum()
+    }
 }
 
 /// `struct files_struct` (single-threaded sharing: one owner).

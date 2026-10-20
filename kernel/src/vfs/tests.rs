@@ -708,12 +708,18 @@ fn dup_fd_gives_the_child_its_own_table_over_shared_descriptions() {
     let fd = parent.alloc_fd(100, 1024, false).unwrap();
     parent.install(fd, high);
     let open_files = vfs.files.open_count();
+    let refs = vfs.files.total_refs();
 
     let mut child = vfs.dup_fd(&parent).unwrap();
     assert_eq!(
         vfs.files.open_count(),
         open_files,
         "descriptions are shared"
+    );
+    assert_eq!(
+        vfs.files.total_refs(),
+        refs + 4,
+        "one reference per descriptor"
     );
     let seen = |t: &FdTable| t.iter().collect::<Vec<_>>();
     assert_eq!(seen(&child), seen(&parent));
@@ -724,6 +730,7 @@ fn dup_fd_gives_the_child_its_own_table_over_shared_descriptions() {
     assert_eq!(seen(&child), []);
     assert_eq!(seen(&parent).len(), 4);
     assert_eq!(vfs.files.open_count(), open_files);
+    assert_eq!(vfs.files.total_refs(), refs);
     // The child's next descriptor is the lowest free one of its own table.
     let mut child = vfs.dup_fd(&parent).unwrap();
     assert_eq!(child.close(0).map(|f| vfs.fput(f)), Some(()));

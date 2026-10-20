@@ -4498,7 +4498,7 @@ fn forkleak_ram_unchanged(line: &str) -> bool {
     )
 }
 
-/// `CHECK fork-objects forks=202 heap=a/b files=a/b pins=a/b root_refs=a/b slots=a/b threads=a/b`
+/// `CHECK fork-objects forks=202 heap=a/b files=a/b file_refs=a/b pins=a/b root_refs=a/b slots=a/b threads=a/b`
 /// (printed by the self-test kernel when init exits): the 202 forks of `-- forkleak` happened and
 /// every live-object count, sampled before the 3rd fork and at init's exit, is the same, which
 /// the free-RAM line cannot show (a leaked file reference, inode pin, task slot or heap byte).
@@ -4514,7 +4514,15 @@ fn forkleak_objects_unchanged(line: &str) -> bool {
         let Some((was, now)) = pair.split_once('/') else {
             return false;
         };
-        let want = ["heap", "files", "pins", "root_refs", "slots", "threads"];
+        let want = [
+            "heap",
+            "files",
+            "file_refs",
+            "pins",
+            "root_refs",
+            "slots",
+            "threads",
+        ];
         if want.get(index) != Some(&name)
             || was != now
             || was.parse::<u64>().is_err()
@@ -4524,7 +4532,7 @@ fn forkleak_objects_unchanged(line: &str) -> bool {
         }
         fields += 1;
     }
-    fields == 6
+    fields == 7
 }
 
 /// `-- forkbomb`: the three records, in order. Each flood forks until `EAGAIN` (at least 100
@@ -7677,7 +7685,7 @@ mod tests {
         };
         let counts = FORKLEAK_MODE_LINE;
         let ram = "init: forkleak free_ram before=453361664 after=453361664";
-        let objects = "CHECK fork-objects forks=202 heap=484795/484795 files=2/2 pins=1/1 root_refs=5/5 slots=1/1 threads=1/1";
+        let objects = "CHECK fork-objects forks=202 heap=484795/484795 files=2/2 file_refs=5/5 pins=1/1 root_refs=5/5 slots=1/1 threads=1/1";
         let with_objects = |lines: &[&str], objects: &str| {
             let serial = oracle_serial(&lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>());
             // The kernel prints the record when init exits, after `init: ok`.
@@ -7695,6 +7703,10 @@ mod tests {
                 objects.replace("484795/484795", "484795/484796"),
             ),
             ("a file kept", objects.replace("files=2/2", "files=2/3")),
+            (
+                "a file reference kept",
+                objects.replace("file_refs=5/5", "file_refs=5/6"),
+            ),
             ("a pin kept", objects.replace("pins=1/1", "pins=1/2")),
             (
                 "a task slot kept",

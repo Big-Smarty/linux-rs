@@ -933,6 +933,7 @@ mod leak {
     struct Snapshot {
         heap: usize,
         files: usize,
+        file_refs: u64,
         pins: usize,
         root_refs: u32,
         slots: usize,
@@ -949,6 +950,7 @@ mod leak {
             // The pid table grows with the highest pid number (until the cursor wraps).
             heap: crate::kalloc::requested_bytes() - process.tasks.pid_table_bytes(),
             files: process.vfs.files.open_count(),
+            file_refs: process.vfs.files.total_refs(),
             pins: process.vfs.pin_count(),
             root_refs: process.vfs.fs.inode_refs(process.vfs.fs.root()),
             slots: ktask::tasks_in_use(),
@@ -969,12 +971,14 @@ mod leak {
             return;
         };
         crate::log!(
-            "CHECK fork-objects forks={} heap={}/{} files={}/{} pins={}/{} root_refs={}/{} slots={}/{} threads={}/{}\n",
+            "CHECK fork-objects forks={} heap={}/{} files={}/{} file_refs={}/{} pins={}/{} root_refs={}/{} slots={}/{} threads={}/{}\n",
             FORKS.load(Ordering::Relaxed),
             was.heap,
             now.heap,
             was.files,
             now.files,
+            was.file_refs,
+            now.file_refs,
             was.pins,
             now.pins,
             was.root_refs,
