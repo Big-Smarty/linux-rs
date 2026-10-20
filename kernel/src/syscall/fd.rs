@@ -15,8 +15,8 @@
 // `TIOCGWINSZ`, `TIOCGPGRP`, `FIONREAD`), include/uapi/asm-generic/ioctls.h,
 // fs/open.c (`do_sys_ftruncate`). All GPL-2.0 / GPL-2.0-only.
 // Transformation: the user-space iterators become `Dest`/bounce-buffer loops
-// with the same page-sized fault granularity; waits become `Stop::Blocked`
-// (one task, nobody to wake it).
+// with the same page-sized fault granularity; waits are interruptible sleeps
+// that end in `Stop::Blocked` when nothing could wake the one task.
 // x86_64 only: `usize` is 64 bits, and the narrowing/sign casts below are the
 // C types of the Linux ABI (`unsigned int` descriptors, `off_t`, `umode_t`,
 // 32-bit inode numbers) reproduced on purpose.
@@ -27,16 +27,19 @@
 )]
 //! Descriptor-based file syscalls.
 //!
-//! Context: task context; nothing sleeps. An operation that would sleep with
-//! no other task to wake it ends in [`Stop::Blocked`], a loud stop, never in a
-//! guessed result. `SIGPIPE` has no delivery yet: writing to a pipe without
-//! readers is [`Stop::Unimplemented`].
+//! Context: task context. The one task cannot be woken by another one or by a
+//! device, so an operation that would sleep (an empty pipe or console, a full
+//! pipe) sleeps interruptibly ([`interruptible_wait`]): it ends with
+//! `-ERESTARTSYS` when a signal arrives (an `ITIMER_REAL` expiry is the only
+//! source), and in [`Stop::Blocked`], a loud stop, when nothing could ever wake
+//! it. `SIGPIPE` and `SIGXFSZ` are sent with `send_sig` as in Linux.
 
 use alloc::vec::Vec;
 use syscalls::{Errno, Sysno};
 
 use super::{Context, MAX_RW_COUNT, Outcome, Stop, Sys, io, outcome};
 use crate::{
+    signal::{SIGPIPE, SIGXFSZ, wait::ERESTARTSYS},
     task::RLIM_INFINITY,
     usercopy::{access_ok, copy_from_user, copy_to_user},
     vfs::{
@@ -319,7 +322,9 @@ fn read_kind<C: Context>(ctx: &mut C, view: &View, dest: &mut Dest, pos: Option<
             if view.flags & O_NONBLOCK != 0 {
                 Err(Errno::EAGAIN.into())
             } else {
-                Err(Stop::Blocked)
+                // `n_tty_read`: `signal_pending` -> `-ERESTARTSYS`.
+                interruptible_wait(ctx)?;
+                Ok(-ERESTARTSYS)
             }
         }
         FileKind::Pipe {
@@ -435,9 +440,31 @@ fn pipe_read<C: Context>(
         if view.flags & O_NONBLOCK != 0 {
             return Err(Errno::EAGAIN.into());
         }
-        return Err(Stop::Blocked);
+        // `wait_event_interruptible_exclusive(pipe->rd_wait, ...) < 0`: nothing
+        // was read, so the call restarts with no side effect.
+        interruptible_wait(ctx)?;
+        return Ok(-ERESTARTSYS);
     }
     Ok(ret)
+}
+
+/// `wait_event_interruptible` on a condition only another task or a device
+/// interrupt could make true, which the single task has none of: sleep until a
+/// signal is pending (`Ok`; the caller returns `-ERESTARTSYS`, or its partial
+/// result). The `ITIMER_REAL` expiry is the only wake-up source, so with none
+/// armed and no signal pending Linux would sleep forever and the kernel stops
+/// loudly ([`Stop::Blocked`]) instead of halting.
+fn interruptible_wait<C: Context>(ctx: &mut C) -> Result<(), Stop> {
+    // Checked on every wake-up, after the timers are brought up to date: an
+    // `ITIMER_REAL` that expired into an ignored or blocked `SIGALRM` leaves
+    // nothing that could end the wait.
+    let mut dead = false;
+    let _ = crate::signal::wait::wait_event_interruptible(ctx, |c| {
+        let state = c.state();
+        dead = !state.signal_pending() && state.itimer.next_event().is_none();
+        dead
+    });
+    if dead { Err(Stop::Blocked) } else { Ok(()) }
 }
 
 // ---- write --------------------------------------------------------------------
@@ -524,7 +551,8 @@ fn write_regular<C: Context>(
     if limit != RLIM_INFINITY {
         let limit = limit as i64;
         if at >= limit {
-            return Err(Stop::SigXfsz); // send_sig(SIGXFSZ) + -EFBIG
+            ctx.state().send_sig(SIGXFSZ);
+            return Err(Errno::EFBIG.into());
         }
         count = count.min((limit - at) as u64);
     }
@@ -595,7 +623,8 @@ fn pipe_write<C: Context>(
         return Ok(0);
     }
     if ctx.files().vfs.pipe_ref(pipe).readers == 0 {
-        return Err(Stop::SigPipe); // send_sig(SIGPIPE) + -EPIPE
+        ctx.state().send_sig(SIGPIPE);
+        return Err(Errno::EPIPE.into());
     }
     let mut bounce = [0u8; PAGE_SIZE];
     let mut ret: u64 = 0;
@@ -620,7 +649,11 @@ fn pipe_write<C: Context>(
     }
     loop {
         if ctx.files().vfs.pipe_ref(pipe).readers == 0 {
-            return Err(Stop::SigPipe);
+            ctx.state().send_sig(SIGPIPE);
+            if ret == 0 {
+                return Err(Errno::EPIPE.into());
+            }
+            break;
         }
         if !ctx.files().vfs.pipe_ref(pipe).is_full() {
             let want = remaining.min(PAGE_SIZE as u64) as usize;
@@ -644,7 +677,14 @@ fn pipe_write<C: Context>(
             }
             break;
         }
-        return Err(Stop::Blocked);
+        // `signal_pending` after the full-pipe checks: a partial write is
+        // returned, an empty one restarts; otherwise sleep until space (a
+        // signal, here) and look again.
+        interruptible_wait(ctx)?;
+        if ret == 0 {
+            return Ok(-ERESTARTSYS);
+        }
+        break;
     }
     Ok(i64::try_from(ret).unwrap_or(i64::MAX))
 }
@@ -1301,7 +1341,8 @@ fn ftruncate<C: Context>(ctx: &mut C, fd: u64, length: u64) -> Sys {
     if size < length as u64 {
         let limit = ctx.rlimit_fsize();
         if limit != RLIM_INFINITY && length as u64 > limit {
-            return Err(Stop::SigXfsz);
+            ctx.state().send_sig(SIGXFSZ);
+            return Err(Errno::EFBIG.into());
         }
     }
     let cred = ctx.cred();

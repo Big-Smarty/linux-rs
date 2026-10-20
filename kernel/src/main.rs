@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
 // Fallible allocation API (`Box::try_new`, `Vec::push_within_capacity`); the
-// infallible one does not exist in target builds, see `kalloc`. Only the
-// self-test uses them so far.
-#![cfg_attr(
-    feature = "qemu-self-test",
-    feature(allocator_ext, vec_push_within_capacity)
-)]
+// infallible one does not exist in target builds, see `kalloc`. The process's
+// signal state uses `Box::try_new`; only the self-test uses the `Vec` form.
+#![feature(allocator_ext)]
+#![cfg_attr(feature = "qemu-self-test", feature(vec_push_within_capacity))]
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 compile_error!(

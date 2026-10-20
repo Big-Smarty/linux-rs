@@ -510,7 +510,8 @@ mod tests {
     use super::*;
     use crate::{
         signal::{
-            SA_ONSTACK, SA_RESTORER, SA_SIGINFO, SIGHUP, SIGKILL, SIGTERM, SIGUSR1, SS_AUTODISARM,
+            SA_ONSTACK, SA_RESTORER, SA_SIGINFO, SIG_IGN, SIGHUP, SIGKILL, SIGTERM, SIGUSR1,
+            SS_AUTODISARM,
         },
         usercopy::fake::Space,
     };
@@ -648,6 +649,71 @@ mod tests {
         put(&mut sp, 0x1000, &SigAction::default().to_bytes());
         assert_eq!(sys_rt_sigaction(&mut st, &mut sp, 17, 0x1000, 0, 8), 0);
         assert!(!st.pending_set().contains(17));
+    }
+
+    fn handled(sig: u8) -> State {
+        let mut st = State::new(7, 0, 100_000);
+        st.actions[usize::from(sig) - 1].handler = 0x1000;
+        st.blocked.add(sig);
+        st
+    }
+    fn drain(st: &mut State) -> usize {
+        st.blocked = SigSet::EMPTY;
+        let mut n = 0;
+        while st.dequeue_signal().is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn tkill_pends_privately_so_sig_ign_flushes_it() {
+        // tkill -> tsk->pending, flushed by `flush_sigqueue_mask` on SIG_IGN.
+        let mut st = handled(SIGUSR1);
+        assert_eq!(sys_tkill(&mut st, 7, 10), 0);
+        assert!(st.pending_set().contains(SIGUSR1));
+        let mut sp = space();
+        put(
+            &mut sp,
+            0x1000,
+            &SigAction {
+                handler: SIG_IGN,
+                ..SigAction::default()
+            }
+            .to_bytes(),
+        );
+        assert_eq!(sys_rt_sigaction(&mut st, &mut sp, 10, 0x1000, 0, 8), 0);
+        assert_eq!(st.pending_set(), SigSet::EMPTY);
+    }
+
+    #[test]
+    fn kill_and_tkill_queue_separately_but_sigqueueinfo_is_process_wide() {
+        // legacy_queue looks at the target queue only (kernel/signal.c:1061):
+        // kill (shared) + tkill (private) deliver twice.
+        let mut st = handled(SIGUSR1);
+        assert_eq!(sys_kill(&mut st, 7, 10), Some(0));
+        assert_eq!(sys_tkill(&mut st, 7, 10), 0);
+        assert_eq!(drain(&mut st), 2);
+        // rt_sigqueueinfo targets the process like kill: coalesces with it.
+        let mut st = handled(SIGUSR1);
+        let mut sp = space();
+        let mut info = [0u8; 128];
+        info[8..12].copy_from_slice(&(-1i32).to_le_bytes()); // SI_QUEUE
+        put(&mut sp, 0x1000, &info);
+        assert_eq!(sys_kill(&mut st, 7, 10), Some(0));
+        assert_eq!(sys_rt_sigqueueinfo(&mut st, &mut sp, 7, 10, 0x1000), 0);
+        assert_eq!(drain(&mut st), 1);
+    }
+
+    #[test]
+    fn rt_tkill_queue_holds_64_entries_then_eagain() {
+        // The array cap is 64 RT entries per queue (shortcut in state.rs).
+        let mut st = handled(40);
+        for n in 0..70u32 {
+            let want = if n < 64 { 0 } else { EAGAIN };
+            assert_eq!(sys_tkill(&mut st, 7, 40), want, "tkill {n}");
+        }
+        assert_eq!(drain(&mut st), 64);
     }
 
     #[test]

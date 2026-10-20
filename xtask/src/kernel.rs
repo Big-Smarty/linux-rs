@@ -558,6 +558,26 @@ const DEBUG_CASES: &[DebugCase] = &[
         framebuffers: 1,
         plat: Q35_TCG,
     },
+    // Signal delivery from the exit-to-user path: handler entry and `rt_sigreturn`, synchronous
+    // faults recovered by handlers, an `ITIMER_REAL` interrupting a busy loop, `pause`,
+    // `rt_sigsuspend`, `rt_sigtimedwait` and the alternate stack (`user/init` mode `signals`).
+    DebugCase {
+        name: "signals",
+        cmdline: Some("-- signals"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some("init: signals ok"),
+            exact_summary: true,
+            protection: (false, false),
+        },
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
     DebugCase {
         name: "cpu-max",
         cmdline: Some("-- sse"),
@@ -703,6 +723,57 @@ const DEBUG_CASES: &[DebugCase] = &[
     oracle_case!(ids),
     oracle_case!(time),
     oracle_case!(fs),
+    oracle_case!(signal),
+    // The signal smoke run on the other two clockevent paths: the PIT-only periodic timer (an
+    // `ITIMER_REAL` wake-up served at tick granularity) and the KVM TSC-deadline timer.
+    DebugCase {
+        name: "signals-nolapic",
+        cmdline: Some("nolapic -- signals"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some("init: signals ok"),
+            exact_summary: true,
+            protection: (false, false),
+        },
+        framebuffers: 1,
+        plat: Platform {
+            mode: "legacy-pic",
+            reason: "nolapic",
+            tsc_sources: &["pit"],
+            event: "pit-periodic",
+            ioapic_timer: "n/a",
+            ..Q35_TCG
+        },
+    },
+    DebugCase {
+        name: "signals-kvm",
+        cmdline: Some("-- signals"),
+        cpu: "host",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::Ok {
+            argc: 2,
+            mode_line: Some("init: signals ok"),
+            exact_summary: false,
+            protection: (true, true),
+        },
+        framebuffers: 1,
+        plat: Platform {
+            kvm: true,
+            mode: "x2apic",
+            reason: "hypervisor",
+            event: "lapic-deadline",
+            tsc_sources: &["pit", "hpet"],
+            ..Q35_TCG
+        },
+    },
 ];
 
 /// Expected stdout lines of the oracle syscall suite (`user/init` modes `mm ids time signal fs
@@ -6414,6 +6485,7 @@ mod tests {
             ("sse", "init: sse ok"),
             ("rseq", "init: rseq enosys"),
             ("demand", DEMAND_MODE_LINE),
+            ("signals", "init: signals ok"),
         ] {
             let serial = base
                 .replace("argc=1", "argc=2")

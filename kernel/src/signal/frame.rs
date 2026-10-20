@@ -273,6 +273,9 @@ pub struct Sigreturn {
     pub ret: u64,
     /// `badframe`: SIGSEGV has been forced.
     pub bad_frame: bool,
+    /// `restore_sigcontext` was entered: its first statement resets
+    /// `restart_block.fn`, which the caller owns (`Clocks::set_restart_block`).
+    pub reached_sigcontext: bool,
 }
 
 /// `fpu__restore_sig(buf, 0)` for FXSR-only state. A null pointer resets the
@@ -312,8 +315,6 @@ fn restore_sigcontext<P: UserPages, C: Cpu>(
     pages: &mut P,
     cpu: &mut C,
 ) -> bool {
-    // (Linux first makes any pending restart_syscall return -EINTR; the
-    // restart block belongs to the timer syscalls, not modelled here.)
     let Some(sc) = get_user::<_, SC_READ>(pages, usc) else {
         return false;
     };
@@ -363,6 +364,7 @@ pub fn rt_sigreturn<P: UserPages, C: Cpu>(
     cpu: &mut C,
 ) -> Sigreturn {
     let frame = regs.sp.wrapping_sub(8);
+    let mut reached_sigcontext = false;
     let ok = (|| {
         if !access_ok(frame, FRAME_SIZE) {
             return false;
@@ -384,6 +386,10 @@ pub fn rt_sigreturn<P: UserPages, C: Cpu>(
             regs.sp,
             MINSIGSTKSZ,
         );
+        // restore_sigcontext's first line resets `restart_block.fn` to
+        // `do_no_restart_syscall`: the caller (`Task::rt_sigreturn`) owns the
+        // block and learns of this point through `reached_sigcontext`.
+        reached_sigcontext = true;
         restore_sigcontext(
             regs,
             frame + UC_MCONTEXT,
@@ -396,6 +402,7 @@ pub fn rt_sigreturn<P: UserPages, C: Cpu>(
         Sigreturn {
             ret: regs.ax,
             bad_frame: false,
+            reached_sigcontext,
         }
     } else {
         // signal_fault -> force_sig(SIGSEGV)
@@ -403,6 +410,7 @@ pub fn rt_sigreturn<P: UserPages, C: Cpu>(
         Sigreturn {
             ret: 0,
             bad_frame: true,
+            reached_sigcontext,
         }
     }
 }

@@ -32,7 +32,7 @@ use super::{
         restart_without_handler,
     },
     frame::{FIX_EFLAGS, FRAME_SIZE, INFO, MAX_FRAME_SIZE, rt_sigreturn},
-    info::{SEGV_MAPERR, SigInfo},
+    info::{SEGV_MAPERR, SI_QUEUE, SigInfo},
     linux_frames,
     state::{State, Target},
     syscalls::StackT,
@@ -348,7 +348,8 @@ fn handler_frame_is_byte_exact_and_sigreturn_restores() {
         out,
         super::frame::Sigreturn {
             ret: 0xa5,
-            bad_frame: false
+            bad_frame: false,
+            reached_sigcontext: true
         }
     );
     let mut want_regs = before;
@@ -763,7 +764,8 @@ fn sigreturn_mask_is_applied_even_when_a_later_step_fails() {
         out,
         super::frame::Sigreturn {
             ret: 0,
-            bad_frame: true
+            bad_frame: true,
+            reached_sigcontext: true
         }
     );
     assert_eq!(st.blocked, SigSet(SigSet::bit(SIGUSR1)));
@@ -818,7 +820,8 @@ fn sigreturn_with_unreadable_frame_forces_sigsegv() {
         out,
         super::frame::Sigreturn {
             ret: 0,
-            bad_frame: true
+            bad_frame: true,
+            reached_sigcontext: false
         }
     );
     assert_eq!(r.sp, 0x30_0000, "registers untouched on a bad frame");
@@ -1210,7 +1213,8 @@ fn replay_linux_frame(frame_hex: &str, fp_hex: &str, frame_addr: u64, sig: u8, a
         out,
         super::frame::Sigreturn {
             ret: before.ax,
-            bad_frame: false
+            bad_frame: false,
+            reached_sigcontext: true
         }
     );
     assert_eq!(
@@ -1390,4 +1394,197 @@ fn spurious_math_fault_updates_arch_info_without_a_signal() {
     st.force_fault(&f);
     assert_eq!((st.arch.trap_nr, st.arch.error_code), (16, 0));
     assert!(!st.signal_pending());
+}
+
+fn segv_handler_state() -> State {
+    let mut st = handler_state();
+    st.actions[usize::from(SIGSEGV) - 1] = SigAction {
+        handler: 0x40_3000,
+        flags: SA_SIGINFO | SA_RESTORER,
+        restorer: 0x40_2000,
+        mask: SigSet::EMPTY,
+    };
+    st
+}
+
+#[test]
+fn a_full_rt_quota_never_loses_a_fault_siginfo() {
+    // Classic signals have reserved slots (legacy_queue allows one entry each),
+    // so a forced fault bypasses the RT cap like `override_rlimit` in
+    // `__send_signal_locked` (kernel/signal.c:1126).
+    let mut st = segv_handler_state();
+    st.blocked.add(40);
+    for v in 0..64 {
+        let info = SigInfo::rt(40, SI_QUEUE, 1, 0, v);
+        st.send_signal(40, info, Target::Thread).unwrap();
+    }
+    let info = SigInfo::rt(40, SI_QUEUE, 1, 0, 64);
+    assert_eq!(
+        st.send_signal(40, info, Target::Thread),
+        Err(::syscalls::Errno::EAGAIN)
+    );
+    st.force_fault(&crate::signal::info::page_fault(
+        crate::signal::info::PageFault::Segv(SEGV_MAPERR),
+        0xdead000,
+        6,
+    ));
+    let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
+    do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu);
+    assert_eq!((r.ip, r.di), (0x40_3000, 11));
+    let info = read(&mut space, r.si, 128);
+    assert_eq!(info[0..4], 11i32.to_le_bytes());
+    assert_eq!(info[8..12], SEGV_MAPERR.to_le_bytes());
+    assert_eq!(info[16..24], 0xdead000u64.to_le_bytes());
+}
+
+#[test]
+fn sigreturn_restores_every_general_register() {
+    // restore_sigcontext COPY(r8..r15, di, si, bp, bx, dx, ax, cx, ip, sp):
+    // 15 distinct values restored into zeroed registers.
+    let mut cpu = FakeCpu::new();
+    let mut st = handler_state();
+    let mut space = user_space();
+    let before = Regs {
+        flags: 0x246,
+        ..regs()
+    };
+    let mut r = before;
+    send(&mut st, SIGUSR1);
+    do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu);
+    let mut ret = Regs {
+        sp: r.sp + 8,
+        ss: USER_DS,
+        cs: USER_CS,
+        flags: 0x202,
+        ..Regs::default()
+    };
+    assert!(!rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu).bad_frame);
+    assert_eq!(ret, before);
+}
+
+/// `base` is the lowest byte of the alternate stack; everything mapped below
+/// it is filled with a canary and must survive a failed frame.
+fn altstack_overflow(size: u64, sp: u64) {
+    let base = STACK_LO + 0x4000;
+    let mut st = handler_state();
+    st.actions[usize::from(SIGUSR1) - 1].flags |= SA_ONSTACK;
+    st.altstack = crate::signal::AltStack {
+        sp: base,
+        size,
+        flags: 0,
+    };
+    let (mut space, mut cpu) = (user_space(), FakeCpu::new());
+    fill(&mut space, STACK_LO, base, 0xaa);
+    let mut r = Regs { sp, ..regs() };
+    send(&mut st, SIGUSR1);
+    assert_eq!(
+        do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu),
+        Outcome::FrameFailed
+    );
+    let below = read(&mut space, STACK_LO, (base - STACK_LO) as usize);
+    assert!(below.iter().all(|&b| b == 0xaa), "frame written below base");
+}
+
+#[test]
+fn altstack_overflow_with_mapped_memory_below_fails_the_frame() {
+    // get_sigframe: `(nested || entering) && !on_sig_stack(sp)` (signal.c:150).
+    // (a) too small an altstack, entered from the normal stack.
+    altstack_overflow(0x100, STACK_LO + 0x7000);
+    // (b) already on the altstack, 0x300 above its base: the next frame would
+    // cross the base.
+    altstack_overflow(0x2000, STACK_LO + 0x4000 + 0x300);
+}
+
+#[test]
+fn sigreturn_rejects_a_valid_fpstate_image_at_an_unaligned_address() {
+    // restore_fpregs_from_user requires a 16-byte aligned FXSAVE area
+    // (signal_64.c:92); the image itself is valid (default MXCSR).
+    let mut cpu = FakeCpu::new();
+    let mut st = handler_state();
+    let mut space = user_space();
+    let (mut ret, frame) = frame_for_return(&mut st, &mut cpu, &mut space);
+    let mut img = [0u8; 512];
+    img[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+    let at = STACK_LO + 0x1001;
+    assert_eq!(copy_to_user(&mut space, at, &img), 0);
+    assert_eq!(
+        copy_to_user(&mut space, frame + 48 + 184, &at.to_le_bytes()),
+        0
+    );
+    assert!(rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu).bad_frame);
+    assert!(cpu.restored.is_empty());
+}
+
+#[test]
+fn sigreturn_with_a_non_64bit_cs_keeps_an_invalid_ss() {
+    // force_valid_ss only applies in 64-bit mode (cs == USER_CS): with cs=0x23
+    // an invalid, non-USER_DS ss stays as given (0x18|3).
+    let mut cpu = FakeCpu::new();
+    let mut st = handler_state();
+    let mut space = user_space();
+    let (mut ret, frame) = frame_for_return(&mut st, &mut cpu, &mut space);
+    assert_eq!(copy_to_user(&mut space, frame + 8, &2u64.to_le_bytes()), 0); // no STRICT
+    assert_eq!(
+        copy_to_user(&mut space, frame + 48 + 144, &0x23u16.to_le_bytes()),
+        0
+    );
+    assert_eq!(
+        copy_to_user(&mut space, frame + 48 + 150, &0x18u16.to_le_bytes()),
+        0
+    );
+    rt_sigreturn(&mut st, &mut ret, &mut space, &mut cpu);
+    assert_eq!((ret.cs, ret.ss), (0x23, 0x1b));
+}
+
+#[test]
+fn handle_pending_signals_loops_after_a_failed_frame() {
+    // A handler without a restorer fails its frame (SIGSEGV forced); the loop
+    // must continue and take the fatal SIGSEGV instead of resuming user mode.
+    let mut st = State::new_init(1000);
+    st.actions[usize::from(SIGUSR1) - 1] = SigAction {
+        handler: 0x40_1000,
+        ..SigAction::default()
+    };
+    let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
+    send(&mut st, SIGUSR1);
+    assert_eq!(
+        handle_pending_signals(&mut st, &mut r, &mut space, &mut cpu),
+        Outcome::Exit {
+            exit_code: 11,
+            core: true
+        }
+    );
+}
+
+#[test]
+fn a_default_stop_signal_stops_the_task() {
+    let mut st = State::new(5, 0, 100);
+    st.blocked.add(SIGTSTP);
+    send(&mut st, SIGTSTP);
+    st.blocked = SigSet::EMPTY;
+    let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
+    assert_eq!(
+        do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu),
+        Outcome::Stop(SIGTSTP)
+    );
+}
+
+#[test]
+fn force_fault_records_trap_error_and_keeps_cr2_for_non_page_faults() {
+    // do_general_protection: trap 13, error 0x18; cr2 is not touched (Linux
+    // keeps the last page-fault address in `thread.cr2`).
+    let mut st = State::new(5, 0, 100);
+    st.actions[usize::from(SIGSEGV) - 1] = segv_handler_state().actions[usize::from(SIGSEGV) - 1];
+    st.arch.cr2 = 0x1234;
+    st.force_fault(&crate::signal::info::exception(13, 0x18, 5, 0, 0).unwrap());
+    assert_eq!(
+        (st.arch.trap_nr, st.arch.error_code, st.arch.cr2),
+        (13, 0x18, 0x1234)
+    );
+    let (mut space, mut cpu, mut r) = (user_space(), FakeCpu::new(), regs());
+    do_signal_or_restart(&mut st, &mut r, &mut space, &mut cpu);
+    let sc = r.sp + 48;
+    assert_eq!(read(&mut space, sc + 160, 8), 13u64.to_le_bytes()); // trapno
+    assert_eq!(read(&mut space, sc + 152, 8), 0x18u64.to_le_bytes()); // err
+    assert_eq!(read(&mut space, sc + 176, 8), 0x1234u64.to_le_bytes()); // cr2
 }

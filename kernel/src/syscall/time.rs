@@ -36,20 +36,21 @@ every range is bounded by `timespec64_valid*` or `KTIME_MAX` at the call site"
 //! and are host-tested against a fake [`Clocks`]; the binary supplies the real
 //! clocks, accounting and halting wait.
 //!
-//! # Signal seam
+//! # Signals
 //! `Clocks::sleep_until` returns `Some(remaining)` when a signal interrupted the
-//! sleep. This file then follows `do_nanosleep`/`hrtimer_nanosleep`: it writes
-//! the remaining time to `rem_out` (relative sleeps only) and returns
-//! `-ERESTART_RESTARTBLOCK` (516) or, for absolute sleeps, `-ERESTARTNOHAND`
-//! (514). The `restart_block` is recorded through [`Clocks::set_restart_block`]:
+//! sleep (the binary: `signal::wait::sleep_until`). This file then follows
+//! `do_nanosleep`/`hrtimer_nanosleep`: it writes the remaining time to
+//! `rem_out` (relative sleeps only) and returns `-ERESTART_RESTARTBLOCK` (516)
+//! or, for absolute sleeps, `-ERESTARTNOHAND` (514), which the return to user
+//! mode turns into `-EINTR` (a handler ran) or a restart (`signal::deliver`).
+//! The `restart_block` is recorded through [`Clocks::set_restart_block`]:
 //! `do_no_restart_syscall` with the `rmtp` pointer when a sleep starts, and the
 //! restart function, `clockid` and absolute `expires` (the hard expiry, i.e.
-//! including `timer_slack_ns` for hrtimer sleeps) when it is interrupted, so
-//! `restart_syscall` (219) can resume with `deadline = expires`. The signal lane
-//! must (a) make `sleep_until` return `Some(expires - now)`, (b) implement
-//! `restart_syscall` over the stored block, and (c) translate 514/516 into
-//! `EINTR`/restart at signal delivery. Today nothing interrupts a sleep, so no
-//! check depends on it.
+//! including `timer_slack_ns` for hrtimer sleeps) when it is interrupted;
+//! `restart_syscall` (219, [`restart_syscall`]) resumes with `deadline =
+//! expires` (`hrtimer_nanosleep_restart`, `alarm_timer_nsleep_restart`), and
+//! `rt_sigreturn` resets the block to `do_no_restart_syscall`
+//! (`restore_sigcontext`).
 
 use super::{Context, Outcome, error};
 use crate::{
@@ -117,6 +118,16 @@ pub struct RestartBlock {
     pub rmtp: u64,
 }
 
+impl RestartBlock {
+    /// `restart_block.fn = do_no_restart_syscall`, no `rmtp`.
+    pub const NONE: Self = Self {
+        func: RestartFn::None,
+        clockid: 0,
+        expires_ns: 0,
+        rmtp: 0,
+    };
+}
+
 /// What the time syscalls need beyond user memory; the binary implements it
 /// over the timekeeper, the CPU-time accounting and the halting timer wait.
 pub trait Clocks {
@@ -126,6 +137,8 @@ pub trait Clocks {
     fn set_realtime(&mut self, offset: i64, real_ns: i64);
     /// Store `current->restart_block` for `restart_syscall` (see the seam notes).
     fn set_restart_block(&mut self, block: RestartBlock);
+    /// `current->restart_block` as stored by [`Self::set_restart_block`].
+    fn restart_block(&self) -> RestartBlock;
     /// `CPUCLOCK_SCHED`/`VIRT`/`PROF` inputs of the (only) task.
     fn cpu_sample(&self) -> crate::cputime::CpuSample;
     /// `thread_group_cputime_adjusted`: `(utime, stime)` in ns for `times(2)`.
@@ -203,6 +216,7 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
             Err(Never) => return Some(Outcome::Unimplemented(sysno as u32)),
         },
         Sysno::nanosleep => nanosleep(ctx, args[0], args[1]),
+        Sysno::restart_syscall => restart_syscall(ctx),
         Sysno::gettimeofday => gettimeofday(ctx, args[0], args[1]),
         Sysno::time => time(ctx, args[0]),
         Sysno::times => times(ctx, args[0]),
@@ -511,14 +525,50 @@ fn sleep_to<C: Context>(
     -ERESTART_RESTARTBLOCK
 }
 
+/// `sys_restart_syscall`: run `current->restart_block.fn`. Only the sleeps
+/// install a continuation: `do_no_restart_syscall` fails with `EINTR`;
+/// `hrtimer_nanosleep_restart` and `alarm_timer_nsleep_restart` sleep on to the
+/// absolute `expires` of the block's clock, reporting the remaining time through
+/// `rmtp` (`do_nanosleep`, `alarmtimer_do_nsleep`) and leaving the same block
+/// installed when interrupted again.
+fn restart_syscall<C: Context>(ctx: &mut C) -> i64 {
+    let block = ctx.restart_block();
+    // `restart->nanosleep.clockid`: the hrtimer clock id (1 monotonic, 7
+    // boottime, 11 TAI) or the `alarmtimer_type` (0 realtime, 1 boottime).
+    let kclock = match (block.func, block.clockid) {
+        (RestartFn::None, _) => return error(Errno::EINTR),
+        (RestartFn::Hrtimer, 1) => Kclock::Monotonic,
+        (RestartFn::Hrtimer, 7) => Kclock::Boottime,
+        (RestartFn::Hrtimer, _) => Kclock::Tai,
+        (RestartFn::Alarm, 0) => Kclock::RealtimeAlarm,
+        (RestartFn::Alarm, _) => Kclock::BoottimeAlarm,
+    };
+    let now = Now {
+        state: ctx.clock_state(),
+    };
+    let expires = i128::from(block.expires_ns);
+    // The expiry is on the timer's base; the wait is on the monotonic clock.
+    let deadline = expires - (now.clock_of(kclock) - now.mono());
+    let resume = Resume {
+        func: block.func,
+        clockid: block.clockid,
+        expires_ns: expires,
+    };
+    sleep_to(
+        ctx,
+        deadline,
+        (block.rmtp != 0).then_some(block.rmtp),
+        false,
+        resume,
+    )
+}
+
 /// `current->restart_block.fn = do_no_restart_syscall` plus the `rmtp` fields,
 /// as `nanosleep` and `clock_nanosleep` do before sleeping.
 fn begin_sleep<C: Context>(ctx: &mut C, rem_out: Option<u64>) {
     ctx.set_restart_block(RestartBlock {
-        func: RestartFn::None,
-        clockid: 0,
-        expires_ns: 0,
         rmtp: rem_out.unwrap_or(0),
+        ..RestartBlock::NONE
     });
 }
 
@@ -579,7 +629,14 @@ fn clock_nanosleep<C: Context>(
                 },
                 expires_ns: add_safe(add_safe(now.clock_of(base), request), TIMER_SLACK_NS),
             };
-            Ok(sleep_to(ctx, deadline, rem_out, abs, resume))
+            // The wait ends at the hard expiry, soft + slack.
+            Ok(sleep_to(
+                ctx,
+                add_safe(deadline, TIMER_SLACK_NS),
+                rem_out,
+                abs,
+                resume,
+            ))
         }
         Sleeper::Alarm => {
             if !ctx.alarm_rtc() {
@@ -659,7 +716,10 @@ fn nanosleep<C: Context>(ctx: &mut C, sleep_req: u64, rem_out: u64) -> i64 {
         clockid: 1,
         expires_ns: add_safe(add_safe(mono, request), TIMER_SLACK_NS),
     };
-    sleep_to(ctx, add_safe(mono, request), rem_out, false, resume)
+    // The wait ends at the hard expiry (`hrtimer_set_expires_range_ns`:
+    // soft + slack) and the remainder is measured against it, as
+    // `hrtimer_expires_remaining` does.
+    sleep_to(ctx, resume.expires_ns, rem_out, false, resume)
 }
 
 fn gettimeofday<C: Context>(ctx: &mut C, tv: u64, tz: u64) -> i64 {
@@ -731,6 +791,8 @@ mod tests {
     const BUF: u64 = 0x1000;
     const BAD: u64 = 0xdead_0000_0000;
     const MONO: i128 = 5_123_456_789;
+    /// `TIMER_SLACK_NS` as the deadlines of hrtimer sleeps carry it.
+    const SLACK: u64 = 50_000;
     const OFFSET: i128 = 1_800_000_000_000_000_000;
     /// `make_process_cpuclock(1, which)` and its per-thread form.
     const fn cpu_clock(pid: i32, which: i32, thread: bool) -> i32 {
@@ -979,7 +1041,13 @@ mod tests {
         assert_eq!(ret(&mut t, Sysno::clock_nanosleep, [1, 1, BUF, 0]), 0);
         assert_eq!(
             t.clocks.slept,
-            [now + 1_000_000_005, 2_000_000_000, 3_000, now + 4_000, 1]
+            [
+                now + 1_000_000_005 + SLACK,
+                2_000_000_000 + SLACK,
+                3_000 + SLACK,
+                now + 4_000 + SLACK,
+                1 + SLACK
+            ]
         );
     }
 
@@ -1260,6 +1328,74 @@ mod tests {
             t.clocks.restarts[1],
             block(RestartFn::Hrtimer, 1, i64::MAX, 0)
         );
+    }
+
+    #[test]
+    fn restart_syscall_resumes_the_stored_block() {
+        let mut t = user_task();
+        let mono = MONO as i64;
+        t.clocks.state.boot_offset_ns = 1_000;
+        let block = |func, clockid, expires_ns| RestartBlock {
+            func,
+            clockid,
+            expires_ns,
+            rmtp: BUF + 16,
+        };
+        // `do_no_restart_syscall`.
+        assert_eq!(
+            ret(&mut t, Sysno::restart_syscall, [0; 4]),
+            neg(Errno::EINTR)
+        );
+        t.clocks.restarts.push(RestartBlock::NONE);
+        assert_eq!(
+            ret(&mut t, Sysno::restart_syscall, [0; 4]),
+            neg(Errno::EINTR)
+        );
+        // Each clock of the block: the wait is to the monotonic equivalent of the
+        // absolute expiry; the base clocks differ from monotonic by their offset.
+        for (func, clockid, expires, deadline) in [
+            (RestartFn::Hrtimer, 1, mono + 7_000, MONO as u64 + 7_000),
+            (
+                RestartFn::Hrtimer,
+                7,
+                mono + 1_000 + 7_000,
+                MONO as u64 + 7_000,
+            ),
+            (
+                RestartFn::Hrtimer,
+                11,
+                mono + OFFSET as i64 + 7_000,
+                MONO as u64 + 7_000,
+            ),
+            (
+                RestartFn::Alarm,
+                0,
+                mono + OFFSET as i64 + 7_000,
+                MONO as u64 + 7_000,
+            ),
+            (
+                RestartFn::Alarm,
+                1,
+                mono + 1_000 + 7_000,
+                MONO as u64 + 7_000,
+            ),
+        ] {
+            let want = block(func, clockid, expires);
+            t.clocks.restarts.push(want);
+            t.clocks.slept.clear();
+            // Slept to the end: success.
+            assert_eq!(ret(&mut t, Sysno::restart_syscall, [0; 4]), 0, "{clockid}");
+            assert_eq!(t.clocks.slept, [deadline], "{func:?} {clockid}");
+            // Interrupted again: the remaining time is reported through `rmtp`
+            // and the same block stays installed for the next restart.
+            t.clocks.interrupt = Some(1_500_000_001);
+            assert_eq!(
+                ret(&mut t, Sysno::restart_syscall, [0; 4]),
+                -ERESTART_RESTARTBLOCK
+            );
+            assert_eq!(get(&mut t, BUF + 16), (1, 500_000_001));
+            assert_eq!(t.clocks.restarts.last(), Some(&want));
+        }
     }
 
     #[test]

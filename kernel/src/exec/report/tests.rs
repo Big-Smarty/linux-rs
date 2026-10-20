@@ -8,8 +8,8 @@
 )]
 extern crate std;
 use super::{
-    ExecFailed, InitDeath, NO_INIT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP, Segfault, TrapLine,
-    signal_exit_code, user_exception,
+    BadFrame, ExecFailed, InitDeath, NO_INIT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP, Segfault,
+    TrapLine, signal_exit_code, user_exception,
 };
 use crate::exec::load::tests::loaded_oracle;
 use crate::exec::report::FileRegion;
@@ -134,7 +134,7 @@ fn trap_line_formats_like_show_signal() {
     };
     assert_eq!(
         line.to_string(),
-        "init[1] general protection fault ip:2055b4 sp:7ffd2010a150 error:0 in init[45b4,204000+7000]"
+        "traps: init[1] general protection fault ip:2055b4 sp:7ffd2010a150 error:0 in init[45b4,204000+7000]"
     );
     let divide = TrapLine {
         kind: "trap ",
@@ -146,6 +146,23 @@ fn trap_line_formats_like_show_signal() {
     };
     assert_eq!(
         divide.to_string(),
-        "init[1] trap divide error ip:1 sp:2 error:0"
+        "traps: init[1] trap divide error ip:1 sp:2 error:0"
+    );
+}
+
+#[test]
+fn bad_frame_line_matches_the_pinned_kernel() {
+    let mm = loaded_oracle();
+    // `signal_fault` on the pinned 6.18.57 (target/sigfix-linux/linux-smoke-tcg.log: the
+    // `signals` smoke's rt_sigreturn with `rsp` at 0x1000), minus the `[ time]` prefix.
+    let line = BadFrame {
+        ip: 0x20_55b4,
+        sp: 0x1000,
+        orig_ax: 0xf,
+        region: FileRegion::of(&mm, 0x20_55b4),
+    };
+    assert_eq!(
+        line.to_string(),
+        "init[1] bad frame in rt_sigreturn frame:(____ptrval____) ip:2055b4 sp:1000 orax:f in init[45b4,204000+7000]"
     );
 }

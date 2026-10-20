@@ -15,10 +15,14 @@
 //! * One thread: `tsk->pending` is [`Target::Thread`], `shared_pending` is
 //!   [`Target::Process`]; both are drained by the same task, private first.
 //! * Allocation: queued `siginfo` lives in two fixed arrays of
-//!   [`QUEUE_CAPACITY`]; no allocation, so a full array behaves like
-//!   `sigqueue_alloc` failing (the signal bit is still set, the `siginfo` is
-//!   lost, `-EAGAIN` for user-queued real-time signals).
-//!   shortcut: the pending limit is `min(RLIMIT_SIGPENDING, 2 * QUEUE_CAPACITY)`;
+//!   [`QUEUE_CAPACITY`]; no allocation. A classic signal (1..=31) has at most
+//!   one entry per queue (`legacy_queue`), so [`CLASSIC_SLOTS`] slots are
+//!   reserved for them and a classic `siginfo` (a forced fault's included) is
+//!   never lost. Real-time signals share [`RT_QUEUE_CAPACITY`] slots per
+//!   queue; a full RT quota behaves like `sigqueue_alloc` failing (the signal
+//!   bit is still set, the `siginfo` is lost, `-EAGAIN` for user-queued
+//!   real-time signals).
+//!   shortcut: the RT pending limit is `min(RLIMIT_SIGPENDING, 64 per queue)`;
 //!   it becomes the plain rlimit once the heap-backed queue replaces the
 //!   arrays (fallible `try_reserve`, never an infallible push).
 //! * `wants_signal`: the task is assumed running or already due to dequeue (it
@@ -26,15 +30,20 @@
 //!   stop states belong to the scheduler step.
 
 use super::{
-    AltStack, KERNEL_IGNORE, KERNEL_STOP, NSIG, SA_IMMUTABLE, SIG_DFL, SIG_IGN, SIGCONT, SIGKILL,
-    SIGRTMIN, SYNCHRONOUS, SigAction, SigSet, in_mask,
+    AltStack, KERNEL_IGNORE, KERNEL_STOP, NSIG, SA_IMMUTABLE, SIG_DFL, SIG_IGN, SIGALRM, SIGCONT,
+    SIGKILL, SIGRTMIN, SYNCHRONOUS, SigAction, SigSet, in_mask,
     info::{Fault, Layout, SI_KERNEL, SI_USER, SigInfo},
+    itimer::RealTimer,
     sig_kernel_coredump, sig_kernel_only, sig_kernel_stop,
 };
 use syscalls::Errno;
 
-/// Entries per pending queue (see the module contract).
-pub const QUEUE_CAPACITY: usize = 64;
+/// Real-time `siginfo` entries per pending queue (see the module contract).
+pub const RT_QUEUE_CAPACITY: usize = 64;
+/// One slot per classic signal `1..=31`.
+pub const CLASSIC_SLOTS: usize = 31;
+/// Array size of a pending queue.
+pub const QUEUE_CAPACITY: usize = RT_QUEUE_CAPACITY + CLASSIC_SLOTS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -147,6 +156,10 @@ pub struct State {
     pub actions: [SigAction; NSIG as usize],
     /// `current->blocked`; never contains SIGKILL or SIGSTOP.
     pub blocked: SigSet,
+    /// `current->real_blocked`: the mask `rt_sigtimedwait` temporarily
+    /// unblocks from; it only keeps those signals from being treated as
+    /// ignored (`sig_ignored`) while the task waits for them.
+    pub real_blocked: SigSet,
     /// `current->saved_sigmask` when `TIF_RESTORE_SIGMASK` is set.
     pub saved_sigmask: Option<SigSet>,
     /// `current->sas_ss_*`.
@@ -167,6 +180,11 @@ pub struct State {
     pub uid: u32,
     /// `RLIMIT_SIGPENDING` of the owner.
     pub rlimit_sigpending: u64,
+    /// `signal->real_timer` / `it_real_incr` (`ITIMER_REAL`).
+    pub itimer: RealTimer,
+    /// `CLOCK_MONOTONIC` as of the last [`State::sync_timers`]: the `now` of
+    /// the interval-timer re-arm that `dequeue_signal` performs.
+    pub now_ns: u64,
     private: Pending,
     shared: Pending,
 }
@@ -181,6 +199,7 @@ impl State {
         Self {
             actions: [SigAction::default(); NSIG as usize],
             blocked: SigSet::EMPTY,
+            real_blocked: SigSet::EMPTY,
             saved_sigmask: None,
             altstack: AltStack::RESET,
             arch: ArchInfo::default(),
@@ -191,6 +210,8 @@ impl State {
             tgid: pid,
             uid,
             rlimit_sigpending,
+            itimer: RealTimer::default(),
+            now_ns: 0,
             private: Pending::new(),
             shared: Pending::new(),
         }
@@ -272,9 +293,11 @@ impl State {
         action.ignored(sig)
     }
 
-    /// `sig_ignored`: blocked signals are never ignored.
+    /// `sig_ignored`: blocked signals (also `real_blocked` ones) are never ignored.
     fn ignores(&self, sig: u8, force: bool) -> bool {
-        !self.blocked.contains(sig) && self.task_ignores(sig, force)
+        !self.blocked.contains(sig)
+            && !self.real_blocked.contains(sig)
+            && self.task_ignores(sig, force)
     }
 
     /// `prepare_signal`: stop/continue side effects at generation time, then
@@ -305,7 +328,13 @@ impl State {
         if self.blocked.contains(sig) {
             return; // does not want it; it dequeues when unblocked
         }
-        if self.sig_fatal(sig) && self.group_exit.is_none() && !sig_kernel_coredump(sig) {
+        // `!sigismember(&t->real_blocked, sig)`: a signal `rt_sigtimedwait` is
+        // waiting for (blocked beforehand) never takes the group down.
+        if self.sig_fatal(sig)
+            && self.group_exit.is_none()
+            && !self.real_blocked.contains(sig)
+            && !sig_kernel_coredump(sig)
+        {
             // Start the group exit: the exit code is the signal itself.
             self.group_exit = Some(u32::from(sig));
             self.private.signal.add(SIGKILL);
@@ -336,7 +365,16 @@ impl State {
             let counted = (self.private.len + self.shared.len) as u64 + 1;
             let allowed = override_rlimit || counted <= self.rlimit_sigpending;
             let pending = self.pending_mut(target);
-            if allowed && pending.len < QUEUE_CAPACITY {
+            // Classic signals have at most one entry (legacy_queue above), so
+            // their reserved slots never run out; only RT entries are capped.
+            let room = sig < SIGRTMIN
+                || pending
+                    .entries()
+                    .iter()
+                    .filter(|q| q.signo >= i32::from(SIGRTMIN))
+                    .count()
+                    < RT_QUEUE_CAPACITY;
+            if allowed && room {
                 pending.queue[pending.len] = info;
                 pending.len += 1;
             } else if sig >= SIGRTMIN && info.code != SI_USER {
@@ -347,6 +385,16 @@ impl State {
         self.pending_mut(target).signal.add(sig);
         self.complete_signal(sig);
         Ok(())
+    }
+
+    /// `send_sig(sig, current, 0)`: the kernel sending `sig` to this thread on
+    /// behalf of the current task (`SIGPIPE` from a pipe or socket write, `SIGXFSZ`,
+    /// ...). The siginfo is `SEND_SIG_NOINFO`: `SI_USER` with this process's pid
+    /// and uid. `sig` is `1..=64`.
+    pub fn send_sig(&mut self, sig: u8) {
+        let info = SigInfo::kill(sig, SI_USER, self.tgid, self.uid);
+        // Only a real-time signal sent with `si_code < 0` can fail; `SI_USER` is >= 0.
+        let _ = self.send_signal(sig, info, Target::Thread);
     }
 
     /// `force_sig_info_to_task` on the current task.
@@ -440,14 +488,38 @@ impl State {
     /// `dequeue_signal(&current->blocked, ..)`: private queue first, then the
     /// shared one.
     pub fn dequeue_signal(&mut self) -> Option<(u8, SigInfo)> {
-        let blocked = self.blocked;
+        self.dequeue_signal_masked(self.blocked)
+    }
+
+    /// `dequeue_signal(mask, ..)`: `mask` is the set to skip (`rt_sigtimedwait`
+    /// passes the complement of the awaited set). A `SIGALRM` taken from the
+    /// shared queue restarts a fired interval timer
+    /// (`posixtimer_rearm_itimer`).
+    pub fn dequeue_signal_masked(&mut self, mask: SigSet) -> Option<(u8, SigInfo)> {
         for target in [Target::Thread, Target::Process] {
             let pending = self.pending_mut(target);
-            if let Some(sig) = pending.next_signal(blocked) {
-                return Some((sig, pending.collect(sig)));
+            if let Some(sig) = pending.next_signal(mask) {
+                let info = pending.collect(sig);
+                if target == Target::Process && sig == SIGALRM {
+                    self.itimer.rearm(self.now_ns);
+                }
+                return Some((sig, info));
             }
         }
         None
+    }
+
+    /// Bring the timers up to `now` (`CLOCK_MONOTONIC` ns): an expired
+    /// `ITIMER_REAL` sends `SIGALRM` to the process (`it_real_fn`:
+    /// `kill_pid_info(SIGALRM, SEND_SIG_PRIV)`, so `SI_KERNEL`, pid 0, uid 0).
+    /// Called on every kernel exit and after every wake-up, before the pending
+    /// set is examined.
+    pub fn sync_timers(&mut self, now: u64) {
+        self.now_ns = now;
+        if self.itimer.expire(now) {
+            // Only a real-time signal sent with `si_code < 0` can fail.
+            let _ = self.send_signal(SIGALRM, SigInfo::kernel(SIGALRM), Target::Process);
+        }
     }
 
     /// `sigdelset(&current->pending.signal, sig)`.

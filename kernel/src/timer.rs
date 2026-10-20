@@ -109,6 +109,17 @@ static LAPIC_MULT: AtomicU64 = AtomicU64::new(0);
 static NEXT_TICK_NS: AtomicU64 = AtomicU64::new(0);
 /// Pending `wait_until_ns` deadline, `u64::MAX` when none.
 static DEADLINE_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The process's `ITIMER_REAL` expiry (`signal::itimer`), `u64::MAX` when
+/// disarmed. Only the wake-up is programmed here; the expiry is acted on by
+/// `State::sync_timers` at the next kernel exit or wake-up.
+static ITIMER_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// The earliest wanted wake-up other than the tick.
+fn event_deadline() -> u64 {
+    DEADLINE_NS
+        .load(Ordering::Relaxed)
+        .min(ITIMER_NS.load(Ordering::Relaxed))
+}
 
 // A sequence-counted clock: readers (any context, including the tick IRQ)
 // never block; the single writer is `init` (and a future refinement) with
@@ -270,7 +281,7 @@ fn rearm(now_ns: u64) {
     } else {
         u64::MAX
     };
-    let deadline = DEADLINE_NS.load(Ordering::Relaxed);
+    let deadline = event_deadline();
     if deadline > now_ns {
         target = target.min(deadline);
     }
@@ -286,7 +297,7 @@ fn rearm(now_ns: u64) {
 /// PIT while a tick or a deadline is wanted, as Linux does without one-shot
 /// hardware; it is stopped and masked otherwise.
 fn pit_rearm(now_ns: u64) {
-    let deadline = DEADLINE_NS.load(Ordering::Relaxed);
+    let deadline = event_deadline();
     let wanted = TICK_ON.load(Ordering::Relaxed) || (deadline != u64::MAX && deadline > now_ns);
     if wanted && !PIT_RUNNING.swap(true, Ordering::Relaxed) {
         pit_start_periodic();
@@ -398,6 +409,51 @@ pub fn wait_until_ns(deadline_ns: u64) {
         DEADLINE_NS.store(u64::MAX, Ordering::Relaxed);
         rearm(ktime_get_ns());
     });
+}
+
+/// Program (or clear) the wake-up for the process's `ITIMER_REAL` expiry.
+/// Called before the CPU can take an interrupt that matters: before halting in
+/// [`wait_event`] and before the return to ring 3. Context: task or interrupt
+/// return path, interrupts masked, BSP.
+pub fn set_itimer_ns(expiry: Option<u64>) {
+    let expiry = expiry.unwrap_or(u64::MAX);
+    // Every syscall exit republishes; reprogramming the clockevent (an MSR or
+    // MMIO write, a VM exit under virtualization) only when it changed.
+    if ITIMER_NS.load(Ordering::Relaxed) == expiry {
+        return;
+    }
+    cpu::timer_transaction(|| {
+        ITIMER_NS.store(expiry, Ordering::Relaxed);
+        if EVENT.load(Ordering::Relaxed) != EVENT_NONE {
+            rearm(ktime_get_ns());
+        }
+    });
+}
+
+/// One interruptible sleep: halt until the next interrupt (a signal source or
+/// the clockevent armed for `deadline_ns` or the interval timer) and return, so
+/// the caller can re-check its condition; a deadline already reached returns at
+/// once. Context: task, interrupts masked on entry and exit, BSP. The caller
+/// checks its wake condition with interrupts masked just before, and the halt is
+/// `sti; hlt`, so a wake-up between the check and the halt is not lost.
+pub fn wait_event(deadline_ns: Option<u64>) {
+    let deadline = deadline_ns.unwrap_or(u64::MAX);
+    if EVENT.load(Ordering::Relaxed) != EVENT_NONE {
+        cpu::timer_transaction(|| {
+            DEADLINE_NS.store(deadline, Ordering::Relaxed);
+            rearm(ktime_get_ns());
+        });
+    }
+    // `rearm` ignores a wake-up that is already due: do not halt for it.
+    if ktime_get_ns() < event_deadline() {
+        idle();
+    }
+    if EVENT.load(Ordering::Relaxed) != EVENT_NONE {
+        cpu::timer_transaction(|| {
+            DEADLINE_NS.store(u64::MAX, Ordering::Relaxed);
+            rearm(ktime_get_ns());
+        });
+    }
 }
 
 /// Block `ns` nanoseconds (the `nanosleep` primitive).

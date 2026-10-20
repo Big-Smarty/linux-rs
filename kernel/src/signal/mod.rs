@@ -18,12 +18,11 @@
 //!
 //! Nothing here touches hardware: user memory goes through the one
 //! [`crate::usercopy`] mechanism, FPU/segment facts through the [`Cpu`] trait,
-//! and the register file is a [`Regs`] value the binary fills from its
-//! `PtRegs`. The wiring step must (1) make `cpu::PtRegs` and [`Regs`] one type,
-//! (2) implement [`Cpu`] with FXSAVE/FXRSTOR/LAR, (3) call
-//! [`deliver::do_signal_or_restart`] on every return to user mode with a signal
-//! pending, [`frame::rt_sigreturn`] from `__NR_rt_sigreturn` and the `sys_*`
-//! functions of [`syscalls`] from the dispatcher.
+//! and the register file is [`Regs`], which the binary uses as its `PtRegs`
+//! (one type). The binary implements [`Cpu`] (`FXSAVE`/`FXRSTOR`/`LAR`) and
+//! [`Task`], calls [`deliver::handle_pending_signals`] on every return to user
+//! mode and the `sys_*` functions of [`syscalls`], [`wait`] and [`itimer`] from
+//! the syscall dispatcher.
 //!
 //! # Contract
 //! * Context: task context of the one user task; no sleeping, no allocation,
@@ -39,8 +38,10 @@
 pub mod deliver;
 pub mod frame;
 pub mod info;
+pub mod itimer;
 pub mod state;
 pub mod syscalls;
+pub mod wait;
 
 #[cfg(test)]
 mod linux_frames;
@@ -55,6 +56,7 @@ pub const SIGQUIT: u8 = 3;
 pub const SIGABRT: u8 = 6;
 pub const SIGKILL: u8 = 9;
 pub const SIGUSR1: u8 = 10;
+pub const SIGUSR2: u8 = 12;
 pub const SIGPIPE: u8 = 13;
 pub const SIGALRM: u8 = 14;
 pub const SIGTERM: u8 = 15;
@@ -280,10 +282,12 @@ impl AltStack {
     }
 }
 
-/// `struct pt_regs` in the field order of `cpu::PtRegs` (lowest address
-/// first). The binary's `PtRegs` and this type are to be unified by the wiring
-/// step; until then conversion is a field-wise copy.
+/// `struct pt_regs` (`arch/x86/include/asm/ptrace.h`), lowest address first:
+/// exactly the frame the binary's entry stubs push and `iretq` consumes, and
+/// the binary's `PtRegs` (`pub use ... as PtRegs`), so a handler entry or
+/// `rt_sigreturn` edits the live return frame in place.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct Regs {
     pub r15: u64,
     pub r14: u64,
@@ -337,3 +341,33 @@ pub trait Cpu {
 }
 
 pub use state::State;
+
+/// The task the signal syscalls and the blocking waits run for: the binary's
+/// process (and the host tests' fake). `parts` hands out the two disjoint
+/// borrows the pure functions need.
+pub trait Task {
+    /// The user-memory view (`crate::usercopy`) the signal code writes frames
+    /// and results through: for a task whose address space can fault pages in,
+    /// the view that does (a kernel access to a non-resident page takes the
+    /// fault Linux would).
+    type Pages<'a>: crate::usercopy::UserPages
+    where
+        Self: 'a;
+    /// The signal state alone.
+    fn state(&mut self) -> &mut State;
+    /// The signal state and user memory, borrowed together.
+    fn parts(&mut self) -> (&mut State, Self::Pages<'_>);
+    /// `CLOCK_MONOTONIC` in nanoseconds (`ktime_get`).
+    fn now_ns(&self) -> u64;
+    /// `schedule()` for one wake-up: halt until an interrupt arrives or the
+    /// monotonic clock reaches `deadline_ns` (`None`: no deadline), then
+    /// return; the caller re-checks its condition. The implementation arms the
+    /// `ITIMER_REAL` expiry of `State::itimer` as a wake-up source too. Context:
+    /// task, interrupts masked on entry and exit.
+    fn wait(&mut self, deadline_ns: Option<u64>);
+    /// `regs->sp` at syscall entry (`sigaltstack`'s `on_sig_stack` argument).
+    fn user_sp(&self) -> u64;
+    /// `frame::rt_sigreturn` on the entry registers, the state and user memory
+    /// (the binary owns the registers and the `Cpu`).
+    fn rt_sigreturn(&mut self) -> frame::Sigreturn;
+}

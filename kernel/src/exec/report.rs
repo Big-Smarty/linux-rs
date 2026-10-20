@@ -178,7 +178,9 @@ pub const fn user_exception(vector: u8) -> Option<UserSignal> {
     Some(UserSignal { signal, message })
 }
 
-/// `show_signal`: `init[1] <type><desc> ip:%lx sp:%lx error:%lx[ in init[...]]`.
+/// `show_signal`: `traps: init[1] <type><desc> ip:%lx sp:%lx error:%lx[ in init[...]]`
+/// (`traps.c` defines `pr_fmt` as `"traps: " fmt`; the pinned reference prints
+/// `traps: init[1] trap int3 ip:...`).
 pub struct TrapLine {
     pub kind: &'static str,
     pub desc: &'static str,
@@ -192,12 +194,40 @@ impl fmt::Display for TrapLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "init[1] {}{} ip:{:x} sp:{:x} error:{:x}{}",
+            "traps: init[1] {}{} ip:{:x} sp:{:x} error:{:x}{}",
             self.kind,
             self.desc,
             self.ip,
             self.sp,
             self.error,
+            InVma(self.region, self.ip)
+        )
+    }
+}
+
+/// `signal_fault`: `init[1] bad frame in rt_sigreturn frame:%p ip:%lx sp:%lx orax:%lx[ in init[...]]`
+/// (`arch/x86/kernel/signal.c:368-383`; `me->comm` is `init`, pid 1, and the line
+/// is `KERN_EMERG` for pid 1).
+///
+/// shortcut: `%p` is printed as the pinned kernel prints it before its pointer-hash
+/// key exists, `(____ptrval____)` (observed for init on the reference kernel under
+/// TCG); once the kernel has entropy (observed under KVM) the value is a per-boot
+/// keyed hash of the frame address that no other kernel can reproduce.
+pub struct BadFrame {
+    pub ip: u64,
+    pub sp: u64,
+    pub orig_ax: u64,
+    /// The file-backed VMA containing `ip` (`FileRegion::of`).
+    pub region: Option<FileRegion>,
+}
+impl fmt::Display for BadFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "init[1] bad frame in rt_sigreturn frame:(____ptrval____) ip:{:x} sp:{:x} orax:{:x}{}",
+            self.ip,
+            self.sp,
+            self.orig_ax,
             InVma(self.region, self.ip)
         )
     }
