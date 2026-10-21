@@ -24,7 +24,7 @@ pub struct Declared {
     pub enosys: &'static [u32],
 }
 
-pub const DECLARED: [Declared; 11] = [
+pub const DECLARED: [Declared; 12] = [
     Declared {
         symbol: "boot: console=ttyS0",
         value: "the console tty is the 8250 serial line at its default 9600n8: TCGETS reports tty_std_termios with c_cflag B9600|CS8|CREAD|HUPCL|CLOCAL (a vt console would differ: vt.c sets IUTF8 in UTF-8 mode)",
@@ -44,9 +44,15 @@ pub const DECLARED: [Declared; 11] = [
         enosys: &[],
     },
     Declared {
-        symbol: "boot: noxsave",
-        value: "FXSAVE-only FPU state (x87 and SSE still run): AT_MINSIGSTKSZ 0x5a0",
-        source: "arch/x86/kernel/fpu/signal.c:511-531, arch/x86/kernel/signal.c:214-226",
+        symbol: "x86 FPU: XSAVE with the user components of the CPU (boot: `noxsave` selects FXSAVE-only state)",
+        value: "CR4.OSXSAVE=1 and XCR0 = the user components CPUID lists (x87, SSE, AVX, AVX-512, PKRU, MPX, APX; never AMX tile state or supervisor state: no dynamic-state permissions, CONFIG_X86_USER_SHADOW_STACK=n, no PASID), tasks saved with XSAVES > XSAVEC > XSAVEOPT > XSAVE, signal frames and rt_sigreturn in the XSAVE standard format (UC_FP_XSTATE, _fpx_sw_bytes with the real xfeatures and size), AT_MINSIGSTKSZ from the XSAVE area size (0xd30 on the AMD Zen 5 workstation). A CPU without XSAVE, `noxsave`, or an enumeration Linux itself rejects runs FXSAVE-only: _fpx_sw_bytes.xfeatures 0, AT_MINSIGSTKSZ 0x5a0",
+        source: "arch/x86/kernel/fpu/xstate.c:805-1010, arch/x86/kernel/fpu/signal.c:51-531, arch/x86/kernel/fpu/xstate.h, arch/x86/kernel/signal.c:187-210 and 416-438",
+        enosys: &[],
+    },
+    Declared {
+        symbol: "CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS=y, boot: nopku",
+        value: "y (as the reference config): with PKU and XSAVE CR4.PKE is set, PKRU starts at init_pkru_value 0x55555554, is switched with the task and saved in signal frames, and a PK fault is SEGV_PKUERR. pkey_alloc/pkey_free/pkey_mprotect stay unimplemented (loud stop), as does a PROT_EXEC-only mmap/mprotect (Linux gives it the execute-only key); kernel copies through the software user-page walk ignore PKRU",
+        source: "arch/x86/kernel/cpu/common.c:523-541, arch/x86/mm/pkeys.c:76-125, arch/x86/include/asm/pkru.h, arch/x86/mm/fault.c:850-905, arch/x86/kernel/process_64.c:375-390",
         enosys: &[],
     },
     Declared {

@@ -8,7 +8,7 @@ use core::{
     arch::{asm, naked_asm},
     marker::PhantomData,
     ptr,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, compiler_fence},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering, compiler_fence},
 };
 use kernel::{
     intc::{ERROR_VECTOR, ISA_IRQ_VECTOR_BASE, LOCAL_TIMER_VECTOR, SPURIOUS_VECTOR},
@@ -189,10 +189,10 @@ pub fn validate() -> Result<(), Error> {
     {
         return Err(Error::Paging);
     }
-    // No XSAVE state management exists (`noxsave`), so CR4.OSXSAVE is cleared
+    // XSAVE state management is enabled later by `fpu::init`, so CR4.OSXSAVE is cleared
     // if a loader set it: with it clear XSETBV/XGETBV/XSAVE are #UD and AVX is
-    // unavailable, so no YMM/ZMM upper state can be read or written by ring 3
-    // (as Linux `noxsave`). SAFETY below: CPL0, IF=0, one reserved-free bit.
+    // unavailable, so no YMM/ZMM upper state can be read or written by anything until
+    // the kernel manages it. SAFETY below: CPL0, IF=0, one reserved-free bit.
     if cr4.contains(Cr4Flags::OSXSAVE) {
         // SAFETY: only OSXSAVE is removed; paging, PGE and PCIDE were checked
         // clear above, so the translation state is unchanged.
@@ -990,6 +990,8 @@ extern "C" fn interrupt_handler(regs: &mut PtRegs, vector: u64, error: u64) {
                 unexpected(regs, vector, error, address);
             }
         }
+        // The one `XRSTOR` of `rt_sigreturn` whose #GP is an answer (`fpu::fixup_xrstor`).
+        13 if crate::fpu::fixup_xrstor(regs) => {}
         // A #DF taken on its IST stack: CR2 still holds the first fault's
         // address, which names a stack overflow (`unexpected`).
         8 => unexpected(regs, vector, error, Cr2::read_raw()),
@@ -1858,247 +1860,6 @@ impl Segments {
     }
 }
 
-/// Linux's initial FPU image for a new task (`fpstate_init_fxstate`, arch/x86/
-/// kernel/fpu/core.c:536-540): FCW 0x37f, MXCSR 0x1f80 (`MXCSR_DEFAULT`),
-/// everything else zero (x87 empty, XMM0-15 zero). FXSAVE layout: FCW at 0,
-/// MXCSR at 24.
-#[repr(C, align(16))]
-#[derive(Clone)]
-pub(crate) struct FxImage(pub(crate) [u8; 512]);
-
-impl FxImage {
-    pub(crate) const ZERO: Self = Self([0; 512]);
-
-    /// The image of a new task.
-    pub(crate) fn initial() -> Self {
-        INIT_FXSTATE.clone()
-    }
-}
-
-/// `switch_fpu_prepare`: save the running ring-3 task's x87/SSE state (live in
-/// the registers, since the kernel is soft-float).
-///
-/// # Panics
-/// Before `init_user_fpu`.
-pub(crate) fn fpu_save(image: &mut FxImage) {
-    assert!(
-        FPU_READY.load(Ordering::Acquire),
-        "FPU used before init_user_fpu"
-    );
-    // SAFETY: `FPU_READY` (CR4.OSFXSR=1, CR0.EM=TS=0, FXSR present); CPL0;
-    // `image` is exclusively borrowed and 16-byte aligned.
-    unsafe { save_fpu_state(image) };
-}
-
-/// `switch_fpu_finish`: make `image` the live state.
-///
-/// # Panics
-/// Before `init_user_fpu`.
-pub(crate) fn fpu_restore(image: &FxImage) {
-    assert!(
-        FPU_READY.load(Ordering::Acquire),
-        "FPU used before init_user_fpu"
-    );
-    // SAFETY: as `fpu_save`; `image` holds a state `fpu_save` produced or the
-    // initial state, so it has no reserved MXCSR bit.
-    unsafe { restore_fpu_state(image) };
-}
-static INIT_FXSTATE: FxImage = {
-    let mut bytes = [0u8; 512];
-    bytes[0] = 0x7f;
-    bytes[1] = 0x03;
-    bytes[24] = 0x80;
-    bytes[25] = 0x1f;
-    FxImage(bytes)
-};
-
-/// `FXRSTOR` of [`INIT_FXSTATE`]. The only FP/SIMD instruction in the kernel:
-/// the kernel itself stays soft-float, so user FP state is never touched by
-/// ring 0 and needs no context switch while a single task runs.
-///
-/// # Safety
-/// CPUID.1:EDX.FXSR, CR4.OSFXSR=1 and CR0.EM=0 (else #UD/#NM); CPL0.
-#[target_feature(enable = "fxsr")]
-unsafe fn load_initial_fpu_state() {
-    // SAFETY: the image is 512 bytes, 16-byte aligned, immutable and valid
-    // FXSAVE contents (no reserved MXCSR bits set); the caller gives the CPU
-    // state FXRSTOR requires.
-    unsafe { core::arch::x86_64::_fxrstor64(ptr::addr_of!(INIT_FXSTATE).cast()) };
-}
-
-/// Make x87/SSE usable from ring 3 the way Linux does with `noxsave`
-/// (`fpu__init_cpu_generic`: CR4.OSFXSR|OSXMMEXCPT, CR0.TS=EM=0; arch/x86/
-/// kernel/fpu/init.c) and give init Linux's initial FP state, so no firmware
-/// or loader residue is visible to it. `#MF`/`#XM` then reach ring 3 as SIGFPE
-/// through `exec::report`.
-///
-/// shortcut: one task and a soft-float kernel, so there is no FP context
-/// switch, no lazy restore and no signal-frame FP state; upgrade with the
-/// scheduler.
-///
-/// # Errors
-/// [`Error::Cpu`] without FPU, FXSR, SSE and SSE2.
-///
-/// # Safety
-/// CPL0 on the BSP, IF clear, before ring 3 runs.
-pub unsafe fn init_user_fpu() -> Result<(), Error> {
-    let supported = CpuId::new().get_feature_info().is_some_and(|features| {
-        features.has_fpu()
-            && features.has_fxsave_fxstor()
-            && features.has_sse()
-            && features.has_sse2()
-    });
-    if !supported {
-        return Err(Error::Cpu);
-    }
-    // On AMD, EFER.FFXSR makes FXRSTOR at CPL0 skip the XMM registers, so
-    // firmware XMM values would survive into ring 3: clear it first.
-    // SAFETY: CPL0; `update` preserves every other EFER bit and FFXSR is
-    // only an optimisation of FXSAVE/FXRSTOR.
-    unsafe {
-        Efer::update(|flags| flags.remove(EferFlags::FAST_FXSAVE_FXRSTOR));
-    }
-    // SAFETY: the CPUID bits above were checked; OSFXSR/OSXMMEXCPT are
-    // reserved-free CR4 bits when FXSR/SSE exist; other bits are preserved.
-    unsafe {
-        Cr4::update(|flags| {
-            flags.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
-        });
-        // MP and NE (native x87 error reporting, `#MF`) as Linux's CR0 state;
-        // EM and TS cleared so ring 3 never takes `#NM`.
-        Cr0::update(|flags| {
-            flags.remove(Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED);
-            flags.insert(Cr0Flags::MONITOR_COPROCESSOR | Cr0Flags::NUMERIC_ERROR);
-        });
-        // SAFETY: OSFXSR set, EM clear, FXSR checked.
-        load_initial_fpu_state();
-    }
-    // Linux `fpu__init_system_mxcsr`: the MXCSR bits this CPU accepts come from
-    // an FXSAVE image's MXCSR_MASK field (0 means the architectural 0xffbf).
-    let mut image = FxImage([0; 512]);
-    // SAFETY: the state FXSAVE needs was just established above.
-    unsafe { save_fpu_state(&mut image) };
-    let mask = u32::from_le_bytes([image.0[28], image.0[29], image.0[30], image.0[31]]);
-    MXCSR_MASK.store(if mask == 0 { 0xffbf } else { mask }, Ordering::Relaxed);
-    FPU_READY.store(true, Ordering::Release);
-    Ok(())
-}
-
-/// `mxcsr_feature_mask`, valid once [`FPU_READY`].
-static MXCSR_MASK: AtomicU32 = AtomicU32::new(0xffbf);
-/// `init_user_fpu` ran: CR4.OSFXSR=1, CR0.EM=0, CR0.TS=0, FXSR/SSE present, so
-/// FXSAVE/FXRSTOR cannot fault on their feature or CR bits.
-static FPU_READY: AtomicBool = AtomicBool::new(false);
-
-/// `FXSAVE64` of the live x87/XMM state.
-///
-/// # Safety
-/// `FPU_READY` (CPUID FXSR, CR4.OSFXSR=1, CR0.EM=0 and TS=0); CPL0.
-#[target_feature(enable = "fxsr")]
-unsafe fn save_fpu_state(image: &mut FxImage) {
-    // SAFETY: `image` is 512 bytes, 16-byte aligned (`FxImage`) and exclusively
-    // borrowed, so FXSAVE's 512-byte store stays inside it; the caller gives
-    // the CPU state FXSAVE requires. 64-bit form, as Linux (`fxsaveq`).
-    unsafe { core::arch::x86_64::_fxsave64(image.0.as_mut_ptr()) };
-}
-
-/// `FXRSTOR64` of `image`.
-///
-/// # Safety
-/// As [`save_fpu_state`], and `image` holds no reserved MXCSR bit (else #GP).
-#[target_feature(enable = "fxsr")]
-unsafe fn restore_fpu_state(image: &FxImage) {
-    // SAFETY: 512 readable, 16-byte aligned bytes; the MXCSR condition is the
-    // caller's contract.
-    unsafe { core::arch::x86_64::_fxrstor64(image.0.as_ptr()) };
-}
-
-/// The CPU facts the signal model needs ([`kernel::signal::Cpu`]): the user FPU
-/// state (which is live in the registers whenever the kernel runs, because the
-/// kernel is soft-float) and the segment test of `force_valid_ss`.
-pub struct UserCpu(());
-
-impl UserCpu {
-    /// # Panics
-    /// Before `init_user_fpu` (a kernel bug: ring 3 cannot run yet).
-    #[must_use]
-    pub fn new() -> Self {
-        assert!(
-            FPU_READY.load(Ordering::Acquire),
-            "user FPU used before init_user_fpu"
-        );
-        Self(())
-    }
-}
-
-impl kernel::signal::Cpu for UserCpu {
-    fn fxsave(&mut self) -> [u8; 512] {
-        let mut image = FxImage([0; 512]);
-        // SAFETY: `UserCpu::new` checked `FPU_READY`; CPL0 (kernel code).
-        unsafe { save_fpu_state(&mut image) };
-        image.0
-    }
-
-    fn mxcsr_mask(&self) -> u32 {
-        MXCSR_MASK.load(Ordering::Relaxed)
-    }
-
-    fn fxrstor(&mut self, image: &[u8; 512]) {
-        let aligned = FxImage(*image);
-        let mxcsr = u32::from_le_bytes([image[24], image[25], image[26], image[27]]);
-        if mxcsr & !self.mxcsr_mask() != 0 {
-            // The caller validated this; a reserved bit would be a #GP in ring
-            // 0, so fail safe to the init state instead.
-            self.fpu_reset();
-            return;
-        }
-        // SAFETY: `FPU_READY` as above; the reserved-MXCSR condition was just
-        // checked; `aligned` is a 16-byte aligned 512-byte copy.
-        unsafe { restore_fpu_state(&aligned) };
-    }
-
-    fn fpu_reset(&mut self) {
-        // SAFETY: `FPU_READY` as above, CPL0; the image is the immutable Linux
-        // initial state.
-        unsafe { load_initial_fpu_state() };
-    }
-
-    // `force_valid_ss`'s `lar` (arch/x86/kernel/signal_64.c:28-48).
-    //
-    // Why asm: LAR (load access rights) has no Rust intrinsic and the x86_64
-    // crate has no wrapper; reading the GDT descriptor by hand would reimplement
-    // the hardware's selector walk (TI bit, LDT, limits, DPL/RPL rules) and
-    // could disagree with it. Prerequisites: none beyond long mode; LAR with a
-    // register operand takes no fault for any 16-bit value (a null, out of
-    // range, LDT or system selector just clears ZF). Inputs: the selector in a
-    // 16-bit register. Outputs: the access-rights dword in a 32-bit register,
-    // preset to 0 and left untouched when LAR fails, so a failure reads as
-    // rights 0 (Linux zeroes it explicitly). Clobbers: ZF (flags are not
-    // declared preserved); no other register. Memory: none read or written
-    // (`nomem`), no stack (`nostack`), no red zone, no side effect on any
-    // descriptor. Privilege/context: any CPL, IF and preemption irrelevant. No
-    // control flow, no unwind.
-    fn ss_is_valid_user_data(&self, ss: u16) -> bool {
-        // AR_DPL_MASK | AR_S | AR_P | AR_TYPE_MASK (the accessed bit 8 is not in
-        // the mask): DPL 3, S, P and type read-write data or its expand-down form.
-        const MASK: u32 = (3 << 13) | (1 << 12) | (1 << 15) | (7 << 9);
-        const DPL3_S_P: u32 = (3 << 13) | (1 << 12) | (1 << 15);
-        let mut rights: u32 = 0;
-        // SAFETY: the instruction only reads the descriptor table entry the
-        // selector names (architecturally, not through Rust memory) and writes
-        // the register operand and ZF, as described above.
-        unsafe {
-            asm!(
-                "lar {rights:e}, {selector:x}",
-                rights = inout(reg) rights,
-                selector = in(reg) ss,
-                options(nomem, nostack),
-            );
-        }
-        matches!(rights & MASK, v if v == DPL3_S_P | (1 << 9) || v == DPL3_S_P | (3 << 9))
-    }
-}
-
 /// Linux `initialize_debug_regs`: no stale hardware breakpoint from the
 /// loader/firmware can fire in ring 0 or in ring 3.
 ///
@@ -2141,16 +1902,6 @@ pub fn take_dr6() -> u64 {
     // SAFETY: the only callers run in the `#DB` handler at CPL0.
     unsafe { reset_dr6() };
     raw ^ DR6_RESET
-}
-
-/// `fpu__exception_code` for `#MF` (vector 16) / `#XM` (19): the `si_code` from
-/// the live FPU state, 0 for a spurious exception.
-pub fn fpu_exception_code(vector: u8) -> i32 {
-    use kernel::signal::Cpu;
-    let image = UserCpu::new().fxsave();
-    let word = |at: usize| u16::from_le_bytes([image[at], image[at + 1]]);
-    let mxcsr = u32::from_le_bytes([image[24], image[25], image[26], image[27]]);
-    kernel::signal::info::fpu_exception_code(vector, word(0), word(2), mxcsr)
 }
 
 const DR6_RESET: u64 = 0xffff_0ff0;

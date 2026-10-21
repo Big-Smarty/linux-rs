@@ -13,8 +13,8 @@ use super::{
     signal_wake_up, sleep_current, spawn, state, wake_up_key,
 };
 use crate::{
-    cpu::{self, FxImage, PtRegs},
-    services, timer,
+    cpu::{self, PtRegs},
+    fpu, services, timer,
 };
 use core::{
     arch::naked_asm,
@@ -147,20 +147,18 @@ extern "C" fn pingpong(me: usize) {
         }
         TURN.store(1 - me as u64, Ordering::Relaxed);
         // XMM0 = a pattern private to this thread and round.
-        let mut want = FxImage::initial();
         let pattern = (seed ^ round).to_le_bytes();
-        want.0[160..168].copy_from_slice(&pattern);
-        want.0[168..176].copy_from_slice(&pattern.map(|b| !b));
-        cpu::fpu_restore(&want);
+        let mut want = [0u8; 16];
+        want[..8].copy_from_slice(&pattern);
+        want[8..].copy_from_slice(&pattern.map(|b| !b));
+        fpu::selftest_set_xmm0(want);
         // SAFETY: CPL0, IF=0 (kernel threads run masked); the probe borrows the
         // callee-saved registers and restores them.
         let intact = unsafe { callee_saved_probe(seed ^ round, yield_now) };
         if intact != 1 {
             REG_BAD.fetch_add(1, Ordering::Relaxed);
         }
-        let mut got = FxImage::ZERO;
-        cpu::fpu_save(&mut got);
-        if got.0[160..176] != want.0[160..176] {
+        if fpu::selftest_xmm0() != want {
             FPU_BAD.fetch_add(1, Ordering::Relaxed);
         }
     }
