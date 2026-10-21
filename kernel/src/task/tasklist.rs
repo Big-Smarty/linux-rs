@@ -597,8 +597,8 @@ impl Tasklist {
         };
         let (group, old_sighand) = (p.group, p.sighand);
         // dup_task_struct: the task's own signal fields.
-        let thread = Box::try_new(p.thread.fork_child(params.reset_altstack))
-            .map_err(|_| Errno::ENOMEM)?;
+        let thread =
+            Box::try_new(p.thread.fork_child(params.reset_altstack)).map_err(|_| Errno::ENOMEM)?;
         // copy_sighand: share the parent's, or a copy (with `CLONE_CLEAR_SIGHAND` reset).
         let new_hand = if params.share_sighand {
             None
@@ -657,7 +657,11 @@ impl Tasklist {
             } else {
                 [Some(own), Some(own), pgid, sid]
             },
-            group_leader: if params.thread { leader } else { TaskId::DANGLING },
+            group_leader: if params.thread {
+                leader
+            } else {
+                TaskId::DANGLING
+            },
             group: new_group.unwrap_or(group),
             sighand: new_hand.unwrap_or(old_sighand),
             real_parent,
@@ -747,6 +751,22 @@ impl Tasklist {
         if let Some(t) = self.tasks.get_mut(task) {
             t.sched = Some(sched);
         }
+    }
+
+    /// `signal_wake_up(t, resume)`: `TIF_SIGPENDING` is set for the thread (it looks at the
+    /// shared queue from now on) and it is woken from an interruptible sleep (`resume`: also
+    /// from a job-control stop).
+    pub(super) fn signal_wake_up(
+        &mut self,
+        t: TaskId,
+        resume: bool,
+        w: &mut dyn super::exit::Waker,
+    ) {
+        if let Some(task) = self.tasks.get_mut(t) {
+            task.thread.shared_seen = true;
+        }
+        let sched = self.sched_of(t);
+        w.signal_wake(t, sched, resume);
     }
 
     /// The scheduling handle of `task`, if one was bound.
@@ -861,11 +881,13 @@ impl Tasklist {
                 .groups
                 .get(group)
                 .is_some_and(|g| g.threads.len() == 1 && g.threads[0] == leader);
-            if alone && self.tasks.get(leader).is_some_and(|l| l.exit_state == ExitState::Zombie) {
-                if let Some(code) = self
-                    .groups
-                    .get(group)
-                    .and_then(|g| g.sig.group_exit)
+            if alone
+                && self
+                    .tasks
+                    .get(leader)
+                    .is_some_and(|l| l.exit_state == ExitState::Zombie)
+            {
+                if let Some(code) = self.groups.get(group).and_then(|g| g.sig.group_exit)
                     && let Some(l) = self.tasks.get_mut(leader)
                 {
                     l.exit_code = code;

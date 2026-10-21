@@ -400,4 +400,3 @@ fn a_view_never_replays_another_tables_log() {
     assert_view_matches(&view, &second, &t, "swapped table");
     assert!(view.fd(0).is_none(), "nothing of the first table is left");
 }
-

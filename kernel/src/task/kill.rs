@@ -269,15 +269,13 @@ impl Tasklist {
                 if let Some(mut state) = self.signal_state(t) {
                     state.mark_killed();
                 }
-                let sched = self.sched_of(t);
-                w.signal_wake(t, sched, true);
+                self.signal_wake_up(t, true, w);
             }
             return;
         }
         // "The signal is already in the shared-pending queue. Tell the chosen thread to wake up
         // and dequeue it."
-        let sched = self.sched_of(chosen);
-        w.signal_wake(chosen, sched, sig == SIGKILL);
+        self.signal_wake_up(chosen, sig == SIGKILL, w);
     }
 
     /// `group_send_sig_info(sig, info, p, type)`: permission, then delivery

@@ -164,7 +164,9 @@ impl Futexes {
         queue.try_reserve_exact(slots).map_err(|_| Errno::ENOMEM)?;
         let mut woken = Vec::new();
         woken.try_reserve_exact(slots).map_err(|_| Errno::ENOMEM)?;
-        woken.resize(slots, None);
+        for _ in 0..slots {
+            let _ = woken.push_within_capacity(None);
+        }
         Ok(Self {
             queue,
             woken,
@@ -265,13 +267,7 @@ impl Futexes {
     /// waiters on `key` whose bitset intersects `bitset`, oldest first. Like Linux it wakes one
     /// even for `nr_wake <= 0` when there is a waiter (`++ret >= nr_wake` after the wake). The
     /// number woken.
-    pub fn wake(
-        &mut self,
-        key: &Key,
-        nr_wake: i32,
-        bitset: u32,
-        wake: &mut dyn FnMut(u32),
-    ) -> i32 {
+    pub fn wake(&mut self, key: &Key, nr_wake: i32, bitset: u32, wake: &mut dyn FnMut(u32)) -> i32 {
         let mut woken = 0;
         let mut at = 0;
         while at < self.queue.len() {

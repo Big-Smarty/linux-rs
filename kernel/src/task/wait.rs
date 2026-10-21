@@ -330,10 +330,12 @@ impl Tasklist {
         let Some(g) = self.group_of(p) else {
             return (0, 0);
         };
-        g.threads.iter().filter_map(|&t| self.task(t)).fold(
-            (g.dead_utime_ns, g.dead_stime_ns),
-            |(u, s), t| (u + t.utime_ns, s + t.stime_ns),
-        )
+        g.threads
+            .iter()
+            .filter_map(|&t| self.task(t))
+            .fold((g.dead_utime_ns, g.dead_stime_ns), |(u, s), t| {
+                (u + t.utime_ns, s + t.stime_ns)
+            })
     }
 
     /// `signal->utime`/`stime`: the times of the group's threads that were released.
@@ -368,7 +370,9 @@ impl Tasklist {
             // Move the task's state to DEAD, then fold the times of the group (and those of
             // its reaped children) into the reaper's group `c*time`.
             let (ut, st) = self.group_cputime(p);
-            let (cut, cst) = self.group_of(p).map_or((0, 0), |g| (g.cutime_ns, g.cstime_ns));
+            let (cut, cst) = self
+                .group_of(p)
+                .map_or((0, 0), |g| (g.cutime_ns, g.cstime_ns));
             if let Some(t) = self.task_mut(p) {
                 t.exit_state = ExitState::Dead;
             }

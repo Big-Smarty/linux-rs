@@ -96,7 +96,14 @@ fn kill_info<C: Context>(ctx: &mut C, sig: i32, thread: bool) -> SigInfo {
 /// own process, the `State`-level send for it.
 fn kill<C: Context>(ctx: &mut C, a: [u64; 6]) -> Outcome {
     let (pid, sig) = (int(a[0]), int(a[1]));
-    if i64::from(pid) == i64::from(ctx.tgid())
+    // The `State`-level send knows one thread; a group with more takes the general path, which
+    // picks the thread that wants the signal (`complete_signal`).
+    let single = {
+        let t = ctx.tasks();
+        t.list.thread_group_empty(t.current)
+    };
+    if single
+        && i64::from(pid) == i64::from(ctx.tgid())
         && let Some(value) = sys_kill(&mut ctx.state(), a[0], a[1])
     {
         return Outcome::Return(value);

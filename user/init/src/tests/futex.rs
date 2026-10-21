@@ -228,19 +228,31 @@ pub fn run() -> bool {
 fn arguments(t: &mut T) {
     let w = at(0);
     word(0).store(1, SeqCst);
-    t.eq("wait-value-mismatch", fx(w, FUTEX_WAIT, 0, 0, 0, 0), Err(Errno::EAGAIN));
+    t.eq(
+        "wait-value-mismatch",
+        fx(w, FUTEX_WAIT, 0, 0, 0, 0),
+        Err(Errno::EAGAIN),
+    );
     t.eq(
         "wait-value-mismatch-private",
         fx(w, FUTEX_WAIT | PRIVATE, 0, 0, 0, 0),
         Err(Errno::EAGAIN),
     );
-    t.eq("wait-null", fx(0, FUTEX_WAIT, 1, 0, 0, 0), Err(Errno::EFAULT));
+    t.eq(
+        "wait-null",
+        fx(0, FUTEX_WAIT, 1, 0, 0, 0),
+        Err(Errno::EFAULT),
+    );
     t.eq(
         "wait-null-private",
         fx(0, FUTEX_WAIT | PRIVATE, 1, 0, 0, 0),
         Err(Errno::EFAULT),
     );
-    t.eq("wait-unaligned", fx(w + 1, FUTEX_WAIT, 1, 0, 0, 0), Err(Errno::EINVAL));
+    t.eq(
+        "wait-unaligned",
+        fx(w + 1, FUTEX_WAIT, 1, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
     t.eq(
         "wait-unaligned-private",
         fx(w + 2, FUTEX_WAIT | PRIVATE, 1, 0, 0, 0),
@@ -261,7 +273,11 @@ fn arguments(t: &mut T) {
         fx(TASK_SIZE, FUTEX_WAIT, 1, 0, 0, 0),
         Err(Errno::EFAULT),
     );
-    t.eq("wait-unmapped", fx(FAR, FUTEX_WAIT, 1, 0, 0, 0), Err(Errno::EFAULT));
+    t.eq(
+        "wait-unmapped",
+        fx(FAR, FUTEX_WAIT, 1, 0, 0, 0),
+        Err(Errno::EFAULT),
+    );
     t.eq(
         "wait-unmapped-private",
         fx(FAR, FUTEX_WAIT | PRIVATE, 1, 0, 0, 0),
@@ -303,8 +319,16 @@ fn arguments(t: &mut T) {
         fx(w, 99 | PRIVATE, 1, 0, 0, 0),
         Err(Errno::ENOSYS),
     );
-    t.eq("huge-command", fx(w, 0x10000, 1, 0, 0, 0), Err(Errno::ENOSYS));
-    t.eq("futex-fd-is-gone", fx(w, FUTEX_FD, 1, 0, 0, 0), Err(Errno::ENOSYS));
+    t.eq(
+        "huge-command",
+        fx(w, 0x10000, 1, 0, 0, 0),
+        Err(Errno::ENOSYS),
+    );
+    t.eq(
+        "futex-fd-is-gone",
+        fx(w, FUTEX_FD, 1, 0, 0, 0),
+        Err(Errno::ENOSYS),
+    );
     for (name, op) in [
         ("wait", FUTEX_WAIT),
         ("wake", FUTEX_WAKE),
@@ -326,14 +350,26 @@ fn arguments(t: &mut T) {
     // The wake side.
     t.eq("wake-nobody", fx(w, FUTEX_WAKE, 5, 0, 0, 0), Ok(0));
     t.eq("wake-zero", fx(w, FUTEX_WAKE, 0, 0, 0, 0), Ok(0));
-    t.eq("wake-bitset-zero", fx(w, FUTEX_WAKE_BITSET, 1, 0, 0, 0), Err(Errno::EINVAL));
-    t.eq("wait-bitset-zero", fx(w, FUTEX_WAIT_BITSET, 1, 0, 0, 0), Err(Errno::EINVAL));
+    t.eq(
+        "wake-bitset-zero",
+        fx(w, FUTEX_WAKE_BITSET, 1, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "wait-bitset-zero",
+        fx(w, FUTEX_WAIT_BITSET, 1, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
     t.eq(
         "wait-bitset-zero-beats-mismatch",
         fx(w, FUTEX_WAIT_BITSET, 0, 0, 0, 0),
         Err(Errno::EINVAL),
     );
-    t.eq("wake-unaligned", fx(w + 1, FUTEX_WAKE, 1, 0, 0, 0), Err(Errno::EINVAL));
+    t.eq(
+        "wake-unaligned",
+        fx(w + 1, FUTEX_WAKE, 1, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
     t.eq(
         "wake-unaligned-private",
         fx(w + 3, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
@@ -355,7 +391,11 @@ fn arguments(t: &mut T) {
         fx(FAR, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
         Ok(0),
     );
-    t.eq("wake-unmapped-shared", fx(FAR, FUTEX_WAKE, 1, 0, 0, 0), Err(Errno::EFAULT));
+    t.eq(
+        "wake-unmapped-shared",
+        fx(FAR, FUTEX_WAKE, 1, 0, 0, 0),
+        Err(Errno::EFAULT),
+    );
     // `access_ok` accepts the first address past the user range for a word-sized access (the
     // x86-64 `valid_user_address` is `<=`), and the private key needs nothing more.
     t.eq(
@@ -409,11 +449,7 @@ fn arguments(t: &mut T) {
         fx(w, FUTEX_REQUEUE | PRIVATE, 1, 1, FAR, 0),
         Ok(0),
     );
-    t.eq(
-        "requeue-to-itself",
-        fx(w, FUTEX_REQUEUE, 1, 1, w, 0),
-        Ok(0),
-    );
+    t.eq("requeue-to-itself", fx(w, FUTEX_REQUEUE, 1, 1, w, 0), Ok(0));
     t.eq(
         "cmp-requeue-to-itself",
         fx(w, FUTEX_CMP_REQUEUE, 1, 1, w, 1),
@@ -506,7 +542,11 @@ fn timeouts(t: &mut T) {
         nap(10);
         th
     };
-    t.eq("wake-before-the-timeout", fx(w, FUTEX_WAKE, 1, 0, 0, 0), Ok(1));
+    t.eq(
+        "wake-before-the-timeout",
+        fx(w, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(1),
+    );
     settle();
     t.eq("woken-waiter-with-timeout-returns-0", result(1), 0);
     finish(&[th]);
@@ -517,9 +557,17 @@ fn wakeups(t: &mut T) {
     word(4).store(0, SeqCst);
     fresh();
     let ths: [Thread; 4] = core::array::from_fn(|i| begin(i, w, FUTEX_WAIT, 0, 0));
-    t.eq("nobody-woke-by-itself", (0..4).filter(|&i| done(i)).count(), 0);
+    t.eq(
+        "nobody-woke-by-itself",
+        (0..4).filter(|&i| done(i)).count(),
+        0,
+    );
     // A different word of the same page wakes nobody.
-    t.eq("wake-another-word", fx(at(5), FUTEX_WAKE, 10, 0, 0, 0), Ok(0));
+    t.eq(
+        "wake-another-word",
+        fx(at(5), FUTEX_WAKE, 10, 0, 0, 0),
+        Ok(0),
+    );
     t.eq("wake-one", fx(w, FUTEX_WAKE, 1, 0, 0, 0), Ok(1));
     settle();
     t.eq("first-in-first-woken", (order(0), done(1)), (1, false));
@@ -527,13 +575,33 @@ fn wakeups(t: &mut T) {
     settle();
     // Which ones a call wakes is queue order; the order in which they then run is the
     // scheduler's (EEVDF there), so only the set is compared.
-    t.eq("wake-in-queue-order", [done(0), done(1), done(2), done(3)], [true, true, true, false]);
-    t.eq("wake-more-than-waiting", fx(w, FUTEX_WAKE, 100, 0, 0, 0), Ok(1));
+    t.eq(
+        "wake-in-queue-order",
+        [done(0), done(1), done(2), done(3)],
+        [true, true, true, false],
+    );
+    t.eq(
+        "wake-more-than-waiting",
+        fx(w, FUTEX_WAKE, 100, 0, 0, 0),
+        Ok(1),
+    );
     settle();
-    t.eq("queue-order-complete", [done(0), done(1), done(2), done(3)], [true; 4]);
-    t.eq("each-waiter-recorded-once", (0..4).map(order).sum::<usize>(), 10);
+    t.eq(
+        "queue-order-complete",
+        [done(0), done(1), done(2), done(3)],
+        [true; 4],
+    );
+    t.eq(
+        "each-waiter-recorded-once",
+        (0..4).map(order).sum::<usize>(),
+        10,
+    );
     t.eq("nobody-left", fx(w, FUTEX_WAKE, 1, 0, 0, 0), Ok(0));
-    t.eq("woken-waiters-return-zero", [result(0), result(1), result(2), result(3)], [0; 4]);
+    t.eq(
+        "woken-waiters-return-zero",
+        [result(0), result(1), result(2), result(3)],
+        [0; 4],
+    );
     finish(&ths);
     // A negative count wakes one (`int nr_wake`, `++ret >= nr_wake`).
     fresh();
@@ -544,11 +612,23 @@ fn wakeups(t: &mut T) {
         Ok(1),
     );
     settle();
-    t.eq("negative-count-woke-the-first", (done(0), done(1)), (true, false));
-    t.eq("wake-the-rest", fx(w, FUTEX_WAKE, i32::MAX as usize, 0, 0, 0), Ok(1));
+    t.eq(
+        "negative-count-woke-the-first",
+        (done(0), done(1)),
+        (true, false),
+    );
+    t.eq(
+        "wake-the-rest",
+        fx(w, FUTEX_WAKE, i32::MAX as usize, 0, 0, 0),
+        Ok(1),
+    );
     finish(&ths);
     // A wake before the wait is lost: the value check is the protocol.
-    t.eq("wake-then-wait-sleeps-not", fx(w, FUTEX_WAKE, 1, 0, 0, 0), Ok(0));
+    t.eq(
+        "wake-then-wait-sleeps-not",
+        fx(w, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(0),
+    );
 }
 
 fn bitsets(t: &mut T) {
@@ -576,9 +656,17 @@ fn bitsets(t: &mut T) {
         (done(0), done(1), done(2)),
         (false, true, true),
     );
-    t.eq("wake-matches-any-bit", fx(w, FUTEX_WAKE, 10, 0, 0, 0), Ok(1));
+    t.eq(
+        "wake-matches-any-bit",
+        fx(w, FUTEX_WAKE, 10, 0, 0, 0),
+        Ok(1),
+    );
     settle();
-    t.eq("all-bitset-waiters-returned", (done(0), result(0)), (true, 0));
+    t.eq(
+        "all-bitset-waiters-returned",
+        (done(0), result(0)),
+        (true, 0),
+    );
     finish(&ths);
 }
 
@@ -594,13 +682,33 @@ fn requeue(t: &mut T) {
         Ok(3),
     );
     settle();
-    t.eq("cmp-requeue-woke-the-first", (done(0), done(1), done(2), done(3)), (true, false, false, false));
-    t.eq("requeued-sleep-on-the-target", fx(b, FUTEX_WAKE, 10, 0, 0, 0), Ok(2));
+    t.eq(
+        "cmp-requeue-woke-the-first",
+        (done(0), done(1), done(2), done(3)),
+        (true, false, false, false),
+    );
+    t.eq(
+        "requeued-sleep-on-the-target",
+        fx(b, FUTEX_WAKE, 10, 0, 0, 0),
+        Ok(2),
+    );
     settle();
-    t.eq("source-keeps-the-rest", fx(a, FUTEX_WAKE, 10, 0, 0, 0), Ok(1));
+    t.eq(
+        "source-keeps-the-rest",
+        fx(a, FUTEX_WAKE, 10, 0, 0, 0),
+        Ok(1),
+    );
     settle();
-    t.eq("every-requeued-waiter-returned", [done(0), done(1), done(2), done(3)], [true; 4]);
-    t.eq("requeued-waiters-return-zero", [result(0), result(1), result(2), result(3)], [0; 4]);
+    t.eq(
+        "every-requeued-waiter-returned",
+        [done(0), done(1), done(2), done(3)],
+        [true; 4],
+    );
+    t.eq(
+        "requeued-waiters-return-zero",
+        [result(0), result(1), result(2), result(3)],
+        [0; 4],
+    );
     finish(&ths);
     // FUTEX_REQUEUE does not compare; it returns woken plus requeued as well.
     fresh();
@@ -618,7 +726,11 @@ fn requeue(t: &mut T) {
         fx(a, FUTEX_CMP_REQUEUE, 1, 1, b, 7),
         Err(Errno::EAGAIN),
     );
-    t.eq("the-waiter-is-still-there", fx(a, FUTEX_WAKE, 1, 0, 0, 0), Ok(1));
+    t.eq(
+        "the-waiter-is-still-there",
+        fx(a, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(1),
+    );
     finish(&[th]);
     // A private waiter is requeued with the private flag only.
     fresh();
@@ -660,7 +772,11 @@ fn wake_op_checks(t: &mut T) {
     );
     t.eq("wake-op-add-stored", word(10).load(SeqCst), 6);
     settle();
-    t.eq("wake-op-woke-one-of-each", (done(0), done(1), done(2), done(3)), (true, false, true, false));
+    t.eq(
+        "wake-op-woke-one-of-each",
+        (done(0), done(1), done(2), done(3)),
+        (true, false, true, false),
+    );
     // *b = 9; the old value 6 is not != 6: only the first futex is woken.
     t.eq(
         "wake-op-set-ne-false",
@@ -681,8 +797,16 @@ fn wake_op_checks(t: &mut T) {
     let side = |op: u32, oparg: u32, cmp: u32, cmparg: u32| {
         fx(a, FUTEX_WAKE_OP, 0, 0, b, wake_op(op, oparg, cmp, cmparg))
     };
-    t.eq("wake-op-andn", (side(OP_ANDN, 1, CMP_EQ, 0), word(10).load(SeqCst)), (Ok(0), 10));
-    t.eq("wake-op-xor", (side(OP_XOR, 3, CMP_LT, 0), word(10).load(SeqCst)), (Ok(0), 9));
+    t.eq(
+        "wake-op-andn",
+        (side(OP_ANDN, 1, CMP_EQ, 0), word(10).load(SeqCst)),
+        (Ok(0), 10),
+    );
+    t.eq(
+        "wake-op-xor",
+        (side(OP_XOR, 3, CMP_LT, 0), word(10).load(SeqCst)),
+        (Ok(0), 9),
+    );
     t.eq(
         "wake-op-oparg-shift",
         (side(OP_SET | OP_SHIFT, 4, CMP_LE, 0), word(10).load(SeqCst)),
@@ -728,12 +852,28 @@ fn keys(t: &mut T) {
     // The private flag is part of the key: a private wake does not reach a shared waiter on
     // the same address and the reverse (`FUT_OFF_MMSHARED`), though both are this process.
     let th = begin(0, w, FUTEX_WAIT, 0, 0);
-    t.eq("private-wake-misses-shared-waiter", fx(w, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0), Ok(0));
-    t.eq("shared-wake-finds-shared-waiter", fx(w, FUTEX_WAKE, 1, 0, 0, 0), Ok(1));
+    t.eq(
+        "private-wake-misses-shared-waiter",
+        fx(w, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
+        Ok(0),
+    );
+    t.eq(
+        "shared-wake-finds-shared-waiter",
+        fx(w, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(1),
+    );
     finish(&[th]);
     let th = begin(0, w, FUTEX_WAIT | PRIVATE, 0, 0);
-    t.eq("shared-wake-misses-private-waiter", fx(w, FUTEX_WAKE, 1, 0, 0, 0), Ok(0));
-    t.eq("private-wake-finds-private-waiter", fx(w, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0), Ok(1));
+    t.eq(
+        "shared-wake-misses-private-waiter",
+        fx(w, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(0),
+    );
+    t.eq(
+        "private-wake-finds-private-waiter",
+        fx(w, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
+        Ok(1),
+    );
     finish(&[th]);
 }
 
@@ -756,9 +896,17 @@ fn signals(t: &mut T) {
         (H_COUNT.load(SeqCst), done(0)),
         (1, false),
     );
-    t.eq("restarted-wait-is-woken", fx(w, FUTEX_WAKE, 1, 0, 0, 0), Ok(1));
+    t.eq(
+        "restarted-wait-is-woken",
+        fx(w, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(1),
+    );
     settle();
-    t.eq("restarted-wait-returns-zero", (done(0), result(0)), (true, 0));
+    t.eq(
+        "restarted-wait-returns-zero",
+        (done(0), result(0)),
+        (true, 0),
+    );
     finish(&[th]);
     // Without SA_RESTART it fails with EINTR.
     handler_flags(0);
@@ -849,25 +997,56 @@ fn robust(t: &mut T) {
     let mut len = 1usize;
     t.eq(
         "get-robust-list-initial",
-        (sys(Sysno::get_robust_list, &[0, addr_mut(&mut head), addr_mut(&mut len)]), head, len),
+        (
+            sys(
+                Sysno::get_robust_list,
+                &[0, addr_mut(&mut head), addr_mut(&mut len)],
+            ),
+            head,
+            len,
+        ),
         (Ok(0), 0, 24),
     );
-    t.eq("set-robust-list-bad-length", sys(Sysno::set_robust_list, &[addr(&HEAD), 16]), Err(Errno::EINVAL));
-    t.eq("set-robust-list", sys(Sysno::set_robust_list, &[addr(&HEAD), 24]), Ok(0));
+    t.eq(
+        "set-robust-list-bad-length",
+        sys(Sysno::set_robust_list, &[addr(&HEAD), 16]),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "set-robust-list",
+        sys(Sysno::set_robust_list, &[addr(&HEAD), 24]),
+        Ok(0),
+    );
     t.eq(
         "get-robust-list",
-        (sys(Sysno::get_robust_list, &[0, addr_mut(&mut head), addr_mut(&mut len)]), head, len),
+        (
+            sys(
+                Sysno::get_robust_list,
+                &[0, addr_mut(&mut head), addr_mut(&mut len)],
+            ),
+            head,
+            len,
+        ),
         (Ok(0), addr(&HEAD), 24),
     );
     let me = super::getpid();
     t.eq(
         "get-robust-list-by-pid",
-        (sys(Sysno::get_robust_list, &[me, addr_mut(&mut head), addr_mut(&mut len)]), head),
+        (
+            sys(
+                Sysno::get_robust_list,
+                &[me, addr_mut(&mut head), addr_mut(&mut len)],
+            ),
+            head,
+        ),
         (Ok(0), addr(&HEAD)),
     );
     t.eq(
         "get-robust-list-no-such-task",
-        sys(Sysno::get_robust_list, &[0x3fff_fff0, addr_mut(&mut head), addr_mut(&mut len)]),
+        sys(
+            Sysno::get_robust_list,
+            &[0x3fff_fff0, addr_mut(&mut head), addr_mut(&mut len)],
+        ),
         Err(Errno::ESRCH),
     );
     t.eq(
@@ -885,7 +1064,10 @@ fn robust(t: &mut T) {
     let th = spawn(
         |_| {
             let (mut head, mut len) = (1usize, 1usize);
-            let r = sys(Sysno::get_robust_list, &[0, addr_mut(&mut head), addr_mut(&mut len)]);
+            let r = sys(
+                Sysno::get_robust_list,
+                &[0, addr_mut(&mut head), addr_mut(&mut len)],
+            );
             ROBUST_GOT[0].store(head, SeqCst);
             ROBUST_GOT[1].store(len, SeqCst);
             ROBUST_GOT[2].store(r.unwrap_or(usize::MAX), SeqCst);
@@ -898,12 +1080,22 @@ fn robust(t: &mut T) {
     nap(10);
     t.eq(
         "new-thread-has-no-robust-list",
-        (ROBUST_GOT[0].load(SeqCst), ROBUST_GOT[1].load(SeqCst), ROBUST_GOT[2].load(SeqCst)),
+        (
+            ROBUST_GOT[0].load(SeqCst),
+            ROBUST_GOT[1].load(SeqCst),
+            ROBUST_GOT[2].load(SeqCst),
+        ),
         (0, 24, 0),
     );
     t.eq(
         "get-robust-list-of-another-thread",
-        (sys(Sysno::get_robust_list, &[th.tid, addr_mut(&mut head), addr_mut(&mut len)]), head),
+        (
+            sys(
+                Sysno::get_robust_list,
+                &[th.tid, addr_mut(&mut head), addr_mut(&mut len)],
+            ),
+            head,
+        ),
         (Ok(0), addr(&HEAD)),
     );
     set_and_wake(&THREAD_GO, 1);
@@ -942,7 +1134,13 @@ fn robust(t: &mut T) {
     wait_for(&THREAD_GO, 1);
     let tid = th.tid as u32;
     // A waiter on the lock with the waiters bit (shared futex, as pthread_mutex robust locks).
-    let waiting = begin(0, addr(&LOCKS[1].futex), FUTEX_WAIT, (tid | FUTEX_WAITERS) as usize, 0);
+    let waiting = begin(
+        0,
+        addr(&LOCKS[1].futex),
+        FUTEX_WAIT,
+        (tid | FUTEX_WAITERS) as usize,
+        0,
+    );
     set_and_wake(&THREAD_GO, 2);
     th.join();
     settle();
@@ -985,9 +1183,21 @@ fn pi_arguments(t: &mut T) {
         ("unlock-pi", FUTEX_UNLOCK_PI),
     ] {
         // `futex_unlock_pi` reads the word and compares the owner before it builds the key.
-        let unaligned = if op == FUTEX_UNLOCK_PI { Errno::EPERM } else { Errno::EINVAL };
-        t.eq(format_args!("{name}-unaligned"), fx(w + 1, op, 0, 0, 0, 0), Err(unaligned));
-        t.eq(format_args!("{name}-null"), fx(0, op, 0, 0, 0, 0), Err(Errno::EFAULT));
+        let unaligned = if op == FUTEX_UNLOCK_PI {
+            Errno::EPERM
+        } else {
+            Errno::EINVAL
+        };
+        t.eq(
+            format_args!("{name}-unaligned"),
+            fx(w + 1, op, 0, 0, 0, 0),
+            Err(unaligned),
+        );
+        t.eq(
+            format_args!("{name}-null"),
+            fx(0, op, 0, 0, 0, 0),
+            Err(Errno::EFAULT),
+        );
         t.eq(
             format_args!("{name}-kernel-address"),
             fx(TASK_SIZE, op, 0, 0, 0, 0),
@@ -1006,13 +1216,41 @@ fn pi_arguments(t: &mut T) {
     );
     // Uncontended: the word is taken with the caller's tid and released again.
     let me = super::gettid() as u32;
-    t.eq("unlock-pi-not-owner", fx(w, FUTEX_UNLOCK_PI, 0, 0, 0, 0), Err(Errno::EPERM));
-    t.eq("trylock-pi-free", (fx(w, FUTEX_TRYLOCK_PI, 0, 0, 0, 0), word(20).load(SeqCst)), (Ok(0), me));
-    t.eq("trylock-pi-owned-by-self", fx(w, FUTEX_TRYLOCK_PI, 0, 0, 0, 0), Err(Errno::EDEADLK));
-    t.eq("lock-pi-owned-by-self", fx(w, FUTEX_LOCK_PI, 0, 0, 0, 0), Err(Errno::EDEADLK));
-    t.eq("unlock-pi-owner", (fx(w, FUTEX_UNLOCK_PI, 0, 0, 0, 0), word(20).load(SeqCst)), (Ok(0), 0));
-    t.eq("lock-pi-free", (fx(w, FUTEX_LOCK_PI, 0, 0, 0, 0), word(20).load(SeqCst)), (Ok(0), me));
-    t.eq("unlock-pi-again", (fx(w, FUTEX_UNLOCK_PI, 0, 0, 0, 0), word(20).load(SeqCst)), (Ok(0), 0));
+    t.eq(
+        "unlock-pi-not-owner",
+        fx(w, FUTEX_UNLOCK_PI, 0, 0, 0, 0),
+        Err(Errno::EPERM),
+    );
+    t.eq(
+        "trylock-pi-free",
+        (fx(w, FUTEX_TRYLOCK_PI, 0, 0, 0, 0), word(20).load(SeqCst)),
+        (Ok(0), me),
+    );
+    t.eq(
+        "trylock-pi-owned-by-self",
+        fx(w, FUTEX_TRYLOCK_PI, 0, 0, 0, 0),
+        Err(Errno::EDEADLK),
+    );
+    t.eq(
+        "lock-pi-owned-by-self",
+        fx(w, FUTEX_LOCK_PI, 0, 0, 0, 0),
+        Err(Errno::EDEADLK),
+    );
+    t.eq(
+        "unlock-pi-owner",
+        (fx(w, FUTEX_UNLOCK_PI, 0, 0, 0, 0), word(20).load(SeqCst)),
+        (Ok(0), 0),
+    );
+    t.eq(
+        "lock-pi-free",
+        (fx(w, FUTEX_LOCK_PI, 0, 0, 0, 0), word(20).load(SeqCst)),
+        (Ok(0), me),
+    );
+    t.eq(
+        "unlock-pi-again",
+        (fx(w, FUTEX_UNLOCK_PI, 0, 0, 0, 0), word(20).load(SeqCst)),
+        (Ok(0), 0),
+    );
     // The requeue operations check their arguments.
     t.eq(
         "wait-requeue-pi-same-word",
@@ -1056,67 +1294,218 @@ fn futex2(t: &mut T) {
     };
     t.eq("waitv-flags", waitv(&v, 1, 1, 0, 0), Err(Errno::EINVAL));
     t.eq("waitv-none", waitv(&v, 0, 0, 0, 0), Err(Errno::EINVAL));
-    t.eq("waitv-too-many", waitv(&v, 129, 0, 0, 0), Err(Errno::EINVAL));
-    t.eq("waitv-null", sys(Sysno::futex_waitv, &[0, 1, 0, 0, 0]), Err(Errno::EINVAL));
-    t.eq("waitv-unreadable", sys(Sysno::futex_waitv, &[BAD, 1, 0, 0, 0]), Err(Errno::EFAULT));
+    t.eq(
+        "waitv-too-many",
+        waitv(&v, 129, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "waitv-null",
+        sys(Sysno::futex_waitv, &[0, 1, 0, 0, 0]),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "waitv-unreadable",
+        sys(Sysno::futex_waitv, &[BAD, 1, 0, 0, 0]),
+        Err(Errno::EFAULT),
+    );
     let bad_flags = [one(0x3, 0)];
-    t.eq("waitv-size-not-u32", waitv(&bad_flags, 1, 0, 0, 0), Err(Errno::EINVAL));
+    t.eq(
+        "waitv-size-not-u32",
+        waitv(&bad_flags, 1, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
     let bad_flags = [one(FUTEX2_U32 | 0x1000, 0)];
-    t.eq("waitv-unknown-flag", waitv(&bad_flags, 1, 0, 0, 0), Err(Errno::EINVAL));
+    t.eq(
+        "waitv-unknown-flag",
+        waitv(&bad_flags, 1, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
     let mut reserved = v;
     reserved[0].reserved = 1;
-    t.eq("waitv-reserved", waitv(&reserved, 1, 0, 0, 0), Err(Errno::EINVAL));
+    t.eq(
+        "waitv-reserved",
+        waitv(&reserved, 1, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
     let big_val = [one(FUTEX2_U32, 1 << 32)];
-    t.eq("waitv-value-wider-than-the-futex", waitv(&big_val, 1, 0, 0, 0), Err(Errno::EINVAL));
+    t.eq(
+        "waitv-value-wider-than-the-futex",
+        waitv(&big_val, 1, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
     let ts = timespec(1);
-    t.eq("waitv-bad-clock", waitv(&v, 1, 0, addr(&ts), 5), Err(Errno::EINVAL));
-    t.eq("waitv-timeout-unreadable", waitv(&v, 1, 0, BAD, MONOTONIC), Err(Errno::EFAULT));
-    t.eq("waitv-value-mismatch", waitv(&v, 1, 0, 0, 0), Err(Errno::EAGAIN));
+    t.eq(
+        "waitv-bad-clock",
+        waitv(&v, 1, 0, addr(&ts), 5),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "waitv-timeout-unreadable",
+        waitv(&v, 1, 0, BAD, MONOTONIC),
+        Err(Errno::EFAULT),
+    );
+    t.eq(
+        "waitv-value-mismatch",
+        waitv(&v, 1, 0, 0, 0),
+        Err(Errno::EAGAIN),
+    );
     let mismatch = [one(FUTEX2_U32 | FUTEX2_PRIVATE, 4)];
     let past = timespec(1);
-    t.eq("waitv-expired-deadline", waitv(&[one(FUTEX2_U32 | FUTEX2_PRIVATE, 3)], 1, 0, addr(&past), MONOTONIC), Err(Errno::ETIMEDOUT));
-    t.eq("waitv-mismatch-beats-deadline", waitv(&mismatch, 1, 0, addr(&past), MONOTONIC), Err(Errno::EAGAIN));
+    t.eq(
+        "waitv-expired-deadline",
+        waitv(
+            &[one(FUTEX2_U32 | FUTEX2_PRIVATE, 3)],
+            1,
+            0,
+            addr(&past),
+            MONOTONIC,
+        ),
+        Err(Errno::ETIMEDOUT),
+    );
+    t.eq(
+        "waitv-mismatch-beats-deadline",
+        waitv(&mismatch, 1, 0, addr(&past), MONOTONIC),
+        Err(Errno::EAGAIN),
+    );
     let unaligned = [WaitV {
         val: 0,
         uaddr: (w + 1) as u64,
         flags: FUTEX2_U32 | FUTEX2_PRIVATE,
         reserved: 0,
     }];
-    t.eq("waitv-unaligned", waitv(&unaligned, 1, 0, 0, 0), Err(Errno::EINVAL));
+    t.eq(
+        "waitv-unaligned",
+        waitv(&unaligned, 1, 0, 0, 0),
+        Err(Errno::EINVAL),
+    );
     // futex_wake / futex_wait / futex_requeue.
     let wake = |uaddr: usize, mask: usize, nr: usize, flags: usize| {
         sys(Sysno::futex_wake, &[uaddr, mask, nr, flags])
     };
-    t.eq("futex-wake-nobody", wake(w, 1, 1, (FUTEX2_U32 | FUTEX2_PRIVATE) as usize), Ok(0));
-    t.eq("futex-wake-flags", wake(w, 1, 1, 0x1000), Err(Errno::EINVAL));
+    t.eq(
+        "futex-wake-nobody",
+        wake(w, 1, 1, (FUTEX2_U32 | FUTEX2_PRIVATE) as usize),
+        Ok(0),
+    );
+    t.eq(
+        "futex-wake-flags",
+        wake(w, 1, 1, 0x1000),
+        Err(Errno::EINVAL),
+    );
     t.eq("futex-wake-size", wake(w, 1, 1, 0), Err(Errno::EINVAL));
-    t.eq("futex-wake-mask-zero", wake(w, 0, 1, FUTEX2_U32 as usize), Err(Errno::EINVAL));
-    t.eq("futex-wake-mask-wide", wake(w, 1 << 32, 1, FUTEX2_U32 as usize), Err(Errno::EINVAL));
-    t.eq("futex-wake-unaligned", wake(w + 1, 1, 1, FUTEX2_U32 as usize), Err(Errno::EINVAL));
-    t.eq("futex-wake-unmapped", wake(BAD, 1, 1, FUTEX2_U32 as usize), Err(Errno::EFAULT));
-    let wait = |uaddr: usize, val: usize, mask: usize, flags: usize, timeout: usize, clockid: usize| {
-        sys(Sysno::futex_wait, &[uaddr, val, mask, flags, timeout, clockid])
-    };
-    t.eq("futex-wait-mismatch", wait(w, 4, 1, FUTEX2_U32 as usize, 0, 0), Err(Errno::EAGAIN));
-    t.eq("futex-wait-flags", wait(w, 3, 1, 0x1000, 0, 0), Err(Errno::EINVAL));
-    t.eq("futex-wait-size", wait(w, 3, 1, 1, 0, 0), Err(Errno::EINVAL));
-    t.eq("futex-wait-val-wide", wait(w, 1 << 32, 1, FUTEX2_U32 as usize, 0, 0), Err(Errno::EINVAL));
-    t.eq("futex-wait-mask-wide", wait(w, 3, 1 << 32, FUTEX2_U32 as usize, 0, 0), Err(Errno::EINVAL));
-    t.eq("futex-wait-bad-clock", wait(w, 3, 1, FUTEX2_U32 as usize, addr(&ts), 9), Err(Errno::EINVAL));
-    t.eq("futex-wait-deadline", wait(w, 3, 1, (FUTEX2_U32 | FUTEX2_PRIVATE) as usize, addr(&past), MONOTONIC), Err(Errno::ETIMEDOUT));
-    t.eq("futex-wait-mask-zero", wait(w, 3, 0, FUTEX2_U32 as usize, 0, 0), Err(Errno::EINVAL));
-    let pair = [one(FUTEX2_U32 | FUTEX2_PRIVATE, 3), WaitV { uaddr: at(22) as u64, ..one(FUTEX2_U32 | FUTEX2_PRIVATE, 3) }];
+    t.eq(
+        "futex-wake-mask-zero",
+        wake(w, 0, 1, FUTEX2_U32 as usize),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "futex-wake-mask-wide",
+        wake(w, 1 << 32, 1, FUTEX2_U32 as usize),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "futex-wake-unaligned",
+        wake(w + 1, 1, 1, FUTEX2_U32 as usize),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "futex-wake-unmapped",
+        wake(BAD, 1, 1, FUTEX2_U32 as usize),
+        Err(Errno::EFAULT),
+    );
+    let wait =
+        |uaddr: usize, val: usize, mask: usize, flags: usize, timeout: usize, clockid: usize| {
+            sys(
+                Sysno::futex_wait,
+                &[uaddr, val, mask, flags, timeout, clockid],
+            )
+        };
+    t.eq(
+        "futex-wait-mismatch",
+        wait(w, 4, 1, FUTEX2_U32 as usize, 0, 0),
+        Err(Errno::EAGAIN),
+    );
+    t.eq(
+        "futex-wait-flags",
+        wait(w, 3, 1, 0x1000, 0, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "futex-wait-size",
+        wait(w, 3, 1, 1, 0, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "futex-wait-val-wide",
+        wait(w, 1 << 32, 1, FUTEX2_U32 as usize, 0, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "futex-wait-mask-wide",
+        wait(w, 3, 1 << 32, FUTEX2_U32 as usize, 0, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "futex-wait-bad-clock",
+        wait(w, 3, 1, FUTEX2_U32 as usize, addr(&ts), 9),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "futex-wait-deadline",
+        wait(
+            w,
+            3,
+            1,
+            (FUTEX2_U32 | FUTEX2_PRIVATE) as usize,
+            addr(&past),
+            MONOTONIC,
+        ),
+        Err(Errno::ETIMEDOUT),
+    );
+    t.eq(
+        "futex-wait-mask-zero",
+        wait(w, 3, 0, FUTEX2_U32 as usize, 0, 0),
+        Err(Errno::EINVAL),
+    );
+    let pair = [
+        one(FUTEX2_U32 | FUTEX2_PRIVATE, 3),
+        WaitV {
+            uaddr: at(22) as u64,
+            ..one(FUTEX2_U32 | FUTEX2_PRIVATE, 3)
+        },
+    ];
     let requeue = |p: &[WaitV; 2], flags: usize, wake: usize, req: usize| {
         sys(Sysno::futex_requeue, &[addr(p), flags, wake, req])
     };
     t.eq("futex-requeue-nobody", requeue(&pair, 0, 1, 1), Ok(0));
-    t.eq("futex-requeue-flags", requeue(&pair, 1, 1, 1), Err(Errno::EINVAL));
-    t.eq("futex-requeue-null", sys(Sysno::futex_requeue, &[0, 0, 1, 1]), Err(Errno::EINVAL));
+    t.eq(
+        "futex-requeue-flags",
+        requeue(&pair, 1, 1, 1),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "futex-requeue-null",
+        sys(Sysno::futex_requeue, &[0, 0, 1, 1]),
+        Err(Errno::EINVAL),
+    );
     let mut mixed = pair;
     mixed[1].flags = FUTEX2_U32;
-    t.eq("futex-requeue-different-flags", requeue(&mixed, 0, 1, 1), Err(Errno::EINVAL));
+    t.eq(
+        "futex-requeue-different-flags",
+        requeue(&mixed, 0, 1, 1),
+        Err(Errno::EINVAL),
+    );
     let mut mismatch = pair;
     mismatch[0].val = 4;
-    t.eq("futex-requeue-mismatch", requeue(&mismatch, 0, 1, 1), Err(Errno::EAGAIN));
-    t.eq("futex-requeue-negative", requeue(&pair, 0, usize::MAX >> 32, 1), Err(Errno::EINVAL));
+    t.eq(
+        "futex-requeue-mismatch",
+        requeue(&mismatch, 0, 1, 1),
+        Err(Errno::EAGAIN),
+    );
+    t.eq(
+        "futex-requeue-negative",
+        requeue(&pair, 0, usize::MAX >> 32, 1),
+        Err(Errno::EINVAL),
+    );
 }

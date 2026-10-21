@@ -200,8 +200,7 @@ impl Tasklist {
                     .signal_state(t)
                     .is_some_and(|mut state| state.join_group_stop(signr));
                 if joined {
-                    let sched = self.sched_of(t);
-                    w.signal_wake(t, sched, false);
+                    self.signal_wake_up(t, false, w);
                 }
             }
         }

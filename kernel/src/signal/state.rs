@@ -192,6 +192,9 @@ impl Default for SigHand {
 pub struct SignalStruct {
     /// `signal->group_exit_code` while `SIGNAL_GROUP_EXIT` is set.
     pub group_exit: Option<u32>,
+    /// `signal->group_exec_task != NULL`: a thread's `execve` is killing the others
+    /// (`de_thread`); `get_signal` treats them as marked for death.
+    pub exec_collapsing: bool,
     /// `SIGNAL_UNKILLABLE`.
     pub unkillable: bool,
     /// `RLIMIT_SIGPENDING` (`signal->rlim`).
@@ -223,6 +226,7 @@ impl SignalStruct {
     pub fn new(rlimit_sigpending: u64) -> Self {
         Self {
             group_exit: None,
+            exec_collapsing: false,
             unkillable: false,
             rlimit_sigpending,
             job_flags: 0,
@@ -270,6 +274,13 @@ pub struct ThreadSignal {
     pub arch: ArchInfo,
     /// `current->jobctl` ([`super::jobctl`]).
     pub jobctl: u32,
+    /// `TIF_SIGPENDING` as far as the group's shared queue is concerned: the thread has been
+    /// told to look at it (`signal_wake_up`) or looked at it itself (`recalc_sigpending`). A
+    /// signal that `complete_signal` leaves to another thread sits in the shared queue
+    /// unseen by this one until one of those happens, as in Linux, where only the flag makes a
+    /// thread dequeue on its way back to user mode. (The private queue, a group exit and a
+    /// pending group stop are seen as soon as they exist.)
+    pub shared_seen: bool,
     private: Pending,
 }
 
@@ -285,6 +296,7 @@ impl ThreadSignal {
             altstack: AltStack::RESET,
             arch: ArchInfo::default(),
             jobctl: 0,
+            shared_seen: false,
             private: Pending::new(),
         }
     }
@@ -579,9 +591,13 @@ impl State<'_> {
     /// (`JOBCTL_PENDING_MASK`).
     #[must_use]
     pub fn signal_pending(&self) -> bool {
-        self.sig.group_exit.is_some()
-            || self.pending_set().0 & !self.me.blocked.0 != 0
-            || self.me.jobctl & super::jobctl::JOBCTL_PENDING_MASK != 0
+        self.pending_without(0)
+    }
+
+    /// `recalc_sigpending`: the flag follows the queues. A thread that looks sees what is
+    /// pending in the shared queue; one that finds nothing there stops looking.
+    pub fn recalc_sigpending(&mut self) {
+        self.me.shared_seen = self.sig.shared.signal.0 & !self.me.blocked.0 != 0;
     }
 
     /// [`State::signal_pending`] as it was before `sig` was queued: what `wants_signal` reads
@@ -589,8 +605,11 @@ impl State<'_> {
     /// that follows the queueing, not by the queueing).
     #[must_use]
     pub(crate) fn pending_without(&self, sig: u8) -> bool {
+        // `sig == 0` excludes nothing (`SigSet::bit(0)` is empty).
+        let unseen = !SigSet::bit(sig);
         self.sig.group_exit.is_some()
-            || self.pending_set().0 & !self.me.blocked.0 & !SigSet::bit(sig) != 0
+            || self.me.private.signal.0 & !self.me.blocked.0 & unseen != 0
+            || (self.me.shared_seen && self.sig.shared.signal.0 & !self.me.blocked.0 & unseen != 0)
             || self.me.jobctl & super::jobctl::JOBCTL_PENDING_MASK != 0
     }
 
@@ -627,12 +646,14 @@ impl State<'_> {
     /// `set_current_blocked`: SIGKILL and SIGSTOP are never blocked.
     pub fn set_blocked(&mut self, new: SigSet) {
         self.me.blocked = new.without_unblockable();
+        self.recalc_sigpending();
     }
 
     /// `flush_sigqueue_mask` on both queues.
     pub fn flush_signals(&mut self, mask: u64) {
         self.me.private.flush(mask);
         self.sig.shared.flush(mask);
+        self.recalc_sigpending();
     }
 
     /// `sig_task_ignored`.
@@ -728,6 +749,8 @@ impl State<'_> {
         if !self.wants_signal(sig, pending_before) {
             return; // it dequeues the signal before it runs again
         }
+        // `signal_wake_up`: `TIF_SIGPENDING`.
+        self.me.shared_seen = true;
         // `!sigismember(&t->real_blocked, sig)`: a signal `rt_sigtimedwait` is
         // waiting for (blocked beforehand) never takes the group down.
         if self.sig_fatal(sig)
@@ -761,7 +784,12 @@ impl State<'_> {
     ///
     /// # Errors
     /// `EAGAIN` when a real-time signal sent with `si_code != SI_USER` cannot be queued.
-    pub(crate) fn enqueue(&mut self, sig: u8, info: SigInfo, target: Target) -> Result<bool, Errno> {
+    pub(crate) fn enqueue(
+        &mut self,
+        sig: u8,
+        info: SigInfo,
+        target: Target,
+    ) -> Result<bool, Errno> {
         // legacy_queue: at most one classic signal pending.
         if sig < SIGRTMIN && self.pending(target).signal.contains(sig) {
             return Ok(false);
@@ -941,9 +969,11 @@ impl State<'_> {
                     // out clears it, and `do_signal_stop` then does not stop.
                     self.me.jobctl |= super::jobctl::JOBCTL_STOP_DEQUEUED;
                 }
+                self.recalc_sigpending();
                 return Some((sig, info));
             }
         }
+        self.recalc_sigpending();
         None
     }
 

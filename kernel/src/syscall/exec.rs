@@ -857,7 +857,10 @@ mod tests {
         // Attributes: name, cleared user pointers; umask and cwd are kept.
         assert_eq!(&t.attrs.comm[..9], b"bin-init\0");
         assert_eq!(
-            (t.attrs.clear_child_tid, t.tasks.task(t.current).unwrap().robust_list),
+            (
+                t.attrs.clear_child_tid,
+                t.tasks.task(t.current).unwrap().robust_list
+            ),
             (0, 0)
         );
         assert_eq!(t.fs.umask, 0o77);

@@ -10,13 +10,13 @@ use super::{
 };
 use crate::{
     cputime::CpuSample,
+    futex::{FutexWaker, Futexes},
     mm::{Env, Mm, VmFlags, tests::Fake},
     signal::{
         self, SIGALRM, SIGUSR1, SIGUSR2, State, frame::Sigreturn, info::SigInfo, state::Target,
     },
     task::{Attributes, TaskId, Tasklist, exit::NoWake, fork::ForkRequest},
     usercopy::{UserPages, fake::Space},
-    futex::{FutexWaker, Futexes},
     vfs::{FdTable, FileId, FsStruct, Timespec, Vfs},
 };
 extern crate std;

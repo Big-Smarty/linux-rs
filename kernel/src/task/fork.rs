@@ -511,7 +511,13 @@ mod tests {
             .request()
             .unwrap();
         assert_eq!(
-            (r.share_vm, r.share_fs, r.share_files, r.tls, r.set_child_tid),
+            (
+                r.share_vm,
+                r.share_fs,
+                r.share_files,
+                r.tls,
+                r.set_child_tid
+            ),
             (true, true, true, Some(0), 0)
         );
         let pthread = CLONE_VM

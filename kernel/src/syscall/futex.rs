@@ -779,9 +779,9 @@ pub fn mm_release<C: Context>(ctx: &mut C) {
     let list = {
         let t = ctx.tasks();
         let current = t.current;
-        t.list.task_mut(current).map_or(0, |task| {
-            core::mem::take(&mut task.robust_list)
-        })
+        t.list
+            .task_mut(current)
+            .map_or(0, |task| core::mem::take(&mut task.robust_list))
     };
     if list != 0 {
         exit_robust_list(ctx, list);
@@ -829,15 +829,34 @@ fn do_futex<C: Context>(
     #[allow(clippy::cast_possible_wrap)]
     let (nr_wake, nr_requeue) = (val as i32, val2 as i32);
     match cmd {
-        FUTEX_WAIT => Ok(futex_wait(ctx, uaddr, flags, val, timeout, BITSET_MATCH_ANY)),
+        FUTEX_WAIT => Ok(futex_wait(
+            ctx,
+            uaddr,
+            flags,
+            val,
+            timeout,
+            BITSET_MATCH_ANY,
+        )),
         FUTEX_WAIT_BITSET => Ok(futex_wait(ctx, uaddr, flags, val, timeout, val3)),
         FUTEX_WAKE => Ok(futex_wake(ctx, uaddr, flags, nr_wake, BITSET_MATCH_ANY)),
         FUTEX_WAKE_BITSET => Ok(futex_wake(ctx, uaddr, flags, nr_wake, val3)),
-        FUTEX_REQUEUE => futex_requeue(ctx, uaddr, flags, uaddr2, flags, nr_wake, nr_requeue, None, false),
-        FUTEX_CMP_REQUEUE => futex_requeue(
-            ctx, uaddr, flags, uaddr2, flags, nr_wake, nr_requeue, Some(val3), false,
+        FUTEX_REQUEUE => futex_requeue(
+            ctx, uaddr, flags, uaddr2, flags, nr_wake, nr_requeue, None, false,
         ),
-        FUTEX_WAKE_OP => Ok(futex_wake_op(ctx, uaddr, flags, uaddr2, nr_wake, nr_requeue, val3)),
+        FUTEX_CMP_REQUEUE => futex_requeue(
+            ctx,
+            uaddr,
+            flags,
+            uaddr2,
+            flags,
+            nr_wake,
+            nr_requeue,
+            Some(val3),
+            false,
+        ),
+        FUTEX_WAKE_OP => Ok(futex_wake_op(
+            ctx, uaddr, flags, uaddr2, nr_wake, nr_requeue, val3,
+        )),
         FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => {
             if cmd == FUTEX_LOCK_PI {
                 flags = flags.with(Flags::CLOCKRT);
@@ -856,7 +875,15 @@ fn do_futex<C: Context>(
             Err(Stop::Unimplemented)
         }
         FUTEX_CMP_REQUEUE_PI => futex_requeue(
-            ctx, uaddr, flags, uaddr2, flags, nr_wake, nr_requeue, Some(val3), true,
+            ctx,
+            uaddr,
+            flags,
+            uaddr2,
+            flags,
+            nr_wake,
+            nr_requeue,
+            Some(val3),
+            true,
         ),
         _ => Err(Errno::ENOSYS.into()),
     }
@@ -899,7 +926,14 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         Sysno::futex => outcome(number, sys_futex(ctx, a)),
         Sysno::futex_waitv => outcome(
             number,
-            futex_waitv(ctx, a[0], int(a[1]).cast_unsigned(), int(a[2]).cast_unsigned(), a[3], int(a[4])),
+            futex_waitv(
+                ctx,
+                a[0],
+                int(a[1]).cast_unsigned(),
+                int(a[2]).cast_unsigned(),
+                a[3],
+                int(a[4]),
+            ),
         ),
         Sysno::futex_wake => outcome(number, sys_futex_wake(ctx, a)),
         Sysno::futex_wait => outcome(number, sys_futex_wait(ctx, a)),
@@ -918,7 +952,13 @@ fn sys_futex_wake<C: Context>(ctx: &mut C, a: [u64; 6]) -> Sys {
         return Err(Errno::EINVAL.into());
     }
     #[allow(clippy::cast_possible_truncation)]
-    Ok(futex_wake(ctx, a[0], flags.with(Flags::STRICT), nr, a[1] as u32))
+    Ok(futex_wake(
+        ctx,
+        a[0],
+        flags.with(Flags::STRICT),
+        nr,
+        a[1] as u32,
+    ))
 }
 
 /// `SYSCALL_DEFINE6(futex_wait)`.
@@ -931,7 +971,14 @@ fn sys_futex_wait<C: Context>(ctx: &mut C, a: [u64; 6]) -> Sys {
     }
     let deadline = futex2_deadline(ctx, a[4], clockid)?;
     #[allow(clippy::cast_possible_truncation)]
-    Ok(futex_wait_once(ctx, a[0], flags, a[1] as u32, deadline, a[2] as u32))
+    Ok(futex_wait_once(
+        ctx,
+        a[0],
+        flags,
+        a[1] as u32,
+        deadline,
+        a[2] as u32,
+    ))
 }
 
 /// `SYSCALL_DEFINE4(futex_requeue)`.
@@ -970,11 +1017,11 @@ mod tests {
     )]
     extern crate std;
     use super::*;
+    use crate::signal::SIGUSR1;
     use crate::syscall::{
         Outcome, dispatch, error,
         testing::{Task, task},
     };
-    use crate::signal::SIGUSR1;
     use crate::usercopy::{copy_from_user, copy_to_user};
 
     const W: u64 = 0x1000;
@@ -1110,9 +1157,18 @@ mod tests {
         assert_eq!(futex(&mut t, &[W + 8, 1 | PRIVATE, 10]), 2);
         assert_eq!(t.futex_wakes.0, [1, 2, 3]);
         // Negative counts; unaligned or unreadable second address.
-        assert_eq!(futex(&mut t, &[W, 3 | PRIVATE, u64::MAX >> 32, 1, W + 8]), neg(Errno::EINVAL));
-        assert_eq!(futex(&mut t, &[W, 3 | PRIVATE, 1, 1, W + 9]), neg(Errno::EINVAL));
-        assert_eq!(futex(&mut t, &[W, 3 | PRIVATE, 1, 1, BAD]), neg(Errno::EFAULT));
+        assert_eq!(
+            futex(&mut t, &[W, 3 | PRIVATE, u64::MAX >> 32, 1, W + 8]),
+            neg(Errno::EINVAL)
+        );
+        assert_eq!(
+            futex(&mut t, &[W, 3 | PRIVATE, 1, 1, W + 9]),
+            neg(Errno::EINVAL)
+        );
+        assert_eq!(
+            futex(&mut t, &[W, 3 | PRIVATE, 1, 1, BAD]),
+            neg(Errno::EFAULT)
+        );
     }
 
     #[test]
@@ -1122,7 +1178,9 @@ mod tests {
         waiters(&mut t, W, &[1, 2]);
         waiters(&mut t, W + 4, &[3, 4]);
         let op = |op: u32, oparg: u32, cmp: u32, cmparg: u32| {
-            u64::from((op & 0xf) << 28 | (cmp & 0xf) << 24 | (oparg & 0xfff) << 12 | (cmparg & 0xfff))
+            u64::from(
+                (op & 0xf) << 28 | (cmp & 0xf) << 24 | (oparg & 0xfff) << 12 | (cmparg & 0xfff),
+            )
         };
         // *b += 1, the old value is 5: wake one on a and one on b.
         assert_eq!(
@@ -1156,7 +1214,10 @@ mod tests {
         let mut t = t();
         put(&mut t, W, 0);
         put(&mut t, 0x2000, 0);
-        assert_eq!(copy_to_user(&mut t, 0x2008, &20_000_000i64.to_le_bytes()), 0);
+        assert_eq!(
+            copy_to_user(&mut t, 0x2008, &20_000_000i64.to_le_bytes()),
+            0
+        );
         let start = t.now;
         // Nothing wakes it: the fake clock jumps to the deadline.
         assert_eq!(
@@ -1179,7 +1240,10 @@ mod tests {
         assert_eq!(block.expires_ns, i64::try_from(deadline).unwrap());
         // restart_syscall resumes with the same absolute deadline (after the signal is gone).
         let _ = t.state.dequeue_signal();
-        assert_eq!(call(&mut t, Sysno::restart_syscall, &[]), neg(Errno::ETIMEDOUT));
+        assert_eq!(
+            call(&mut t, Sysno::restart_syscall, &[]),
+            neg(Errno::ETIMEDOUT)
+        );
         assert!(t.now >= deadline);
         assert_eq!(t.clocks.restarts.last().copied(), Some(RestartBlock::NONE));
     }
@@ -1190,7 +1254,14 @@ mod tests {
         // head at 0x2000: next = L0 (0x2100), offset 8, pending = L2 (0x2300).
         let head = 0x2000u64;
         let (l0, l1, l2) = (0x2100u64, 0x2200u64, 0x2300u64);
-        for (at, word) in [(head, l0), (head + 8, 8), (head + 16, l2), (l0, l1), (l1, head), (l2, head)] {
+        for (at, word) in [
+            (head, l0),
+            (head + 8, 8),
+            (head + 16, l2),
+            (l0, l1),
+            (l1, head),
+            (l2, head),
+        ] {
             assert_eq!(copy_to_user(&mut t, at, &word.to_le_bytes()), 0);
         }
         let tid = t.tgid;
@@ -1204,18 +1275,31 @@ mod tests {
         t.tasks.task_mut(t.current).unwrap().robust_list = head;
         mm_release(&mut t);
         assert_eq!(get(&mut t, l0 + 8), FUTEX_OWNER_DIED | FUTEX_WAITERS);
-        assert_eq!(get(&mut t, l1 + 8), tid + 1, "another owner's lock is left alone");
+        assert_eq!(
+            get(&mut t, l1 + 8),
+            tid + 1,
+            "another owner's lock is left alone"
+        );
         assert_eq!(get(&mut t, l2 + 8), FUTEX_OWNER_DIED, "the pending entry");
         assert_eq!(t.tasks.task(t.current).unwrap().robust_list, 0);
         // set_robust_list / get_robust_list.
         assert_eq!(call(&mut t, Sysno::set_robust_list, &[head, 24]), 0);
-        assert_eq!(call(&mut t, Sysno::get_robust_list, &[0, 0x1800, 0x1808]), 0);
+        assert_eq!(
+            call(&mut t, Sysno::get_robust_list, &[0, 0x1800, 0x1808]),
+            0
+        );
         let mut out = [0u8; 16];
         assert_eq!(copy_from_user(&mut t, &mut out, 0x1800), 0);
         assert_eq!(u64::from_le_bytes(out[..8].try_into().unwrap()), head);
         assert_eq!(u64::from_le_bytes(out[8..].try_into().unwrap()), 24);
-        assert_eq!(call(&mut t, Sysno::get_robust_list, &[99, 0x1800, 0x1808]), neg(Errno::ESRCH));
-        assert_eq!(call(&mut t, Sysno::get_robust_list, &[0, 0x1800, BAD]), neg(Errno::EFAULT));
+        assert_eq!(
+            call(&mut t, Sysno::get_robust_list, &[99, 0x1800, 0x1808]),
+            neg(Errno::ESRCH)
+        );
+        assert_eq!(
+            call(&mut t, Sysno::get_robust_list, &[0, 0x1800, BAD]),
+            neg(Errno::EFAULT)
+        );
     }
 
     #[test]
@@ -1224,7 +1308,11 @@ mod tests {
         put(&mut t, W, 77);
         t.attrs.clear_child_tid = W;
         mm_release(&mut t);
-        assert_eq!(get(&mut t, W), 77, "a private mm: unobservable, not written");
+        assert_eq!(
+            get(&mut t, W),
+            77,
+            "a private mm: unobservable, not written"
+        );
         assert_eq!(t.attrs.clear_child_tid, 0);
         t.attrs.clear_child_tid = W;
         t.mm_users = 2;
@@ -1254,7 +1342,15 @@ mod tests {
         let _ = held;
         let child = t
             .tasks
-            .fork(t.current, crate::task::tasklist::ForkParams { rlimit_sigpending: 10, rlimit_nproc: 100, exit_signal: 17, clear_sighand: false })
+            .fork(
+                t.current,
+                crate::task::tasklist::ForkParams {
+                    rlimit_sigpending: 10,
+                    rlimit_nproc: 100,
+                    exit_signal: 17,
+                    clear_sighand: false,
+                },
+            )
             .unwrap();
         let other = u32::try_from(t.tasks.task_pid_vnr(child)).unwrap();
         put(&mut t, W, other);
@@ -1263,11 +1359,24 @@ mod tests {
             Outcome::Unimplemented(Sysno::futex as u32)
         );
         // The requeue operations check first; with no waiter they are a no-op.
-        assert_eq!(futex(&mut t, &[W, 11 | PRIVATE, 0, 0, W]), neg(Errno::EINVAL));
-        assert_eq!(futex(&mut t, &[W, 12 | PRIVATE, 1, 1, W, 0]), neg(Errno::EINVAL));
-        assert_eq!(futex(&mut t, &[W, 12 | PRIVATE, 2, 1, W + 4, 0]), neg(Errno::EINVAL), "one waiter to wake");
+        assert_eq!(
+            futex(&mut t, &[W, 11 | PRIVATE, 0, 0, W]),
+            neg(Errno::EINVAL)
+        );
+        assert_eq!(
+            futex(&mut t, &[W, 12 | PRIVATE, 1, 1, W, 0]),
+            neg(Errno::EINVAL)
+        );
+        assert_eq!(
+            futex(&mut t, &[W, 12 | PRIVATE, 2, 1, W + 4, 0]),
+            neg(Errno::EINVAL),
+            "one waiter to wake"
+        );
         put(&mut t, W, 3);
-        assert_eq!(futex(&mut t, &[W, 12 | PRIVATE, 1, 1, W + 4, 4]), neg(Errno::EAGAIN));
+        assert_eq!(
+            futex(&mut t, &[W, 12 | PRIVATE, 1, 1, W + 4, 4]),
+            neg(Errno::EAGAIN)
+        );
         assert_eq!(futex(&mut t, &[W, 12 | PRIVATE, 1, 1, W + 4, 3]), 0);
     }
 
@@ -1289,25 +1398,52 @@ mod tests {
         assert_eq!(waitv(&mut t, 1, 1, 0, 0), neg(Errno::EINVAL));
         assert_eq!(waitv(&mut t, 0, 0, 0, 0), neg(Errno::EINVAL));
         assert_eq!(waitv(&mut t, 129, 0, 0, 0), neg(Errno::EINVAL));
-        assert_eq!(call(&mut t, Sysno::futex_waitv, &[0, 1, 0, 0, 0]), neg(Errno::EINVAL));
-        assert_eq!(call(&mut t, Sysno::futex_waitv, &[BAD, 1, 0, 0, 0]), neg(Errno::EFAULT));
+        assert_eq!(
+            call(&mut t, Sysno::futex_waitv, &[0, 1, 0, 0, 0]),
+            neg(Errno::EINVAL)
+        );
+        assert_eq!(
+            call(&mut t, Sysno::futex_waitv, &[BAD, 1, 0, 0, 0]),
+            neg(Errno::EFAULT)
+        );
         entry(&mut t, 0x2000, 3, W, 3, 0);
         assert_eq!(waitv(&mut t, 1, 0, 0, 0), neg(Errno::EINVAL), "size 8");
         entry(&mut t, 0x2000, 3, W, private32, 1);
         assert_eq!(waitv(&mut t, 1, 0, 0, 0), neg(Errno::EINVAL), "reserved");
         entry(&mut t, 0x2000, 1 << 32, W, private32, 0);
-        assert_eq!(waitv(&mut t, 1, 0, 0, 0), neg(Errno::EINVAL), "value wider than the futex");
+        assert_eq!(
+            waitv(&mut t, 1, 0, 0, 0),
+            neg(Errno::EINVAL),
+            "value wider than the futex"
+        );
         entry(&mut t, 0x2000, 4, W, private32, 0);
         assert_eq!(waitv(&mut t, 1, 0, 0, 0), neg(Errno::EAGAIN));
         assert_eq!(waitv(&mut t, 1, 0, 0x2800, 5), neg(Errno::EINVAL), "clock");
         assert_eq!(waitv(&mut t, 1, 0, BAD, 1), neg(Errno::EFAULT));
         // futex_wake / futex_wait.
-        assert_eq!(call(&mut t, Sysno::futex_wake, &[W, 1, 1, private32 as u64]), 0);
-        assert_eq!(call(&mut t, Sysno::futex_wake, &[W, 0, 1, private32 as u64]), neg(Errno::EINVAL));
-        assert_eq!(call(&mut t, Sysno::futex_wake, &[W, 1, 1, 0]), neg(Errno::EINVAL));
-        assert_eq!(call(&mut t, Sysno::futex_wake, &[W, 1, 0, private32 as u64]), 0, "STRICT: zero is zero");
         assert_eq!(
-            call(&mut t, Sysno::futex_wait, &[W, 4, 1, private32 as u64, 0, 0]),
+            call(&mut t, Sysno::futex_wake, &[W, 1, 1, private32 as u64]),
+            0
+        );
+        assert_eq!(
+            call(&mut t, Sysno::futex_wake, &[W, 0, 1, private32 as u64]),
+            neg(Errno::EINVAL)
+        );
+        assert_eq!(
+            call(&mut t, Sysno::futex_wake, &[W, 1, 1, 0]),
+            neg(Errno::EINVAL)
+        );
+        assert_eq!(
+            call(&mut t, Sysno::futex_wake, &[W, 1, 0, private32 as u64]),
+            0,
+            "STRICT: zero is zero"
+        );
+        assert_eq!(
+            call(
+                &mut t,
+                Sysno::futex_wait,
+                &[W, 4, 1, private32 as u64, 0, 0]
+            ),
             neg(Errno::EAGAIN)
         );
     }

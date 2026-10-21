@@ -29,9 +29,7 @@ use super::{
 };
 use crate::{
     sched::{CLASS_CHLDEXIT, SchedId, WaitKey},
-    signal::{
-        NSIG, SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, info::SigInfo,
-    },
+    signal::{NSIG, SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, info::SigInfo},
 };
 
 pub use crate::signal::jobctl::{
@@ -154,8 +152,7 @@ impl Tasklist {
             if let Some(mut state) = self.signal_state(t) {
                 state.mark_killed();
             }
-            let sched = self.sched_of(t);
-            w.signal_wake(t, sched, true);
+            self.signal_wake_up(t, true, w);
         }
         count
     }
@@ -165,17 +162,26 @@ impl Tasklist {
     /// its code; otherwise the group exit starts and the other threads are
     /// killed. Returns the code `do_exit` runs with.
     pub fn do_group_exit(&mut self, task: TaskId, exit_code: u32, w: &mut dyn Waker) -> u32 {
-        let Some(mut state) = self.signal_state(task) else {
+        let Some(group_exit) = self.sig(task).map(|sig| sig.group_exit) else {
             return exit_code;
         };
-        // A task that gets here with the flag set (a fatal signal started the exit, or a core
-        // dump signal's `get_signal` did) still has to be sure the others are dying.
-        let code = state.group_exit_code(exit_code);
-        if self.group_of(task).is_some_and(|g| g.group_exec_task.is_some()) {
-            // "else if (sig->group_exec_task) exit_code = 0": an `execve` of another thread is
-            // collapsing the group and owns the other threads' deaths.
+        // "else if (sig->group_exec_task) exit_code = 0;": an `execve` of another thread is
+        // collapsing the group and owns the other threads' deaths.
+        if group_exit.is_none()
+            && self
+                .group_of(task)
+                .is_some_and(|g| g.group_exec_task.is_some())
+        {
             return 0;
         }
+        // "if (signal_group_exit(sig)) exit_code = sig->group_exit_code; else start it".
+        let code = self
+            .signal_state(task)
+            .map_or(exit_code, |mut state| state.group_exit_code(exit_code));
+        // A task that gets here with the flag set (a fatal signal started the exit, or a core
+        // dump signal's `get_signal` did) still has to be sure the others are dying: a signal
+        // generated for the running task by its own `State` (a fault, `tgkill` on itself) could
+        // not wake the other threads.
         self.zap_other_threads(task, w);
         code
     }
@@ -185,7 +191,13 @@ impl Tasklist {
     /// `group_dead` decision, the panic for global init, the cancellation of
     /// the real interval timer and `tsk->exit_code = code`. `signaled` is
     /// `PF_SIGNALED` (killed by a signal).
-    pub fn exit_prepare(&mut self, task: TaskId, code: u32, signaled: bool, w: &mut dyn Waker) -> ExitPrep {
+    pub fn exit_prepare(
+        &mut self,
+        task: TaskId,
+        code: u32,
+        signaled: bool,
+        w: &mut dyn Waker,
+    ) -> ExitPrep {
         let init = self.is_global_init(task);
         if self.task(task).is_none() {
             return ExitPrep::Proceed { group_dead: true };
@@ -264,17 +276,14 @@ impl Tasklist {
                 retarget &= view.me.blocked.0;
                 let wake = !view.signal_pending();
                 if wake {
-                    let sched = self.sched_of(t);
-                    w.signal_wake(t, sched, false);
+                    self.signal_wake_up(t, false, w);
                 }
             }
         }
-        let participate = self
-            .signal_state(task)
-            .is_some_and(|mut s| {
-                s.me.jobctl & crate::signal::jobctl::JOBCTL_STOP_PENDING != 0
-                    && s.task_participate_group_stop()
-            });
+        let participate = self.signal_state(task).is_some_and(|mut s| {
+            s.me.jobctl & crate::signal::jobctl::JOBCTL_STOP_PENDING != 0
+                && s.task_participate_group_stop()
+        });
         if participate {
             self.do_notify_parent_cldstop(task, CLD_STOPPED, w);
         }

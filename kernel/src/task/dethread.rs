@@ -52,6 +52,7 @@ impl Tasklist {
         let leader = self.thread_group_leader(tsk);
         if let Some(g) = self.group_mut(tsk) {
             g.group_exec_task = Some(tsk);
+            g.sig.exec_collapsing = true;
         }
         let count = self.zap_other_threads(tsk, w);
         if let Some(g) = self.group_mut(tsk) {
@@ -86,6 +87,7 @@ impl Tasklist {
     pub fn de_thread_abort(&mut self, tsk: TaskId) {
         if let Some(g) = self.group_mut(tsk) {
             g.group_exec_task = None;
+            g.sig.exec_collapsing = false;
             g.notify_count = 0;
         }
     }
@@ -112,6 +114,7 @@ impl Tasklist {
         }
         if let Some(g) = self.group_mut(tsk) {
             g.group_exec_task = None;
+            g.sig.exec_collapsing = false;
             g.notify_count = 0;
         }
     }
@@ -159,7 +162,9 @@ impl Tasklist {
     fn exchange_leader(&mut self, tsk: TaskId, leader: TaskId) {
         // exchange_tids: the two threads swap their PIDTYPE_PID pids.
         let own = self.task(tsk).and_then(|t| t.pids[PidType::Pid as usize]);
-        let theirs = self.task(leader).and_then(|t| t.pids[PidType::Pid as usize]);
+        let theirs = self
+            .task(leader)
+            .and_then(|t| t.pids[PidType::Pid as usize]);
         if let Some(t) = self.task_mut(tsk) {
             t.pids[PidType::Pid as usize] = theirs;
         }

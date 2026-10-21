@@ -207,6 +207,7 @@ pub fn sys_rt_sigtimedwait<T: Task>(
         let real_blocked = state.me.blocked;
         state.me.real_blocked = real_blocked;
         state.me.blocked = SigSet(real_blocked.0 & mask.0);
+        state.recalc_sigpending();
         let deadline = timeout.map(|ns| now.saturating_add(ns));
         loop {
             if synced(task).signal_pending() {
@@ -222,6 +223,7 @@ pub fn sys_rt_sigtimedwait<T: Task>(
         // __set_task_blocked(real_blocked), then collect.
         state.me.blocked = real_blocked;
         state.me.real_blocked = SigSet::EMPTY;
+        state.recalc_sigpending();
         found = state.dequeue_signal_masked(mask);
     }
     match found {

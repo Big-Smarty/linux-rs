@@ -133,7 +133,11 @@ pub fn exit_code(status: u64) -> u32 {
 /// signal pending (the return path turns it into `-EINTR` or restarts).
 fn do_wait<C: Context>(ctx: &mut C, wo: &mut WaitOpts) -> i64 {
     let mut result = 0;
-    let key = chldexit_key(ctx.tasks().current);
+    // `current->signal->wait_chldexit`: every thread of the group waits on the leader's.
+    let key = {
+        let t = ctx.tasks();
+        chldexit_key(t.list.group_leader(t.current))
+    };
     let waited = wait_event_interruptible(ctx, key, |c| {
         let t = c.tasks();
         result = t.list.do_wait_once(t.current, wo);
@@ -621,16 +625,37 @@ mod tests {
         assert_eq!(call(&mut t, Sysno::clone, &[0x100 | 0x11, 0, 0, 0, 0]), 7);
         let thread_flags = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000 | 0x8_0000;
         assert_eq!(
-            call(&mut t, Sysno::clone, &[thread_flags | 0x10_0000 | 0x20_0000, 0x9000, 0x1000, 0x1004, 0x55]),
+            call(
+                &mut t,
+                Sysno::clone,
+                &[
+                    thread_flags | 0x10_0000 | 0x20_0000,
+                    0x9000,
+                    0x1000,
+                    0x1004,
+                    0x55
+                ]
+            ),
             8
         );
         let (vm, thread) = (t.forked[5], t.forked[6]);
-        assert_eq!((vm.share_vm, vm.thread, vm.share_files), (true, false, false));
         assert_eq!(
-            (thread.thread, thread.share_sighand, thread.share_files, thread.share_fs),
+            (vm.share_vm, vm.thread, vm.share_files),
+            (true, false, false)
+        );
+        assert_eq!(
+            (
+                thread.thread,
+                thread.share_sighand,
+                thread.share_files,
+                thread.share_fs
+            ),
             (true, true, true, true)
         );
-        assert_eq!((thread.clear_child_tid, thread.tls, thread.child_sp), (0x1004, Some(0x55), 0x9000));
+        assert_eq!(
+            (thread.clear_child_tid, thread.tls, thread.child_sp),
+            (0x1004, Some(0x55), 0x9000)
+        );
         t.forked.truncate(5);
         // clone3: size and field errors, then the copy with the stack top.
         assert_eq!(

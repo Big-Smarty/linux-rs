@@ -246,7 +246,11 @@ fn group_exit_code_wins_over_the_thread_exit_code() {
     let (mut l, init) = list();
     let child = l.fork(init, FORK).unwrap();
     assert_eq!(l.do_group_exit(child, 7 << 8, &mut NoWake), 7 << 8);
-    assert_eq!(l.do_group_exit(child, 1 << 8, &mut NoWake), 7 << 8, "first code sticks");
+    assert_eq!(
+        l.do_group_exit(child, 1 << 8, &mut NoWake),
+        7 << 8,
+        "first code sticks"
+    );
     exit(&mut l, child, 1 << 8, &mut Rec::default());
     let (ret, wo) = wait_pid(&mut l, init, 2, 0);
     assert_eq!((ret, wo.stat), (2, 7 << 8));
@@ -1443,10 +1447,7 @@ fn a_task_signalling_itself_is_the_current_task() {
     assert_eq!(l.sig(child).unwrap().group_exit, None);
     // ... while the child's own fatal signal, with those pending, starts it.
     send(&mut l, child, SIGHUP, &mut w);
-    assert_eq!(
-        l.sig(child).unwrap().group_exit,
-        Some(u32::from(SIGHUP))
-    );
+    assert_eq!(l.sig(child).unwrap().group_exit, Some(u32::from(SIGHUP)));
 }
 
 #[test]
@@ -1587,7 +1588,11 @@ fn a_thread_that_exits_is_released_at_once_and_tells_nobody() {
     assert_eq!(l.group_thread_count(c), 1);
     assert_eq!(l.nr_threads(), 2);
     assert!(w.child_events.is_empty());
-    assert_eq!(pending(&mut l, init), SigSet::EMPTY, "no SIGCHLD for a thread");
+    assert_eq!(
+        pending(&mut l, init),
+        SigSet::EMPTY,
+        "no SIGCHLD for a thread"
+    );
     assert_eq!(l.task(c).unwrap().exit_state, ExitState::Live);
 }
 
@@ -1601,7 +1606,11 @@ fn a_zombie_leader_waits_for_its_threads_and_the_last_exit_sets_the_status() {
     assert_eq!(thread_exit(&mut l, c, 7 << 8, &mut w), Notified::Zombie);
     assert!(w.child_events.is_empty());
     assert_eq!(pending(&mut l, init), SigSet::EMPTY);
-    assert_eq!(wait_pid(&mut l, init, 2, WNOHANG).0, 0, "delay_group_leader");
+    assert_eq!(
+        wait_pid(&mut l, init, 2, WNOHANG).0,
+        0,
+        "delay_group_leader"
+    );
     // The last thread's code is the group's (`synchronize_group_exit`), and its release tells
     // the leader's parent.
     assert_eq!(thread_exit(&mut l, t1, 3 << 8, &mut w), Notified::Reaped);
@@ -1785,11 +1794,19 @@ fn exec_from_a_non_leader_takes_the_leaders_pid() {
     // t2 exits and is released; the old leader is not counted.
     thread_exit(&mut l, t2, 0, &mut w);
     assert!(l.de_thread_others_gone(t1));
-    assert_eq!(w.de_thread_events, [t1], "the last other thread woke the exec");
+    assert_eq!(
+        w.de_thread_events,
+        [t1],
+        "the last other thread woke the exec"
+    );
     // The leader has not exited yet: wait, and be woken when it does.
     assert!(!l.de_thread_leader_exited(t1));
     thread_exit(&mut l, c, 0, &mut w);
-    assert_eq!(w.de_thread_events, [t1, t1], "and the old leader's exit woke it again");
+    assert_eq!(
+        w.de_thread_events,
+        [t1, t1],
+        "and the old leader's exit woke it again"
+    );
     assert!(l.de_thread_leader_exited(t1));
     l.de_thread_finish(t1, &mut w);
     // t1 is the leader now, with the old leader's pid, group and place.
@@ -1847,9 +1864,7 @@ fn a_group_stop_waits_for_every_thread_before_the_parent_is_told() {
         StopPlan::Stop { fatal: false }
     );
     assert_eq!(l.sig(c).unwrap().group_stop_count, 1);
-    assert!(
-        l.signal_state(c).unwrap().me.jobctl & crate::signal::jobctl::JOBCTL_STOP_PENDING != 0
-    );
+    assert!(l.signal_state(c).unwrap().me.jobctl & crate::signal::jobctl::JOBCTL_STOP_PENDING != 0);
     assert!(
         l.signal_state(c).unwrap().signal_pending(),
         "the stop is a pending event"
@@ -1861,10 +1876,7 @@ fn a_group_stop_waits_for_every_thread_before_the_parent_is_told() {
         "not stopped as a group yet"
     );
     // The leader takes part when it next returns to user mode; it is the last one.
-    assert_eq!(
-        l.signal_stop(c, 0, &mut w),
-        StopPlan::Stop { fatal: false }
-    );
+    assert_eq!(l.signal_stop(c, 0, &mut w), StopPlan::Stop { fatal: false });
     assert!(pending(&mut l, init).contains(SIGCHLD));
     assert_eq!(
         l.sig(c).unwrap().job_flags & super::exit::SIGNAL_STOP_STOPPED,

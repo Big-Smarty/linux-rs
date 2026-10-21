@@ -123,11 +123,12 @@ pub enum GetSignal {
 /// `get_signal` for the one task.
 pub fn get_signal(state: &mut State) -> GetSignal {
     loop {
-        // Has this task already been marked for death?
-        if let Some(code) = state.sig.group_exit {
+        // Has this task already been marked for death? (`SIGNAL_GROUP_EXIT`, or an `execve` of
+        // another thread is killing the group: `do_group_exit(SIGKILL)` then yields exit code 0.)
+        if state.sig.group_exit.is_some() || state.sig.exec_collapsing {
             state.remove_private(SIGKILL);
             return GetSignal::Fatal {
-                exit_code: code,
+                exit_code: state.sig.group_exit.unwrap_or(u32::from(SIGKILL)),
                 core: false,
             };
         }

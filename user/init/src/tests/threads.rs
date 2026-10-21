@@ -44,7 +44,9 @@ use core::sync::atomic::{
 
 use syscalls::{Errno, Sysno};
 
-use super::proc::{BAD, SIGCHLD, SIGKILL, SIGTERM, SIGUSR1, SIGUSR2, WNOHANG, nap, reap_all, wait4};
+use super::proc::{
+    BAD, SIGCHLD, SIGKILL, SIGTERM, SIGUSR1, SIGUSR2, WNOHANG, nap, reap_all, wait4,
+};
 use super::proc::{sigaction, spawn as fork_child};
 use super::signal::{KSigaction, SA_SIGINFO, bit};
 use super::{PAGE, R, T, addr, addr_mut, fn_addr, getpid, gettid, peek, poke, sys};
@@ -574,11 +576,7 @@ fn identity(t: &mut T) {
         Ok(me),
     );
     t.eq("main-gettid", gettid(), me);
-    t.eq(
-        "tgkill-joined-thread",
-        tgkill(th.tid, 0),
-        Err(Errno::ESRCH),
-    );
+    t.eq("tgkill-joined-thread", tgkill(th.tid, 0), Err(Errno::ESRCH));
     t.eq(
         "tgkill-wrong-group",
         sys(Sysno::tgkill, &[me + 1000, me, 0]),
@@ -590,7 +588,11 @@ fn identity(t: &mut T) {
         sys(Sysno::tgkill, &[me, 0, 0]),
         Err(Errno::EINVAL),
     );
-    t.eq("tkill-bad-tid", sys(Sysno::tkill, &[0, 0]), Err(Errno::EINVAL));
+    t.eq(
+        "tkill-bad-tid",
+        sys(Sysno::tkill, &[0, 0]),
+        Err(Errno::EINVAL),
+    );
     // A thread that keeps running when the thread that made it exits.
     static LATE: AtomicUsize = AtomicUsize::new(0);
     let outer = spawn(
@@ -617,7 +619,11 @@ fn identity(t: &mut T) {
     };
     set_and_wake(&READY, 1);
     inner.join();
-    t.eq("thread-of-an-exited-thread-runs", LATE.load(SeqCst), inner.tid);
+    t.eq(
+        "thread-of-an-exited-thread-runs",
+        LATE.load(SeqCst),
+        inner.tid,
+    );
     READY.store(0, SeqCst);
 }
 
@@ -684,7 +690,12 @@ fn arguments(t: &mut T) {
     forget();
     install(SIGCHLD);
     let quiet = spawn_with(THREAD_FLAGS | SIGCHLD, |_| 0, 0);
-    t.holds("thread-with-exit-signal", quiet.is_ok(), quiet.map(|_| ()), "Ok");
+    t.holds(
+        "thread-with-exit-signal",
+        quiet.is_ok(),
+        quiet.map(|_| ()),
+        "Ok",
+    );
     if let Ok(th) = quiet {
         th.join();
     }
@@ -692,6 +703,7 @@ fn arguments(t: &mut T) {
     t.eq("thread-exit-sends-no-sigchld", H_COUNT.load(SeqCst), 0);
     default_action(SIGCHLD);
     // clone3: a thread with its stack and size, and the checks that concern threads.
+    static CLONE3_GATE: AtomicU32 = AtomicU32::new(0);
     let mapping = super::mmap(0, STACK_BYTES, 3, 0x22, usize::MAX, 0).unwrap_or(0);
     let control = (mapping + STACK_BYTES - size_of::<Control>()) as *mut Control;
     // SAFETY: inside the fresh mapping, aligned as above, nothing else refers to it.
@@ -700,6 +712,7 @@ fn arguments(t: &mut T) {
             f: |c| {
                 SEEN[0].store(gettid(), SeqCst);
                 SEEN[1].store(read_fs0(), SeqCst);
+                wait_for(&CLONE3_GATE, 1);
                 c.arg
             },
             arg: 11,
@@ -723,7 +736,9 @@ fn arguments(t: &mut T) {
     let started = clone3_raw(&args, 64, thread_entry, addr(control));
     t.holds("clone3-thread", started.is_ok(), started, "a tid");
     let tid = started.unwrap_or(0);
+    // The word as the call left it, sampled before the thread is let go to finish.
     let at_return = control.ctid.load(SeqCst) as usize;
+    set_and_wake(&CLONE3_GATE, 1);
     wait_for(&control.ctid, 0);
     t.eq("clone3-thread-ran", SEEN[0].load(SeqCst), tid);
     t.eq("clone3-thread-parent-settid", at_return, tid);
@@ -770,9 +785,7 @@ fn sharing(t: &mut T) {
         "a page holding 0x5a",
     );
     let unmapper = spawn(
-        |_| {
-            usize::from(sys(Sysno::munmap, &[MAPPED.load(SeqCst), PAGE]).is_ok())
-        },
+        |_| usize::from(sys(Sysno::munmap, &[MAPPED.load(SeqCst), PAGE]).is_ok()),
         0,
     );
     t.eq("thread-munmap-ok", unmapper.join(), 1);
@@ -804,14 +817,11 @@ fn sharing(t: &mut T) {
     let (a, b) = (FDS[2].load(SeqCst), FDS[3].load(SeqCst));
     t.eq(
         "thread-pipe-usable-in-main",
-        (
-            sys(Sysno::write, &[b, addr(b"q"), 1]),
-            {
-                let mut byte = [0u8; 1];
-                let r = sys(Sysno::read, &[a, addr_mut(&mut byte), 1]);
-                (r, byte)
-            },
-        ),
+        (sys(Sysno::write, &[b, addr(b"q"), 1]), {
+            let mut byte = [0u8; 1];
+            let r = sys(Sysno::read, &[a, addr_mut(&mut byte), 1]);
+            (r, byte)
+        }),
         (Ok(1), (Ok(1), *b"q")),
     );
     let _ = (close(a), close(b), close(p1));
@@ -845,7 +855,11 @@ fn sharing(t: &mut T) {
     let mut cwd = [0u8; 16];
     let n = sys(Sysno::getcwd, &[addr_mut(&mut cwd), 16]).unwrap_or(0);
     t.eq("thread-chdir-seen-by-main", &cwd[..n], b"/dev\0".as_slice());
-    t.eq("thread-umask-seen-by-main", sys(Sysno::umask, &[0o022]), Ok(0o077));
+    t.eq(
+        "thread-umask-seen-by-main",
+        sys(Sysno::umask, &[0o022]),
+        Ok(0o077),
+    );
     let _ = sys(Sysno::chdir, &[addr(b"/\0")]);
     let kid = spawn_with(
         CLONE_VM | SIGCHLD,
@@ -875,7 +889,11 @@ fn sharing(t: &mut T) {
     )
     .unwrap_or(Thread { tid: 0, base: 0 });
     let _ = kid.reap();
-    t.eq("fs-shared-without-thread", sys(Sysno::umask, &[0o022]), Ok(0o027));
+    t.eq(
+        "fs-shared-without-thread",
+        sys(Sysno::umask, &[0o022]),
+        Ok(0o027),
+    );
 
     // One sighand for CLONE_SIGHAND.
     default_action(SIGUSR2);
@@ -931,7 +949,11 @@ fn sharing(t: &mut T) {
         0,
     );
     t.eq("thread-inherits-mask-and-owns-it", th.join(), 3);
-    t.eq("main-mask-unchanged", mask_now() & bit(SIGUSR2), bit(SIGUSR2));
+    t.eq(
+        "main-mask-unchanged",
+        mask_now() & bit(SIGUSR2),
+        bit(SIGUSR2),
+    );
     procmask(2, 0);
     // The alternate stack is reset in a CLONE_VM child (`sas_ss_reset`), kept in main.
     let alt = super::mmap(0, 8192, 3, 0x22, usize::MAX, 0).unwrap_or(0);
@@ -1009,7 +1031,11 @@ fn delivery(t: &mut T) {
     nap(10);
     t.eq(
         "blocked-leader-passes-signal-to-thread",
-        (H_TID.load(SeqCst), H_COUNT.load(SeqCst), H_CODE.load(SeqCst)),
+        (
+            H_TID.load(SeqCst),
+            H_COUNT.load(SeqCst),
+            H_CODE.load(SeqCst),
+        ),
         (th.tid, 1, SI_USER),
     );
     set_and_wake(&GATE, 1);
@@ -1071,12 +1097,18 @@ fn delivery(t: &mut T) {
     let main_shared = pending_now();
     t.eq(
         "private-pending-is-the-threads",
-        (PENDING[0].load(SeqCst) as u64 & bit(SIGUSR2), main_private & bit(SIGUSR2)),
+        (
+            PENDING[0].load(SeqCst) as u64 & bit(SIGUSR2),
+            main_private & bit(SIGUSR2),
+        ),
         (bit(SIGUSR2), 0),
     );
     t.eq(
         "shared-pending-is-every-threads",
-        (PENDING[1].load(SeqCst) as u64 & bit(SIGUSR2), main_shared & bit(SIGUSR2)),
+        (
+            PENDING[1].load(SeqCst) as u64 & bit(SIGUSR2),
+            main_shared & bit(SIGUSR2),
+        ),
         (bit(SIGUSR2), bit(SIGUSR2)),
     );
     // The main thread unblocks first: it takes the shared signal. The thread then takes its own.
@@ -1127,12 +1159,20 @@ fn delivery(t: &mut T) {
     th.join();
     t.eq(
         "thread-sigwait-process-signal",
-        (WAITED[0].load(SeqCst), WAITED[1].load(SeqCst), WAITED[2].load(SeqCst)),
+        (
+            WAITED[0].load(SeqCst),
+            WAITED[1].load(SeqCst),
+            WAITED[2].load(SeqCst),
+        ),
         (SIGUSR1, SI_USER, me),
     );
     t.eq(
         "thread-sigwait-thread-signal",
-        (WAITED[3].load(SeqCst), WAITED[4].load(SeqCst), WAITED[5].load(SeqCst)),
+        (
+            WAITED[3].load(SeqCst),
+            WAITED[4].load(SeqCst),
+            WAITED[5].load(SeqCst),
+        ),
         (SIGUSR1, SI_TKILL, me),
     );
     t.eq("sigwait-consumed-the-signals", H_COUNT.load(SeqCst), 0);
@@ -1161,7 +1201,12 @@ fn delivery(t: &mut T) {
     th.join();
     t.eq(
         "sigchld-goes-to-the-forking-thread",
-        (H_COUNT.load(SeqCst), H_TID.load(SeqCst), H_CODE.load(SeqCst), H_PID.load(SeqCst)),
+        (
+            H_COUNT.load(SeqCst),
+            H_TID.load(SeqCst),
+            H_CODE.load(SeqCst),
+            H_PID.load(SeqCst),
+        ),
         (1, th.tid, 1, KID.load(SeqCst)),
     );
     default_action(SIGCHLD);
@@ -1196,7 +1241,11 @@ fn lifecycle(t: &mut T) {
         );
         sleep_forever()
     });
-    t.eq("exit-group-from-thread", wait4(sub as isize, 0), (Ok(sub), 9 << 8));
+    t.eq(
+        "exit-group-from-thread",
+        wait4(sub as isize, 0),
+        (Ok(sub), 9 << 8),
+    );
     t.eq("no-children-left", wait4(-1, WNOHANG).0, Err(Errno::ECHILD));
 
     // exit of the leader leaves a zombie that wait cannot reap until the last thread has gone;
@@ -1221,7 +1270,11 @@ fn lifecycle(t: &mut T) {
         exit_thread(7)
     });
     let _ = read_byte(a_r);
-    t.eq("zombie-leader-is-not-waitable", wait4(sub as isize, WNOHANG).0, Ok(0));
+    t.eq(
+        "zombie-leader-is-not-waitable",
+        wait4(sub as isize, WNOHANG).0,
+        Ok(0),
+    );
     write_byte(b_w);
     t.eq(
         "last-thread-sets-the-group-status",
@@ -1234,7 +1287,11 @@ fn lifecycle(t: &mut T) {
         th.join();
         exit_thread(7)
     });
-    t.eq("last-leader-sets-the-group-status", wait4(sub as isize, 0), (Ok(sub), 7 << 8));
+    t.eq(
+        "last-leader-sets-the-group-status",
+        wait4(sub as isize, 0),
+        (Ok(sub), 7 << 8),
+    );
     let _ = (close(a_r), close(a_w), close(b_r), close(b_w));
 
     // Fatal signals take the whole group down.
@@ -1244,7 +1301,11 @@ fn lifecycle(t: &mut T) {
         let _ = sys(Sysno::kill, &[getpid(), SIGTERM]);
         sleep_forever()
     });
-    t.eq("sigterm-ends-the-group", wait4(sub as isize, 0), (Ok(sub), SIGTERM as i32));
+    t.eq(
+        "sigterm-ends-the-group",
+        wait4(sub as isize, 0),
+        (Ok(sub), SIGTERM as i32),
+    );
     // Sent by a thread to a process whose leader blocks it: the thread takes it and the group dies.
     let sub = fork_child(|| {
         let _ = spawn(
@@ -1274,7 +1335,11 @@ fn lifecycle(t: &mut T) {
         );
         sleep_forever()
     });
-    t.eq("tgkill-sigkill-ends-the-group", wait4(sub as isize, 0), (Ok(sub), SIGKILL as i32));
+    t.eq(
+        "tgkill-sigkill-ends-the-group",
+        wait4(sub as isize, 0),
+        (Ok(sub), SIGKILL as i32),
+    );
     // A fault in a thread is delivered to that thread and its default action ends the group.
     let sub = fork_child(|| {
         let _ = spawn(sleeper, 0);
@@ -1289,7 +1354,11 @@ fn lifecycle(t: &mut T) {
         );
         sleep_forever()
     });
-    t.eq("sigsegv-in-a-thread-ends-the-group", wait4(sub as isize, 0), (Ok(sub), 11));
+    t.eq(
+        "sigsegv-in-a-thread-ends-the-group",
+        wait4(sub as isize, 0),
+        (Ok(sub), 11),
+    );
     // exit_group by the leader while threads are blocked in system calls.
     let sub = fork_child(|| {
         let _ = spawn(sleeper, 0);
@@ -1297,7 +1366,11 @@ fn lifecycle(t: &mut T) {
         nap(20);
         exit_group(4)
     });
-    t.eq("exit-group-from-leader", wait4(sub as isize, 0), (Ok(sub), 4 << 8));
+    t.eq(
+        "exit-group-from-leader",
+        wait4(sub as isize, 0),
+        (Ok(sub), 4 << 8),
+    );
 
     // execve from a thread that is not the leader: the others are gone, the thread has the
     // leader's pid, and the parent waits for the pid it knew.
@@ -1323,7 +1396,11 @@ fn lifecycle(t: &mut T) {
         );
         sleep_forever()
     });
-    t.eq("exec-from-a-thread", wait4(sub as isize, 0), (Ok(sub), 0x1f << 8));
+    t.eq(
+        "exec-from-a-thread",
+        wait4(sub as isize, 0),
+        (Ok(sub), 0x1f << 8),
+    );
 
     // Children belong to the group: a thread waits for the leader's child; with __WNOTHREAD it
     // cannot.
@@ -1376,7 +1453,11 @@ fn lifecycle(t: &mut T) {
                 let _ = read_byte(PIPES[0].load(SeqCst));
                 let me_ppid = sys(Sysno::getppid, &[]).unwrap_or(0);
                 // The group's pid is the parent's tgid whichever thread adopted it.
-                if me_ppid == PIPES[2].load(SeqCst) { 6 } else { 99 }
+                if me_ppid == PIPES[2].load(SeqCst) {
+                    6
+                } else {
+                    99
+                }
             });
             ADOPTED.store(kid, SeqCst);
             0
@@ -1413,7 +1494,8 @@ fn decimal(mut n: usize, out: &mut [u8; 24]) {
 pub fn image(argv: crate::Strings) -> ! {
     let number = |index: usize| {
         argv.iter().nth(index).map_or(0, |text| {
-            text.iter().fold(0usize, |n, d| n * 10 + usize::from(d - b'0'))
+            text.iter()
+                .fold(0usize, |n, d| n * 10 + usize::from(d - b'0'))
         })
     };
     let (old_pid, old_tid) = (number(2), number(3));
@@ -1482,8 +1564,16 @@ fn fpu(t: &mut T) {
         ok &= xmm3() == 0x1000_0000_0000_0000 | u64::from(round);
     }
     th.join();
-    t.eq("thread-starts-with-creators-fpu", FPU_RESULT[0].load(SeqCst), 1);
-    t.eq("thread-fpu-survives-switches", FPU_RESULT[1].load(SeqCst), 1);
+    t.eq(
+        "thread-starts-with-creators-fpu",
+        FPU_RESULT[0].load(SeqCst),
+        1,
+    );
+    t.eq(
+        "thread-fpu-survives-switches",
+        FPU_RESULT[1].load(SeqCst),
+        1,
+    );
     t.eq("main-fpu-survives-switches", usize::from(ok), 1);
     set_xmm3(0);
 }
@@ -1538,7 +1628,11 @@ fn stress(t: &mut T) {
         );
     }
     let sum: usize = all.iter().map(Thread::join).sum();
-    t.eq("mutex-keeps-every-update", TOTAL.load(SeqCst), THREADS * ITERATIONS);
+    t.eq(
+        "mutex-keeps-every-update",
+        TOTAL.load(SeqCst),
+        THREADS * ITERATIONS,
+    );
     t.eq("every-thread-ran-to-the-end", sum, THREADS * ITERATIONS);
     t.holds(
         "distinct-tids",
