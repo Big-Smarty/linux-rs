@@ -4,10 +4,10 @@ This document describes the **host structural audit**, not kernel qualification.
 
 ## Current state
 
-Observed 2026-10-21 by running `cargo +1.88.0 run -p xtask --locked --offline -- check` and `status` on the documentation change that wrote this section, based on `main` 9804570 (the Markdown and link counts include that change):
+What `cargo +1.88.0 run -p xtask --locked --offline -- check` and `status` report at the current commit is the structural-audit row of the [current status](implementation.md#current-status). What they leave out:
 
-- `check`: structural audit passed; 97,294 pinned upstream entries, 2,623 planned workstreams, 16 skills, 57 Markdown files, 2125 local file links checked, 23 vendored packages verified. Not validated: 690 external link destinations, 200 anchor-only links, all fragment anchors, signatures, semantic completeness, kernel execution or performance. (Fragment anchors are therefore the author's responsibility; a broken `#anchor` does not fail the audit.)
-- `status`: 36 `in_progress` and 2,587 `not_started`; priority totals P0 620, P1 544, P2 1,419, P3 40. These are routing counts, not a compatibility percentage ([routing table](implementation.md#routed-implementation-status)).
+- `check` does not validate external link destinations, anchor-only links, fragment anchors, signatures, semantic completeness, kernel execution or performance. (Fragment anchors are therefore the author's responsibility; a broken `#anchor` does not fail the audit.)
+- `status` prints routing counts (36 `in_progress` and 2,587 `not_started` at 9804570; priority totals P0 620, P1 544, P2 1,419, P3 40). They are routing counts, not a compatibility percentage ([routing table](implementation.md#routed-implementation-status)).
 - Everything under *Observed initial host integration evidence* and *Current integrated evidence and final gates* below is historical (the original setup revision and `integrated-004`; the 17, 20, 46, 51 and 55 test counts and the 5 or 6 `in_progress` rows are of those eras).
 
 ## Invocation and exit contract
