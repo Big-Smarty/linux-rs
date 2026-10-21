@@ -153,12 +153,25 @@ fn waiter(c: &'static super::threads::Control) -> usize {
 
 /// Starts waiter `i` on `uaddr` and gives it time to reach its sleep.
 fn begin(i: usize, uaddr: usize, op: usize, val: usize, val3: usize) -> Thread {
+    begin_timed(i, uaddr, op, val, val3, 0)
+}
+
+/// [`begin`] with a relative timeout (a pointer to a `timespec`, or 0): a wake-up that never
+/// comes ends the wait with `ETIMEDOUT` instead of hanging the group.
+fn begin_timed(
+    i: usize,
+    uaddr: usize,
+    op: usize,
+    val: usize,
+    val3: usize,
+    timeout: usize,
+) -> Thread {
     let s = &SLOTS[i];
     s.uaddr.store(uaddr, SeqCst);
     s.op.store(op, SeqCst);
     s.val.store(val, SeqCst);
     s.val3.store(val3, SeqCst);
-    s.timeout.store(0, SeqCst);
+    s.timeout.store(timeout, SeqCst);
     s.uaddr2.store(0, SeqCst);
     s.result.store(0, SeqCst);
     s.order.store(0, SeqCst);
@@ -221,6 +234,7 @@ pub fn run() -> bool {
     robust(&mut t);
     pi_arguments(&mut t);
     futex2(&mut t);
+    waitv_sleepers(&mut t);
     reap_all();
     t.finish()
 }
@@ -823,6 +837,32 @@ fn wake_op_checks(t: &mut T) {
         (side(5, 1, CMP_EQ, 0), word(10).load(SeqCst)),
         (Err(Errno::ENOSYS), 15),
     );
+    // `arch_futex_atomic_op_inuser` decides the operation before it touches the word: a private
+    // futex needs no mapping for its key, so the unmapped target is never read.
+    t.eq(
+        "wake-op-bad-operation-unmapped-target",
+        fx(
+            a,
+            FUTEX_WAKE_OP | PRIVATE,
+            0,
+            0,
+            FAR,
+            wake_op(5, 1, CMP_EQ, 0),
+        ),
+        Err(Errno::ENOSYS),
+    );
+    t.eq(
+        "wake-op-good-operation-unmapped-target",
+        fx(
+            a,
+            FUTEX_WAKE_OP | PRIVATE,
+            0,
+            0,
+            FAR,
+            wake_op(OP_SET, 1, CMP_EQ, 0),
+        ),
+        Err(Errno::EFAULT),
+    );
     t.eq(
         "wake-op-bad-comparison-after-the-operation",
         (side(OP_SET, 3, 6, 0), word(10).load(SeqCst)),
@@ -846,6 +886,7 @@ fn wake_op_checks(t: &mut T) {
 }
 
 fn keys(t: &mut T) {
+    shared_file_keys(t);
     let w = at(11);
     word(11).store(0, SeqCst);
     fresh();
@@ -875,6 +916,99 @@ fn keys(t: &mut T) {
         Ok(1),
     );
     finish(&[th]);
+}
+
+/// A shared futex on a page of a read-only file mapping is keyed by the inode and the page (and
+/// the offset in it), not by the open file description or the address: another open of the file,
+/// another mapping, another process find the same futex (`get_futex_key`: `i_seq`, `pgoff`).
+fn shared_file_keys(t: &mut T) {
+    let path = b"/futex-key\0";
+    let created = sys(Sysno::open, &[addr(path), 0o102, 0o600]).and_then(|fd| {
+        let sized = sys(Sysno::ftruncate, &[fd, PAGE]);
+        let _ = sys(Sysno::close, &[fd]);
+        sized
+    });
+    t.eq("shared-file-created", created, Ok(0));
+    // A fresh description and a fresh read-only mapping of the file's first page.
+    let map = |flags: usize| -> usize {
+        let fd = sys(Sysno::open, &[addr(path), 0, 0]).unwrap_or(usize::MAX);
+        let mapped = super::mmap(0, PAGE, 1, flags, fd, 0).unwrap_or(0);
+        let _ = sys(Sysno::close, &[fd]);
+        mapped
+    };
+    const SHARED: usize = 1;
+    const PRIVATE_MAP: usize = 2;
+    let (a, b, c) = (map(SHARED), map(SHARED), map(PRIVATE_MAP));
+    t.holds(
+        "shared-file-mapped",
+        a != 0 && b != 0 && c != 0 && a != b,
+        (a, b, c),
+        "three mappings",
+    );
+    static LIMIT: [i64; 2] = [3, 0];
+    let limit = addr(&LIMIT);
+    fresh();
+    let th = begin_timed(0, a, FUTEX_WAIT, 0, 0, limit);
+    t.eq(
+        "shared-file-other-offset-is-another-futex",
+        fx(b + 4, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(0),
+    );
+    t.eq(
+        "shared-file-wake-through-another-open-and-mapping",
+        fx(b, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(1),
+    );
+    settle();
+    t.eq(
+        "shared-file-waiter-returned",
+        (done(0), result(0)),
+        (true, 0),
+    );
+    finish(&[th]);
+    fresh();
+    let th = begin_timed(0, b, FUTEX_WAIT, 0, 0, limit);
+    t.eq(
+        "shared-file-wake-through-a-private-read-only-mapping",
+        fx(c, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(1),
+    );
+    settle();
+    finish(&[th]);
+    fresh();
+    let th = begin_timed(0, c, FUTEX_WAIT | PRIVATE, 0, 0, limit);
+    t.eq(
+        "private-flag-ignores-the-file",
+        fx(a, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(0),
+    );
+    t.eq(
+        "private-wake-on-the-private-mapping",
+        fx(c, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
+        Ok(1),
+    );
+    finish(&[th]);
+    // Across processes: the child opens and maps the file itself.
+    let kid = super::proc::spawn(|| {
+        let m = map(SHARED);
+        let limit = [3i64, 0];
+        usize::from(fx(m, FUTEX_WAIT, 0, addr(&limit), 0, 0) == Ok(0))
+    });
+    nap(60);
+    t.eq(
+        "shared-file-wake-across-processes",
+        fx(a, FUTEX_WAKE, 1, 0, 0, 0),
+        Ok(1),
+    );
+    t.eq(
+        "shared-file-waiter-process-returned",
+        super::proc::wait4(kid as isize, 0),
+        (Ok(kid), 1 << 8),
+    );
+    let _ = sys(Sysno::munmap, &[a, PAGE]);
+    let _ = sys(Sysno::munmap, &[b, PAGE]);
+    let _ = sys(Sysno::munmap, &[c, PAGE]);
+    let _ = sys(Sysno::unlink, &[addr(path)]);
 }
 
 fn handler_flags(flags: u64) {
@@ -1257,12 +1391,130 @@ fn pi_arguments(t: &mut T) {
         fx(w, FUTEX_WAIT_REQUEUE_PI, 0, 0, w, 0),
         Err(Errno::EINVAL),
     );
+    // `do_futex` passes FUTEX_BITSET_MATCH_ANY, whatever val3 says; then the key of uaddr2, and
+    // `futex_wait_setup` on uaddr: key, word, value.
+    let w2 = at(31);
+    word(31).store(0, SeqCst);
+    t.eq(
+        "wait-requeue-pi-value-mismatch-val3-zero",
+        fx(w, FUTEX_WAIT_REQUEUE_PI | PRIVATE, 1, 0, w2, 0),
+        Err(Errno::EAGAIN),
+    );
+    t.eq(
+        "wait-requeue-pi-value-mismatch-val3-set",
+        fx(w, FUTEX_WAIT_REQUEUE_PI | PRIVATE, 1, 0, w2, 5),
+        Err(Errno::EAGAIN),
+    );
+    t.eq(
+        "wait-requeue-pi-unaligned-second",
+        fx(w, FUTEX_WAIT_REQUEUE_PI | PRIVATE, 1, 0, w2 + 1, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "wait-requeue-pi-unaligned-first",
+        fx(w + 2, FUTEX_WAIT_REQUEUE_PI | PRIVATE, 0, 0, w2, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "wait-requeue-pi-second-key-is-built-first",
+        fx(w + 2, FUTEX_WAIT_REQUEUE_PI, 0, 0, FAR, 0),
+        Err(Errno::EFAULT),
+    );
+    t.eq(
+        "wait-requeue-pi-first-unmapped",
+        fx(FAR, FUTEX_WAIT_REQUEUE_PI | PRIVATE, 0, 0, w2, 0),
+        Err(Errno::EFAULT),
+    );
+    t.eq(
+        "wait-requeue-pi-second-unmapped-shared",
+        fx(w, FUTEX_WAIT_REQUEUE_PI, 1, 0, FAR, 0),
+        Err(Errno::EFAULT),
+    );
+    t.eq(
+        "wait-requeue-pi-second-unmapped-private-is-not-looked-at",
+        fx(w, FUTEX_WAIT_REQUEUE_PI | PRIVATE, 1, 0, FAR, 0),
+        Err(Errno::EAGAIN),
+    );
+    t.eq(
+        "wait-requeue-pi-kernel-address",
+        fx(w, FUTEX_WAIT_REQUEUE_PI | PRIVATE, 1, 0, BAD, 0),
+        Err(Errno::EFAULT),
+    );
+    trylock_of_a_held_lock(t);
     t.eq(
         "cmp-requeue-pi-same-word",
         fx(w, FUTEX_CMP_REQUEUE_PI, 1, 1, w, 0),
         Err(Errno::EINVAL),
     );
 }
+
+/// `FUTEX_TRYLOCK_PI` on a lock another task holds does not wait: `-EWOULDBLOCK` once the
+/// `pi_state` is attached, or `-ESRCH` when the owner is gone, with the waiters bit set either
+/// way.
+fn trylock_of_a_held_lock(t: &mut T) {
+    let w = at(30);
+    let waiters = 0x8000_0000u32;
+    static HOLD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    HOLD.store(0, SeqCst);
+    READY_HOLDER.store(0, SeqCst);
+    let holder = spawn(
+        |_| {
+            set_and_wake(&READY_HOLDER, 1);
+            wait_for(&HOLD, 1);
+            0
+        },
+        0,
+    );
+    wait_for(&READY_HOLDER, 1);
+    word(30).store(holder.tid as u32, SeqCst);
+    t.eq(
+        "trylock-pi-held-by-a-thread",
+        (
+            fx(w, FUTEX_TRYLOCK_PI | PRIVATE, 0, 0, 0, 0),
+            word(30).load(SeqCst),
+        ),
+        (Err(Errno::EAGAIN), holder.tid as u32 | waiters),
+    );
+    t.eq(
+        "trylock-pi-held-by-a-thread-shared-key",
+        (fx(w, FUTEX_TRYLOCK_PI, 0, 0, 0, 0), word(30).load(SeqCst)),
+        (Err(Errno::EAGAIN), holder.tid as u32 | waiters),
+    );
+    // `futex_unlock_pi` by a task that is not the owner.
+    t.eq(
+        "unlock-pi-held-by-a-thread",
+        fx(w, FUTEX_UNLOCK_PI | PRIVATE, 0, 0, 0, 0),
+        Err(Errno::EPERM),
+    );
+    set_and_wake(&HOLD, 1);
+    holder.join();
+    // A finished thread's tid is gone: ESRCH.
+    word(30).store(holder.tid as u32, SeqCst);
+    t.eq(
+        "trylock-pi-held-by-a-gone-thread",
+        (
+            fx(w, FUTEX_TRYLOCK_PI | PRIVATE, 0, 0, 0, 0),
+            word(30).load(SeqCst),
+        ),
+        (Err(Errno::ESRCH), holder.tid as u32 | waiters),
+    );
+    // A process that exited and is not yet reaped is a zombie: handle_exit_race gives ESRCH.
+    let kid = super::proc::spawn(|| 0);
+    nap(30);
+    word(30).store(kid as u32, SeqCst);
+    t.eq(
+        "trylock-pi-held-by-a-zombie",
+        (
+            fx(w, FUTEX_TRYLOCK_PI | PRIVATE, 0, 0, 0, 0),
+            word(30).load(SeqCst),
+        ),
+        (Err(Errno::ESRCH), kid as u32 | waiters),
+    );
+    reap_all();
+    word(30).store(0, SeqCst);
+}
+
+static READY_HOLDER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // ---- futex2 --------------------------------------------------------------------------------
 
@@ -1508,4 +1760,137 @@ fn futex2(t: &mut T) {
         requeue(&pair, 0, usize::MAX >> 32, 1),
         Err(Errno::EINVAL),
     );
+}
+
+// ---- futex_waitv sleepers --------------------------------------------------------------------
+
+/// The entries a sleeping `futex_waitv` thread passes: 128 `struct futex_waitv` of three
+/// 64-bit words each (`val`, `uaddr`, `flags` and the reserved word).
+static WAITV: [core::sync::atomic::AtomicU64; 3 * 128] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 3 * 128];
+static WAITV_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn waitv_waiter(c: &'static super::threads::Control) -> usize {
+    let s = &SLOTS[c.arg];
+    let r = sys(
+        Sysno::futex_waitv,
+        &[
+            addr(&WAITV),
+            WAITV_COUNT.load(SeqCst),
+            0,
+            s.timeout.load(SeqCst),
+            MONOTONIC,
+        ],
+    );
+    s.result.store(encode(r), SeqCst);
+    s.order.store(ORDER.fetch_add(1, SeqCst) + 1, SeqCst);
+    set_and_wake(&s.done, 1);
+    0
+}
+
+/// Starts a `futex_waitv` thread on the first `n` of `words` (index = position).
+fn begin_waitv(i: usize, words: &[usize], timeout: usize) -> Thread {
+    for (k, &uaddr) in words.iter().enumerate() {
+        WAITV[3 * k].store(0, SeqCst);
+        WAITV[3 * k + 1].store(uaddr as u64, SeqCst);
+        WAITV[3 * k + 2].store(u64::from(FUTEX2_U32 | FUTEX2_PRIVATE), SeqCst);
+    }
+    WAITV_COUNT.store(words.len(), SeqCst);
+    let s = &SLOTS[i];
+    s.timeout.store(timeout, SeqCst);
+    s.result.store(0, SeqCst);
+    s.order.store(0, SeqCst);
+    s.done.store(0, SeqCst);
+    let th = spawn(waitv_waiter, i);
+    nap(10);
+    th
+}
+
+/// What a sleeping `futex_waitv` reports: the index of an entry that was woken, the highest of
+/// them when several were before it ran (`futex_unqueue_multiple`), and its entries do not take
+/// the queue room that other tasks' plain waits need.
+fn waitv_sleepers(t: &mut T) {
+    static LIMIT: [i64; 2] = [3, 0];
+    let limit = addr(&LIMIT);
+    let (a, b) = (at(60), at(61));
+    word(60).store(0, SeqCst);
+    word(61).store(0, SeqCst);
+    fresh();
+    let th = begin_waitv(0, &[a, b], limit);
+    t.eq(
+        "waitv-woken-index-is-returned",
+        fx(b, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
+        Ok(1),
+    );
+    settle();
+    t.eq("waitv-sleeper-returned-the-index", result(0), 1);
+    finish(&[th]);
+    fresh();
+    let th = begin_waitv(0, &[a, b], limit);
+    t.eq(
+        "waitv-first-entry-index",
+        fx(a, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
+        Ok(1),
+    );
+    settle();
+    t.eq("waitv-sleeper-returned-index-zero", result(0), 0);
+    finish(&[th]);
+    // Two entries woken by one call before the sleeper runs: the highest index, whichever was
+    // woken last.
+    for (name, first, second) in [
+        ("waitv-highest-index-woken-first", b, a),
+        ("waitv-highest-index-woken-last", a, b),
+    ] {
+        fresh();
+        let th = begin_waitv(0, &[a, b], limit);
+        t.eq(
+            name,
+            fx(
+                first,
+                FUTEX_WAKE_OP | PRIVATE,
+                1,
+                1,
+                second,
+                wake_op(OP_SET, 0, CMP_EQ, 0),
+            ),
+            Ok(2),
+        );
+        settle();
+        t.eq(format_args!("{name}-index"), result(0), 1);
+        finish(&[th]);
+    }
+    // 128 entries and plain waiters beside them.
+    let words: [usize; 128] = core::array::from_fn(|k| at(100 + k));
+    for k in 0..128 {
+        word(100 + k).store(0, SeqCst);
+    }
+    let (p, q) = (at(70), at(71));
+    word(70).store(0, SeqCst);
+    word(71).store(0, SeqCst);
+    fresh();
+    let big = begin_waitv(0, &words, limit);
+    let ths = [
+        begin_timed(1, p, FUTEX_WAIT | PRIVATE, 0, 0, limit),
+        begin_timed(2, q, FUTEX_WAIT | PRIVATE, 0, 0, limit),
+    ];
+    t.eq(
+        "waitv-128-entries-wake-the-last",
+        fx(words[127], FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
+        Ok(1),
+    );
+    t.eq(
+        "waitv-128-entries-beside-plain-waiters",
+        (
+            fx(p, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
+            fx(q, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
+        ),
+        (Ok(1), Ok(1)),
+    );
+    settle();
+    t.eq(
+        "waitv-128-entries-results",
+        (result(0), result(1), result(2)),
+        (127, 0, 0),
+    );
+    finish(&[big, ths[0], ths[1]]);
 }

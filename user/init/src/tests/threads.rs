@@ -50,7 +50,7 @@ const WUNTRACED: usize = 2;
 const WCONTINUED: usize = 8;
 
 use super::proc::{
-    BAD, SIGCHLD, SIGKILL, SIGTERM, SIGUSR1, SIGUSR2, WNOHANG, nap, reap_all, wait4,
+    BAD, SIGCHLD, SIGHUP, SIGKILL, SIGTERM, SIGUSR1, SIGUSR2, WNOHANG, nap, reap_all, wait4,
 };
 use super::proc::{sigaction, spawn as fork_child};
 use super::signal::{KSigaction, SA_SIGINFO, bit};
@@ -482,6 +482,7 @@ pub fn run() -> bool {
     fpu(&mut t);
     cpu_time(&mut t);
     stress(&mut t);
+    group_wide(&mut t);
     reap_all();
     t.finish()
 }
@@ -1795,4 +1796,412 @@ fn cpu_time(t: &mut T) {
         ticks() - ticks_before,
         "at least 3 ticks of 10 ms",
     );
+}
+
+// ---- what a thread sees of the group ------------------------------------------------------
+
+/// Bit `n` of a subject's exit status: whether `cond` held in the subject.
+fn flag(n: u32, cond: bool) -> usize {
+    usize::from(cond) << n
+}
+
+const SIGALRM: usize = 14;
+
+/// `kill(-1)`, `setpgid`, `setsid`, an orphaned group whose leader is a zombie, `ITIMER_REAL`,
+/// the CPU clocks and the resource limits, each used from a thread of a group. Linux 6.18.57:
+/// `kernel/signal.c` (`kill_something_info`, `complete_signal`), `kernel/sys.c` (`do_setpgid`,
+/// `ksys_setsid`, `do_prlimit`), `kernel/exit.c` (`kill_orphaned_pgrp`, `reparent_leader`),
+/// `kernel/time/itimer.c` (`it_real_fn`), `kernel/time/posix-cpu-timers.c` (`pid_for_clock`).
+fn group_wide(t: &mut T) {
+    kill_all_from_a_thread(t);
+    process_groups_and_sessions(t);
+    orphaned_group_with_a_zombie_leader(t);
+    real_timer_goes_to_the_leader(t);
+    cpu_clock_ids(t);
+    resource_limits(t);
+}
+
+/// `kill(-1)` skips init and every task of the caller's own thread group, not only the caller.
+fn kill_all_from_a_thread(t: &mut T) {
+    reap_all();
+    let victim = fork_child(|| {
+        let _ = sys(Sysno::pause, &[]);
+        0
+    });
+    let sender = fork_child(|| {
+        static SENT: AtomicUsize = AtomicUsize::new(usize::MAX);
+        let th = spawn(
+            |_| {
+                SENT.store(raw_errno(sys(Sysno::kill, &[usize::MAX, SIGKILL])), SeqCst);
+                0
+            },
+            0,
+        );
+        th.join();
+        flag(0, SENT.load(SeqCst) == 0)
+    });
+    t.eq(
+        "kill-all-from-a-thread-spares-its-own-group",
+        wait4(sender as isize, 0),
+        (Ok(sender), 1 << 8),
+    );
+    t.eq(
+        "kill-all-from-a-thread-reaches-the-others",
+        wait4(victim as isize, 0),
+        (Ok(victim), SIGKILL as i32),
+    );
+    reap_all();
+}
+
+/// `setpgid` names a thread group leader; `setsid` makes the whole group a session.
+fn process_groups_and_sessions(t: &mut T) {
+    reap_all();
+    static R: [AtomicUsize; 6] = [const { AtomicUsize::new(usize::MAX) }; 6];
+    let sub = fork_child(|| {
+        let th = spawn(
+            |_| {
+                // `setpgid`: pid 0 is the group leader; a thread's own tid is not a leader (`EINVAL`).
+                R[0].store(raw_errno(sys(Sysno::setpgid, &[gettid(), 0])), SeqCst);
+                R[1].store(raw_errno(sys(Sysno::setpgid, &[0, 0])), SeqCst);
+                R[2].store(sys(Sysno::getpgid, &[0]).unwrap_or(0), SeqCst);
+                R[3].store(
+                    raw_errno(sys(Sysno::setpgid, &[getpid(), getpid()])),
+                    SeqCst,
+                );
+                0
+            },
+            0,
+        );
+        th.join();
+        let me = getpid();
+        flag(0, R[0].load(SeqCst) == Errno::EINVAL.into_raw() as usize)
+            | flag(1, R[1].load(SeqCst) == 0)
+            | flag(2, R[2].load(SeqCst) == me)
+            | flag(3, R[3].load(SeqCst) == 0)
+            | flag(4, sys(Sysno::getpgid, &[0]) == Ok(me))
+            | flag(5, sys(Sysno::getpgid, &[me]) == Ok(me))
+    });
+    t.eq(
+        "setpgid-from-a-thread",
+        wait4(sub as isize, 0),
+        (Ok(sub), 0x3f << 8),
+    );
+    let sub = fork_child(|| {
+        let th = spawn(
+            |_| {
+                R[0].store(sys(Sysno::setsid, &[]).unwrap_or(0), SeqCst);
+                R[1].store(sys(Sysno::getsid, &[0]).unwrap_or(0), SeqCst);
+                R[2].store(sys(Sysno::getpgid, &[0]).unwrap_or(0), SeqCst);
+                R[3].store(raw_errno(sys(Sysno::setsid, &[])), SeqCst);
+                R[4].store(raw_errno(sys(Sysno::setpgid, &[0, 0])), SeqCst);
+                0
+            },
+            0,
+        );
+        th.join();
+        let me = getpid();
+        let eperm = Errno::EPERM.into_raw() as usize;
+        flag(0, R[0].load(SeqCst) == me)
+            | flag(1, R[1].load(SeqCst) == me)
+            | flag(2, R[2].load(SeqCst) == me)
+            | flag(3, R[3].load(SeqCst) == eperm)
+            | flag(4, R[4].load(SeqCst) == eperm)
+            | flag(5, sys(Sysno::getsid, &[0]) == Ok(me))
+            | flag(6, sys(Sysno::getsid, &[me]) == Ok(me))
+    });
+    t.eq(
+        "setsid-from-a-thread",
+        wait4(sub as isize, 0),
+        (Ok(sub), 0x7f << 8),
+    );
+    reap_all();
+}
+
+/// A process group whose leader is a zombie with one stopped thread left is still a group with
+/// a stopped job: when its last link to the rest of the session exits, it gets `SIGHUP` and
+/// `SIGCONT` (`will_become_orphaned_pgrp` counts a zombie leader whose group is not empty).
+fn orphaned_group_with_a_zombie_leader(t: &mut T) {
+    reap_all();
+    let (r, w) = pipe();
+    PIPES[0].store(r, SeqCst);
+    PIPES[1].store(w, SeqCst);
+    let middle = fork_child(|| {
+        // The session of the subject; the subject's parent is outside the subject's group.
+        let _ = sys(Sysno::setsid, &[]);
+        let _ = fork_child(|| {
+            let _ = sys(Sysno::setpgid, &[0, 0]);
+            install(SIGHUP);
+            forget();
+            LEADER_WORD.store(1, SeqCst);
+            let _ = sys(Sysno::set_tid_address, &[addr(&LEADER_WORD)]);
+            let _ = spawn(
+                |_| {
+                    // The leader's exit clears and wakes its word; give it time to be a zombie.
+                    wait_for(&LEADER_WORD, 0);
+                    nap(20);
+                    write_byte(PIPES[1].load(SeqCst));
+                    let _ = sys(Sysno::kill, &[getpid(), SIGSTOP]);
+                    // Resumed by the SIGCONT that follows SIGHUP: the handler has run by now.
+                    let hup = H_COUNT.load(SeqCst) == 1 && H_SIG.load(SeqCst) == SIGHUP;
+                    exit_group(if hup { 77 } else { 78 })
+                },
+                0,
+            );
+            exit_thread(0)
+        });
+        // Wait until the subject's thread is about to stop, let it stop, then leave.
+        let _ = read_byte(PIPES[0].load(SeqCst));
+        nap(60);
+        0
+    });
+    t.eq(
+        "orphan-subject-parent-exits",
+        wait4(middle as isize, 0),
+        (Ok(middle), 0),
+    );
+    nap(80);
+    // The subject was reparented to init; it ran SIGHUP and then continued.
+    let (reaped, status) = wait4(-1, WNOHANG);
+    t.eq(
+        "orphaned-group-with-a-zombie-leader-is-hung-up",
+        (reaped.is_ok_and(|pid| pid > 0), status),
+        (true, 77 << 8),
+    );
+    let _ = (close(r), close(w));
+    if status != 77 << 8 {
+        // A subject that was not hung up is still stopped: do not leave it.
+        let _ = sys(Sysno::kill, &[usize::MAX, SIGKILL]);
+    }
+    reap_all();
+}
+
+/// `it_real_fn` sends `SIGALRM` to the group leader (`complete_signal` tries it first), whichever
+/// thread happens to run when the timer expires.
+fn real_timer_goes_to_the_leader(t: &mut T) {
+    const ITIMER_REAL: usize = 0;
+    install(SIGALRM);
+    forget();
+    READY.store(0, SeqCst);
+    GATE.store(0, SeqCst);
+    let me = gettid();
+    let th = spawn(
+        |_| {
+            // Keep entering and leaving the kernel while the leader sleeps (a clock read is
+            // a system call here: there is no vDSO), for at most two seconds.
+            set_and_wake(&READY, 1);
+            let mut ts = [0i64; 2];
+            let _ = sys(Sysno::clock_gettime, &[1, addr_mut(&mut ts)]);
+            let end = ts[0] + 2;
+            while GATE.load(SeqCst) == 0 && H_COUNT.load(SeqCst) == 0 && ts[0] < end {
+                let _ = sys(Sysno::clock_gettime, &[1, addr_mut(&mut ts)]);
+            }
+            0
+        },
+        0,
+    );
+    wait_for(&READY, 1);
+    // One shot after 40 ms.
+    let timer = [0i64, 0, 0, 40_000];
+    let _ = sys(Sysno::setitimer, &[ITIMER_REAL, addr(&timer), 0]);
+    let sleep = [2i64, 0];
+    let r = futex(&GATE, FUTEX_WAIT, 0, addr(&sleep), 0, 0);
+    set_and_wake(&GATE, 1);
+    th.join();
+    t.eq(
+        "itimer-interrupts-the-sleeping-leader",
+        r,
+        Err(Errno::EINTR),
+    );
+    t.eq(
+        "itimer-signal-is-handled-by-the-leader",
+        (H_TID.load(SeqCst), H_COUNT.load(SeqCst), H_SIG.load(SeqCst)),
+        (me, 1, SIGALRM),
+    );
+    default_action(SIGALRM);
+    forget();
+}
+
+/// `pid_for_clock`: a thread clock of any thread of the caller's group, a process clock of any
+/// process leader (or, to read, of the caller's own tid), and nothing else.
+fn cpu_clock_ids(t: &mut T) {
+    reap_all();
+    const SCHED: i32 = 2;
+    const PERTHREAD: i32 = 4;
+    const BURN_NS: u64 = 40_000_000;
+    fn id(pid: usize, thread: bool) -> usize {
+        // MAKE_PROCESS_CPUCLOCK / MAKE_THREAD_CPUCLOCK: ((~pid) << 3) | which, a 32-bit clockid.
+        let clock = ((!(pid as i32)) << 3) | SCHED | if thread { PERTHREAD } else { 0 };
+        clock as u32 as usize
+    }
+    fn read(clock: usize) -> Result<u64, Errno> {
+        let mut ts = [0i64; 2];
+        sys(Sysno::clock_gettime, &[clock, addr_mut(&mut ts)])
+            .map(|_| ts[0].cast_unsigned() * 1_000_000_000 + ts[1].cast_unsigned())
+    }
+    fn res(clock: usize) -> R {
+        let mut ts = [0i64; 2];
+        sys(Sysno::clock_getres, &[clock, addr_mut(&mut ts)])
+    }
+    static SIBLING: [AtomicUsize; 6] = [const { AtomicUsize::new(usize::MAX) }; 6];
+    static LEADER: AtomicUsize = AtomicUsize::new(0);
+    READY.store(0, SeqCst);
+    GATE.store(0, SeqCst);
+    LEADER.store(getpid(), SeqCst);
+    let kid = fork_child(|| {
+        let _ = sys(Sysno::pause, &[]);
+        0
+    });
+    let th = spawn(
+        |_| {
+            let start = read(id(0, true)).unwrap_or(0);
+            while read(id(0, true)).unwrap_or(0) - start < BURN_NS {}
+            set_and_wake(&READY, 1);
+            wait_for(&GATE, 1);
+            // From the sibling: its own tid names its group's clock to read, not to measure.
+            let (me, leader) = (gettid(), LEADER.load(SeqCst));
+            SIBLING[0].store(raw_errno(read(id(me, false)).map(|_| ())), SeqCst);
+            SIBLING[1].store(raw_errno(res(id(me, false)).map(|_| ())), SeqCst);
+            SIBLING[2].store(raw_errno(read(id(leader, false)).map(|_| ())), SeqCst);
+            SIBLING[3].store(raw_errno(read(id(leader, true)).map(|_| ())), SeqCst);
+            SIBLING[4].store(raw_errno(res(id(leader, true)).map(|_| ())), SeqCst);
+            0
+        },
+        0,
+    );
+    wait_for(&READY, 1);
+    let sibling = read(id(th.tid, true));
+    t.holds(
+        "sibling-thread-cpu-clock",
+        sibling.is_ok_and(|ns| ns >= BURN_NS),
+        sibling,
+        "the burned 40 ms",
+    );
+    t.eq(
+        "process-clock-of-a-non-leader-tid",
+        read(id(th.tid, false)).map(|_| ()),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "process-clock-of-the-callers-pid",
+        read(id(getpid(), false)).is_ok(),
+        true,
+    );
+    t.eq(
+        "process-clock-of-another-process",
+        read(id(kid, false)).is_ok(),
+        true,
+    );
+    t.eq(
+        "thread-clock-of-another-process",
+        read(id(kid, true)).map(|_| ()),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "thread-clock-of-a-missing-tid",
+        read(id(99_999, true)).map(|_| ()),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "getres-of-a-sibling-thread-clock",
+        res(id(th.tid, true)).is_ok(),
+        true,
+    );
+    set_and_wake(&GATE, 1);
+    th.join();
+    let einval = Errno::EINVAL.into_raw() as usize;
+    t.eq(
+        "sibling-reads-its-own-tid-as-a-process-clock",
+        SIBLING[0].load(SeqCst),
+        0,
+    );
+    t.eq(
+        "sibling-getres-of-its-own-tid-as-a-process-clock",
+        SIBLING[1].load(SeqCst),
+        einval,
+    );
+    t.eq(
+        "sibling-reads-the-leader-process-clock",
+        SIBLING[2].load(SeqCst),
+        0,
+    );
+    t.eq(
+        "sibling-reads-the-leader-thread-clock",
+        SIBLING[3].load(SeqCst),
+        0,
+    );
+    t.eq(
+        "sibling-getres-of-the-leader-thread-clock",
+        SIBLING[4].load(SeqCst),
+        0,
+    );
+    let _ = sys(Sysno::kill, &[kid, SIGKILL]);
+    reap_all();
+}
+
+/// `signal->rlim` belongs to the group: a thread's `setrlimit` is everyone's, a new process gets a
+/// copy.
+fn resource_limits(t: &mut T) {
+    const RLIMIT_CORE: usize = 4;
+    fn get(resource: usize) -> [u64; 2] {
+        let mut limit = [0u64; 2];
+        let _ = sys(Sysno::getrlimit, &[resource, addr_mut(&mut limit)]);
+        limit
+    }
+    fn set(resource: usize, limit: [u64; 2]) -> R {
+        sys(Sysno::setrlimit, &[resource, addr(&limit)])
+    }
+    let before = get(RLIMIT_CORE);
+    let th = spawn(
+        |_| {
+            usize::from(set(RLIMIT_CORE, [4096, 8192]).is_ok())
+                | usize::from(get(RLIMIT_CORE) == [4096, 8192]) << 1
+        },
+        0,
+    );
+    t.eq("thread-setrlimit-succeeds", th.join(), 3);
+    t.eq(
+        "thread-setrlimit-seen-by-main",
+        get(RLIMIT_CORE),
+        [4096, 8192],
+    );
+    // prlimit64 on the caller returns the group's old value and stores the new one.
+    static OLD: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+    let th = spawn(
+        |_| {
+            let (new, mut old) = ([1000u64, 8192], [0u64; 2]);
+            let r = sys(
+                Sysno::prlimit64,
+                &[0, RLIMIT_CORE, addr(&new), addr_mut(&mut old)],
+            );
+            OLD[0].store(old[0] as usize, SeqCst);
+            OLD[1].store(old[1] as usize, SeqCst);
+            usize::from(r.is_ok())
+        },
+        0,
+    );
+    t.eq("thread-prlimit64-succeeds", th.join(), 1);
+    t.eq(
+        "thread-prlimit64-returns-the-groups-old-value",
+        (OLD[0].load(SeqCst), OLD[1].load(SeqCst)),
+        (4096, 8192),
+    );
+    t.eq(
+        "thread-prlimit64-seen-by-main",
+        get(RLIMIT_CORE),
+        [1000, 8192],
+    );
+    // A process copies them at fork and then keeps its own.
+    let sub = fork_child(|| {
+        let inherited = get(RLIMIT_CORE) == [1000, 8192];
+        let th = spawn(|_| usize::from(set(RLIMIT_CORE, [7, 8]).is_ok()), 0);
+        let set_ok = th.join() == 1;
+        flag(0, inherited) | flag(1, set_ok) | flag(2, get(RLIMIT_CORE) == [7, 8])
+    });
+    t.eq(
+        "forked-process-copies-the-groups-limits",
+        wait4(sub as isize, 0),
+        (Ok(sub), 7 << 8),
+    );
+    t.eq("child-setrlimit-is-its-own", get(RLIMIT_CORE), [1000, 8192]);
+    let _ = set(RLIMIT_CORE, before);
 }
