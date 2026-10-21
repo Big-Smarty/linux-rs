@@ -316,12 +316,13 @@ fn initramfs_files(t: &mut T) {
     t.eq("lseek-end-minus", lseek(fd, -4, 2), Ok(size as usize - 4));
     t.eq("read-at-end-part", read(fd, &mut buf), Ok(4));
     t.eq("read-at-eof", read(fd, &mut buf), Ok(0));
-    t.eq("lseek-past-end", lseek(fd, 1 << 20, 0), Ok(1 << 20));
+    // Far beyond the file: the init binary of a larger build (the bare-metal suite's) passes 1 MiB.
+    t.eq("lseek-past-end", lseek(fd, 1 << 26, 0), Ok(1 << 26));
     t.eq("read-past-end", read(fd, &mut buf), Ok(0));
     t.eq("lseek-negative", lseek(fd, -1, 0), Err(Errno::EINVAL));
     t.eq(
         "lseek-negative-from-cur",
-        lseek(fd, -(1 << 21), 1),
+        lseek(fd, -(1 << 27), 1),
         Err(Errno::EINVAL),
     );
     t.eq("lseek-bad-whence", lseek(fd, 0, 7), Err(Errno::EINVAL));
