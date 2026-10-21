@@ -41,6 +41,7 @@ pub mod dynelf;
 mod dynsys;
 pub mod fork;
 pub mod fs;
+pub mod futex;
 pub mod ids;
 pub mod jobctl;
 pub mod mm;
@@ -50,6 +51,7 @@ pub mod proc;
 pub mod procfs;
 pub mod signal;
 pub mod smoke;
+pub mod threads;
 pub mod time;
 pub mod tty;
 pub mod ttyin;
@@ -383,6 +385,8 @@ pub fn run_mode(mode: &[u8]) -> bool {
         // (needs the generated `dynamic.cpio` module and, on the host, AVX-512): see `dynelf`.
         b"dynrun" => dynelf::run(),
         b"procfs" => procfs::run(),
+        b"threads" => threads::run(),
+        b"futex" => futex::run(),
         // Reference-only (the pinned Linux; this kernel has no `setuid` family): the permission
         // matrix of /proc. Prints `info` rows, no checks: see `procfs::perm_probe`.
         b"procperm" => {

@@ -335,6 +335,11 @@ fn run(stack: &Stack) {
     if stack.argv.iter().nth(1) == Some(b"procvfork".as_slice()) {
         tests::procfs::vfork::image();
     }
+    // The image of the `threads` group's `execve` from a non-leader thread: silent, exits with a
+    // bit per fact about its identity.
+    if stack.argv.iter().nth(1) == Some(b"thrimage".as_slice()) {
+        tests::threads::image(stack.argv);
+    }
     tests::xstate::set_minsigstksz(stack.find(AT_MINSIGSTKSZ).unwrap_or(0));
     out!("init: {stack:?}");
 
