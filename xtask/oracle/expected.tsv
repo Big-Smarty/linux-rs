@@ -4184,7 +4184,13 @@ threads	check	thread-prlimit64-seen-by-main	init: test threads.thread-prlimit64-
 threads	check	prlimit64-of-a-sibling-thread	init: test threads.prlimit64-of-a-sibling-thread ok
 threads	check	forked-process-copies-the-groups-limits	init: test threads.forked-process-copies-the-groups-limits ok
 threads	check	child-setrlimit-is-its-own	init: test threads.child-setrlimit-is-its-own ok
-threads	summary	-	init: tests threads passed=128 failed=0
+threads	check	thread-mremap-succeeds	init: test threads.thread-mremap-succeeds ok
+threads	check	thread-mremap-returns-the-new-address	init: test threads.thread-mremap-returns-the-new-address ok
+threads	check	thread-mremap-keeps-the-contents	init: test threads.thread-mremap-keeps-the-contents ok
+threads	check	thread-mremap-old-range-gone-in-main	init: test threads.thread-mremap-old-range-gone-in-main ok
+threads	check	thread-mremap-grown-page-usable	init: test threads.thread-mremap-grown-page-usable ok
+threads	check	thread-mremap-seen-by-a-sibling	init: test threads.thread-mremap-seen-by-a-sibling ok
+threads	summary	-	init: tests threads passed=134 failed=0
 futex	check	wait-value-mismatch	init: test futex.wait-value-mismatch ok
 futex	check	wait-value-mismatch-private	init: test futex.wait-value-mismatch-private ok
 futex	check	wait-null	init: test futex.wait-null ok

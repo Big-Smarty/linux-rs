@@ -1819,6 +1819,7 @@ fn group_wide(t: &mut T) {
     real_timer_goes_to_the_leader(t);
     cpu_clock_ids(t);
     resource_limits(t);
+    remap_in_a_thread(t);
 }
 
 /// `kill(-1)` skips init and every task of the caller's own thread group, not only the caller.
@@ -2229,4 +2230,59 @@ fn resource_limits(t: &mut T) {
     );
     t.eq("child-setrlimit-is-its-own", get(RLIMIT_CORE), [1000, 8192]);
     let _ = set(RLIMIT_CORE, before);
+}
+
+/// `mremap(2)` in a thread moves the mapping of the one `mm` the group shares: the page keeps
+/// its contents at the new address, the old range is unmapped for every thread, and a thread
+/// that was not the caller sees both.
+fn remap_in_a_thread(t: &mut T) {
+    const MREMAP_MAYMOVE_FIXED: usize = 3;
+    static MOVED: AtomicUsize = AtomicUsize::new(0);
+    let from = super::mmap(0, PAGE, 3, 0x22, usize::MAX, 0).unwrap_or(0);
+    let to = super::mmap(0, 2 * PAGE, 3, 0x22, usize::MAX, 0).unwrap_or(0);
+    poke(from, 0x77);
+    FDS[0].store(from, SeqCst);
+    FDS[1].store(to, SeqCst);
+    let th = spawn(
+        |_| {
+            let r = sys(
+                Sysno::mremap,
+                &[
+                    FDS[0].load(SeqCst),
+                    PAGE,
+                    2 * PAGE,
+                    MREMAP_MAYMOVE_FIXED,
+                    FDS[1].load(SeqCst),
+                ],
+            );
+            MOVED.store(r.unwrap_or(0), SeqCst);
+            usize::from(r.is_ok())
+        },
+        0,
+    );
+    t.eq("thread-mremap-succeeds", th.join(), 1);
+    t.eq(
+        "thread-mremap-returns-the-new-address",
+        MOVED.load(SeqCst),
+        to,
+    );
+    t.eq("thread-mremap-keeps-the-contents", peek(to), 0x77);
+    t.eq(
+        "thread-mremap-old-range-gone-in-main",
+        sys(Sysno::madvise, &[from, PAGE, 0]),
+        Err(Errno::ENOMEM),
+    );
+    poke(to + PAGE, 0x33);
+    t.eq("thread-mremap-grown-page-usable", peek(to + PAGE), 0x33);
+    // A thread that was not the caller sees the move as well.
+    let reader = spawn(
+        |_| {
+            let at = FDS[1].load(SeqCst);
+            usize::from(peek(at) == 0x77)
+                | usize::from(sys(Sysno::madvise, &[FDS[0].load(SeqCst), PAGE, 0]).is_err()) << 1
+        },
+        0,
+    );
+    t.eq("thread-mremap-seen-by-a-sibling", reader.join(), 3);
+    let _ = sys(Sysno::munmap, &[to, 2 * PAGE]);
 }
