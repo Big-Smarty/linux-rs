@@ -85,13 +85,15 @@ const DEFAULT_PAUSE_MS: usize = 6000;
 /// slow framebuffer should not come near this.
 const DEFAULT_TIMEOUT_S: u64 = 120;
 /// Groups that sleep on the monotonic clock and so cannot run without it.
-const NEEDS_CLOCK: [&str; 7] = ["time", "signal", "fork", "proc", "jobctl", "pipe", "xstate"];
+const NEEDS_CLOCK: [&str; 9] = [
+    "time", "signal", "fork", "proc", "jobctl", "pipe", "xstate", "procfs", "busybox",
+];
 const CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_PROOFS: usize = 40;
 /// Inventory facts the summary repeats: cpu, memory, platform, time, display, pci, adapters.
 const KEYS: usize = 7;
 const NONE: usize = usize::MAX;
-const MAX_GROUPS: usize = 12;
+const MAX_GROUPS: usize = 16;
 /// Extra `suite_groups=` words of the QEMU harness: `/init` modes that end a
 /// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not; a
 /// loop that never ends; the same loop in a child while init waits for it, so the time bound
@@ -290,8 +292,9 @@ enum Cause {
     TimedOut,
     /// Not run: it needs the monotonic clock and `timer::init` failed.
     NoClock,
-    /// Not run: the CPU lacks a feature the group needs, or has AMX state it does not cover
-    /// (neither a pass nor a failure); the text completes "the CPU has ...".
+    /// Not run: the CPU lacks a feature the group needs, has AMX state it does not cover, or the
+    /// stick has no BusyBox module (neither a pass nor a failure); the text is the whole reason
+    /// ("the CPU has no avx512f", "no busybox module ...").
     Unavailable(&'static str),
 }
 
@@ -306,9 +309,7 @@ impl Cause {
             Self::Stopped => Text::from_args(format_args!("kernel stop")),
             Self::TimedOut => Text::from_args(format_args!("timeout")),
             Self::NoClock => Text::from_args(format_args!("skipped, no clock")),
-            Self::Unavailable(reason) => {
-                Text::from_args(format_args!("unavailable on this CPU: {reason}"))
-            }
+            Self::Unavailable(reason) => Text::from_args(format_args!("unavailable: {reason}")),
         }
     }
 }
@@ -842,62 +843,89 @@ fn finish_group() {
     ktask::reset_group();
 }
 
-/// Why this CPU cannot run `group`, or `None`: the first CPU feature it lacks (`no <flag>`), or AMX
-/// where the recorded rows assume none. Only `xstate` has needs: it reads and writes the AVX-512
-/// registers and the protection-key register, and checks the `XSAVE` frame that holds them.
+/// The first of `needs` whose condition is false: the group's reason to be unavailable.
+fn first_missing(needs: &[(&'static str, bool)]) -> Option<&'static str> {
+    needs
+        .iter()
+        .find(|(_, present)| !present)
+        .map(|(reason, _)| *reason)
+}
+
+/// Why this machine cannot run `group`, or `None`: the first CPU feature it lacks (`the CPU has no
+/// <flag>`), AMX where the recorded rows assume none, or (`busybox`) a stick without the BusyBox
+/// module. Only two groups have needs, both because of what their `/init` executes:
+/// * `xstate` reads and writes the AVX-512 registers and the protection-key register, and checks
+///   the `XSAVE` frame that holds them;
+/// * `busybox` runs the host's BusyBox, a static x86-64-v4 program (`xtask`'s
+///   `fixture::BUSYBOX_CPU_FLAGS`): AVX-512 F/BW/CD/DQ/VL on an OS that saves the ZMM state
+///   (`XSAVE`), and `getrandom` draws on the CPU's generator (`hw_random_u64`: `RDSEED` or `RDRAND`,
+///   a CPU with neither stops loudly, there is no CRNG). Its program and data files are the second
+///   Limine module, which `xtask baremetal-suite` adds only for the exact program the rows were
+///   recorded with; without it the group would fail with `/bin/busybox` missing, which is no
+///   result about this kernel.
+///
 /// (`/init` of every other group runs on any x86-64 CPU.)
 fn unavailable_reason(group: &str) -> Option<&'static str> {
-    if group != "xstate" {
+    if group != "xstate" && group != "busybox" {
         return None;
     }
     let cpuid = CpuId::new();
     let basic = cpuid.get_feature_info();
     let extended = cpuid.get_extended_feature_info();
-    let missing = [
+    let ext = |has: fn(&ExtendedFeatures) -> bool| extended.as_ref().is_some_and(has);
+    let xsave = basic.as_ref().is_some_and(FeatureInfo::has_xsave);
+    if group == "busybox" {
+        let random = basic.as_ref().is_some_and(FeatureInfo::has_rdrand)
+            || ext(ExtendedFeatures::has_rdseed);
+        return first_missing(&[
+            (
+                "no busybox module on the stick (no matching host program)",
+                ARCHIVES.lock().len() > 1,
+            ),
+            ("the CPU has no xsave", xsave),
+            ("the CPU has no avx512f", ext(ExtendedFeatures::has_avx512f)),
+            (
+                "the CPU has no avx512bw",
+                ext(ExtendedFeatures::has_avx512bw),
+            ),
+            (
+                "the CPU has no avx512cd",
+                ext(ExtendedFeatures::has_avx512cd),
+            ),
+            (
+                "the CPU has no avx512dq",
+                ext(ExtendedFeatures::has_avx512dq),
+            ),
+            (
+                "the CPU has no avx512vl",
+                ext(ExtendedFeatures::has_avx512vl),
+            ),
+            ("the CPU has no rdseed or rdrand", random),
+        ]);
+    }
+    first_missing(&[
+        ("the CPU has no xsave", xsave),
+        ("the CPU has no avx512f", ext(ExtendedFeatures::has_avx512f)),
         (
-            "no xsave",
-            basic.as_ref().is_some_and(FeatureInfo::has_xsave),
+            "the CPU has no avx512bw",
+            ext(ExtendedFeatures::has_avx512bw),
         ),
         (
-            "no avx512f",
-            extended.as_ref().is_some_and(ExtendedFeatures::has_avx512f),
+            "the CPU has no avx512dq",
+            ext(ExtendedFeatures::has_avx512dq),
         ),
         (
-            "no avx512bw",
-            extended
-                .as_ref()
-                .is_some_and(ExtendedFeatures::has_avx512bw),
+            "the CPU has no avx512vl",
+            ext(ExtendedFeatures::has_avx512vl),
         ),
-        (
-            "no avx512dq",
-            extended
-                .as_ref()
-                .is_some_and(ExtendedFeatures::has_avx512dq),
-        ),
-        (
-            "no avx512vl",
-            extended
-                .as_ref()
-                .is_some_and(ExtendedFeatures::has_avx512vl),
-        ),
-        (
-            "no pku",
-            extended.as_ref().is_some_and(ExtendedFeatures::has_pku),
-        ),
-    ];
-    missing
-        .into_iter()
-        .find(|(_, present)| !present)
-        .map(|(reason, _)| reason)
-        // The recorded rows (`req-perm-17`, `req-perm-18`: `EOPNOTSUPP`) are Linux's answers on a
-        // CPU without AMX; with AMX Linux grants the tile-data permission and this kernel stops
-        // loudly (`xstate::Config::amx`). Neither is a result this group can compare.
-        .or_else(|| {
-            extended
-                .as_ref()
-                .is_some_and(ExtendedFeatures::has_amx_tile)
-                .then_some("AMX tile state (not covered)")
-        })
+        ("the CPU has no pku", ext(ExtendedFeatures::has_pku)),
+    ])
+    // The recorded rows (`req-perm-17`, `req-perm-18`: `EOPNOTSUPP`) are Linux's answers on a
+    // CPU without AMX; with AMX Linux grants the tile-data permission and this kernel stops
+    // loudly (`xstate::Config::amx`). Neither is a result this group can compare.
+    .or_else(|| {
+        ext(ExtendedFeatures::has_amx_tile).then_some("the CPU has AMX tile state (not covered)")
+    })
 }
 
 fn start_next() -> ! {
@@ -908,7 +936,7 @@ fn start_next() -> ! {
             summary(None)
         };
         if let Some(reason) = unavailable_reason(group) {
-            log!("SUITE group {} not run: the CPU has {}\n", group, reason);
+            log!("SUITE group {} not run: {}\n", group, reason);
             let run = GroupRun {
                 cause: Cause::Unavailable(reason),
                 report: None,
@@ -1166,7 +1194,7 @@ fn summary(abort: Option<Text>) -> ! {
             proofs
         ),
         None if ok => log!(
-            "RESULT: ALL PASS ({} groups, {} unavailable on this CPU, {} self-tests)\n",
+            "RESULT: ALL PASS ({} groups, {} unavailable, {} self-tests)\n",
             groups_passed,
             groups_unavailable,
             proofs
