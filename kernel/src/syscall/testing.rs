@@ -14,7 +14,7 @@ use crate::{
     signal::{
         self, SIGALRM, SIGUSR1, SIGUSR2, State, frame::Sigreturn, info::SigInfo, state::Target,
     },
-    task::{Attributes, TaskId, Tasklist, exit::NoWake, fork::ForkRequest, tasklist::ForkParams},
+    task::{Attributes, TaskId, Tasklist, exit::NoWake, fork::ForkRequest},
     usercopy::{UserPages, fake::Space},
     futex::{FutexWaker, Futexes},
     vfs::{FdTable, FileId, FsStruct, Timespec, Vfs},
@@ -420,10 +420,16 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
         ))
     }
     fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, syscalls::Errno> {
-        let params = ForkParams::of(&self.attrs, request);
-        let child = self.tasks.fork(self.current, params)?;
+        let child = self.tasks.clone_task(
+            self.current,
+            crate::task::tasklist::CloneParams::of(&self.attrs, request),
+        )?;
         self.forked.push(*request);
-        Ok(self.tasks.task_pid_vnr(child))
+        let pid = self.tasks.task_pid_vnr(child);
+        if request.parent_settid != 0 {
+            let _ = crate::usercopy::put_user(self, request.parent_settid, &pid.to_le_bytes());
+        }
+        Ok(pid)
     }
 }
 

@@ -1883,3 +1883,40 @@ fn a_group_stop_waits_for_every_thread_before_the_parent_is_told() {
     .unwrap();
     assert_eq!(w.stopped_wakes.len(), 2);
 }
+
+#[test]
+fn unshare_sighand_copies_only_what_others_still_share() {
+    let (mut l, init, c, _) = group(0);
+    // A process that shares its dispositions with another process (CLONE_SIGHAND, no thread).
+    let sharer = l
+        .clone_task(
+            c,
+            CloneParams {
+                fork: FORK,
+                thread: false,
+                share_sighand: true,
+                reset_altstack: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(l.sighand_users(c), 2);
+    l.signal_state(sharer).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+    assert_eq!(
+        l.signal_state(c).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler,
+        0x1000
+    );
+    l.unshare_sighand(sharer).unwrap();
+    assert_eq!((l.sighand_users(c), l.sighand_users(sharer)), (1, 1));
+    l.signal_state(sharer).unwrap().hand.flush();
+    assert_eq!(
+        l.signal_state(c).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler,
+        0x1000,
+        "the other process keeps its own"
+    );
+    // Not shared: nothing happens.
+    l.unshare_sighand(init).unwrap();
+    assert_eq!(l.sighand_users(init), 1);
+    // Releasing the last task of a sighand frees it: no leak across many.
+    let mut w = Rec::default();
+    thread_exit(&mut l, sharer, 0, &mut w);
+}

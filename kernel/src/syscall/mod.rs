@@ -220,21 +220,39 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     /// `EAGAIN` (`max_threads`, `RLIMIT_NPROC`, pid space, no task slot or
     /// kernel stack), `ENOMEM`, as `copy_process`.
     fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, Errno>;
-    /// `bprm_mm_init` for a caller that works in an address space it borrows (a `vfork`
-    /// child): the fresh address space its `execve` will move to, made before the point of no
-    /// return so that a lack of memory is an `ENOMEM` of the call. Nothing for every other
-    /// task.
+    /// `bprm_mm_init` for a caller whose address space is shared (with a `vfork` parent, a
+    /// `CLONE_VM` child or its own other threads): the fresh address space its `execve` will
+    /// move to, made before the point of no return so that a lack of memory is an `ENOMEM` of
+    /// the call. If only the caller's own threads shared it, the exec finds it private again
+    /// after `de_thread` and drops the fresh one. Nothing for every other task.
     ///
     /// # Errors
     /// `ENOMEM`.
-    fn exec_prepare_mm(&mut self) -> Result<(), Errno> {
+    fn exec_prepare(&mut self) -> Result<(), Errno> {
         Ok(())
     }
-    /// `exec_mmap` for a caller that borrows its address space: move to the one
-    /// [`Context::exec_prepare_mm`] made and give the borrowed one back to its owner, who
-    /// wakes (`mm_release` -> `complete_vfork_done`). Nothing for every other task, whose
-    /// address space the exec replaces in place.
-    fn exec_switch_mm(&mut self) {}
+    /// `unshare_files`: a descriptor table another process still shares (`CLONE_FILES`) is
+    /// replaced by a private copy, which the close-on-exec step then edits. A lack of memory is
+    /// fatal to the task (past the point of no return).
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    fn exec_unshare_files(&mut self) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// `exec_mmap` and `unshare_sighand`: move to what [`Context::exec_prepare`] made and
+    /// leave the shared address space and dispositions to the other process; a `vfork` parent
+    /// wakes (`mm_release` -> `complete_vfork_done`). Nothing else for a task whose address
+    /// space the exec replaces in place.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    fn exec_switch_mm(&mut self) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// The task's pid and tid changed (`de_thread` made a non-leader thread the leader with the
+    /// old leader's pid): refresh what is cached.
+    fn thread_ids_changed(&mut self) {}
     /// `current_cred()` as the VFS needs it.
     fn cred(&mut self) -> Cred {
         Cred::of_task(&self.attrs().cred)

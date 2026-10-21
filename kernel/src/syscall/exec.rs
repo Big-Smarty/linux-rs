@@ -283,7 +283,7 @@ fn prepare<C: Context>(
     ctx.files()
         .vfs
         .reserve_pins(1 + usize::from(interp_file.is_some()))?;
-    ctx.exec_prepare_mm()?;
+    ctx.exec_prepare()?;
     Ok(Some(Prepared {
         file: *file,
         bytes: core::mem::take(bytes),
@@ -326,22 +326,42 @@ fn dev_fd_name(fd: i32, path: &[u8]) -> Result<Vec<u8>, Errno> {
 /// The old image is gone when the first step runs; every failure from here on
 /// is fatal to the task.
 fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
+    // bprm->point_of_no_return: from here an error ends the task with SIGSEGV (unless it is
+    // being killed already) after the errno is stored (`bprm_execve`).
+    let die = |ctx: &mut C, errno: Errno| {
+        if !ctx.state().fatal_signal_pending() {
+            ctx.state().force_fatal_sig(SIGSEGV);
+        }
+        fail(errno)
+    };
+    // de_thread: every other thread of the group is killed and gone, and a thread that is not
+    // the leader takes the leader's pid.
+    if let Err(errno) = de_thread(ctx) {
+        return die(ctx, errno);
+    }
+    // unshare_files: the descriptor table is not shared with another process any more.
+    if let Err(errno) = ctx.exec_unshare_files() {
+        return die(ctx, errno);
+    }
     // Close-on-exec descriptors (`do_close_on_exec`).
     {
         let Files { vfs, fdt, .. } = ctx.files();
         vfs.do_close_on_exec(fdt);
     }
-    // exec_mm_release: the old mm's robust list is walked and `clear_child_tid` written and
-    // its waiters woken (`futex_exec_release`, `mm_release`).
-    super::futex::mm_release(ctx);
     // set_mm_exe_file: the new file is `mm->exe_file`.
     let id = u64::from(p.file.index());
     if let Some(old) = ctx.replace_exe_file(p.file) {
         ctx.files().vfs.fput(old);
     }
-    // exec_mmap: a caller that borrows its address space (`vfork`) leaves it for its
-    // owner and takes the fresh one; any other task's old image is unmapped below.
-    ctx.exec_switch_mm();
+    // exec_mmap -> exec_mm_release: the old mm's robust list is walked and `clear_child_tid`
+    // written and its waiters woken (`futex_exec_release`, `mm_release`).
+    super::futex::mm_release(ctx);
+    // ... then the address space is switched when it is shared with another process (a
+    // `vfork` parent wakes: `complete_vfork_done`), and the dispositions made private
+    // (`unshare_sighand`); any other task's old image is unmapped below.
+    if let Err(errno) = ctx.exec_switch_mm() {
+        return die(ctx, errno);
+    }
     // The old image's mappings go, a fresh address space replaces
     // the VMA set; then `setup_arg_pages` and `elf_load`.
     let mapped = {
@@ -422,6 +442,53 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
     // flush_thread + start_thread.
     ctx.start_thread(layout.entry, p.built.sp);
     Outcome::Return(0)
+}
+
+/// `de_thread(current)`: kill the other threads of the group and wait (killable) until they
+/// are gone; a thread that is not the leader then waits for the leader to be a zombie and takes
+/// over its pid, process group, session and place in the tree.
+///
+/// # Errors
+/// `EAGAIN` when a group exit or another `execve` of the group is under way, or a fatal signal
+/// arrived while waiting.
+fn de_thread<C: Context>(ctx: &mut C) -> Result<(), Errno> {
+    use crate::task::dethread::DeThread;
+    let me = ctx.tasks().current;
+    let key = crate::task::exit::de_thread_key(me);
+    let started = {
+        let t = ctx.tasks();
+        t.list.de_thread_start(me, t.wake)?
+    };
+    if started == DeThread::Wait {
+        // "sig->notify_count": every other thread released.
+        while !ctx.tasks().list.de_thread_others_gone(me) {
+            if killed(ctx) {
+                ctx.tasks().list.de_thread_abort(me);
+                return Err(Errno::EAGAIN);
+            }
+            ctx.wait(key, None);
+        }
+        // The non-leader waits for the old leader to exit as well.
+        while !ctx.tasks().list.de_thread_leader_exited(me) {
+            if killed(ctx) {
+                ctx.tasks().list.de_thread_abort(me);
+                return Err(Errno::EAGAIN);
+            }
+            ctx.wait(key, None);
+        }
+    }
+    {
+        let t = ctx.tasks();
+        t.list.de_thread_finish(me, t.wake);
+    }
+    ctx.thread_ids_changed();
+    Ok(())
+}
+
+/// `__fatal_signal_pending(current)` after the timers are brought up to date.
+fn killed<C: Context>(ctx: &mut C) -> bool {
+    crate::signal::wait::signal_pending_synced(ctx);
+    ctx.state().fatal_signal_pending()
 }
 
 /// The argument pages: private frames holding the prepared block, writable

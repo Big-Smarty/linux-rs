@@ -16,9 +16,10 @@
 use super::{
     exit::Waker,
     pid::PidType,
-    tasklist::{ExitState, TaskId, Tasklist},
+    tasklist::{ExitState, Sighand, TaskId, Tasklist},
 };
 use crate::signal::SIGCHLD;
+use alloc::boxed::Box;
 use syscalls::Errno;
 
 /// What [`Tasklist::de_thread_start`] found.
@@ -113,6 +114,44 @@ impl Tasklist {
             g.group_exec_task = None;
             g.notify_count = 0;
         }
+    }
+
+    /// `unshare_sighand(me)`: when another task still points at the caller's dispositions
+    /// (`CLONE_SIGHAND` without `CLONE_THREAD`; its own threads are gone after `de_thread`) the
+    /// caller gets a private copy.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn unshare_sighand(&mut self, task: TaskId) -> Result<(), Errno> {
+        let Some(old) = self.task(task).map(|t| t.sighand) else {
+            return Err(Errno::ESRCH);
+        };
+        let Some(shared) = self.sighands.get(old) else {
+            return Err(Errno::ESRCH);
+        };
+        if shared.count <= 1 {
+            return Ok(());
+        }
+        let hand = Box::try_new((*shared.hand).clone()).map_err(|_| Errno::ENOMEM)?;
+        let new = self
+            .sighands
+            .try_insert(Sighand { hand, count: 1 })
+            .map_err(|_| Errno::ENOMEM)?;
+        if let Some(old) = self.sighands.get_mut(old) {
+            old.count -= 1;
+        }
+        if let Some(t) = self.task_mut(task) {
+            t.sighand = new;
+        }
+        Ok(())
+    }
+
+    /// The tasks pointing at the dispositions of `task` (`sighand->count`).
+    #[must_use]
+    pub fn sighand_users(&self, task: TaskId) -> u32 {
+        self.task(task)
+            .and_then(|t| self.sighands.get(t.sighand))
+            .map_or(0, |h| h.count)
     }
 
     /// `exchange_tids(tsk, leader)`, `transfer_pid(leader, tsk, ...)` x3, the replacement in

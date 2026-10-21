@@ -112,14 +112,11 @@ fn clone_syscall<C: Context>(ctx: &mut C, sysno: Sysno, args: &CloneArgs) -> Out
     if ctx.state().signal_pending() {
         return Outcome::Return(-ERESTARTNOINTR);
     }
+    // `kernel_clone` stores `CLONE_PARENT_SETTID` before the child is woken, which
+    // `copy_process` of the binary does.
     match ctx.copy_process(&request) {
         Err(errno) => Outcome::Return(error(errno)),
-        Ok(pid) => {
-            if let Some(at) = args.parent_settid() {
-                let _ = put_user(ctx, at, &pid.to_le_bytes());
-            }
-            Outcome::Return(i64::from(pid))
-        }
+        Ok(pid) => Outcome::Return(i64::from(pid)),
     }
 }
 

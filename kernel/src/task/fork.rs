@@ -95,6 +95,9 @@ pub struct ForkRequest {
     /// `CLONE_CHILD_CLEARTID`'s pointer (the child's `clear_child_tid`), 0 if
     /// the flag is clear.
     pub clear_child_tid: u64,
+    /// `CLONE_PARENT_SETTID`'s pointer: the child's tid is stored there by `kernel_clone` before
+    /// the child can run (the store's failure is ignored); 0 if the flag is clear.
+    pub parent_settid: u64,
     /// `CLONE_CHILD_SETTID`'s pointer (the child's `set_child_tid`: its tid is stored there
     /// when it first runs), 0 if the flag is clear.
     pub set_child_tid: u64,
@@ -125,6 +128,7 @@ impl ForkRequest {
             child_sp: 0,
             clear_sighand: false,
             clear_child_tid: 0,
+            parent_settid: 0,
             set_child_tid: 0,
             share_vm: false,
             vfork: false,
@@ -357,6 +361,7 @@ impl CloneArgs {
             child_sp: self.stack,
             clear_sighand: self.flags & CLONE_CLEAR_SIGHAND != 0,
             clear_child_tid: flag(CLONE_CHILD_CLEARTID, self.child_tid),
+            parent_settid: flag(CLONE_PARENT_SETTID, self.parent_tid),
             set_child_tid: flag(CLONE_CHILD_SETTID, self.child_tid),
             share_vm: self.flags & CLONE_VM != 0,
             vfork: self.flags & CLONE_VFORK != 0,

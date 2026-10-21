@@ -73,10 +73,10 @@ pub fn chldexit_key(leader: TaskId) -> WaitKey {
 }
 
 /// The wait queue of a thread in `de_thread` waiting for the others to be gone: the id is the
-/// slot of the group leader of the group being collapsed.
+/// slot of the waiting thread itself (`wake_up_process(group_exec_task)` names one task).
 #[must_use]
-pub fn de_thread_key(leader: TaskId) -> WaitKey {
-    WaitKey::new(crate::sched::CLASS_DETHREAD, leader.slot())
+pub fn de_thread_key(waiting: TaskId) -> WaitKey {
+    WaitKey::new(crate::sched::CLASS_DETHREAD, waiting.slot())
 }
 
 /// For callers with no other task to wake (the single-task kernel).
