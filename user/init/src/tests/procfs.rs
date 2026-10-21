@@ -126,6 +126,9 @@ macro_rules! text {
     }};
 }
 
+mod attr;
+pub mod vfork;
+
 /// `s` followed by a NUL, for a system call argument.
 fn c(s: &str) -> [u8; 192] {
     let mut out = [0u8; 192];
@@ -416,6 +419,12 @@ pub fn run() -> bool {
     seq_records(&mut t);
     wchan(&mut t);
     publication(&mut t);
+    attr::setattr(&mut t);
+    attr::llseek(&mut t);
+    attr::mmap_files(&mut t);
+    attr::statfs_flags(&mut t);
+    vfork::window(&mut t);
+    vfork::exec(&mut t);
     mounts_poll(&mut t);
     root_umount(&mut t);
     t.finish()
