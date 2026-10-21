@@ -373,7 +373,12 @@ impl Results {
 
     /// The selected groups with their runs (`None`: not run).
     fn runs(&self) -> impl Iterator<Item = (&'static str, Option<GroupRun>)> + '_ {
-        self.selected().iter().copied().zip(self.groups)
+        // By reference: the array is some 15 KiB, and the summary walks it several times on the
+        // 64 KiB boot stack (a by-value `zip` copied it into each iterator and overflowed it).
+        self.selected()
+            .iter()
+            .copied()
+            .zip(self.groups.iter().copied())
     }
 
     fn select(&mut self, name: &'static str) -> bool {
