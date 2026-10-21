@@ -14,7 +14,7 @@
 extern crate std;
 
 use super::{
-    attrs::Cred,
+    attrs::{Cred, RLIMIT_NPROC, Rlimit, Rlimits},
     exit::{
         CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, ExitPrep, NoWake, Notified,
         Waker,
@@ -28,8 +28,8 @@ use super::{
 };
 use super::{jobctl::StopPlan, kill::SendTo};
 use crate::signal::{
-    SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_DFL, SIG_IGN, SIGCHLD, SIGCONT, SIGHUP, SIGKILL, SIGSTOP,
-    SIGTERM, SIGTSTP, SIGUSR1, SigAction, SigSet, deliver::ERESTARTSYS, info::SigInfo,
+    SA_NOCLDSTOP, SA_NOCLDWAIT, SIG_DFL, SIG_IGN, SIGALRM, SIGCHLD, SIGCONT, SIGHUP, SIGKILL,
+    SIGSTOP, SIGTERM, SIGTSTP, SIGUSR1, SigAction, SigSet, deliver::ERESTARTSYS, info::SigInfo,
     jobctl::JOBCTL_STOPPED,
 };
 use std::vec::Vec;
@@ -37,8 +37,6 @@ use syscalls::Errno;
 
 const ECHILD: i64 = -10;
 const FORK: ForkParams = ForkParams {
-    rlimit_sigpending: 100,
-    rlimit_nproc: 1000,
     exit_signal: SIGCHLD,
     clear_sighand: false,
 };
@@ -69,7 +67,7 @@ impl Waker for Rec {
 }
 
 fn list() -> (Tasklist, TaskId) {
-    Tasklist::new(100, &Cred::root(), 100).unwrap()
+    Tasklist::new(100, &Cred::root(), Rlimits::for_tests(100, 1000)).unwrap()
 }
 
 fn user_cred(uid: u32) -> CredSnapshot {
@@ -150,7 +148,7 @@ fn fork_publishes_children_in_creation_order() {
 fn fork_limits_follow_copy_process() {
     // max_threads is EAGAIN for everyone; RLIMIT_NPROC only for tasks without
     // CAP_SYS_RESOURCE.
-    let (mut l, init) = Tasklist::new(3, &Cred::root(), 100).unwrap();
+    let (mut l, init) = Tasklist::new(3, &Cred::root(), Rlimits::for_tests(100, 1000)).unwrap();
     let a = l.fork(init, FORK).unwrap();
     let _b = l.fork(init, FORK).unwrap();
     assert_eq!(l.fork(init, FORK), Err(Errno::EAGAIN));
@@ -161,16 +159,20 @@ fn fork_limits_follow_copy_process() {
     assert_eq!(pid(&l, again), 4);
 
     let (mut l, init) = list();
-    let nproc = ForkParams {
-        rlimit_nproc: 2,
-        ..FORK
-    };
     let user = l.fork(init, FORK).unwrap();
+    // The limit is the caller's group's (`current->signal->rlim`).
+    let low = Rlimit { cur: 2, max: 2 };
+    for task in [init, user] {
+        l.rlimits_mut(task)
+            .unwrap()
+            .prlimit(RLIMIT_NPROC as u32, Some(low))
+            .unwrap();
+    }
     // root bypasses the limit ...
-    assert!(l.fork(init, nproc).is_ok());
+    assert!(l.fork(init, FORK).is_ok());
     // ... an ordinary user does not (nr_threads 3 >= 2).
     l.task_mut(user).unwrap().cred = user_cred(1000);
-    assert_eq!(l.fork(user, nproc), Err(Errno::EAGAIN));
+    assert_eq!(l.fork(user, FORK), Err(Errno::EAGAIN));
     // A stale or exiting parent cannot fork.
     exit(&mut l, user, 0, &mut Rec::default());
     assert_eq!(l.fork(user, FORK), Err(Errno::ESRCH));
@@ -1051,7 +1053,7 @@ fn signal_state_view_derives_ids_from_the_task() {
     let s = l.signal_state(child).unwrap();
     assert_eq!((s.pid, s.tgid, s.uid, s.global_init), (2, 2, 1234, false));
     assert!(!s.sig.unkillable);
-    assert_eq!(s.sig.rlimit_sigpending, 100);
+    assert_eq!(s.sig.rlimit_sigpending(), 100);
     l.release_task(child, &mut NoWake);
     assert!(l.signal_state(child).is_none(), "stale id");
     let _ = SIGKILL;
@@ -1931,4 +1933,141 @@ fn unshare_sighand_copies_only_what_others_still_share() {
     // Releasing the last task of a sighand frees it: no leak across many.
     let mut w = Rec::default();
     thread_exit(&mut l, sharer, 0, &mut w);
+}
+
+#[test]
+fn kill_all_from_a_thread_skips_every_thread_of_its_own_group() {
+    // kill_something_info: `task_pid_vnr(p) > 1 && !same_thread_group(p, current)`. The process
+    // list holds leaders only, so the sender (a non-leader thread) must not be compared with
+    // them directly.
+    let (mut l, init, c, th) = group(1);
+    let d = l.fork(init, FORK).unwrap();
+    for t in [c, d] {
+        l.signal_state(t).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+        l.signal_state(t).unwrap().me.blocked.add(SIGUSR1);
+    }
+    let info = SigInfo::from_kill(SIGUSR1, false, 3, 0);
+    let mut w = Rec::default();
+    assert_eq!(
+        l.kill_something_info(th[0], i32::from(SIGUSR1), info, -1, &mut w),
+        Ok(())
+    );
+    assert!(
+        !pending(&mut l, c).contains(SIGUSR1),
+        "the sender's own group"
+    );
+    assert!(!l.sig(c).unwrap().shared_pending().contains(SIGUSR1));
+    assert!(pending(&mut l, d).contains(SIGUSR1));
+    // With no other process the answer is ESRCH, as for a single-threaded sender.
+    let (mut l, _init, _c, th) = group(1);
+    assert_eq!(
+        l.kill_something_info(th[0], i32::from(SIGUSR1), info, -1, &mut Rec::default()),
+        Err(Errno::ESRCH)
+    );
+}
+
+#[test]
+fn ptrace_may_access_with_realcreds_compares_the_real_ids() {
+    // `__ptrace_may_access`: `caller_uid = cred->uid` for PTRACE_MODE_READ_REALCREDS (the
+    // effective ids matter only as the *target's*).
+    let (mut l, init) = list();
+    let (a, b) = (l.fork(init, FORK).unwrap(), l.fork(init, FORK).unwrap());
+    let cred = |uid, euid| CredSnapshot {
+        uid,
+        euid,
+        suid: uid,
+        gid: uid,
+        egid: euid,
+        sgid: uid,
+        ..user_cred(uid)
+    };
+    l.task_mut(b).unwrap().cred = cred(1000, 1000);
+    // Real uid equal to the target's, effective id different: allowed.
+    l.task_mut(a).unwrap().cred = cred(1000, 2000);
+    assert!(l.ptrace_may_access(a, b));
+    // Effective uid equal to the target's, real id different: not allowed.
+    l.task_mut(a).unwrap().cred = cred(2000, 1000);
+    assert!(!l.ptrace_may_access(a, b));
+    // The capability needs no match, and a non-dumpable target needs it.
+    l.task_mut(a).unwrap().cred = CredSnapshot {
+        cap_sys_ptrace: true,
+        ..cred(2000, 2000)
+    };
+    assert!(l.ptrace_may_access(a, b));
+    l.task_mut(a).unwrap().cred = cred(1000, 1000);
+    l.set_dumpable(b, false);
+    assert!(!l.ptrace_may_access(a, b));
+    // The caller's own thread group is always allowed.
+    assert!(l.ptrace_may_access(b, b));
+}
+
+#[test]
+fn the_real_timer_signals_the_leader_whichever_thread_looks_at_the_clock() {
+    // `it_real_fn`: kill_pid_info(SIGALRM, SEND_SIG_PRIV, leader pid); `complete_signal` tries
+    // the leader first.
+    let (mut l, _init, c, th) = group(1);
+    let t1 = th[0];
+    l.signal_state(c).unwrap().hand.actions[usize::from(SIGALRM) - 1].handler = 0x1000;
+    let start = |l: &mut Tasklist| {
+        l.signal_state(c).unwrap().sig.itimer.start(1_000, 500, 0);
+    };
+    start(&mut l);
+    let mut w = Rec::default();
+    l.sync_timers(t1, 1_400, &mut w);
+    assert!(w.resumes.is_empty(), "not due yet");
+    l.sync_timers(t1, 1_500, &mut w);
+    assert_eq!(
+        w.signal_wakes,
+        [c],
+        "the leader is woken, not the thread that looked"
+    );
+    assert!(l.sig(c).unwrap().shared_pending().contains(SIGALRM));
+    assert!(!l.signal_state(t1).unwrap().signal_pending());
+    assert!(l.signal_state(c).unwrap().signal_pending());
+    // It fires once.
+    l.sync_timers(t1, 1_600, &mut w);
+    assert_eq!(w.signal_wakes, [c]);
+    // A leader that blocks SIGALRM leaves it to the thread.
+    let _ = l.signal_state(c).unwrap().dequeue_signal();
+    l.signal_state(c).unwrap().me.blocked.add(SIGALRM);
+    start(&mut l);
+    let mut w = Rec::default();
+    l.sync_timers(t1, 2_600, &mut w);
+    assert_eq!(w.signal_wakes, [t1]);
+}
+
+#[test]
+fn resource_limits_belong_to_the_thread_group() {
+    // `signal->rlim`: a `setrlimit` in a thread is seen by the others, a new process gets a copy.
+    let (mut l, init, c, th) = group(1);
+    let t1 = th[0];
+    let new = Rlimit { cur: 7, max: 9 };
+    l.rlimits_mut(t1).unwrap().prlimit(4, Some(new)).unwrap();
+    assert_eq!(l.rlimits(c).unwrap().get(4), new);
+    assert_eq!(
+        l.rlimits(init).unwrap().get(4).cur,
+        0,
+        "another process keeps its own"
+    );
+    let child = l.fork(c, FORK).unwrap();
+    assert_eq!(
+        l.rlimits(child).unwrap().get(4),
+        new,
+        "copy_signal copies them"
+    );
+    l.rlimits_mut(child)
+        .unwrap()
+        .prlimit(4, Some(Rlimit { cur: 1, max: 1 }))
+        .unwrap();
+    assert_eq!(
+        l.rlimits(c).unwrap().get(4),
+        new,
+        "and then they are separate"
+    );
+    // The signal queue limit is the same value.
+    l.rlimits_mut(t1)
+        .unwrap()
+        .prlimit(11, Some(Rlimit { cur: 5, max: 5 }))
+        .unwrap();
+    assert_eq!(l.sig(c).unwrap().rlimit_sigpending(), 5);
 }

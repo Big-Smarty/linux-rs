@@ -37,7 +37,7 @@
 //!   owner's `Attributes`: the owner may be gone.
 
 use super::{
-    attrs::Cred,
+    attrs::{Cred, RLIMIT_NPROC, Rlimits},
     pid::{PID_MAX_DEFAULT, Pid, PidId, PidRef, PidTable, PidType},
 };
 use crate::{
@@ -89,13 +89,15 @@ pub struct CredSnapshot {
     pub cap_kill: bool,
     /// `capable(CAP_SYS_RESOURCE)` (the `RLIMIT_NPROC` bypass).
     pub cap_sys_resource: bool,
+    /// `ns_capable(CAP_SYS_PTRACE)` (`ptrace_may_access`).
+    pub cap_sys_ptrace: bool,
 }
 
 impl CredSnapshot {
     /// Snapshot of `cred`. shortcut: capability sets are not modelled
     /// (nothing can drop or add one: every credential syscall stops the kernel
     /// loudly), so a task holds every capability iff its effective uid is 0.
-    /// Replace the two booleans with the real `cap_effective` bits with the
+    /// Replace the three booleans with the real `cap_effective` bits with the
     /// first syscall that changes either.
     #[must_use]
     pub const fn of(cred: &Cred) -> Self {
@@ -109,6 +111,7 @@ impl CredSnapshot {
             sgid: cred.sgid,
             cap_kill: root,
             cap_sys_resource: root,
+            cap_sys_ptrace: root,
         }
     }
 }
@@ -216,14 +219,10 @@ pub struct TaskStruct {
     pub(super) thread: Box<ThreadSignal>,
 }
 
-/// What [`Tasklist::fork`] needs from the forking owner.
+/// What [`Tasklist::fork`] needs from the forking owner. The limits it checks and hands on are
+/// the caller's thread group's ([`SignalStruct::rlimits`]), read from the task list.
 #[derive(Clone, Copy, Debug)]
 pub struct ForkParams {
-    /// `RLIMIT_SIGPENDING` of the child (copied from the parent's limits).
-    pub rlimit_sigpending: u64,
-    /// `RLIMIT_NPROC`'s soft limit: the `copy_process` `EAGAIN` check is
-    /// bypassed for `CAP_SYS_RESOURCE`/`CAP_SYS_ADMIN` (root).
-    pub rlimit_nproc: u64,
     /// `args->exit_signal`: the signal the parent receives when the child
     /// exits (`SIGCHLD` for `fork`; 0 for none; `clone` may name another,
     /// which makes the child a "clone child" for `__WCLONE`).
@@ -233,13 +232,10 @@ pub struct ForkParams {
 }
 
 impl ForkParams {
-    /// The limits of the forking task and the request's exit signal and
-    /// signal-handler choice.
+    /// The request's exit signal and signal-handler choice.
     #[must_use]
-    pub fn of(attrs: &super::attrs::Attributes, request: &super::fork::ForkRequest) -> Self {
+    pub fn of(request: &super::fork::ForkRequest) -> Self {
         Self {
-            rlimit_sigpending: attrs.rlimits.get(super::attrs::RLIMIT_SIGPENDING).cur,
-            rlimit_nproc: attrs.rlimits.get(super::attrs::RLIMIT_NPROC).cur,
             exit_signal: request.exit_signal,
             clear_sighand: request.clear_sighand,
         }
@@ -272,11 +268,11 @@ impl CloneParams {
         }
     }
 
-    /// The request's choices on top of the limits ([`ForkParams::of`]).
+    /// The request's choices ([`ForkParams::of`]).
     #[must_use]
-    pub fn of(attrs: &super::attrs::Attributes, request: &super::fork::ForkRequest) -> Self {
+    pub fn of(request: &super::fork::ForkRequest) -> Self {
         Self {
-            fork: ForkParams::of(attrs, request),
+            fork: ForkParams::of(request),
             thread: request.thread,
             share_sighand: request.share_sighand,
             reset_altstack: request.share_vm && !request.vfork,
@@ -374,11 +370,7 @@ impl Tasklist {
     ///
     /// # Errors
     /// `ENOMEM`.
-    pub fn new(
-        max_threads: u32,
-        cred: &Cred,
-        rlimit_sigpending: u64,
-    ) -> Result<(Self, TaskId), Errno> {
+    pub fn new(max_threads: u32, cred: &Cred, rlimits: Rlimits) -> Result<(Self, TaskId), Errno> {
         let mut pids = Arena::new();
         let init_pid = pids.try_insert(Pid::new(0)).map_err(|_| Errno::ENOMEM)?;
         let mut list = Self {
@@ -398,7 +390,7 @@ impl Tasklist {
                 count: 1,
             },
         };
-        let (hand, sig, thread) = TaskSignals::new_init(rlimit_sigpending).into_parts();
+        let (hand, sig, thread) = TaskSignals::new_init(rlimits).into_parts();
         let hand = Box::try_new(hand).map_err(|_| Errno::ENOMEM)?;
         let sig = Box::try_new(sig).map_err(|_| Errno::ENOMEM)?;
         let thread = Box::try_new(thread).map_err(|_| Errno::ENOMEM)?;
@@ -578,7 +570,7 @@ impl Tasklist {
         reason = "one copy_process, each failure undoing what the steps before it allocated"
     )]
     pub fn clone_task(&mut self, parent: TaskId, params: CloneParams) -> Result<TaskId, Errno> {
-        self.fork_allowed(parent, params.fork)?;
+        self.fork_allowed(parent)?;
         let p = self.tasks.get(parent).ok_or(Errno::ESRCH)?;
         let (leader, pgid, sid, cred, exec_id, parent_exec_id, dumpable) = (
             p.group_leader,
@@ -596,6 +588,12 @@ impl Tasklist {
             Some(parent)
         };
         let (group, old_sighand) = (p.group, p.sighand);
+        // copy_signal: "memcpy(sig->rlim, current->signal->rlim, sizeof sig->rlim)".
+        let rlimits = self
+            .groups
+            .get(group)
+            .map(|g| g.sig.rlimits)
+            .ok_or(Errno::ESRCH)?;
         // dup_task_struct: the task's own signal fields.
         let thread =
             Box::try_new(p.thread.fork_child(params.reset_altstack)).map_err(|_| Errno::ENOMEM)?;
@@ -622,7 +620,7 @@ impl Tasklist {
         let new_group = if params.thread {
             None
         } else {
-            let made = Box::try_new(SignalStruct::new(params.fork.rlimit_sigpending))
+            let made = Box::try_new(SignalStruct::new(rlimits))
                 .map_err(|_| Errno::ENOMEM)
                 .and_then(|sig| {
                     self.groups
@@ -728,7 +726,7 @@ impl Tasklist {
     ///
     /// # Errors
     /// `ESRCH` for a stale or exiting parent; `EAGAIN`.
-    pub fn fork_allowed(&self, parent: TaskId, params: ForkParams) -> Result<(), Errno> {
+    pub fn fork_allowed(&self, parent: TaskId) -> Result<(), Errno> {
         let p = self.tasks.get(parent).ok_or(Errno::ESRCH)?;
         if p.exit_state != ExitState::Live {
             return Err(Errno::ESRCH);
@@ -739,7 +737,10 @@ impl Tasklist {
         if self.nr_threads >= self.max_threads {
             return Err(Errno::EAGAIN);
         }
-        if !p.cred.cap_sys_resource && u64::from(self.nr_threads) >= params.rlimit_nproc {
+        let nproc = self
+            .group_of(parent)
+            .map_or(0, |g| g.sig.rlimits.get(RLIMIT_NPROC).cur);
+        if !p.cred.cap_sys_resource && u64::from(self.nr_threads) >= nproc {
             return Err(Errno::EAGAIN);
         }
         Ok(())
@@ -1278,6 +1279,17 @@ impl Tasklist {
     pub(super) fn group_mut(&mut self, task: TaskId) -> Option<&mut Group> {
         let id = self.tasks.get(task)?.group;
         self.groups.get_mut(id)
+    }
+
+    /// `signal->rlim` of `task`'s group: the limits all its threads share.
+    #[must_use]
+    pub fn rlimits(&self, task: TaskId) -> Option<&Rlimits> {
+        Some(&self.group_of(task)?.sig.rlimits)
+    }
+
+    /// [`Tasklist::rlimits`] for `setrlimit`.
+    pub fn rlimits_mut(&mut self, task: TaskId) -> Option<&mut Rlimits> {
+        Some(&mut self.group_mut(task)?.sig.rlimits)
     }
 
     /// The `signal_struct` signal fields of `task`'s group.

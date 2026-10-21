@@ -41,9 +41,8 @@ fn err(errno: Errno) -> i64 {
 /// Bring the timers up to date and borrow the state.
 fn synced<T: Task>(task: &mut T) -> State<'_> {
     let now = task.now_ns();
-    let mut state = task.state();
-    state.sync_timers(now);
-    state
+    task.sync_timers(now);
+    task.state()
 }
 
 /// `signal_pending(current)` after the timers are brought up to date: an
@@ -192,12 +191,12 @@ pub fn sys_rt_sigtimedwait<T: Task>(
         };
         (these, timeout)
     };
+    task.sync_timers(now);
     let mut state = task.state();
     // `mask` is the set to skip: everything not awaited, plus KILL and STOP.
     let awaited =
         SigSet(u64::from_le_bytes(these) & !(SigSet::bit(SIGKILL) | SigSet::bit(SIGSTOP)));
     let mask = SigSet(!awaited.0);
-    state.sync_timers(now);
     let mut found = state.dequeue_signal_masked(mask);
     // `ret` of `schedule_hrtimeout_range`: -EINTR unless the timer ran out.
     let mut interrupted = false;

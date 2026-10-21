@@ -26,10 +26,18 @@ use crate::{
         ProcState,
         view::{Collect, TaskView},
     },
-    task::{Attributes, Cred, TaskId, exit::NoWake, fork::ForkRequest, tasklist::ForkParams},
+    task::{
+        Attributes, Cred, Rlimits, TaskId, exit::NoWake, fork::ForkRequest, tasklist::ForkParams,
+    },
     vfs::{FdTable, FileId},
 };
 use syscalls::Sysno;
+
+/// The thread group's limits a published view carries.
+fn limits() -> &'static Rlimits {
+    extern crate std;
+    std::boxed::Box::leak(std::boxed::Box::new(Rlimits::init(1000)))
+}
 
 fn collect<'a>(
     attrs: &'a Attributes,
@@ -40,6 +48,7 @@ fn collect<'a>(
 ) -> Collect<'a> {
     Collect {
         attrs,
+        rlimits: limits(),
         fs: t.fs,
         fdt,
         files: &t.vfs.files,
@@ -96,7 +105,7 @@ fn assert_view_matches(view: &TaskView, fdt: &FdTable, t: &Task, what: &str) {
 fn a_view_follows_the_descriptor_table_by_replaying_its_log() {
     let mut t = task();
     let cred = crate::vfs::Cred::root();
-    let attrs = Attributes::init(1000);
+    let attrs = Attributes::init();
     let mut files = Vec::new();
     for _ in 0..40 {
         let (read, write) = t.vfs.pipe_create(0, &cred).unwrap();
@@ -167,7 +176,7 @@ fn a_view_follows_the_descriptor_table_by_replaying_its_log() {
 #[test]
 fn the_vma_vector_is_shared_until_the_address_space_changes() {
     let mut t = task();
-    let attrs = Attributes::init(1000);
+    let attrs = Attributes::init();
     let fdt = FdTable::default();
     let (read, _) = t.vfs.pipe_create(0, &crate::vfs::Cred::root()).unwrap();
     let mut view = TaskView::collect(collect(&attrs, &fdt, &t, read, (1, 0, 0))).unwrap();
@@ -217,10 +226,7 @@ fn the_vma_vector_is_shared_until_the_address_space_changes() {
 
 fn fork_child(t: &mut Task) -> (TaskId, i32) {
     let request = ForkRequest::plain(17);
-    let id = t
-        .tasks
-        .fork(t.current, ForkParams::of(&t.attrs, &request))
-        .unwrap();
+    let id = t.tasks.fork(t.current, ForkParams::of(&request)).unwrap();
     let pid = t.tasks.task_pid_vnr(id);
     (id, pid)
 }
@@ -317,7 +323,7 @@ fn the_pid_mirror_follows_the_task_list_through_its_log() {
 #[test]
 fn views_and_totals_go_with_their_tasks() {
     let mut t = task();
-    let attrs = Attributes::init(1000);
+    let attrs = Attributes::init();
     let fdt = FdTable::default();
     let (exe, _) = t.vfs.pipe_create(0, &crate::vfs::Cred::root()).unwrap();
     let mut ps = ProcState::default();
@@ -384,7 +390,7 @@ fn a_view_never_replays_another_tables_log() {
     // A table that happens to be at the generation the view last read, but is
     // not the table it read, must be copied, not patched.
     let mut t = task();
-    let attrs = Attributes::init(1000);
+    let attrs = Attributes::init();
     let (read, write) = t.vfs.pipe_create(0, &crate::vfs::Cred::root()).unwrap();
     let mut first = FdTable::default();
     let fd = first.alloc_fd(0, 64, false).unwrap();

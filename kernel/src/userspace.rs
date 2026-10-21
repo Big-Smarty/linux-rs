@@ -97,7 +97,7 @@ use kernel::{
         Machine, Outcome, RestartBlock, Tasks,
     },
     task::{
-        self, Attributes, TaskId, Tasklist,
+        self, Attributes, Rlimits, TaskId, Tasklist,
         exit::{ExitPrep, Waker, chldexit_key, de_thread_key},
         fork::ForkRequest,
         jobctl::StopPlan,
@@ -1126,12 +1126,17 @@ const MAX_PUBLISHED_ARGS: u64 = 2 << 20;
 /// (`procfs::view`).
 fn publish(process: &mut Process, own: &Owned) -> Result<(), Errno> {
     let Process {
+        tasks,
         vfs,
         mms,
         files_structs,
         fs_structs,
         ..
     } = process;
+    // `signal->rlim` is the group's: any of its threads publishes the same.
+    let Some(&rlimits) = tasks.rlimits(own.me) else {
+        return Err(Errno::ESRCH);
+    };
     let (Some(mm), Some(files), Some(fs)) = (
         mms.get_mut(own.mm),
         files_structs.get(own.files),
@@ -1153,7 +1158,7 @@ fn publish(process: &mut Process, own: &Owned) -> Result<(), Errno> {
         vfs.fs.ns.proc.publish_mm(tgid, &mm.space, rss, bytes)?;
         let table = &vfs.files;
         if let Some(view) = vfs.fs.ns.proc.view_mut(tgid) {
-            view.refresh_files(&attrs, fs.fs, &files.fdt, table, mm.exe_file)?;
+            view.refresh_files(&attrs, &rlimits, fs.fs, &files.fdt, table, mm.exe_file)?;
         }
         return Ok(());
     }
@@ -1203,6 +1208,7 @@ fn publish(process: &mut Process, own: &Owned) -> Result<(), Errno> {
         tgid,
         Collect {
             attrs: &own.attrs,
+            rlimits: &rlimits,
             fs: fs.fs,
             fdt: &files.fdt,
             files: &vfs.files,
@@ -1684,7 +1690,7 @@ impl Syscall<'_> {
     )]
     fn fork(&mut self, request: &ForkRequest) -> Result<i32, Errno> {
         let parent = self.own.me;
-        let params = CloneParams::of(&self.own.attrs, request);
+        let params = CloneParams::of(request);
         #[cfg(feature = "qemu-self-test")]
         leak::at_fork(self.shared.get());
         // dup_task_struct: the child's state block, so that no later step
@@ -1703,7 +1709,7 @@ impl Syscall<'_> {
         }
         let process = self.shared.get();
         // copy_process: RLIMIT_NPROC and max_threads (fork.c:2059, 2072).
-        process.tasks.fork_allowed(parent, params.fork)?;
+        process.tasks.fork_allowed(parent)?;
         // The arena slots of the objects that are copied.
         let enomem = |_| Errno::ENOMEM;
         if !request.share_files {
@@ -2261,6 +2267,7 @@ impl Context for Syscall<'_> {
         // is published when a file of `/proc` is read, and when the task leaves the CPU.
         let tgid = self.own.tgid.cast_signed();
         let Process {
+            tasks,
             vfs,
             mms,
             files_structs,
@@ -2293,8 +2300,11 @@ impl Context for Syscall<'_> {
             view_attrs
         };
         let files = &vfs.files;
+        let Some(&rlimits) = tasks.rlimits(self.own.me) else {
+            return;
+        };
         if let Some(view) = vfs.fs.ns.proc.view_mut(tgid) {
-            let _ = view.refresh_files(&attrs, fs, fdt, files, exe);
+            let _ = view.refresh_files(&attrs, &rlimits, fs, fdt, files, exe);
         }
     }
     fn with_show<R>(
@@ -2339,7 +2349,7 @@ impl Context for Syscall<'_> {
 }
 
 impl Syscall<'_> {
-    /// `thread_group_cputime` and `thread_group_cputime_adjusted` of the caller's group: every
+    /// `thread_group_cputime` and `thread_group_cputime_adjusted` of the group `member` is in: every
     /// live thread's account, the times the finished threads left in the group and those of a
     /// thread that is exiting (folded by `do_exit` before the thread is released). The sample
     /// and the `(utime, stime)` pair `times(2)` reports.
@@ -2347,41 +2357,46 @@ impl Syscall<'_> {
     /// to `sum_exec_runtime` by construction (`cputime_adjust`), but its tick-accounted user
     /// and system parts are the adjusted ones, so `CPUCLOCK_VIRT` of a group that lost a
     /// thread is the adjusted figure.
-    fn group_cpu(&mut self) -> (CpuSample, (u64, u64)) {
+    fn group_cpu(&mut self, member: TaskId) -> (CpuSample, (u64, u64)) {
         let now = timer::ktime_get_ns();
-        let me = self.own.me;
         let tasks = &self.shared.get().tasks;
-        let (mut user, mut system) = tasks.dead_cputime(me);
+        let (mut user, mut system) = tasks.dead_cputime(member);
         let mut sample = CpuSample {
             runtime_ns: user + system,
             user_ns: user,
             system_ns: system,
         };
-        for thread in tasks.threads(me) {
+        for thread in tasks.threads(member) {
             let Some(task) = tasks.task(thread) else {
                 continue;
             };
-            match task.sched {
-                Some(sched) if task.exit_state == task::tasklist::ExitState::Live => {
-                    let account = ktask::cpu_account(sched);
-                    let part = account.sample(now);
-                    sample.runtime_ns += part.runtime_ns;
-                    sample.user_ns += part.user_ns;
-                    sample.system_ns += part.system_ns;
-                    let (u, s) = account.adjusted(now);
-                    user += u;
-                    system += s;
-                }
-                _ => {
-                    sample.runtime_ns += task.utime_ns + task.stime_ns;
-                    sample.user_ns += task.utime_ns;
-                    sample.system_ns += task.stime_ns;
-                    user += task.utime_ns;
-                    system += task.stime_ns;
-                }
-            }
+            let (part, (u, s)) = thread_cpu(task, now);
+            sample.runtime_ns += part.runtime_ns;
+            sample.user_ns += part.user_ns;
+            sample.system_ns += part.system_ns;
+            user += u;
+            system += s;
         }
         (sample, (user, system))
+    }
+}
+
+/// One thread's CPU time at `now`: the account of a live task (its sample, and the adjusted
+/// `(utime, stime)`), or what an exited one left in its task structure.
+fn thread_cpu(task: &task::tasklist::TaskStruct, now: u64) -> (CpuSample, (u64, u64)) {
+    match task.sched {
+        Some(sched) if task.exit_state == task::tasklist::ExitState::Live => {
+            let account = ktask::cpu_account(sched);
+            (account.sample(now), account.adjusted(now))
+        }
+        _ => (
+            CpuSample {
+                runtime_ns: task.utime_ns + task.stime_ns,
+                user_ns: task.utime_ns,
+                system_ns: task.stime_ns,
+            },
+            (task.utime_ns, task.stime_ns),
+        ),
     }
 }
 
@@ -2403,10 +2418,25 @@ impl Clocks for Syscall<'_> {
         ktask::cpu_account(self.own.sched).sample(timer::ktime_get_ns())
     }
     fn group_cpu_sample(&mut self) -> CpuSample {
-        self.group_cpu().0
+        self.group_cpu(self.own.me).0
+    }
+    fn cpu_sample_of(&mut self, task: TaskId) -> CpuSample {
+        let now = timer::ktime_get_ns();
+        // The caller resolved `task` under the same lock hold: it is in the list.
+        self.shared.get().tasks.task(task).map_or(
+            CpuSample {
+                runtime_ns: 0,
+                user_ns: 0,
+                system_ns: 0,
+            },
+            |t| thread_cpu(t, now).0,
+        )
+    }
+    fn group_cpu_sample_of(&mut self, task: TaskId) -> CpuSample {
+        self.group_cpu(task).0
     }
     fn cpu_adjusted(&mut self) -> (u64, u64) {
-        self.group_cpu().1
+        self.group_cpu(self.own.me).1
     }
     fn sleep_until(&mut self, deadline_ns: u64) -> Option<u64> {
         // `do_nanosleep`: asleep until the deadline or a pending signal.
@@ -2438,6 +2468,10 @@ impl signal::Task for Syscall<'_> {
     }
     fn now_ns(&self) -> u64 {
         timer::ktime_get_ns()
+    }
+    fn sync_timers(&mut self, now: u64) {
+        let Process { tasks, wake, .. } = self.shared.get();
+        tasks.sync_timers(self.own.me, now, wake);
     }
     fn wait(&mut self, key: WaitKey, deadline_ns: Option<u64>) {
         // The interval timer is a wake-up source of every sleep: it rides on the
@@ -2819,13 +2853,17 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
         }
         // Nothing to expire or dequeue: skip the clock read (`now_ns` is only
         // used when a pending SIGALRM leaves the queue).
-        let pending = {
-            let mut state = current_signals(&mut process.tasks, own.me);
-            if state.sig.itimer.next_event().is_some() || state.signal_pending() {
-                state.sync_timers(timer::ktime_get_ns());
-            }
-            state.signal_pending()
-        } || core::mem::take(&mut after_stop);
+        let due = {
+            let state = current_signals(&mut process.tasks, own.me);
+            state.sig.itimer.next_event().is_some() || state.signal_pending()
+        };
+        if due {
+            // `it_real_fn` sends the group's `SIGALRM` to its leader, whichever thread looks.
+            let Process { tasks, wake, .. } = &mut *process;
+            tasks.sync_timers(own.me, timer::ktime_get_ns(), wake);
+        }
+        let pending = current_signals(&mut process.tasks, own.me).signal_pending()
+            || core::mem::take(&mut after_stop);
         if pending {
             let outcome = {
                 let (mut state, mut pages) = FaultPages::of(&mut process, own);
@@ -3841,14 +3879,14 @@ fn start(mut init: Loaded) {
     if init.vfs.console_on_rootfs(&mut fdt).is_err() {
         crate::log!("Warning: unable to open an initial console.\n");
     }
-    let attrs = Attributes::init(task::max_threads(managed_pages));
+    let attrs = Attributes::init();
     let init_fs = init.vfs.new_fs_struct(0o022);
     let max_threads = task::max_threads(managed_pages);
     let (tasks, me) = crate::unwrap(
         Tasklist::new(
             u32::try_from(max_threads).unwrap_or(u32::MAX),
             &attrs.cred,
-            max_threads / 2,
+            Rlimits::init(max_threads),
         )
         .map_err(|_| "out of memory"),
         "task-list",

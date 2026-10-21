@@ -28,7 +28,7 @@ use super::{
     tasklist::{TaskId, Tasklist},
 };
 use crate::signal::{
-    NSIG, SIGCONT, SIGKILL, State, info::SigInfo, jobctl::JOBCTL_STOPPED, sig_kernel_stop,
+    NSIG, SIGALRM, SIGCONT, SIGKILL, State, info::SigInfo, jobctl::JOBCTL_STOPPED, sig_kernel_stop,
     state::Target, valid_signal,
 };
 use syscalls::Errno;
@@ -54,9 +54,11 @@ impl Tasklist {
         c.euid == tc.suid || c.euid == tc.uid || c.uid == tc.suid || c.uid == tc.uid || c.cap_kill
     }
 
-    /// `ptrace_may_access(target, PTRACE_MODE_READ_REALCREDS)` for the task `caller`: the same
-    /// thread group, or the same real, effective and saved ids with a dumpable target, or the
-    /// capability (root here).
+    /// `__ptrace_may_access(target, PTRACE_MODE_READ_REALCREDS)` for the task `caller`
+    /// (kernel/ptrace.c:279-345): the same thread group; else the caller's *real* uid and gid
+    /// (`FSCREDS` would use the filesystem ids) equal to the target's real, effective and saved
+    /// ids, or `CAP_SYS_PTRACE`; and then a target whose address space is not dumpable needs the
+    /// capability too.
     #[must_use]
     pub fn ptrace_may_access(&self, caller: TaskId, target: TaskId) -> bool {
         if self.same_thread_group(caller, target) {
@@ -66,14 +68,13 @@ impl Tasklist {
             return false;
         };
         let (c, t) = (c.cred, t.cred);
-        let same = c.euid == t.euid
-            && c.euid == t.suid
-            && c.euid == t.uid
-            && c.egid == t.egid
-            && c.egid == t.sgid
-            && c.egid == t.gid;
-        let privileged = c.cap_kill;
-        privileged || same && t_dumpable(self, target)
+        let same = c.uid == t.euid
+            && c.uid == t.suid
+            && c.uid == t.uid
+            && c.gid == t.egid
+            && c.gid == t.sgid
+            && c.gid == t.gid;
+        c.cap_sys_ptrace || same && t_dumpable(self, target)
     }
 
     /// `check_kill_permission(sig, info, t)` for a signal sent by `sender`
@@ -198,6 +199,30 @@ impl Tasklist {
                 let sched = self.sched_of(t);
                 w.wake_stopped(t, sched);
             }
+        }
+    }
+
+    /// `it_real_fn` for the thread group of `task`, run in the context of `task` (the thread
+    /// that looks at the clock): the real interval timer is brought up to `now`, and an
+    /// expiry sends `SIGALRM` to the group's *leader* (`kill_pid_info(SIGALRM, SEND_SIG_PRIV,
+    /// leader_pid)`), whom `complete_signal` prefers; a thread that happens to run first does
+    /// not take it unless the leader cannot (blocked, exiting).
+    pub fn sync_timers(&mut self, task: TaskId, now: u64, w: &mut dyn Waker) {
+        let fired = self.signal_state_as(task, true).is_some_and(|state| {
+            state.sig.now_ns = now;
+            state.sig.itimer.expire(now)
+        });
+        if fired {
+            let leader = self.group_leader(task);
+            // Only a real-time signal sent with `si_code < 0` can fail.
+            let _ = self.send_signal_to(
+                Some(task),
+                leader,
+                SIGALRM,
+                SigInfo::kernel(SIGALRM),
+                SendTo::Group,
+                w,
+            );
         }
     }
 
@@ -442,7 +467,7 @@ impl Tasklist {
                 break;
             };
             index += 1;
-            if self.task_pid_vnr(p) > 1 && p != sender {
+            if self.task_pid_vnr(p) > 1 && !self.same_thread_group(p, sender) {
                 let err = self.group_send_sig_info(Some(sender), sig, info, p, SendTo::Group, w);
                 count += 1;
                 if err != Err(Errno::EPERM) {

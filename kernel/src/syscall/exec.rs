@@ -192,7 +192,7 @@ fn prepare<C: Context>(
     let fatal = |c: &mut C| c.state().sig.group_exit.is_some();
     let arg_count = count(ctx, argv, fatal)?;
     let env_count = count(ctx, envp, fatal)?;
-    let rlim_stack = ctx.attrs().rlimits.get(RLIMIT_STACK).cur;
+    let rlim_stack = ctx.rlimits().get(RLIMIT_STACK).cur;
     let budget = string_budget(rlim_stack, arg_count, env_count)?;
     let mut used = 0u64;
     let mut name = Strings::new();

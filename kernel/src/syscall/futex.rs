@@ -41,6 +41,7 @@ use crate::{
         deliver::{ERESTART_RESTARTBLOCK, ERESTARTSYS},
         wait::signal_pending_synced,
     },
+    task::tasklist::ExitState,
     usercopy::{TASK_SIZE_MAX, copy_from_user, put_user},
 };
 use syscalls::{Errno, Sysno};
@@ -136,7 +137,7 @@ fn get_futex_key<C: Context>(
     if vma.flags.contains(VmFlags::WRITE) {
         // get_user_pages_fast(FOLL_WRITE): the page is present and private to the address
         // space (a private file page was copied), so the key is the address space's.
-        if crate::usercopy::UserPages::page(ctx, page, true).is_none() {
+        if !crate::usercopy::UserPages::resident(ctx, page, true) {
             return Err(Errno::EFAULT);
         }
         return Ok(Key::MmShared {
@@ -153,11 +154,15 @@ fn get_futex_key<C: Context>(
     let Some(file) = vma.file else {
         return Err(Errno::EFAULT);
     };
-    if crate::usercopy::UserPages::page(ctx, page, false).is_none() {
+    if !crate::usercopy::UserPages::resident(ctx, page, false) {
         return Err(Errno::EFAULT);
     }
-    Ok(Key::File {
-        file,
+    // `key->shared.i_seq = get_inode_sequence_number(inode)`: the inode, not the open file
+    // description, so two opens of one file (or two processes) share the futex.
+    let (sb, ino) = ctx.files().vfs.mapped_inode(file);
+    Ok(Key::Inode {
+        sb,
+        ino,
         index: vma.pgoff + ((page - vma.start) >> 12),
         offset,
     })
@@ -210,7 +215,12 @@ fn futex_wake_op<C: Context>(
         Err(errno) => return err(errno),
     };
     // futex_atomic_op_inuser: the operation on the word, then the comparison on the old value.
+    // `arch_futex_atomic_op_inuser` checks `access_ok` only (done by the key) and answers
+    // `-ENOSYS` for an operation that does not exist before it touches the word.
     let decoded = WakeOp::decode(op);
+    if let Err(errno) = decoded.validate() {
+        return err(errno);
+    }
     let Some(old) = read_u32(ctx, uaddr2) else {
         return err(Errno::EFAULT);
     };
@@ -424,10 +434,42 @@ pub(super) fn restart<C: Context>(ctx: &mut C, block: RestartBlock) -> i64 {
 
 // ---- priority inheritance: the uncontended cases --------------------------------------------
 
+/// `futex_wait_requeue_pi(uaddr, flags, val, abs_time, bitset, uaddr2)` up to the point where it
+/// queues a `rt_waiter` for the lock hand-over: the checks that need no `rt_mutex` answer with
+/// Linux's errno (`EINVAL` for one word, the key of `uaddr2`, then `futex_wait_setup`'s key,
+/// word, value and `futex_match(&q->key, key2)` checks); the wait itself is a loud stop.
+fn futex_wait_requeue_pi<C: Context>(
+    ctx: &mut C,
+    uaddr: u64,
+    flags: Flags,
+    val: u32,
+    uaddr2: u64,
+) -> Sys {
+    if uaddr == uaddr2 {
+        return Err(Errno::EINVAL.into());
+    }
+    let key2 = get_futex_key(ctx, uaddr2, flags, Access::Write)?;
+    // futex_wait_setup: the key, the word, the value, and that the two futexes differ.
+    let key = get_futex_key(ctx, uaddr, flags, Access::Read)?;
+    let Some(current) = read_u32(ctx, uaddr) else {
+        return Err(Errno::EFAULT.into());
+    };
+    if current != val {
+        return Err(Errno::EAGAIN.into());
+    }
+    if key == key2 {
+        return Err(Errno::EINVAL.into());
+    }
+    Err(Stop::Unimplemented)
+}
+
 /// `futex_lock_pi(uaddr, flags, time, trylock)` when no `pi_state` is needed: the word is free
-/// (taken), or already ours (`EDEADLK`), or its owner does not exist (`ESRCH`, after the waiters
-/// bit is set). A lock another live task holds needs an `rt_mutex`: a loud stop.
-fn futex_lock_pi<C: Context>(ctx: &mut C, uaddr: u64, flags: Flags) -> Sys {
+/// (taken), or already ours (`EDEADLK`), or its owner does not exist or is dead (`ESRCH`, after
+/// the waiters bit is set). A lock another live task holds is `EAGAIN` for a trylock
+/// (`rt_mutex_futex_trylock` of a mutex the owner holds fails; the `pi_state` made for it is
+/// dropped again, the waiters bit stays) and, for the blocking call, needs an `rt_mutex`: a
+/// loud stop.
+fn futex_lock_pi<C: Context>(ctx: &mut C, uaddr: u64, flags: Flags, trylock: bool) -> Sys {
     get_futex_key(ctx, uaddr, flags, Access::Write)?;
     let vpid = ctx.futex().tid;
     // futex_lock_pi_atomic
@@ -451,9 +493,22 @@ fn futex_lock_pi<C: Context>(ctx: &mut C, uaddr: u64, flags: Flags) -> Sys {
         return Err(Errno::EFAULT.into());
     }
     let owner = i32::try_from(uval & FUTEX_TID_MASK).unwrap_or(0);
-    let exists = ctx.tasks().list.find_task_by_vpid(owner).is_some();
-    if !exists {
+    let t = ctx.tasks();
+    // `attach_to_pi_owner`: a task that is gone, or past its futex cleanup (a zombie), gives
+    // `handle_exit_race`, which re-reads the unchanged word: `-ESRCH`.
+    let live = t.list.find_task_by_vpid(owner).filter(|&o| {
+        t.list
+            .task(o)
+            .is_some_and(|task| task.exit_state == ExitState::Live)
+    });
+    let Some(owner) = live else {
         return Err(Errno::ESRCH.into());
+    };
+    // For a private key the owner must work in the waiter's address space (`-EPERM` else).
+    // shortcut: the address space of a task of another thread group is not known here, so
+    // that case stops loudly; a thread of the caller's group shares it by `CLONE_THREAD`.
+    if trylock && (flags.shared() || t.list.same_thread_group(t.current, owner)) {
+        return Err(Errno::EAGAIN.into());
     }
     Err(Stop::Unimplemented)
 }
@@ -607,6 +662,20 @@ fn futex_waitv<C: Context>(
         .try_reserve_exact(nr as usize)
         .map_err(|_| Errno::ENOMEM)?;
     ctx.futex().queue.reserve(nr as usize)?;
+    let ret = futex_waitv_reserved(ctx, waiters, nr, deadline, entries);
+    // Every exit has taken this call's waiters out of the queue.
+    ctx.futex().queue.release(nr as usize);
+    ret
+}
+
+/// `futex_waitv` after the vector is allocated and the queue has room for its entries.
+fn futex_waitv_reserved<C: Context>(
+    ctx: &mut C,
+    waiters: u64,
+    nr: u32,
+    deadline: Option<Abs>,
+    mut entries: alloc::vec::Vec<WaitvEntry>,
+) -> Sys {
     for index in 0..u64::from(nr) {
         let entry = parse_waitv_entry(ctx, waiters, index)?;
         let _ = entries.push_within_capacity(entry);
@@ -859,19 +928,12 @@ fn do_futex<C: Context>(
             if cmd == FUTEX_LOCK_PI {
                 flags = flags.with(Flags::CLOCKRT);
             }
-            futex_lock_pi(ctx, uaddr, flags)
+            futex_lock_pi(ctx, uaddr, flags, false)
         }
         FUTEX_UNLOCK_PI => futex_unlock_pi(ctx, uaddr, flags),
-        FUTEX_TRYLOCK_PI => futex_lock_pi(ctx, uaddr, flags),
-        FUTEX_WAIT_REQUEUE_PI => {
-            if uaddr == uaddr2 || val3 == 0 {
-                // `futex_wait_requeue_pi`: "if (uaddr == uaddr2) return -EINVAL; if (!bitset)
-                // return -EINVAL" (do_futex passes FUTEX_BITSET_MATCH_ANY, never zero).
-                return Err(Errno::EINVAL.into());
-            }
-            // The wait itself queues a `rt_waiter` for the lock hand-over.
-            Err(Stop::Unimplemented)
-        }
+        FUTEX_TRYLOCK_PI => futex_lock_pi(ctx, uaddr, flags, true),
+        // `do_futex` passes `FUTEX_BITSET_MATCH_ANY`: the bitset is never zero.
+        FUTEX_WAIT_REQUEUE_PI => futex_wait_requeue_pi(ctx, uaddr, flags, val, uaddr2),
         FUTEX_CMP_REQUEUE_PI => futex_requeue(
             ctx,
             uaddr,
@@ -1247,6 +1309,120 @@ mod tests {
     }
 
     #[test]
+    fn a_trylock_of_a_lock_a_live_thread_holds_fails_and_a_dead_owner_is_esrch() {
+        use crate::task::{exit::NoWake, tasklist::CloneParams};
+        let mut t = t();
+        let trylock = 8 | PRIVATE;
+        let params = CloneParams {
+            fork: crate::task::tasklist::ForkParams {
+                exit_signal: 0,
+                clear_sighand: false,
+            },
+            thread: true,
+            share_sighand: true,
+            reset_altstack: true,
+        };
+        let thread = t.tasks.clone_task(t.current, params).unwrap();
+        let tid = u32::try_from(t.tasks.task_pid_vnr(thread)).unwrap();
+        put(&mut t, W, tid);
+        // attach_to_pi_owner + a failed rt_mutex_futex_trylock: -EWOULDBLOCK, waiters bit left.
+        assert_eq!(futex(&mut t, &[W, trylock]), neg(Errno::EAGAIN));
+        assert_eq!(get(&mut t, W), tid | FUTEX_WAITERS);
+        // A process (another address space, perhaps) owning a private lock: not known here.
+        let child = t
+            .tasks
+            .fork(
+                t.current,
+                crate::task::tasklist::ForkParams {
+                    exit_signal: 17,
+                    clear_sighand: false,
+                },
+            )
+            .unwrap();
+        let other = u32::try_from(t.tasks.task_pid_vnr(child)).unwrap();
+        put(&mut t, W, other);
+        assert_eq!(
+            dispatch(&mut t, Sysno::futex as u64, [W, trylock, 0, 0, 0, 0]),
+            Outcome::Unimplemented(Sysno::futex as u32)
+        );
+        // An owner that has exited (a zombie not yet reaped): handle_exit_race re-reads the
+        // unchanged word and answers -ESRCH.
+        t.tasks.exit_prepare(child, 0, false, &mut NoWake);
+        t.tasks.exit_notify(child, true, &mut NoWake).unwrap();
+        assert!(t.tasks.task(child).is_some());
+        put(&mut t, W, other);
+        assert_eq!(futex(&mut t, &[W, trylock]), neg(Errno::ESRCH));
+        assert_eq!(get(&mut t, W), other | FUTEX_WAITERS);
+        // The blocking call on a lock a live thread holds waits for the rt_mutex: a loud stop.
+        put(&mut t, W, tid);
+        assert_eq!(
+            dispatch(&mut t, Sysno::futex as u64, [W, 6 | PRIVATE, 0, 0, 0, 0]),
+            Outcome::Unimplemented(Sysno::futex as u32)
+        );
+    }
+
+    #[test]
+    fn wait_requeue_pi_answers_what_needs_no_rt_mutex() {
+        let mut t = t();
+        let wait_pi = 0xb | PRIVATE;
+        put(&mut t, W, 0);
+        put(&mut t, W + 4, 0);
+        // The bitset is MATCH_ANY whatever val3 is: a zero val3 does not make this EINVAL.
+        // Linux order: one word, the key of uaddr2, the key and value of uaddr, the key match.
+        assert_eq!(futex(&mut t, &[W, wait_pi, 0, 0, W, 0]), neg(Errno::EINVAL));
+        assert_eq!(
+            futex(&mut t, &[W + 1, wait_pi, 0, 0, W + 4, 0]),
+            neg(Errno::EINVAL),
+            "unaligned"
+        );
+        assert_eq!(
+            futex(&mut t, &[W, wait_pi, 0, 0, W + 6, 0]),
+            neg(Errno::EINVAL),
+            "uaddr2 is checked first"
+        );
+        assert_eq!(
+            futex(&mut t, &[BAD, wait_pi, 0, 0, W + 4, 0]),
+            neg(Errno::EFAULT)
+        );
+        assert_eq!(
+            futex(&mut t, &[W, wait_pi, 0, 0, BAD, 0]),
+            neg(Errno::EFAULT)
+        );
+        assert_eq!(
+            futex(&mut t, &[0x3000, wait_pi, 0, 0, W + 4, 0]),
+            neg(Errno::EFAULT),
+            "an unmapped word"
+        );
+        assert_eq!(
+            futex(&mut t, &[W, wait_pi, 1, 0, W + 4, 0]),
+            neg(Errno::EAGAIN),
+            "the value differs"
+        );
+        // A matching value on two distinct words queues a rt_waiter: the part that is not here.
+        assert_eq!(
+            dispatch(&mut t, Sysno::futex as u64, [W, wait_pi, 0, 0, W + 4, 0]),
+            Outcome::Unimplemented(Sysno::futex as u32)
+        );
+    }
+
+    #[test]
+    fn wake_op_refuses_an_operation_that_does_not_exist_before_touching_the_word() {
+        let mut t = t();
+        let wake_op = 5 | PRIVATE;
+        // Operation 5 on an address in range that nothing maps: ENOSYS, not EFAULT.
+        let encoded = (5u64 << 28) | (1 << 12);
+        assert_eq!(
+            futex(&mut t, &[W, wake_op, 0, 0, 0x3000, encoded]),
+            neg(Errno::ENOSYS)
+        );
+        // An operation that exists faults on the unmapped word.
+        assert_eq!(
+            futex(&mut t, &[W, wake_op, 0, 0, 0x3000, (1 << 28) | (1 << 12)]),
+            neg(Errno::EFAULT)
+        );
+    }
+
+    #[test]
     fn the_robust_list_of_an_exiting_thread_is_walked() {
         let mut t = t();
         // head at 0x2000: next = L0 (0x2100), offset 8, pending = L2 (0x2300).
@@ -1343,8 +1519,6 @@ mod tests {
             .fork(
                 t.current,
                 crate::task::tasklist::ForkParams {
-                    rlimit_sigpending: 10,
-                    rlimit_nproc: 100,
                     exit_signal: 17,
                     clear_sighand: false,
                 },

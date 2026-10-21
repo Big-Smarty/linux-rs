@@ -37,6 +37,7 @@ use super::{
     itimer::RealTimer,
     sig_kernel_coredump, sig_kernel_only, sig_kernel_stop,
 };
+use crate::task::{RLIMIT_SIGPENDING, Rlimits};
 use syscalls::Errno;
 
 /// Real-time `siginfo` entries per pending queue (see the module contract).
@@ -197,8 +198,9 @@ pub struct SignalStruct {
     pub exec_collapsing: bool,
     /// `SIGNAL_UNKILLABLE`.
     pub unkillable: bool,
-    /// `RLIMIT_SIGPENDING` (`signal->rlim`).
-    pub rlimit_sigpending: u64,
+    /// `signal->rlim`: the resource limits the threads of the group share (`setrlimit` in one
+    /// is seen by all; `copy_signal` gives a new process a copy).
+    pub rlimits: Rlimits,
     /// The job-control bits of `signal->flags` (`SIGNAL_STOP_STOPPED`,
     /// `SIGNAL_STOP_CONTINUED`, `SIGNAL_CLD_STOPPED`, `SIGNAL_CLD_CONTINUED`;
     /// see [`crate::task::wait`]). Kept apart from `group_exit` (which carries
@@ -221,14 +223,14 @@ pub struct SignalStruct {
 
 impl SignalStruct {
     /// The `signal_struct` `copy_signal` gives a new thread group: nothing pending, no group
-    /// exit or stop, the real interval timer unarmed, `RLIMIT_SIGPENDING` as given.
+    /// exit or stop, the real interval timer unarmed, the limits as given.
     #[must_use]
-    pub fn new(rlimit_sigpending: u64) -> Self {
+    pub fn new(rlimits: Rlimits) -> Self {
         Self {
             group_exit: None,
             exec_collapsing: false,
             unkillable: false,
-            rlimit_sigpending,
+            rlimits,
             job_flags: 0,
             group_stop_count: 0,
             stop_code: 0,
@@ -236,6 +238,12 @@ impl SignalStruct {
             now_ns: 0,
             shared: Pending::new(),
         }
+    }
+
+    /// `rlimit(RLIMIT_SIGPENDING)` of the group.
+    #[must_use]
+    pub fn rlimit_sigpending(&self) -> u64 {
+        self.rlimits.get(RLIMIT_SIGPENDING).cur
     }
 
     /// The signals pending for the whole group, for `/proc` and tests.
@@ -392,10 +400,10 @@ impl TaskSignals {
     /// altstack disabled (`sas_ss_reset`). `execve` is [`State::flush_on_exec`],
     /// not this.
     #[must_use]
-    pub fn new(rlimit_sigpending: u64) -> Self {
+    pub fn new(rlimits: Rlimits) -> Self {
         Self {
             hand: SigHand::new(),
-            signal: SignalStruct::new(rlimit_sigpending),
+            signal: SignalStruct::new(rlimits),
             thread: ThreadSignal::new(),
         }
     }
@@ -403,7 +411,7 @@ impl TaskSignals {
     /// The signal state `copy_process` gives a forked child of this task
     /// (no `CLONE_*` sharing): `copy_sighand` copies the dispositions;
     /// `copy_signal` makes a fresh `signal_struct` (nothing pending, no group
-    /// exit or stop, the real interval timer unarmed, the limits `rlimit`);
+    /// exit or stop, the real interval timer unarmed, the limits of the caller's group, copied);
     /// the blocked masks and the alternate stack are copied with the task
     /// struct (`dup_task_struct`; `sas_ss_reset` happens only for `CLONE_VM`),
     /// the private pending queue is emptied (`init_sigpending`) and a mask
@@ -414,8 +422,8 @@ impl TaskSignals {
     /// default, `SIG_IGN` kept; confirmed against the pinned kernel by the
     /// `fork.clone3-clear-sighand` oracle row).
     #[must_use]
-    pub fn fork_child(&self, rlimit_sigpending: u64, clear_sighand: bool) -> Self {
-        let mut child = Self::new(rlimit_sigpending);
+    pub fn fork_child(&self, rlimits: Rlimits, clear_sighand: bool) -> Self {
+        let mut child = Self::new(rlimits);
         child.hand = self.hand.clone();
         if clear_sighand {
             child.hand.flush();
@@ -434,8 +442,8 @@ impl TaskSignals {
 
     /// The global init's: `SIGNAL_UNKILLABLE` (`copy_process`, child reaper).
     #[must_use]
-    pub fn new_init(rlimit_sigpending: u64) -> Self {
-        let mut signals = Self::new(rlimit_sigpending);
+    pub fn new_init(rlimits: Rlimits) -> Self {
+        let mut signals = Self::new(rlimits);
         signals.signal.unkillable = true;
         signals
     }
@@ -505,7 +513,7 @@ impl State<'static> {
     #[must_use]
     pub fn standalone(pid: i32, uid: u32, rlimit_sigpending: u64) -> Self {
         Self::leak(
-            TaskSignals::new(rlimit_sigpending),
+            TaskSignals::new(Rlimits::for_tests(rlimit_sigpending, 1000)),
             Ids {
                 pid,
                 tgid: pid,
@@ -521,7 +529,7 @@ impl State<'static> {
     #[must_use]
     pub fn standalone_init(rlimit_sigpending: u64) -> Self {
         Self::leak(
-            TaskSignals::new_init(rlimit_sigpending),
+            TaskSignals::new_init(Rlimits::for_tests(rlimit_sigpending, 1000)),
             Ids {
                 pid: 1,
                 tgid: 1,
@@ -797,7 +805,7 @@ impl State<'_> {
         if sig != SIGKILL {
             let override_rlimit = sig < SIGRTMIN && info.code >= 0;
             let counted = (self.me.private.len + self.sig.shared.len) as u64 + 1;
-            let allowed = override_rlimit || counted <= self.sig.rlimit_sigpending;
+            let allowed = override_rlimit || counted <= self.sig.rlimit_sigpending();
             let pending = self.pending_mut(target);
             // Classic signals have at most one entry (legacy_queue above), so
             // their reserved slots never run out; only RT entries are capped.
@@ -981,7 +989,8 @@ impl State<'_> {
     /// `ITIMER_REAL` sends `SIGALRM` to the process (`it_real_fn`:
     /// `kill_pid_info(SIGALRM, SEND_SIG_PRIV)`, so `SI_KERNEL`, pid 0, uid 0).
     /// Called on every kernel exit and after every wake-up, before the pending
-    /// set is examined.
+    /// set is examined. For the one task this view stands for; a thread group's other
+    /// threads are [`crate::task::Tasklist::sync_timers`]'s (the signal goes to the leader).
     pub fn sync_timers(&mut self, now: u64) {
         self.sig.now_ns = now;
         if self.sig.itimer.expire(now) {

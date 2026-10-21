@@ -26,8 +26,10 @@
 //!   in `Task::wait`).
 //! * Allocation: a task waits on at most one futex at a time (`futex_wait`), or on up to
 //!   [`WAITV_MAX`] (`futex_waitv`, which reserves its entries first and may fail with `ENOMEM`
-//!   as `kcalloc` does). The vector is sized for one entry per scheduler slot when it is made, so
-//!   a plain wait cannot fail to queue.
+//!   as `kcalloc` does). The vector holds one entry per scheduler slot when it is made, and a
+//!   `futex_waitv` call adds room for its own entries on top of that ([`Futexes::reserve`]) for
+//!   as long as they may be queued ([`Futexes::release`]), so a plain wait cannot fail to queue
+//!   whatever the other tasks wait on.
 //! * Fairness: wake-ups go in queue order within a key (`plist` FIFO within one priority); a
 //!   requeued waiter goes to the end (`plist_add` after `plist_del`).
 
@@ -117,11 +119,19 @@ pub enum Key {
     /// A non-private futex on an anonymous page: the address space and the address, in a key
     /// that never equals a private one (`FUT_OFF_MMSHARED` is part of `offset` in Linux).
     MmShared { mm: u64, page: u64, offset: u32 },
-    /// A non-private futex on a page of a mapped file: the file and the page index
-    /// (`FUT_OFF_INODE`). shortcut: the identity is the open file description's, not the
-    /// inode's, so two descriptions of one file do not match; upgrade with an inode id from the
-    /// VFS.
-    File { file: u64, index: u64, offset: u32 },
+    /// A non-private futex on a page of a mapped file: the inode and the page index
+    /// (`FUT_OFF_INODE`, `key->shared.i_seq` and `pgoff`). shortcut: the inode is named by its
+    /// superblock and inode number, which tmpfs never reuses while the superblock exists;
+    /// Linux's `i_sequence` is global and an `ihold` keeps the inode while a waiter is queued,
+    /// where here a waiter whose last mapping and file are gone would keep a key that a later
+    /// superblock in the same slot could match. Upgrade with a global inode sequence number
+    /// from the VFS.
+    Inode {
+        sb: u16,
+        ino: u64,
+        index: u64,
+        offset: u32,
+    },
 }
 
 /// A queued waiter (`struct futex_q`).
@@ -149,9 +159,14 @@ pub struct Ticket(u64);
 /// The futex hash: every waiting task of every address space, in queue order.
 pub struct Futexes {
     queue: Vec<Waiter>,
-    /// Per task slot: `Some(index)` once a waker took one of its waiters out of the queue.
+    /// Per task slot: `Some(index)` once a waker took one of its waiters out of the queue (the
+    /// highest index of those, as `futex_unqueue_multiple` reports).
     woken: Vec<Option<u32>>,
     next_ticket: u64,
+    /// The scheduler slots: at most one plain waiter each.
+    slots: usize,
+    /// Entries `futex_waitv` calls in progress may queue ([`Futexes::reserve`]).
+    extra: usize,
 }
 
 impl Futexes {
@@ -171,23 +186,42 @@ impl Futexes {
             queue,
             woken,
             next_ticket: 1,
+            slots,
+            extra: 0,
         })
     }
 
-    /// Room for `count` more waiters of one `futex_waitv` call.
+    /// Room for `count` waiters of one `futex_waitv` call, on top of one plain waiter per slot
+    /// and of the other calls' entries: the call's entries may then be queued whatever else
+    /// sleeps here, and every plain wait still finds room. Paired with [`Futexes::release`]
+    /// when the call ends.
     ///
     /// # Errors
     /// `ENOMEM`.
     pub fn reserve(&mut self, count: usize) -> Result<(), Errno> {
-        self.queue.try_reserve(count).map_err(|_| Errno::ENOMEM)
+        let extra = self.extra.checked_add(count).ok_or(Errno::ENOMEM)?;
+        let want = self.slots.checked_add(extra).ok_or(Errno::ENOMEM)?;
+        // The queue never holds more than `slots + self.extra` entries, so `want >= len`.
+        self.queue
+            .try_reserve(want.saturating_sub(self.queue.len()))
+            .map_err(|_| Errno::ENOMEM)?;
+        self.extra = extra;
+        Ok(())
+    }
+
+    /// The `futex_waitv` call that reserved `count` entries is over (its waiters are out of
+    /// the queue). The storage stays: it is bounded by the most that were ever reserved at
+    /// once.
+    pub fn release(&mut self, count: usize) {
+        self.extra = self.extra.saturating_sub(count);
     }
 
     /// `futex_queue`: `owner` waits on `key` for a wake-up matching `bitset`. `index` is the
     /// entry's place in a `futex_waitv` vector (0 otherwise).
     ///
     /// # Panics
-    /// When no room was reserved: a plain wait is one entry per slot, [`Futexes::reserve`]
-    /// covers the vector of a `futex_waitv`.
+    /// When no room was reserved, which cannot happen: a plain wait is one entry per slot and
+    /// [`Futexes::reserve`] adds the entries of every `futex_waitv` in progress.
     pub fn queue(&mut self, key: Key, bitset: u32, owner: u32, index: u32) -> Ticket {
         let ticket = self.next_ticket;
         self.next_ticket += 1;
@@ -217,8 +251,8 @@ impl Futexes {
         }
     }
 
-    /// `futex_unqueue_multiple`: take every waiter of `owner` out; the index of the last one
-    /// that had been woken, if any.
+    /// `futex_unqueue_multiple`: take every waiter of `owner` out; the highest index of those
+    /// that had been woken (`if (!futex_unqueue(..)) ret = i`), if any.
     pub fn unqueue_owner(&mut self, owner: u32) -> Option<u32> {
         self.queue.retain(|w| w.owner != owner);
         self.take_woken(owner)
@@ -258,7 +292,9 @@ impl Futexes {
     fn wake_at(&mut self, at: usize, wake: &mut dyn FnMut(u32)) {
         let w = self.queue.remove(at);
         if let Some(mark) = self.woken.get_mut(w.owner as usize) {
-            *mark = Some(w.index);
+            // The sleeper may be woken through several of its entries before it runs; it
+            // reports the highest index of them.
+            *mark = Some(mark.map_or(w.index, |seen| seen.max(w.index)));
         }
         wake(w.owner);
     }
@@ -393,6 +429,19 @@ impl WakeOp {
             oparg,
             cmp,
             cmparg,
+        }
+    }
+
+    /// Whether the operation exists: `arch_futex_atomic_op_inuser` decides this before it
+    /// touches the word.
+    ///
+    /// # Errors
+    /// `ENOSYS`.
+    pub fn validate(&self) -> Result<(), Errno> {
+        if self.op <= 4 {
+            Ok(())
+        } else {
+            Err(Errno::ENOSYS)
         }
     }
 
@@ -544,5 +593,76 @@ mod tests {
         // Signed comparisons: -1 < 0.
         assert_eq!(WakeOp::decode(enc(0, 0, 2, 0)).compare(u32::MAX), Ok(true));
         assert_eq!(WakeOp::decode(enc(0, 0, 4, 0xfff)).compare(0), Ok(true));
+    }
+
+    #[test]
+    fn waitv_entries_leave_room_for_every_plain_wait() {
+        // One slot per task; a `futex_waitv` of 4 entries occupies four more entries than its
+        // own slot. Every other task can still wait on one futex.
+        let slots: usize = 5;
+        let mut f = Futexes::new(slots).unwrap();
+        f.reserve(4).unwrap();
+        for index in 0..4 {
+            f.queue(key(1), !0, 0, index);
+        }
+        for owner in 1..5u32 {
+            f.queue(key(2), !0, owner, 0);
+        }
+        assert_eq!(f.len(), 4 + slots - 1);
+        // A second waitv in progress adds its own room.
+        let mut f = Futexes::new(slots).unwrap();
+        f.reserve(4).unwrap();
+        f.reserve(3).unwrap();
+        for owner in 0..2u32 {
+            for index in 0..if owner == 0 { 4 } else { 3 } {
+                f.queue(key(1), !0, owner, index);
+            }
+        }
+        for owner in 2..5u32 {
+            f.queue(key(2), !0, owner, 0);
+        }
+        assert_eq!(f.len(), 7 + slots - 2);
+        // The calls end: their room is given back to the count, and the next call asks again.
+        assert_eq!(f.unqueue_owner(0), None);
+        f.release(4);
+        f.release(3);
+        assert_eq!(f.extra, 0);
+    }
+
+    #[test]
+    fn a_sleeper_woken_through_several_entries_reports_the_highest_index() {
+        // `futex_unqueue_multiple`: `if (!futex_unqueue(..)) ret = i`, so the last woken wins by
+        // index, not by the order the wakers ran.
+        let mut f = Futexes::new(4).unwrap();
+        f.reserve(3).unwrap();
+        for index in 0..3 {
+            f.queue(key(u64::from(index) + 1), !0, 0, index);
+        }
+        // Woken 2, then 0, then 1 before the sleeper runs.
+        for k in [3, 1, 2] {
+            assert_eq!(f.wake(&key(k), 1, !0, &mut |_| {}), 1);
+        }
+        assert!(f.is_woken(0));
+        assert_eq!(f.unqueue_owner(0), Some(2));
+        assert!(!f.is_woken(0));
+        // Woken 0 and then 1: 1.
+        f.reserve(3).unwrap();
+        for index in 0..3 {
+            f.queue(key(u64::from(index) + 1), !0, 0, index);
+        }
+        for k in [1, 2] {
+            f.wake(&key(k), 1, !0, &mut |_| {});
+        }
+        assert_eq!(f.unqueue_owner(0), Some(1));
+    }
+
+    #[test]
+    fn a_wake_op_with_an_operation_that_does_not_exist_is_refused_before_any_access() {
+        for op in 0..8u32 {
+            let decoded = WakeOp::decode(op << 28);
+            assert_eq!(decoded.validate().is_ok(), op <= 4, "{op}");
+        }
+        // The shift flag is bit 31 of the operation field: operation numbers stay 0..=7.
+        assert!(WakeOp::decode(0x8000_0000).validate().is_ok());
     }
 }

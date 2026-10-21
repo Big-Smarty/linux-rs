@@ -24,7 +24,7 @@
 
 use super::{Context, Outcome, Tasks};
 use crate::task::pid::PidType;
-use crate::task::{Attributes, COMM_LEN, LimitError, RLIM_INFINITY, RLIMIT_CPU, Rlimit};
+use crate::task::{COMM_LEN, LimitError, RLIM_INFINITY, RLIMIT_CPU, Rlimit};
 use crate::usercopy::{TASK_SIZE_MAX, copy_from_user, copy_to_user, put_user, strncpy_from_user};
 use syscalls::{Errno, Sysno};
 
@@ -307,8 +307,8 @@ fn get_rlimit_arg<C: Context>(ctx: &mut C, pointer: u64) -> Result<Rlimit, Stop>
 /// ordinary validation it stops the kernel instead of storing a limit nothing
 /// would enforce (nothing is stored in that case).
 fn do_prlimit<C: Context>(ctx: &mut C, resource: u32, new: Option<Rlimit>) -> Result<Rlimit, Stop> {
-    let attrs: &mut Attributes = ctx.attrs();
-    let mut trial = attrs.rlimits;
+    let limits = ctx.rlimits();
+    let mut trial = *limits;
     let old = trial.prlimit(resource, new)?;
     if let Some(new) = new
         && resource as usize == RLIMIT_CPU
@@ -316,7 +316,7 @@ fn do_prlimit<C: Context>(ctx: &mut C, resource: u32, new: Option<Rlimit>) -> Re
     {
         return Err(Stop::Unimplemented);
     }
-    attrs.rlimits = trial;
+    *limits = trial;
     Ok(old)
 }
 
@@ -1173,7 +1173,7 @@ mod tests {
     fn rlimits_default_set_and_read_back() {
         let mut t = user_task();
         const INF: u64 = u64::MAX;
-        t.attrs = crate::task::Attributes::init(2000);
+        *t.tasks.rlimits_mut(t.current).unwrap() = crate::task::Rlimits::init(2000);
         let defaults = [
             (INF, INF),
             (INF, INF),

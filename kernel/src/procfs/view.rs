@@ -32,7 +32,7 @@ use syscalls::Errno;
 
 use crate::{
     mm::{Mm, Vma},
-    task::{Attributes, COMM_LEN},
+    task::{Attributes, COMM_LEN, Rlimits},
     vfs::{FdTable, FileId, FileTable, InodeId, KResult},
 };
 
@@ -85,9 +85,10 @@ pub struct MmView {
 /// list).
 #[derive(Debug)]
 pub struct TaskView {
-    /// The identity group's state of the task: credentials, limits, `comm` and the
-    /// personality.
+    /// The identity group's state of the task: credentials, `comm` and the personality.
     pub attrs: Attributes,
+    /// `signal->rlim` of the task's thread group (`/proc/<pid>/limits`, `stat`'s `rsslim`).
+    pub rlimits: Rlimits,
     /// The filesystem context (`fs->root`, `fs->pwd`, `fs->umask`).
     pub fs: FsStruct,
     /// `task->fs` still exists (`exit_fs` has not run).
@@ -129,6 +130,7 @@ pub struct TaskView {
 /// What [`TaskView::collect`] reads from the owning task.
 pub struct Collect<'a> {
     pub attrs: &'a Attributes,
+    pub rlimits: &'a Rlimits,
     pub fs: FsStruct,
     pub fdt: &'a FdTable,
     pub files: &'a FileTable,
@@ -157,6 +159,7 @@ impl TaskView {
     pub fn collect(input: Collect<'_>) -> KResult<Self> {
         let mut view = Self {
             attrs: *input.attrs,
+            rlimits: *input.rlimits,
             fs: input.fs,
             has_fs: true,
             mm: None,
@@ -199,6 +202,7 @@ impl TaskView {
         };
         self.fds.sync(self.fd_stamp, input.fdt, input.files)?;
         self.attrs = *input.attrs;
+        self.rlimits = *input.rlimits;
         self.fs = input.fs;
         self.has_fs = true;
         self.has_files = true;
@@ -234,6 +238,7 @@ impl TaskView {
     pub fn refresh_files(
         &mut self,
         attrs: &Attributes,
+        rlimits: &Rlimits,
         fs: FsStruct,
         fdt: &FdTable,
         files: &FileTable,
@@ -241,6 +246,7 @@ impl TaskView {
     ) -> KResult<()> {
         self.fds.sync(self.fd_stamp, fdt, files)?;
         self.attrs = *attrs;
+        self.rlimits = *rlimits;
         self.fs = fs;
         self.fd_stamp = fdt.stamp();
         self.max_fds = u32::try_from(fdt.max_fds()).unwrap_or(u32::MAX);

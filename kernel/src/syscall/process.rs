@@ -299,8 +299,6 @@ mod tests {
             .fork(
                 t.current,
                 ForkParams {
-                    rlimit_sigpending: 100,
-                    rlimit_nproc: 1000,
                     exit_signal: crate::signal::SIGCHLD,
                     clear_sighand: false,
                 },
@@ -760,9 +758,13 @@ mod tests {
     fn fork_limits_come_from_the_task_list() {
         let mut t = t();
         // max_threads is 1000 in the fake, RLIMIT_NPROC is not reached by root.
-        t.tasks = crate::task::Tasklist::new(3, &t.attrs.cred, 1000)
-            .unwrap()
-            .0;
+        t.tasks = crate::task::Tasklist::new(
+            3,
+            &t.attrs.cred,
+            crate::task::Rlimits::for_tests(1000, 1000),
+        )
+        .unwrap()
+        .0;
         t.current = t.tasks.child_reaper();
         assert_eq!(call(&mut t, Sysno::fork, &[]), 2);
         assert_eq!(call(&mut t, Sysno::fork, &[]), 3);

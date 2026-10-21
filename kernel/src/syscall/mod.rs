@@ -64,7 +64,8 @@ use crate::{
     exec::load::Pager,
     mm::{Env, Mm},
     task::{
-        Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE, TaskId, Tasklist, exit::Waker, fork::ForkRequest,
+        Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE, Rlimits, TaskId, Tasklist, exit::Waker,
+        fork::ForkRequest,
     },
     usercopy::UserPages,
     vfs::{Cred, FdTable, FileId, FsStruct, Vfs, mapping::Mappable},
@@ -140,8 +141,8 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     fn tgid(&self) -> u32;
     /// `task_pid_vnr(current)`: what `gettid` returns.
     fn tid(&self) -> u32;
-    /// The identity, limits, filesystem context and small per-task state of the
-    /// caller (`task`); see [`Attributes`].
+    /// The identity and small per-task state of the caller (`task`); see [`Attributes`]. The
+    /// limits are the group's ([`Context::rlimits`]).
     fn attrs(&mut self) -> &mut Attributes;
     /// The user `%fs` base as the CPU holds it (`x86_fsbase_read_cpu`).
     fn fs_base(&self) -> u64;
@@ -257,13 +258,23 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     fn cred(&mut self) -> Cred {
         Cred::of_task(&self.attrs().cred)
     }
+    /// `current->signal->rlim`: the resource limits of the caller's thread group, which all its
+    /// threads share.
+    ///
+    /// # Panics
+    /// If the running task is not in the task list, which is a kernel bug.
+    fn rlimits(&mut self) -> &mut Rlimits {
+        let Tasks { list, current, .. } = self.tasks();
+        list.rlimits_mut(current)
+            .expect("the running task is in the task list")
+    }
     /// `rlimit(RLIMIT_FSIZE)`: the soft limit (`RLIM_INFINITY` when unlimited).
     fn rlimit_fsize(&mut self) -> u64 {
-        self.attrs().rlimits.get(RLIMIT_FSIZE).cur
+        self.rlimits().get(RLIMIT_FSIZE).cur
     }
     /// `rlimit(RLIMIT_NOFILE)`: the soft limit.
     fn rlimit_nofile(&mut self) -> u64 {
-        self.attrs().rlimits.get(RLIMIT_NOFILE).cur
+        self.rlimits().get(RLIMIT_NOFILE).cur
     }
 }
 

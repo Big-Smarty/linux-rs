@@ -394,7 +394,7 @@ fn status(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
         format_args!(
             "Threads:\t{}\nSigQ:\t{queued}/{}\n",
             show.tasks.group_thread_count(task),
-            view.attrs.rlimits.get(crate::task::RLIMIT_SIGPENDING).cur,
+            view.rlimits.get(crate::task::RLIMIT_SIGPENDING).cur,
         ),
     )?;
     sigset(seq, "SigPnd:\t", sets.pending)?;
@@ -477,7 +477,7 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     };
     let rss = mm.map_or(0, |m| m.rss_anon + m.rss_file + m.rss_shmem);
     let wchan = u64::from(permitted && state != b'R');
-    let rsslim = view.attrs.rlimits.get(5).cur;
+    let rsslim = view.rlimits.get(5).cur;
     seq::print(seq, format_args!("{} (", show.tasks.task_pid_vnr(task)))?;
     let comm = view.comm_bytes();
     seq.put(&comm[..comm.len().min(64)])?;
@@ -605,7 +605,7 @@ fn limits(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     let (_, view) = pid_view(show, node)?;
     seq.puts("Limit                     Soft Limit           Hard Limit           Units     \n")?;
     for (index, (name, unit)) in NAMES.iter().enumerate() {
-        let limit = view.attrs.rlimits.get(index);
+        let limit = view.rlimits.get(index);
         let fmt = |seq: &mut Seq, value: u64, last: bool| -> KResult<()> {
             if value == RLIM_INFINITY {
                 seq::print(seq, format_args!("{:<20}", "unlimited"))?;

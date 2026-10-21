@@ -32,7 +32,9 @@ use super::{
 };
 use crate::{
     procfs::view::{Collect, TaskView},
-    task::{Attributes, Cred, TaskId, exit::NoWake, fork::ForkRequest, tasklist::ForkParams},
+    task::{
+        Attributes, Cred, Rlimits, TaskId, exit::NoWake, fork::ForkRequest, tasklist::ForkParams,
+    },
     vfs::{FdTable, O_CREAT, O_DIRECTORY, O_RDONLY},
 };
 use syscalls::{Errno, Sysno};
@@ -117,10 +119,7 @@ fn victim(
     exe: crate::vfs::FileId,
 ) -> Victim {
     let request = ForkRequest::plain(17);
-    let id: TaskId = t
-        .tasks
-        .fork(t.current, ForkParams::of(&t.attrs, &request))
-        .unwrap();
+    let id: TaskId = t.tasks.fork(t.current, ForkParams::of(&request)).unwrap();
     let pid = t.tasks.task_pid_vnr(id);
     t.tasks.publish_cred(id, &cred);
     t.tasks.set_dumpable(id, dumpable);
@@ -129,10 +128,12 @@ fn victim(
     let mut fdt = FdTable::default();
     assert_eq!(fdt.alloc_fd(fd, 1024, false).unwrap(), fd);
     fdt.install(fd, read);
-    let mut attrs = Attributes::init(1000);
+    let mut attrs = Attributes::init();
+    let limits = Rlimits::init(1000);
     attrs.cred = cred;
     let view = TaskView::collect(Collect {
         attrs: &attrs,
+        rlimits: &limits,
         fs: t.fs,
         fdt: &fdt,
         files: &t.vfs.files,

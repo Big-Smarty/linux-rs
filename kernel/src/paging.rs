@@ -1808,8 +1808,10 @@ impl UserSpace<'_> {
 /// borrow lives, so nothing can free, remap or hand out another reference to the frame, and
 /// user code does not run (one CPU) while the kernel holds it. Any byte pattern is a valid
 /// `[u8; N]`. The zero frame stays zero only because every caller obeys the `UserPages::page`
-/// contract: a page requested with `write == false` is only read (the sole caller is
-/// `usercopy::walk`, whose read visitor is `copy_from_user`).
+/// contract: a page requested with `write == false` is only read. The callers that request one
+/// are `usercopy::walk`, whose read visitor is `copy_from_user`, and `UserPages::resident`,
+/// which drops the reference without using it (`get_futex_key` asks whether a read-only file
+/// page is present).
 impl UserPages for Tables {
     fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
         let pointer = self.user_page_pointer(page, write)?;

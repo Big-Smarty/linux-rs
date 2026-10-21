@@ -185,9 +185,10 @@ impl<P, C> Task<P, C> {
         vfs.default_rootfs().expect("default rootfs");
         let mut fdt = FdTable::default();
         vfs.console_on_rootfs(&mut fdt).expect("console");
-        let attrs = Attributes::init(1000);
+        let attrs = Attributes::init();
         let fs = vfs.new_fs_struct(0o022);
-        let (tasks, current) = Tasklist::new(1000, &attrs.cred, 1000).expect("task list");
+        let (tasks, current) =
+            Tasklist::new(1000, &attrs.cred, crate::task::Rlimits::init(1000)).expect("task list");
         let state = State::standalone(1, 0, 1000);
         for sig in [SIGUSR1, SIGUSR2, SIGALRM] {
             state.hand.actions[usize::from(sig) - 1].handler = 0x4000;
@@ -379,8 +380,10 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
         // reads its own /proc entries and when it leaves the CPU).
         self.vfs.sync_proc(&self.tasks)?;
         let exe = self.exe;
+        let rlimits = *self.tasks.rlimits(self.current).expect("the current task");
         let view = TaskView::collect(Collect {
             attrs: &self.attrs,
+            rlimits: &rlimits,
             fs: self.fs,
             fdt: &self.fdt,
             files: &self.vfs.files,
@@ -422,7 +425,7 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
     fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, syscalls::Errno> {
         let child = self.tasks.clone_task(
             self.current,
-            crate::task::tasklist::CloneParams::of(&self.attrs, request),
+            crate::task::tasklist::CloneParams::of(request),
         )?;
         self.forked.push(*request);
         let pid = self.tasks.task_pid_vnr(child);
@@ -453,6 +456,13 @@ impl<P: UserPages, C> Clocks for Task<P, C> {
             .unwrap_or(RestartBlock::NONE)
     }
     fn cpu_sample(&self) -> CpuSample {
+        self.clocks.sample
+    }
+    fn cpu_sample_of(&mut self, _task: crate::task::TaskId) -> CpuSample {
+        // One thread per group in the fake: every task has the scripted sample.
+        self.clocks.sample
+    }
+    fn group_cpu_sample_of(&mut self, _task: crate::task::TaskId) -> CpuSample {
         self.clocks.sample
     }
     fn cpu_adjusted(&mut self) -> (u64, u64) {

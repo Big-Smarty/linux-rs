@@ -381,6 +381,12 @@ pub trait Task {
     fn parts(&mut self) -> (State<'_>, Self::Pages<'_>);
     /// `CLOCK_MONOTONIC` in nanoseconds (`ktime_get`).
     fn now_ns(&self) -> u64;
+    /// Bring the group's `ITIMER_REAL` up to `now`: an expiry sends `SIGALRM` to the process
+    /// (`it_real_fn`). The default acts on this task alone ([`State::sync_timers`]); a task of
+    /// a thread group sends it to the group's leader.
+    fn sync_timers(&mut self, now: u64) {
+        self.state().sync_timers(now);
+    }
     /// `schedule()` for one wake-up: sleep (interruptibly) on `key` until a
     /// wake-up of that key, a signal, the monotonic clock reaching `deadline_ns`
     /// (`None`: no deadline) or any other wake-up, then return; the caller

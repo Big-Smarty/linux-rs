@@ -54,6 +54,7 @@ every range is bounded by `timespec64_valid*` or `KTIME_MAX` at the call site"
 
 use super::{Context, Outcome, error, outcome};
 use crate::{
+    task::TaskId,
     time::{HZ, NSEC_PER_SEC, TICK_NSEC},
     usercopy::{copy_from_user, copy_to_user},
 };
@@ -170,6 +171,12 @@ pub trait Clocks {
     fn group_cpu_sample(&mut self) -> crate::cputime::CpuSample {
         self.cpu_sample()
     }
+    /// `cpu_clock_sample(clkid, task)`: the inputs of any thread of the caller's group, live or
+    /// finished but not yet released.
+    fn cpu_sample_of(&mut self, task: TaskId) -> crate::cputime::CpuSample;
+    /// `cpu_clock_sample_group(clkid, task, false)`: the group `task` belongs to, which need not
+    /// be the caller's.
+    fn group_cpu_sample_of(&mut self, task: TaskId) -> crate::cputime::CpuSample;
     /// `thread_group_cputime_adjusted`: `(utime, stime)` in ns of the whole group for
     /// `times(2)`.
     fn cpu_adjusted(&mut self) -> (u64, u64);
@@ -319,19 +326,38 @@ fn to_ktime((sec, nsec): Ts) -> i128 {
     }
 }
 
-/// `pid_for_clock` for the only task: pid 0 is "current", otherwise the id must
-/// name this thread group. `which` (`CPUCLOCK_WHICH`) 3 is invalid.
-fn cpu_clock_valid<C: Context>(ctx: &C, id: i32) -> Result<(), Errno> {
-    let upid = !(id >> 3);
-    // shortcut: only the caller's own clocks (`pid` 0, its tgid, or with the thread bit its
-    // own tid); another task's, or another thread's of the group, needs the pid lookup
-    // (`pid_for_clock`).
-    let own = i64::from(upid) == i64::from(ctx.tgid())
-        || (id & 4 != 0 && i64::from(upid) == i64::from(ctx.tid()));
-    if id & 3 >= 3 || (upid != 0 && !own) {
-        return Err(Errno::EINVAL);
+/// `pid_for_clock(clock, gettime)` (kernel/time/posix-cpu-timers.c:57-95), as the task it names:
+/// a per-thread clock names a thread of the caller's group; a process clock names a thread
+/// group leader (any process, not only the caller's) or, for `clock_gettime`, the caller's own
+/// thread id (its group). Pid 0 is the caller (or its group). `CPUCLOCK_WHICH` 3 is invalid.
+fn pid_for_clock<C: Context>(ctx: &mut C, id: i32, gettime: bool) -> Option<TaskId> {
+    if id & 3 >= 3 {
+        return None;
     }
-    Ok(())
+    let thread = id & 4 != 0;
+    let upid = !(id >> 3);
+    let t = ctx.tasks();
+    if upid == 0 {
+        return Some(t.current);
+    }
+    let target = t.list.find_task_by_vpid(upid)?;
+    if thread {
+        return t
+            .list
+            .same_thread_group(target, t.current)
+            .then_some(target);
+    }
+    if gettime && target == t.current {
+        return Some(t.current);
+    }
+    t.list.thread_group_leader(target).then_some(target)
+}
+
+/// `validate_clock_permissions`: the id names something (`EINVAL` else).
+fn cpu_clock_valid<C: Context>(ctx: &mut C, id: i32) -> Result<(), Errno> {
+    pid_for_clock(ctx, id, false)
+        .map(|_| ())
+        .ok_or(Errno::EINVAL)
 }
 
 struct Now {
@@ -387,12 +413,12 @@ fn clock_get<C: Context>(ctx: &mut C, kclock: Kclock, id: i32) -> Result<i128, E
         Kclock::Process => i128::from(ctx.group_cpu_sample().runtime_ns),
         Kclock::Thread => i128::from(ctx.cpu_sample().runtime_ns),
         Kclock::PosixCpu(id) => {
-            cpu_clock_valid(ctx, id)?;
-            // The per-thread bit selects the thread's own clock, else the group's.
+            let task = pid_for_clock(ctx, id, true).ok_or(Errno::EINVAL)?;
+            // The per-thread bit selects that thread's clock, else the group's.
             let sample = if id & 4 != 0 {
-                ctx.cpu_sample()
+                ctx.cpu_sample_of(task)
             } else {
-                ctx.group_cpu_sample()
+                ctx.group_cpu_sample_of(task)
             };
             i128::from(match id & 3 {
                 0 => sample.user_ns + sample.system_ns,
@@ -715,7 +741,7 @@ fn clock_nanosleep<C: Context>(
             if let Kclock::PosixCpu(id) = kclock {
                 if id & 4 != 0 {
                     let upid = !(id >> 3);
-                    if upid == 0 || i64::from(upid) == i64::from(ctx.tgid()) {
+                    if upid == 0 || i64::from(upid) == i64::from(ctx.tid()) {
                         return Ok(error(Errno::EINVAL));
                     }
                 }
@@ -991,6 +1017,88 @@ mod tests {
         ] {
             assert_eq!(gettime(&mut t, clock).0, neg(Errno::EINVAL), "{clock}");
         }
+    }
+
+    #[test]
+    fn cpu_clock_ids_name_threads_of_the_group_and_any_process_leader() {
+        // pid_for_clock (posix-cpu-timers.c:57): a thread clock takes any tid of the caller's
+        // group, a process clock a thread-group leader (any process), and `clock_gettime`
+        // also the caller's own tid.
+        use crate::task::tasklist::{CloneParams, ForkParams};
+        let mut t = user_task();
+        let fork = ForkParams {
+            exit_signal: 17,
+            clear_sighand: false,
+        };
+        let sibling = t
+            .tasks
+            .clone_task(
+                t.current,
+                CloneParams {
+                    fork,
+                    thread: true,
+                    share_sighand: true,
+                    reset_altstack: true,
+                },
+            )
+            .unwrap(); // tid 2 in group 1
+        let child = t.tasks.fork(t.current, fork).unwrap(); // pid 3
+        let _ = child;
+        let main = t.current;
+        // From the leader: the sibling's thread clock, the child's process clock.
+        assert_eq!(
+            gettime(&mut t, cpu_clock(2, 2, true)).0,
+            0,
+            "sibling thread"
+        );
+        assert_eq!(
+            gettime(&mut t, cpu_clock(3, 2, false)).0,
+            0,
+            "another process"
+        );
+        assert_eq!(
+            gettime(&mut t, cpu_clock(2, 2, false)).0,
+            neg(Errno::EINVAL),
+            "a process clock needs a leader"
+        );
+        assert_eq!(
+            gettime(&mut t, cpu_clock(3, 2, true)).0,
+            neg(Errno::EINVAL),
+            "a thread clock needs the caller's group"
+        );
+        assert_eq!(gettime(&mut t, cpu_clock(9, 2, true)).0, neg(Errno::EINVAL));
+        // From the sibling: its own tid names its group's clock for gettime only.
+        t.current = sibling;
+        assert_eq!(gettime(&mut t, cpu_clock(2, 2, false)).0, 0, "own tid");
+        assert_eq!(gettime(&mut t, cpu_clock(1, 2, false)).0, 0, "the leader");
+        put(&mut t, BUF, -1, -1);
+        assert_eq!(
+            ret(
+                &mut t,
+                Sysno::clock_getres,
+                [arg(cpu_clock(2, 2, false)), BUF, 0, 0]
+            ),
+            neg(Errno::EINVAL),
+            "getres validates without the gettime allowance"
+        );
+        assert_eq!(
+            ret(
+                &mut t,
+                Sysno::clock_getres,
+                [arg(cpu_clock(1, 2, false)), BUF, 0, 0]
+            ),
+            0
+        );
+        put(&mut t, BUF, 0, 0);
+        assert_eq!(
+            ret(
+                &mut t,
+                Sysno::clock_settime,
+                [arg(cpu_clock(1, 2, true)), BUF, 0, 0]
+            ),
+            neg(Errno::EPERM)
+        );
+        t.current = main;
     }
 
     #[test]
