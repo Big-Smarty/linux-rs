@@ -68,7 +68,23 @@ A case reported `unavailable` is neither passed nor failed and the command still
 env PATH="/bin:$PATH" CARGO_HOME=<empty dir> CARGO_NET_OFFLINE=true cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/<new-name> --timeout-seconds 60
 ```
 
-**The gate sequence has no committed command.** The integrator's gate runner is the ignored script `target/gates.sh` (fmt; host 1.88 clippy and tests; nightly clippy and tests; `kernel-test`; the four target Clippy profiles; `xtask check`; `xtask status`), and there is no CI workflow. Both are [item 6](next-steps.md#item-6-reproducible-verification-off-the-original-workstation). Until then a clone can run each step by hand from this page and [verification](verification.md#what-each-command-establishes), but not reproduce the recorded gate as one command.
+### Gate sequence
+
+**The gate sequence has no committed command.** The integrator's gate runner is the ignored script `target/gates.sh`, and there is no CI workflow; both are [item 6](next-steps.md#item-6-reproducible-verification-off-the-original-workstation). By hand, from the repository root, the recorded sequence is the following, with `<run>` and `<new>` unused names; `kernel-test` comes before the target Clippy runs because they reuse its merged vendor configuration ([fallible-only allocation](#fallible-only-kernel-allocation) explains the `--cfg`):
+
+```text
+cargo fmt --all --check
+cargo +1.88.0 clippy -p xtask -p baremetal --all-targets --locked --offline -- -D warnings
+cargo +1.88.0 test -p xtask -p baremetal --locked --offline
+cargo +nightly clippy --workspace --all-targets --locked --offline -- -D warnings
+cargo +nightly test --workspace --locked --offline
+env PATH="/bin:$PATH" cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/<run> --timeout-seconds 60
+# target Clippy, once for each of the four kernel profiles <f>:
+#   qemu-self-test, freestanding, freestanding,baremetal-suite, qemu-self-test,baremetal-suite
+env CARGO_ENCODED_RUSTFLAGS=--cfg=no_global_oom_handling cargo +nightly clippy --config target/kernel-tooling/<run>/freestanding-build/cargo-home/config.toml -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem -p kernel --bin linux-rs-kernel --target x86_64-unknown-none --target-dir target/kernel-tooling/<new> --release --locked --offline --no-default-features --features <f> -- -D warnings -Crelocation-model=static -Clink-arg=--no-pie -Clink-arg=-Tkernel/linker.ld -Clink-arg=--no-undefined
+cargo +1.88.0 run -p xtask --locked --offline -- check
+cargo +1.88.0 run -p xtask --locked --offline -- status
+```
 
 ## Build profiles and compiler contract
 
@@ -108,7 +124,7 @@ The ELF must be x86-64 ET_EXEC with executable PT_LOAD ranges. Its immutable sna
 
 ### Fallible-only kernel allocation
 
-The kernel links `alloc` (`-Zbuild-std=core,alloc,compiler_builtins`) rebuilt with `--cfg no_global_oom_handling`, the switch Rust-for-Linux uses: every `alloc` API that can abort when allocation fails (`Box::new`, `Vec::push`/`with_capacity`/`vec!`, `String::from`, `format!`, `Clone` of collections, ...) is compiled out, so kernel code can only use `try_reserve`, `Vec::push_within_capacity`, `Box::try_new` and similar. Observed on `rustc 1.101.0-nightly 5c543b0b8` with a probe crate built exactly this way: the fallible calls compile; `Box::new(1)` fails with `E0599 no associated function or constant named new found for struct Box`, and `Vec::push` with `E0599 no method named push`. The flag must reach the `alloc` build, so it is in the harness's `CARGO_ENCODED_RUSTFLAGS` (kernel only) and in every target Clippy command: `env CARGO_ENCODED_RUSTFLAGS=--cfg=no_global_oom_handling cargo +nightly clippy --config <run>/freestanding-build/cargo-home/config.toml -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem -p kernel --bin linux-rs-kernel --target x86_64-unknown-none ...` (a Clippy run without it would accept infallible calls that the maintained build rejects). The flag is recorded in `cargo_encoded_rustflags` of the build manifest, and a unit test pins the flag set and the build-std list. Third-party crates that call infallible `alloc` APIs fail to compile in this configuration (observed: `allocator-api2` 0.4.0 with feature `alloc`), which is part of the admission test for any crate ([dependencies](dependencies.md#kernel-heap-buddy_system_allocator)). The host library tests link the ordinary `alloc`, so the guarantee is the target build's, not the host unit tests'.
+The kernel links `alloc` (`-Zbuild-std=core,alloc,compiler_builtins`) rebuilt with `--cfg no_global_oom_handling`, the switch Rust-for-Linux uses: every `alloc` API that can abort when allocation fails (`Box::new`, `Vec::push`/`with_capacity`/`vec!`, `String::from`, `format!`, `Clone` of collections, ...) is compiled out, so kernel code can only use `try_reserve`, `Vec::push_within_capacity`, `Box::try_new` and similar. Observed on `rustc 1.101.0-nightly 5c543b0b8` with a probe crate built exactly this way: the fallible calls compile; `Box::new(1)` fails with `E0599 no associated function or constant named new found for struct Box`, and `Vec::push` with `E0599 no method named push`. The flag must reach the `alloc` build, so it is in the harness's `CARGO_ENCODED_RUSTFLAGS` (kernel only) and in every target Clippy command (the complete command is in the [gate sequence](#gate-sequence); a Clippy run without the flag would accept infallible calls that the maintained build rejects). The flag is recorded in `cargo_encoded_rustflags` of the build manifest, and a unit test pins the flag set and the build-std list. Third-party crates that call infallible `alloc` APIs fail to compile in this configuration (observed: `allocator-api2` 0.4.0 with feature `alloc`), which is part of the admission test for any crate ([dependencies](dependencies.md#kernel-heap-buddy_system_allocator)). The host library tests link the ordinary `alloc`, so the guarantee is the target build's, not the host unit tests'.
 
 ### Vendored dependencies and the fresh-clone build
 

@@ -10,7 +10,7 @@ This page is the working queue. [The roadmap](roadmap.md) stays the complete M0â
 
 ## The process rule
 
-For each repair: **one reproducible failure or missing capability, one bounded change, one acceptance test.** A change that alters behaviour carries its own executable test (a host unit test, a `user/init` oracle row recorded on the pinned Linux first, or a `kernel-test` case) and the evidence record required by [verification](verification.md); it does not repeat the project history. A refactor is never combined with a semantic change. An item moves to "done" only when its acceptance test exists, ran, and its commit or PR and evidence path are recorded here; failures stay recorded as history.
+Each repair follows [CONTRIBUTING](../CONTRIBUTING.md#branches-pull-requests-and-evidence) steps 2â€“3. An item moves to "done" only when its acceptance test exists, ran, and its commit or PR and evidence path are recorded here; failures stay recorded as history.
 
 ## Status at a glance
 
@@ -279,4 +279,4 @@ Verified by: read-only greps and documentation reading for all five; nothing was
 
 ## Keeping this page current
 
-When an item or sub-item changes state: update its status and evidence here with the commit or PR, update the matching "Current status" rows in [implementation](implementation.md#current-status) and the support matrix in [compatibility](compatibility.md#current-support-matrix) in the same change, and add a [CHANGELOG](../CHANGELOG.md) line. Do not delete a closed item; mark it done with its evidence. Findings that are not in the audit belong in the same format (one failure or missing capability, one change, one test) rather than in a new status narrative elsewhere.
+When an item or sub-item changes state: update its status and evidence here with the commit or PR, and the other pages in [CONTRIBUTING](../CONTRIBUTING.md#branches-pull-requests-and-evidence) step 5. Do not delete a closed item; mark it done with its evidence.
