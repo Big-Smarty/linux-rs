@@ -1,35 +1,34 @@
 # Documentation index
 
-The repository contains a real Rust `no_std` x86_64 bootstrap with maintained QEMU evidence and an actual unsigned diagnostic ALPM package, alongside the original planning inventory and host tools. [Implementation and evidence](implementation.md) distinguishes historical manual `cell9` and initial planning results from `target/kernel-tooling/integrated-002`, `integrated-003` and final current-source-bound `integrated-004`, each of which returned 0 with eight matched cases. The real failed `integrated-001` 7/8 CSI-framing verdict remains retained. Independent director default-PNG reviews and separate bounded artifact/provider inspections are identified there, not inferred from capture-time pending fields.
+This is an index. **Start with the two pages that say what is true now:** the [current status](implementation.md#current-status-at-main-9804570) (what exists, what was tested at which commit, what is open) and [next steps](next-steps.md) (the working queue: each open item with its status, dependencies and acceptance test). Everything else is either a contract (what the finished kernel must do), a subsystem plan, or chronological history that names the commit or artifact it describes.
 
-[Diagnostic handoff](diagnostic-handoff.md) records the actual unsigned `target/kernel-tooling/diagnostic-001` package, read-only archive inspection, fresh project-owned extraction, metadata/checksum/source-binding evidence and exact artifact identities. Director independently opened and accepted the actual archive's format/source boundary, and the documented build succeeded from a new writable packaged-source copy. Neither is installation, a signature, approved SBOM, independent reproducibility or physical qualification. Host Rust1.88 strict Clippy/46 tests and separate final nightly strict-Clippy/51-test/format/check/status gates passed; [implementation](implementation.md) retains their distinct scope and raw evidence.
-
-M1 is underway, not complete; no physical boot, full Linux compatibility or performance qualification is claimed. The complete Linux 6.18.57 scope remains mandatory. Read the [project entry point](../README.md) first. A link to a plan is not evidence of implemented support.
+The repository is a Rust `no_std` x86_64 kernel for Linux 6.18.57 behaviour that runs processes, threads and unmodified Linux programs on one CPU in QEMU, with Rust host tooling for the build, the QEMU suite and a structural audit. M1 is underway, not complete; no physical boot, full Linux compatibility or performance qualification is claimed, and the complete Linux 6.18.57 scope remains mandatory. Read the [project entry point](../README.md) first. A link to a plan is not evidence of implemented support. Historical records (the `cell9` and `integrated-*` runs, the withdrawn `diagnostic-001`/`002` packages) are kept in [implementation](implementation.md) and [diagnostic handoff](diagnostic-handoff.md); only corrected `diagnostic-003` is conditionally cleared, and only for the user's own separate-media trial.
 
 ## Program and engineering contracts
 
 | Document | Purpose |
 | --- | --- |
-| [Implementation and evidence](implementation.md) | Actual bootstrap mechanisms, exact source/toolchain provenance, historical manual versus current maintained runs, distinct host gates and bounded artifact/provider reviews |
-| [Kernel tooling](kernel-tooling.md) | Exercised Rust-owned `kernel-build`, `kernel-test` and `kernel-package` interfaces, prerequisites, fresh-output rules and bounded evidence contracts |
-| [Diagnostic handoff](diagnostic-handoff.md) | Actual unsigned package, ALPM/source/checksum inspection, independent archive format/source review, delivered-source consumer build and user-operated safety limits |
-| [Architecture](architecture.md) | Accepted modular monolithic direction, bounded bootstrap, ownership/unsafe contexts and remaining full-scope design |
+| [Next steps](next-steps.md) | The working queue from the external audit: status at `main`, evidence, remaining work and acceptance test per item |
+| [Implementation and evidence](implementation.md) | The authoritative current-status section, then lane-by-lane records and exact source/toolchain provenance as chronological history |
+| [Kernel tooling](kernel-tooling.md) | The Rust-owned `kernel-build`, `kernel-test`, `kernel-package` and `baremetal-suite` interfaces, prerequisites and known gaps, fresh-output rules, case catalog |
+| [Diagnostic handoff](diagnostic-handoff.md) | The separate storage-free diagnostic package lineage: which archive is conditionally cleared (`diagnostic-003` only), its inspection records and the user-operated safety limits |
+| [Architecture](architecture.md) | What is implemented at `main` (process state, services, scheduler, VFS, memory ownership, locking exceptions), then the accepted modular monolithic direction and the remaining full-scope design |
 | [Definition of done](definition-of-done.md) | Exhaustive per-unit, subsystem, milestone and full-kernel closure requirements; standing completion rule |
 | [Packaging](packaging.md) | Separate storage-free diagnostic handoff versus Linux-replacement prerequisites, actual boot formats and user-controlled recovery |
-| [Roadmap](roadmap.md) | Complete porting program: idiomatic Rust architecture and abstractions, crate strategy, M0–M8 work packages with correctness/performance/physical exit gates, coverage map and risks |
+| [Roadmap](roadmap.md) | The complete program and inventory (not the day-to-day queue): idiomatic Rust architecture and abstractions, crate strategy, M0–M8 work packages with exit gates, coverage map and risks |
 | [Decisions](decisions.md) | Original and later approved requirements, distinct engineering choices, unresolved blockers and change discipline |
-| [Compatibility](compatibility.md) | Exact Linux behavioral boundary, userspace ABI and configuration semantics |
+| [Compatibility](compatibility.md) | A short current support matrix, then the exact Linux behavioral boundary, userspace ABI and configuration semantics that are required |
 | [Coverage](coverage.md) | Pinned upstream inventory, longest-prefix routing, scope gaps, and limits of structural coverage |
 | [Dependencies](dependencies.md) | Candidate/rejected crates, bundling, runtime suitability, supply-chain and licensing admission |
-| [Toolchain](toolchain.md) | Host and target compiler/linker/configuration strategy and reproducibility prerequisites |
+| [Toolchain](toolchain.md) | How the host and kernel compilers are selected today, and the target compiler/linker/configuration strategy and reproducibility prerequisites |
 | [Licensing](licensing.md) | Direct-port notices, SPDX expressions, syscall exceptions, and firmware provenance |
-| [Verification](verification.md) | Differential, regression, adversarial, stress, recovery and actual smoke evidence |
+| [Verification](verification.md) | What each command establishes (host tests, candidate-kernel execution, reference-Linux observation, historical evidence); the differential, regression, adversarial, stress and recovery program |
 | [Performance](performance.md) | At-least-Linux release requirement, fair measurements, noise control, confidence, and optimization policy |
 | [Bare metal](bare-metal.md) | Physical lab, serial/recovery, multi-vendor platforms, DMA/NUMA, destructive-test isolation, and platform gates |
 | [Maintenance](maintenance.md) | Security response, upstream version drift, release policy, and sustained qualification |
 | [Research](research.md) | Primary-source evidence, source pinning, assumptions, and research method |
-| [Project audit](project-audit.md) | Rust host CLI, structural planning checks, negative fixtures, and precisely bounded audit claims |
-| [Bare-metal suite](bare-metal-suite.md) | Actual bounded nondestructive Rust smoke runner, command, outcomes, privacy and qualification limitations |
+| [Project audit](project-audit.md) | Rust host CLI `check`/`status`, structural planning checks, current counts, negative fixtures, and precisely bounded audit claims |
+| [Bare-metal suite](bare-metal-suite.md) | The user-run kernel suite (13 groups, prepared, never run on hardware) and the bounded nondestructive Rust smoke runner for an existing Linux: commands, outcomes, privacy and qualification limits |
 | [Skills guide](skills.md) | Index and operating instructions for all sixteen local kernel skills |
 
 ## Subsystem implementation plans
