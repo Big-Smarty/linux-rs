@@ -713,6 +713,9 @@ pub struct SbInfo {
 pub struct Zombie {
     pub sb: SbId,
     pub mnt_id: u32,
+    /// `mnt_flags` of the detached mount: an open file keeps being used through it, so the flags
+    /// it had still apply (`path->mnt` of the file).
+    pub flags: u32,
 }
 
 /// The mount namespace.
@@ -871,6 +874,7 @@ impl Namespace {
             && let Some(info) = entry.take()
         {
             self.devs.free(info.dev);
+            self.proc.forget_sb(sb);
         }
     }
 
@@ -910,6 +914,21 @@ impl Namespace {
     #[must_use]
     pub fn mount_of_sb(&self, sb: SbId) -> Option<&Mount> {
         self.mounts.iter().find(|m| m.sb == sb)
+    }
+
+    /// `mnt_flags` of the mount a file of superblock `sb` is used through (`path->mnt`): its
+    /// mount, or the one `MNT_DETACH` removed from the tree while files were open on it.
+    #[must_use]
+    pub fn mnt_flags(&self, sb: SbId) -> u32 {
+        self.mount_of_sb(sb).map_or_else(
+            || {
+                self.zombies
+                    .iter()
+                    .find(|z| z.sb == sb)
+                    .map_or(0, |z| z.flags)
+            },
+            |m| m.flags,
+        )
     }
 
     /// `lookup_mnt`: the mount attached at `point` of the mount `parent`, the
@@ -994,8 +1013,8 @@ impl Namespace {
     ///
     /// # Errors
     /// `ENOMEM`.
-    pub fn defer_release(&mut self, sb: SbId, mnt_id: u32) -> KResult<()> {
-        try_push(&mut self.zombies, Zombie { sb, mnt_id })
+    pub fn defer_release(&mut self, sb: SbId, mnt_id: u32, flags: u32) -> KResult<()> {
+        try_push(&mut self.zombies, Zombie { sb, mnt_id, flags })
     }
 
     /// Release the ids of every parked mount whose superblock is dead

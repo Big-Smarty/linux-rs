@@ -1167,3 +1167,165 @@ fn statfs_is_per_filesystem_and_follows_the_mount_flags() {
         (0x0102_1994, 1024, 1 << 16)
     );
 }
+
+/// A tmpfs mounted at `/t` with `flags`, and the environment that mounts it.
+fn tmpfs_at_t(flags: u64) -> (Vfs, Env) {
+    use super::mountops::MountArgs;
+    let (mut vfs, env) = rootfs(1 << 10);
+    vfs.mkdir(&env, b"/t", 0o755).unwrap();
+    let point = vfs.lookup(&env, b"/t", 0).unwrap();
+    let mut env = env;
+    env.cred.sys_admin = true;
+    let args = MountArgs {
+        source: Some(b"none"),
+        point,
+        fstype: Some(b"tmpfs"),
+        flags,
+        data: None,
+    };
+    vfs.do_mount(&env, &args)
+        .unwrap_or_else(|_| panic!("mount"));
+    (vfs, env)
+}
+
+#[test]
+fn an_open_file_on_a_detached_mount_keeps_the_flags_of_its_mount() {
+    use super::{
+        mount::{MNT_DETACH, MS_NOSUID, MS_RDONLY, MS_REMOUNT},
+        mountops::MountArgs,
+    };
+    // include/linux/statfs.h
+    const ST_RDONLY: u64 = 1;
+    const ST_NOSUID: u64 = 2;
+    let (mut vfs, env) = tmpfs_at_t(MS_NOSUID);
+    let fd = open(&mut vfs, &env, b"/t/f", O_CREAT | O_RDWR, 0o644).unwrap();
+    let file = vfs.files.get(fd).inode.unwrap();
+    let point = vfs.lookup(&env, b"/t", 0).unwrap();
+    let remount = MountArgs {
+        source: None,
+        point,
+        fstype: Some(b"tmpfs"),
+        flags: MS_REMOUNT | MS_NOSUID | MS_RDONLY,
+        data: None,
+    };
+    // The file is open for writing: the superblock cannot go read-only (EBUSY), but the mount
+    // flag changes with a bind remount only; drop the write reference first.
+    vfs.fput(fd);
+    let fd = open(&mut vfs, &env, b"/t/f", O_RDONLY, 0).unwrap();
+    vfs.do_mount(&env, &remount)
+        .unwrap_or_else(|_| panic!("remount"));
+    let st = vfs.fs.statfs(file);
+    assert_eq!(st.flags & (ST_NOSUID | ST_RDONLY), ST_NOSUID | ST_RDONLY);
+    assert!(vfs.fs.want_write(file).is_err());
+    // Detached with the file still open: the mount is gone from the tree, its flags stay.
+    let root = vfs.lookup(&env, b"/t", 0).unwrap();
+    vfs.do_umount(&env, root, MNT_DETACH).unwrap();
+    assert!(vfs.fs.mount_of(file).is_none());
+    let st = vfs.fs.statfs(file);
+    assert_eq!(st.flags & (ST_NOSUID | ST_RDONLY), ST_NOSUID | ST_RDONLY);
+    assert_eq!(vfs.fs.want_write(file), Err(Errno::EROFS));
+    // The last close ends it.
+    vfs.fput(fd);
+    vfs.fs.reap();
+}
+
+#[test]
+fn truncate_checks_the_permission_before_the_read_only_mount() {
+    use super::mount::{MS_BIND, MS_RDONLY, MS_REMOUNT};
+    use super::mountops::MountArgs;
+    let (mut vfs, env) = tmpfs_at_t(0);
+    let no_umask = Env { umask: 0, ..env };
+    let readonly = open(&mut vfs, &no_umask, b"/t/ro", O_CREAT | O_RDWR, 0o444).unwrap();
+    let writable = open(&mut vfs, &no_umask, b"/t/rw", O_CREAT | O_RDWR, 0o666).unwrap();
+    let (ro, rw) = (
+        vfs.files.get(readonly).inode.unwrap(),
+        vfs.files.get(writable).inode.unwrap(),
+    );
+    vfs.fput(readonly);
+    vfs.fput(writable);
+    let point = vfs.lookup(&env, b"/t", 0).unwrap();
+    let remount = MountArgs {
+        source: None,
+        point,
+        fstype: Some(b"tmpfs"),
+        // A read-only mount over a writable superblock (`mount -o remount,bind,ro`): a read-only
+        // superblock would make `inode_permission` itself answer `EROFS`.
+        flags: MS_REMOUNT | MS_BIND | MS_RDONLY,
+        data: None,
+    };
+    vfs.do_mount(&env, &remount)
+        .unwrap_or_else(|_| panic!("remount"));
+    // vfs_truncate: inode_permission first, mnt_want_write after.
+    let other = Env {
+        cred: user(1000),
+        ..env
+    };
+    assert_eq!(vfs.truncate_check(&other, ro), Err(Errno::EACCES));
+    assert_eq!(vfs.truncate_check(&other, rw), Err(Errno::EROFS));
+    // The owner of the system (root) passes the permission and meets the mount.
+    assert_eq!(vfs.truncate_check(&env, ro), Err(Errno::EROFS));
+}
+
+#[test]
+fn newsize_ok_checks_the_limit_first_and_then_the_superblock_maximum() {
+    use super::ops::{NewSizeRefused, inode_newsize_ok};
+    let signal = Err(NewSizeRefused { signal: true });
+    let big = Err(NewSizeRefused { signal: false });
+    assert_eq!(inode_newsize_ok(0, 10, 100, u64::MAX), Ok(()));
+    assert_eq!(inode_newsize_ok(0, 101, 100, u64::MAX), big);
+    assert_eq!(inode_newsize_ok(0, 101, 100, 50), signal);
+    // The limit is for growth only.
+    assert_eq!(inode_newsize_ok(60, 60, 100, 50), Ok(()));
+    assert_eq!(inode_newsize_ok(60, 10, 100, 0), Ok(()));
+    assert_eq!(inode_newsize_ok(60, 61, 100, 50), signal);
+    assert_eq!(inode_newsize_ok(0, 50, 100, 50), Ok(()));
+}
+
+#[test]
+fn procfs_has_the_non_lfs_maximum_and_keeps_the_times_a_setattr_stamped() {
+    use super::{
+        MAX_NON_LFS,
+        mount::{MNT_DETACH, MS_RDONLY},
+        mountops::MountArgs,
+    };
+    let (mut vfs, env) = rootfs(1 << 10);
+    vfs.mkdir(&env, b"/p", 0o755).unwrap();
+    let mut env = env;
+    env.cred.sys_admin = true;
+    let point = vfs.lookup(&env, b"/p", 0).unwrap();
+    let args = MountArgs {
+        source: Some(b"proc"),
+        point,
+        fstype: Some(b"proc"),
+        flags: 0,
+        data: None,
+    };
+    vfs.do_mount(&env, &args)
+        .unwrap_or_else(|_| panic!("mount"));
+    let version = vfs.lookup(&env, b"/p/version", 0).unwrap();
+    assert!(version.is_proc());
+    let edge = MAX_NON_LFS as u64;
+    assert_eq!(vfs.newsize_ok(version, edge, u64::MAX), Ok(()));
+    assert!(vfs.newsize_ok(version, edge + 1, u64::MAX).is_err());
+    let hit = vfs.newsize_ok(version, edge + 1, 10).unwrap_err();
+    assert!(hit.signal, "the limit is checked first");
+    // A tmpfs file is limited by MAX_LFS_FILESIZE only.
+    let file = open(&mut vfs, &env, b"/f", O_CREAT | O_RDWR, 0o644).unwrap();
+    let inode = vfs.files.get(file).inode.unwrap();
+    assert_eq!(vfs.newsize_ok(inode, edge + 1, u64::MAX), Ok(()));
+    // The stamp is the moment of the call, and nothing else changes.
+    let before = vfs.getattr(version);
+    vfs.proc_touch(version).unwrap();
+    let after = vfs.getattr(version);
+    assert_eq!((after.mtime, after.ctime), (clock(), clock()));
+    assert_eq!((after.size, after.mode), (before.size, before.mode));
+    // Another node keeps reporting the time of its getattr.
+    let other = vfs.lookup(&env, b"/p/uptime", 0).unwrap();
+    assert_eq!(vfs.getattr(other).mtime, vfs.getattr(other).atime);
+    // The stamps go with the superblock.
+    let _ = (MS_RDONLY, MNT_DETACH);
+    let root = vfs.lookup(&env, b"/p", 0).unwrap();
+    vfs.do_umount(&env, root, 0).unwrap();
+    vfs.fs.reap();
+    assert!(vfs.fs.ns.proc.stamp(version).is_none());
+}

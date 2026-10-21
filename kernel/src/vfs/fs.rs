@@ -391,11 +391,29 @@ impl Fs {
     #[must_use]
     pub fn mnt_is_readonly(&self, id: InodeId) -> bool {
         let sb = self.sb_of(id);
-        let mount_ro = self
-            .ns
-            .mount_of_sb(sb)
-            .is_some_and(|m| m.flags & MNT_READONLY != 0);
-        mount_ro || self.sb_is_readonly(sb)
+        self.ns.mnt_flags(sb) & MNT_READONLY != 0 || self.sb_is_readonly(sb)
+    }
+
+    /// `path_noexec`: the mount is `MNT_NOEXEC`, or the superblock is `SB_I_NOEXEC`, which
+    /// `proc_fill_super` sets.
+    #[must_use]
+    pub fn path_noexec(&self, id: InodeId) -> bool {
+        let sb = self.sb_of(id);
+        self.ns.mnt_flags(sb) & MNT_NOEXEC != 0
+            || (self.ns.has_sb(sb) && self.ns.sb(sb).fstype == FsType::Proc)
+    }
+
+    /// `i_size_read` of an inode or node: a tmpfs file's length, or what procfs reports (0 for
+    /// nearly every entry).
+    #[must_use]
+    pub fn i_size(&self, id: InodeId) -> u64 {
+        match ProcNode::of(id) {
+            Some(node) => {
+                let attr = procfs::attr(&self.ns.proc, node, &self.proc_opts(node));
+                u64::try_from(attr.size).unwrap_or(0)
+            }
+            None => self.tmp.inode(id).size,
+        }
     }
 
     /// `sb_rdonly`.
@@ -475,21 +493,21 @@ impl Fs {
             }
             FsType::Proc => (PROC_SUPER_MAGIC, (0, 0, 0, 0)),
         };
-        let flags_by_mnt = self.ns.mount_of_sb(sb).map_or(0, |m| {
-            [
-                (MNT_READONLY, ST_RDONLY),
-                (MNT_NOSUID, ST_NOSUID),
-                (MNT_NODEV, ST_NODEV),
-                (MNT_NOEXEC, ST_NOEXEC),
-                (MNT_NOATIME, ST_NOATIME),
-                (MNT_NODIRATIME, ST_NODIRATIME),
-                (MNT_RELATIME, ST_RELATIME),
-                (MNT_NOSYMFOLLOW, ST_NOSYMFOLLOW),
-            ]
-            .iter()
-            .filter(|(mnt, _)| m.flags & mnt != 0)
-            .fold(0, |acc, (_, st)| acc | st)
-        });
+        // `path->mnt`: the mount of the file, which `MNT_DETACH` may have taken from the tree.
+        let mnt_flags = self.ns.mnt_flags(sb);
+        let flags_by_mnt = [
+            (MNT_READONLY, ST_RDONLY),
+            (MNT_NOSUID, ST_NOSUID),
+            (MNT_NODEV, ST_NODEV),
+            (MNT_NOEXEC, ST_NOEXEC),
+            (MNT_NOATIME, ST_NOATIME),
+            (MNT_NODIRATIME, ST_NODIRATIME),
+            (MNT_RELATIME, ST_RELATIME),
+            (MNT_NOSYMFOLLOW, ST_NOSYMFOLLOW),
+        ]
+        .iter()
+        .filter(|(mnt, _)| mnt_flags & mnt != 0)
+        .fold(0, |acc, (_, st)| acc | st);
         let sb_flags = self.ns.sb(sb).flags;
         let flags_by_sb = [
             (SB_SYNCHRONOUS, ST_SYNCHRONOUS),

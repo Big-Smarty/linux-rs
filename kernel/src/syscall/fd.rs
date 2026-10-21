@@ -51,17 +51,15 @@ use crate::{
     usercopy::{access_ok, copy_from_user, copy_to_user},
     vfs::{
         FASYNC, FMODE_CAN_READ, FMODE_CAN_WRITE, FMODE_LSEEK, FMODE_PATH, FMODE_PREAD,
-        FMODE_PWRITE, FMODE_READ, FMODE_WRITE, FileId, InodeId, MAX_LFS_FILESIZE, O_APPEND,
-        O_CLOEXEC, O_DIRECT, O_EXCL, O_LARGEFILE, O_NOATIME, O_NONBLOCK, PAGE_SIZE, S_IFMT,
-        SETFL_MASK,
+        FMODE_PWRITE, FMODE_READ, FMODE_WRITE, FileId, InodeId, MAX_LFS_FILESIZE, MAX_NON_LFS,
+        O_APPEND, O_CLOEXEC, O_DIRECT, O_EXCL, O_LARGEFILE, O_NOATIME, O_NONBLOCK, PAGE_SIZE,
+        S_IFMT, SETFL_MASK,
         file::{CharDev, FileKind},
         tmpfs::DIR_OFFSET_EOD,
         try_push,
     },
 };
 
-/// `MAX_NON_LFS`: the offset limit of a file opened without `O_LARGEFILE`.
-const MAX_NON_LFS: i64 = (1 << 31) - 1;
 /// `UIO_MAXIOV`.
 const UIO_MAXIOV: u64 = 1024;
 
@@ -1293,16 +1291,8 @@ fn lseek<C: Context>(ctx: &mut C, fd: u64, offset: u64, whence: u64) -> Sys {
                 .inspect(|&new| set_pos(ctx, &view, new));
         }
         FileKind::Directory if view.inode.is_some_and(InodeId::is_proc) => {
-            // generic_file_llseek on a procfs directory (i_size 0 here).
-            let target = match whence {
-                0 | 2 => offset,
-                1 => offset.wrapping_add(view.pos),
-                _ => return Err(Errno::EINVAL.into()),
-            };
-            if target < 0 {
-                return Err(Errno::EINVAL.into());
-            }
-            setpos(view.pos, target, MAX_LFS_FILESIZE)?
+            // generic_file_llseek on a procfs directory (i_size 0).
+            procio::generic_llseek(view.pos, offset, whence)?
         }
         FileKind::Directory => {
             // offset_dir_llseek: SET and CUR only.
@@ -1910,25 +1900,25 @@ fn ftruncate<C: Context>(ctx: &mut C, fd: u64, length: u64) -> Sys {
     if !is_reg || view.mode & FMODE_WRITE == 0 {
         return Err(Errno::EINVAL.into());
     }
+    // `small` is cleared by the file's O_LARGEFILE, which every open sets on 64-bit (the syscall
+    // itself passes 1), so MAX_NON_LFS never limits the length. inode_newsize_ok (from
+    // notify_change): growing past RLIMIT_FSIZE raises SIGXFSZ with -EFBIG, then s_maxbytes
+    // (MAX_LFS_FILESIZE, which a non-negative length cannot exceed, but MAX_NON_LFS on procfs).
+    #[allow(clippy::cast_sign_loss)]
+    let length = length as u64;
+    let limit = ctx.rlimit_fsize();
+    if let Err(refused) = ctx.files().vfs.newsize_ok(inode, length, limit) {
+        if refused.signal {
+            ctx.state().send_sig(SIGXFSZ);
+        }
+        return Err(Errno::EFBIG.into());
+    }
     if inode.is_proc() {
-        // `proc_setattr` ignores ATTR_SIZE: truncating a procfs file is a no-op.
+        // The setattr of a procfs node copies ATTR_MTIME | ATTR_CTIME and no size.
+        ctx.files().vfs.proc_touch(inode)?;
         return Ok(0);
     }
-    // `small` is false on 64-bit (the syscall passes 0), so MAX_NON_LFS never
-    // applies. inode_newsize_ok (from notify_change): growing past
-    // RLIMIT_FSIZE raises SIGXFSZ with -EFBIG, and s_maxbytes is
-    // MAX_LFS_FILESIZE, which a non-negative length cannot exceed.
-    let size = ctx.files().vfs.fs.inode(inode).size;
-    #[allow(clippy::cast_sign_loss)]
-    if size < length as u64 {
-        let limit = ctx.rlimit_fsize();
-        if limit != RLIM_INFINITY && length as u64 > limit {
-            ctx.state().send_sig(SIGXFSZ);
-            return Err(Errno::EFBIG.into());
-        }
-    }
     let cred = ctx.cred();
-    #[allow(clippy::cast_sign_loss)]
-    ctx.files().vfs.do_truncate(&cred, inode, length as u64);
+    ctx.files().vfs.do_truncate(&cred, inode, length);
     Ok(0)
 }

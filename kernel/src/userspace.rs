@@ -788,6 +788,8 @@ struct Owned {
 #[derive(Clone, Copy)]
 struct Lender {
     sched: SchedId,
+    /// The parent's thread group: its `/proc` view follows its address space.
+    tgid: i32,
     /// The child works in the parent's address space (`CLONE_VM`).
     lent: bool,
 }
@@ -862,7 +864,10 @@ fn vfork_done_key(parent: SchedId) -> WaitKey {
 /// `complete_vfork_done`, called by the child when it execs or exits: the parent wakes (and
 /// takes back its address space). A parent that no longer exists (it was killed while it
 /// waited) cannot take it: the address space is freed here, with the mappings' pins it left.
-fn complete_vfork(lender: Lender, key: u32, lent: Option<Lent>, vfs: &mut Vfs) {
+///
+/// `from` is the thread group that lets go of the address space: a lender that is still alive
+/// shows what that task's view showed.
+fn complete_vfork(lender: Lender, key: u32, lent: Option<Lent>, from: i32, vfs: &mut Vfs) {
     let alive = matches!(ktask::state(lender.sched), Some(state) if state != TaskState::Dead);
     // Taken as its own statement: an `if let` scrutinee guard lives through the whole branch
     // (edition 2024), and the recursion below must run with `VFORK_FORWARD` released.
@@ -872,11 +877,14 @@ fn complete_vfork(lender: Lender, key: u32, lent: Option<Lent>, vfs: &mut Vfs) {
         VFORK_FORWARD.lock()[lender.sched.index()].take()
     };
     if alive {
+        if lent.is_some() {
+            vfs.fs.ns.proc.return_mm(lender.tgid, from);
+        }
         VFORK_DONE.lock()[lender.sched.index()] = Some(Done { lent });
         ktask::wake_up_key(vfork_done_key(lender.sched), WakeMode::Normal, 0);
     } else if let Some(next) = next {
         // The lender died borrowing: the address space goes to whom it borrowed it from.
-        complete_vfork(next, key, lent, vfs);
+        complete_vfork(next, key, lent, from, vfs);
     } else if let Some(lent) = lent {
         vfs.unpin_all(key);
         destroy_tables(lent.tables);
@@ -1000,15 +1008,17 @@ fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Res
     // The argument and environment bytes are copied when the layout changes
     // (an `execve`) and kept otherwise.
     let layout = (own.space.arg_start, own.space.env_end);
-    // A parent whose address space is lent to its `vfork` child keeps the view it had (the
-    // child works in the same `mm_struct`; the slot holds a placeholder).
-    // shortcut: the sums behind `AnonPages`, `Mapped` and `PageTables` of /proc/meminfo count
-    // that shared address space twice until the child execs or exits (they are sums of views,
-    // not per-`mm` counters); revisit when `CLONE_VM` threads share views.
+    // A parent whose address space is lent to its `vfork` child publishes no address space (the
+    // slot holds a placeholder): the child works in the same `mm_struct` and its view stands for
+    // both (`ProcState::mm_of`). The exec-time bytes stay what they were.
     let lent = own.lent_out;
     let kept = process.vfs.fs.ns.proc.view(tgid).and_then(|view| {
-        let mm = view.mm.as_ref()?;
-        (((mm.arg_start, mm.env_end) == layout || lent) && !view.args().is_empty())
+        let same_image = lent
+            || view
+                .mm
+                .as_ref()
+                .is_some_and(|mm| (mm.arg_start, mm.env_end) == layout);
+        (same_image && !view.args().is_empty())
             .then(|| view.args.clone())
             .flatten()
     });
@@ -1055,6 +1065,17 @@ fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Res
             args,
         },
     )
+}
+
+/// The address space `own` works in, published to its own view: the part of [`publish`] that a
+/// `vfork` hand-back needs, since the lender's view takes over what this task's last showed.
+fn publish_mm(vfs: &mut Vfs, own: &Owned, space: &mut UserSpace<'_>) {
+    let _ = vfs.fs.ns.proc.publish_mm(
+        own.tgid.cast_signed(),
+        &own.space,
+        space.rss(),
+        space.table_bytes(),
+    );
 }
 
 /// [`publish`] for the running task, taking its state and `PROCESS`.
@@ -1561,6 +1582,16 @@ impl Syscall<'_> {
         let (mut tables, space) = match memory {
             ChildMemory::Copy { space, tables } => (tables, space),
             ChildMemory::Lend { placeholder } => {
+                // The parent's view is brought up to date with the address space it lends
+                // (what it mapped or exec'd since it last published), then it follows the
+                // child, who works in the same `mm_struct`.
+                let _ = publish(process, &self.own, &mut self.space);
+                process
+                    .vfs
+                    .fs
+                    .ns
+                    .proc
+                    .lend_mm(self.own.tgid.cast_signed(), tid.cast_signed());
                 // The child takes the real tree and VMA set, the parent the placeholders.
                 let tables = self.space.replace_tables(placeholder);
                 let space = core::mem::replace(&mut self.own.space, Mm::new(&self.own.env));
@@ -1583,6 +1614,7 @@ impl Syscall<'_> {
             pin_owner: child_owner,
             vfork_parent: request.vfork.then_some(Lender {
                 sched: self.own.sched,
+                tgid: self.own.tgid.cast_signed(),
                 lent: request.share_vm,
             }),
             pending_mm: None,
@@ -1814,6 +1846,9 @@ impl Context for Syscall<'_> {
             return;
         };
         let lent = if lender.lent {
+            // The address space goes back to the lender: its view shows what this task's did,
+            // brought up to date first.
+            publish_mm(&mut self.shared.get().vfs, self.own, &mut self.space);
             let Some((tables, space)) = self.own.pending_mm.take() else {
                 crate::log!("FAIL vfork child's exec without its new address space\n");
                 crate::fail();
@@ -1837,7 +1872,8 @@ impl Context for Syscall<'_> {
         if lender.lent {
             self.own.pin_owner = next_pin_owner();
         }
-        complete_vfork(lender, key, lent, &mut self.shared.get().vfs);
+        let from = self.own.tgid.cast_signed();
+        complete_vfork(lender, key, lent, from, &mut self.shared.get().vfs);
     }
     fn sync_proc(&mut self) {
         let process = self.shared.get();
@@ -1881,8 +1917,13 @@ impl Context for Syscall<'_> {
     ) -> Result<R, Errno> {
         // The caller's own view is current before anyone reads it: when its
         // own files are shown, or every task's counters are summed.
+        // A `vfork` child works in its lender's address space, which the lender's files show:
+        // its own is current before it reads anyone's.
         let mine = self.own.tgid.cast_signed();
-        if matches!(scope, ShowScope::Machine) || scope == ShowScope::Pid(mine) {
+        if matches!(scope, ShowScope::Machine)
+            || scope == ShowScope::Pid(mine)
+            || self.own.vfork_parent.is_some_and(|lender| lender.lent)
+        {
             publish(self.shared.get(), self.own, &mut self.space)?;
         }
         let process = self.shared.get();
@@ -2062,12 +2103,24 @@ fn exit_mm(mut tables: Tables, own: &mut Owned, vfs: &mut Vfs) {
         // left here are placeholders. The borrowed space cannot go back yet; the child's
         // completion forwards it to the lender, who keeps sleeping until then.
         Some(lender) if lender.lent && own.lent_out => {
+            // The lender's view follows the child that holds the address space now.
+            vfs.fs
+                .ns
+                .proc
+                .skip_lent(lender.tgid, own.tgid.cast_signed());
             destroy_tables(tables);
             VFORK_FORWARD.lock()[own.sched.index()] = Some(lender);
         }
         Some(lender) if lender.lent => {
+            publish_mm(vfs, own, &mut tables.user_space());
             let space = core::mem::replace(&mut own.space, Mm::new(&own.env));
-            complete_vfork(lender, owner, Some(Lent { tables, space }), vfs);
+            complete_vfork(
+                lender,
+                owner,
+                Some(Lent { tables, space }),
+                own.tgid.cast_signed(),
+                vfs,
+            );
         }
         other => {
             destroy_tables(tables);
@@ -2076,7 +2129,7 @@ fn exit_mm(mut tables: Tables, own: &mut Owned, vfs: &mut Vfs) {
                 vfs.unpin_all(owner);
             }
             if let Some(lender) = other {
-                complete_vfork(lender, owner, None, vfs);
+                complete_vfork(lender, owner, None, own.tgid.cast_signed(), vfs);
             }
         }
     }

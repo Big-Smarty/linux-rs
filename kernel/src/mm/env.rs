@@ -135,6 +135,10 @@ pub struct FileInfo {
     pub append_only: bool,
     /// `can_mmap_file`: the file has `->mmap`/`->mmap_prepare`.
     pub can_mmap: bool,
+    /// What its `->mmap` always answers once `mmap_region` has prepared the mapping and cleared
+    /// what it replaces (`proc_reg_mmap` of an entry without `proc_mmap`: `-EIO`); `None` when it
+    /// maps.
+    pub mmap_error: Option<syscalls::Errno>,
     /// `file_mmap_size_max`: `MAX_LFS_FILESIZE` for regular, block and socket
     /// files, `u64::MAX` otherwise, 0 for `FOP_UNSIGNED_OFFSET`.
     pub mmap_size_max: u64,

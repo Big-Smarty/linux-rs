@@ -246,6 +246,9 @@ pub const MAXSYMLINKS: u32 = 40;
 pub const PAGE_SIZE: usize = 4096;
 /// `MAX_LFS_FILESIZE` on 64-bit (`LLONG_MAX`).
 pub const MAX_LFS_FILESIZE: i64 = i64::MAX;
+/// `MAX_NON_LFS`: the offset limit of a file opened without `O_LARGEFILE`, and the `s_maxbytes` of
+/// a superblock that never sets one (procfs: `alloc_super` leaves the default).
+pub const MAX_NON_LFS: i64 = (1 << 31) - 1;
 /// `sysctl_nr_open`: the hard ceiling of a descriptor number.
 pub const NR_OPEN: u64 = 1 << 20;
 /// `INR_OPEN_CUR` / `INR_OPEN_MAX`: init's `RLIMIT_NOFILE`.

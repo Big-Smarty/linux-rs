@@ -462,6 +462,7 @@ fn mmap_file_branch_checks_and_typed_outcome() {
         swapfile: false,
         append_only: false,
         can_mmap: true,
+        mmap_error: None,
         mmap_size_max: u64::MAX >> 1,
         mmap_sync: false,
         hugepages: false,
@@ -597,6 +598,83 @@ fn mmap_file_branch_checks_and_typed_outcome() {
     w.pt.pages.get_mut(&m.addr).unwrap().kind = Pte::Anon { writable: false };
     assert_eq!(w.fault(m.addr, PF_WRITE | PF_PROT), FaultOutcome::Handled);
     assert_eq!(w.pt.lookup(m.addr), Pte::Anon { writable: true });
+}
+
+/// src: mm/vma.c `__mmap_setup` (limits, then the PTEs of what the range replaces are cleared),
+/// `__mmap_new_file_vma` (`->mmap` fails) and `vms_abort_munmap_vmas` (the PTEs are gone, so the
+/// replaced VMAs cannot come back: "leaving a gap"). oracle: `procfs.mmap-fixed-eio-leaves-gap`.
+#[test]
+fn a_failing_file_mmap_leaves_a_gap_after_the_limits() {
+    let mut w = W::new();
+    let at = 0x2000_0000;
+    w.map(at, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    w.pt.map_anon_page(at, page_prot(VmFlags::READ | VmFlags::WRITE))
+        .unwrap();
+    let file = FileInfo {
+        id: 7,
+        readable: true,
+        writable: false,
+        noexec: false,
+        swapfile: false,
+        append_only: false,
+        can_mmap: true,
+        mmap_error: Some(Errno::EIO),
+        mmap_size_max: u64::MAX >> 1,
+        mmap_sync: false,
+        hugepages: false,
+    };
+    let prepare = |w: &mut W| {
+        let r = w.mm.mmap(
+            &w.env,
+            &mut w.pt,
+            at,
+            P,
+            PROT_READ,
+            MAP_PRIVATE | MAP_FIXED,
+            0,
+            Some(&file),
+        );
+        let Ok(Mmap::NeedsFile(m)) = r else {
+            panic!("{r:?}")
+        };
+        m
+    };
+    let m = prepare(&mut w);
+    // The address-space limit comes before ->mmap.
+    let total = w.mm.total_vm;
+    w.env.rlimit_as = 0;
+    let r = w.mm.mmap_region_with(
+        &w.env,
+        &mut w.pt,
+        Some(7),
+        m.addr,
+        m.len,
+        m.vm_flags,
+        m.pgoff,
+        m.file.mmap_error,
+    );
+    assert_eq!(r, Err(Errno::ENOMEM));
+    assert_eq!(w.mm.total_vm, total);
+    let covers = |w: &W, page: u64| w.mm.vmas().iter().any(|v| v.start <= page && page < v.end);
+    assert!(covers(&w, at));
+    w.env.rlimit_as = RLIM_INFINITY;
+    let r = w.mm.mmap_region_with(
+        &w.env,
+        &mut w.pt,
+        Some(7),
+        m.addr,
+        m.len,
+        m.vm_flags,
+        m.pgoff,
+        m.file.mmap_error,
+    );
+    assert_eq!(r, Err(Errno::EIO));
+    assert!(!covers(&w, at), "the replaced page is gone");
+    assert!(covers(&w, at + P), "its neighbour stays");
+    assert_eq!(w.mm.total_vm, total - 1);
+    assert_eq!(w.pt.lookup(at), Pte::Absent);
+    assert!(w.mm.vmas().iter().all(|vma| vma.file != Some(7)));
+    w.check_invariants();
 }
 
 /// src: mm/mmap.c do_mmap: MAP_FIXED_NOREPLACE -> EEXIST is after

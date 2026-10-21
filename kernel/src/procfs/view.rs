@@ -45,7 +45,7 @@ pub struct FdEntry {
 }
 
 /// The address-space facts of a published task (`mm_struct`).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MmView {
     /// The VMAs as of `vma_stamp`, shared with the previous publication while
     /// [`Mm::vma_stamp`] has not moved.
@@ -89,8 +89,13 @@ pub struct TaskView {
     pub attrs: Attributes,
     /// `task->fs` still exists (`exit_fs` has not run).
     pub has_fs: bool,
-    /// `None` for a task without an address space (a zombie).
+    /// `None` for a task without an address space (a zombie), and while a `vfork` child works in
+    /// it (`lent_to`).
     pub mm: Option<MmView>,
+    /// The tgid of the `vfork` child (`CLONE_VM`) that works in this task's `mm_struct`, until it
+    /// execs or exits: `/proc` shows that task's address space ([`ProcState::mm_of`]), which
+    /// is the one `mm_struct` and so always current.
+    pub lent_to: Option<i32>,
     /// `mm->exe_file`.
     pub exe: Option<FdEntry>,
     /// [`crate::vfs::FdTable::stamp`] when the table was read.
@@ -129,7 +134,8 @@ pub struct Collect<'a> {
     pub fdt: &'a FdTable,
     pub files: &'a FileTable,
     /// The address space, or `None` while a `vfork` child works in it (the task's own slot holds a
-    /// placeholder): the previous view's `mm` is kept, which is what the shared `mm_struct` showed.
+    /// placeholder): the view's `mm` is then `None` too and the child's shows
+    /// ([`TaskView::lent_to`]).
     pub mm: Option<&'a Mm>,
     pub exe: Option<FileId>,
     /// `(anon, file, shmem)` resident pages and the page-table bytes of the
@@ -156,6 +162,7 @@ impl TaskView {
             attrs: *input.attrs,
             has_fs: true,
             mm: None,
+            lent_to: None,
             exe: None,
             // No table has this stamp, so the first update copies the table.
             fd_stamp: (0, u64::MAX),
@@ -426,7 +433,10 @@ impl FdView {
 impl MmView {
     /// The address-space facts of `mm`; the VMA vector is shared with `prev`
     /// while `mm` reports the same stamp, copied once otherwise.
-    fn collect(
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn collect(
         prev: Option<&Self>,
         mm: &Mm,
         rss: (u64, u64, u64),

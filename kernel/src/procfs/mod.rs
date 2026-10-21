@@ -51,6 +51,7 @@ use alloc::vec::Vec;
 use syscalls::Errno;
 
 use crate::{
+    mm::Mm,
     task::Tasklist,
     vfs::{
         Cred, FileTable, InodeId, KResult, Kstat, MAY_EXEC, PROC_NODE_BIT, S_IFDIR, S_IFLNK,
@@ -677,6 +678,12 @@ pub struct ProcState {
     totals: MmTotals,
     /// `pde->size` of `/proc/cmdline`: the command line length plus one.
     pub cmdline_size: i64,
+    /// The `i_mtime` and `i_ctime` of the nodes a `setattr` stamped (`ftruncate`, `O_TRUNC`).
+    /// shortcut: a node nobody stamped reports the time of the `getattr` call, where Linux
+    /// reports the time its inode was instantiated; a stamped one keeps its time until its pid
+    /// is released or its superblock goes, where Linux's inode may be evicted earlier. Upgrade
+    /// with stored inodes (a procfs inode cache).
+    stamps: Vec<(InodeId, Timespec)>,
 }
 
 impl ProcState {
@@ -786,6 +793,13 @@ impl ProcState {
             }
             kept
         });
+        // The nodes of the pids that went (a pid without a view has none).
+        let views = &self.views;
+        self.stamps.retain(|(id, _)| {
+            ProcNode::of(*id).is_none_or(|node| {
+                node.tgid == 0 || views.binary_search_by_key(&node.tgid, |(t, _)| *t).is_ok()
+            })
+        });
     }
 
     fn drop_view(&mut self, tgid: i32) {
@@ -793,6 +807,43 @@ impl ProcState {
             let (_, view) = self.views.remove(at);
             self.totals.sub(MmTotals::of(&view));
         }
+        self.forget_pid(tgid);
+    }
+
+    /// The nodes below `/proc/<tgid>` are gone: forget what `setattr` stamped on them.
+    fn forget_pid(&mut self, tgid: i32) {
+        self.stamps
+            .retain(|(id, _)| ProcNode::of(*id).is_none_or(|node| node.tgid != tgid));
+    }
+
+    /// The superblock `sb` is gone.
+    pub fn forget_sb(&mut self, sb: SbId) {
+        self.stamps
+            .retain(|(id, _)| ProcNode::of(*id).is_none_or(|node| node.sb != sb));
+    }
+
+    /// The time `setattr_copy` stored in the node's `i_mtime` and `i_ctime`, if a `setattr`
+    /// did.
+    #[must_use]
+    pub fn stamp(&self, id: InodeId) -> Option<Timespec> {
+        self.stamps
+            .iter()
+            .find_map(|(node, time)| (*node == id).then_some(*time))
+    }
+
+    /// `setattr_copy` of `ATTR_MTIME | ATTR_CTIME` with the time `notify_change` took (`now`):
+    /// both times of the node become `time`.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn set_stamp(&mut self, id: InodeId, time: Timespec) -> KResult<()> {
+        if let Some(entry) = self.stamps.iter_mut().find(|(node, _)| *node == id) {
+            entry.1 = time;
+            return Ok(());
+        }
+        self.stamps.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        let _ = self.stamps.push_within_capacity((id, time));
+        Ok(())
     }
 
     /// The facts of a thread group.
@@ -827,6 +878,78 @@ impl ProcState {
         Some(&mut self.views[at].1)
     }
 
+    /// The address space `/proc/<tgid>` shows: the task's own, or, while a `vfork` child works in
+    /// it, the child's -- one `mm_struct` however many `vfork`s deep.
+    #[must_use]
+    pub fn mm_of(&self, tgid: i32) -> Option<&MmView> {
+        let mut view = self.view(tgid)?;
+        // A chain of holders cannot be longer than the number of views.
+        for _ in 0..=self.views.len() {
+            let Some(next) = view.lent_to else {
+                return view.mm.as_ref();
+            };
+            view = self.view(next)?;
+        }
+        None
+    }
+
+    /// `copy_mm` with `CLONE_VM` for a `vfork`: the address space of `tgid` is now the one
+    /// `holder` works in.
+    pub fn lend_mm(&mut self, tgid: i32, holder: i32) {
+        if let Ok(at) = self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
+            let view = &mut self.views[at].1;
+            self.totals.sub(MmTotals::of(view));
+            view.mm = None;
+            view.lent_to = Some(holder);
+        }
+    }
+
+    /// The address space is back with `tgid` (`holder` exec'd or exited, `mm_release`): its view
+    /// shows what the holder's showed when it let go.
+    pub fn return_mm(&mut self, tgid: i32, holder: i32) {
+        let mm = self.view(holder).and_then(|view| view.mm.clone());
+        if let Ok(at) = self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
+            let view = &mut self.views[at].1;
+            view.lent_to = None;
+            view.mm = mm;
+            self.totals.add(MmTotals::of(view));
+        }
+    }
+
+    /// `holder` borrowed the address space of `tgid` and exited while its own `vfork` child still
+    /// works in it: `tgid` waits for that child now.
+    pub fn skip_lent(&mut self, tgid: i32, holder: i32) {
+        let next = self.view(holder).and_then(|view| view.lent_to);
+        if let Ok(at) = self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
+            let view = &mut self.views[at].1;
+            if view.lent_to == Some(holder) {
+                view.lent_to = next;
+            }
+        }
+    }
+
+    /// Bring the address-space part of the view of `tgid` up to date with `mm`, which the task
+    /// works in (the part of a publication a `vfork` hand-back needs).
+    ///
+    /// # Errors
+    /// `ENOMEM`; the view is unchanged.
+    pub fn publish_mm(
+        &mut self,
+        tgid: i32,
+        mm: &Mm,
+        rss: (u64, u64, u64),
+        pgtables_bytes: u64,
+    ) -> KResult<()> {
+        if let Ok(at) = self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
+            let view = &mut self.views[at].1;
+            let fresh = MmView::collect(view.mm.as_ref(), mm, rss, pgtables_bytes)?;
+            self.totals.sub(MmTotals::of(view));
+            view.mm = Some(fresh);
+            self.totals.add(MmTotals::of(view));
+        }
+        Ok(())
+    }
+
     /// The sum of the address-space figures of all published views.
     #[must_use]
     pub const fn totals(&self) -> MmTotals {
@@ -840,6 +963,7 @@ impl ProcState {
             let view = &mut self.views[at].1;
             self.totals.sub(MmTotals::of(view));
             view.mm = None;
+            view.lent_to = None;
             view.exe = None;
             view.fds = view::FdView::default();
             view.has_files = false;
@@ -1288,6 +1412,7 @@ pub fn getattr(
     now: Timespec,
 ) -> Kstat {
     let attr = attr(state, node, opts);
+    let stamp = state.stamp(node.id());
     Kstat {
         dev: mkdev(0, dev),
         ino: ino(node),
@@ -1300,8 +1425,9 @@ pub fn getattr(
         blksize: 1024,
         blocks: 0,
         atime: now,
-        mtime: now,
-        ctime: now,
+        // `setattr_copy` stored these; otherwise see `ProcState::stamps`.
+        mtime: stamp.unwrap_or(now),
+        ctime: stamp.unwrap_or(now),
         btime: now,
         attributes: 0,
         attributes_mask: crate::vfs::STATX_ATTR_AUTOMOUNT

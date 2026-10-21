@@ -31,7 +31,7 @@ use crate::{
     },
     seq::{Seq, Snapshot},
     usercopy::copy_from_user,
-    vfs::{FMODE_LSEEK, MAX_LFS_FILESIZE},
+    vfs::{FMODE_LSEEK, MAX_NON_LFS},
 };
 
 /// The node a procfs file refers to.
@@ -135,7 +135,7 @@ fn own_text<C: Context>(ctx: &mut C, node: ProcNode) -> Result<Vec<u8>, Stop> {
         |s| -> Result<Option<ExecArgs>, Errno> {
             s.tasks.find_task_by_vpid(node.tgid).ok_or(Errno::ESRCH)?;
             let view = s.vfs.fs.ns.proc.view(node.tgid).ok_or(Errno::ESRCH)?;
-            let Some(mm) = view.mm.as_ref() else {
+            let Some(mm) = s.vfs.fs.ns.proc.mm_of(node.tgid) else {
                 return Ok(None);
             };
             Ok(Some((
@@ -237,29 +237,75 @@ fn slice_args(
     out
 }
 
+/// `generic_file_llseek` of a procfs file or directory: `generic_file_llseek_size` with the
+/// superblock's `s_maxbytes` (`MAX_NON_LFS`: procfs never sets one) and the end of file `i_size`
+/// (0). `pos` is the file position; the result is the new one.
+///
+/// # Errors
+/// `ENXIO` for `SEEK_DATA` and `SEEK_HOLE` (`must_set_pos`: at or beyond the end of file),
+/// `EINVAL` for a negative or too large position.
+pub(super) fn generic_llseek(pos: i64, offset: i64, whence: u32) -> Result<i64, Errno> {
+    let target = match whence {
+        0 | 2 => offset,
+        1 if offset == 0 => return Ok(pos),
+        1 => pos.wrapping_add(offset),
+        _ => return Err(Errno::ENXIO),
+    };
+    if (0..=MAX_NON_LFS).contains(&target) {
+        Ok(target)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
+/// `default_llseek` of a sysctl file (`proc_sys_file_operations`): no maximum, an end of file of 0
+/// compared as signed numbers.
+fn default_llseek(pos: i64, offset: i64, whence: u32) -> Result<i64, Errno> {
+    let target = match whence {
+        0 | 2 => offset,
+        1 if offset == 0 => return Ok(pos),
+        1 => pos.wrapping_add(offset),
+        // SEEK_DATA and SEEK_HOLE at or beyond the end of file; below it (any negative offset)
+        // the data stays where the offset is, and the hole is at the end of file.
+        _ if offset >= 0 => return Err(Errno::ENXIO),
+        3 => offset,
+        _ => 0,
+    };
+    if target >= 0 {
+        Ok(target)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
 /// `seq_lseek` / `generic_file_llseek` / `default_llseek` of a procfs file.
 pub(super) fn lseek<C: Context>(ctx: &mut C, view: &View, whence: u32, offset: i64) -> Sys {
     let node = node_of(view)?;
     if view.mode & FMODE_LSEEK == 0 {
         return Err(Errno::ESPIPE.into());
     }
-    let generic = own_read(node.kind) || node.kind == Kind::SysFile;
+    if own_read(node.kind) || node.kind == Kind::SysFile {
+        let new = if node.kind == Kind::SysFile {
+            default_llseek(view.pos, offset, whence)?
+        } else {
+            generic_llseek(view.pos, offset, whence)?
+        };
+        if whence != 1 || offset != 0 {
+            // The next read shows the text afresh.
+            ctx.files().vfs.files.get_mut(view.id).seq = None;
+        }
+        return Ok(new);
+    }
+    // seq_lseek: SET and CUR only, any non-negative position.
     let new = match whence {
         0 => offset,
         1 => offset.wrapping_add(view.pos),
-        // SEEK_END with i_size 0; seq_lseek refuses it.
-        2 if generic => offset,
         _ => return Err(Errno::EINVAL.into()),
     };
-    if !(0..=MAX_LFS_FILESIZE).contains(&new) {
+    if new < 0 {
         return Err(Errno::EINVAL.into());
     }
     let file = ctx.files().vfs.files.get_mut(view.id);
-    if generic {
-        // generic_file_llseek: the next read shows the text afresh.
-        file.seq = None;
-        return Ok(new);
-    }
     // seq_lseek: a new position other than the read position runs `traverse`.
     let mut state = file.seq.take().unwrap_or_default();
     let moved = if state.seek_wants_snapshot(new) {
@@ -330,4 +376,44 @@ pub fn comm_write<C: Context>(ctx: &mut C, view: &View, buf: u64, count: u64) ->
     name[length..].fill(0);
     ctx.attrs().comm = name;
     Ok(i64::try_from(count).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // oracle: `procfs.llseek-{cmdline,dir,...}-*` (generic_file_llseek) and
+    // `procfs.llseek-sysctl-*` (default_llseek), recorded on the pinned Linux.
+    #[test]
+    fn generic_llseek_is_limited_to_non_lfs_with_an_empty_file() {
+        let max = MAX_NON_LFS;
+        assert_eq!(generic_llseek(5, max, 0), Ok(max));
+        assert_eq!(generic_llseek(5, max + 1, 0), Err(Errno::EINVAL));
+        assert_eq!(generic_llseek(max, 0, 1), Ok(max), "SEEK_CUR 0 asks only");
+        assert_eq!(generic_llseek(max, 1, 1), Err(Errno::EINVAL));
+        assert_eq!(generic_llseek(max, -max + 15, 1), Ok(15));
+        assert_eq!(generic_llseek(5, 7, 2), Ok(7));
+        assert_eq!(generic_llseek(5, -1, 2), Err(Errno::EINVAL));
+        assert_eq!(generic_llseek(5, -1, 0), Err(Errno::EINVAL));
+        for offset in [0, 100, -1, i64::MAX] {
+            assert_eq!(generic_llseek(5, offset, 3), Err(Errno::ENXIO));
+            assert_eq!(generic_llseek(5, offset, 4), Err(Errno::ENXIO));
+        }
+    }
+
+    #[test]
+    fn default_llseek_has_no_maximum_and_compares_as_signed() {
+        assert_eq!(default_llseek(0, 1 << 40, 0), Ok(1 << 40));
+        assert_eq!(default_llseek(1 << 40, 0, 1), Ok(1 << 40));
+        assert_eq!(default_llseek(1 << 40, 5, 1), Ok((1 << 40) + 5));
+        assert_eq!(default_llseek(0, -1, 0), Err(Errno::EINVAL));
+        assert_eq!(default_llseek(0, 7, 2), Ok(7));
+        assert_eq!(default_llseek(0, -1, 2), Err(Errno::EINVAL));
+        assert_eq!(default_llseek(0, 0, 3), Err(Errno::ENXIO));
+        assert_eq!(default_llseek(0, 1 << 40, 3), Err(Errno::ENXIO));
+        assert_eq!(default_llseek(0, -1, 3), Err(Errno::EINVAL));
+        assert_eq!(default_llseek(0, 0, 4), Err(Errno::ENXIO));
+        // A negative offset is below the end of file: the hole is at the end of file (0).
+        assert_eq!(default_llseek(9, -5, 4), Ok(0));
+    }
 }

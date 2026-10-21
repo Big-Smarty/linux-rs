@@ -25,10 +25,11 @@ use syscalls::Errno;
 use super::{
     __O_TMPFILE, AT_SYMLINK_NOFOLLOW, Cred, FMODE_CAN_READ, FMODE_CAN_WRITE, FMODE_LSEEK,
     FMODE_PATH, FMODE_PREAD, FMODE_PWRITE, FMODE_READ, FMODE_WRITE, FileId, FsStruct, InodeId,
-    KResult, Kstat, MAY_APPEND, MAY_EXEC, MAY_READ, MAY_WRITE, NAME_MAX, O_ACCMODE, O_APPEND,
-    O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_DSYNC, O_EXCL, O_NOATIME, O_NOCTTY, O_NOFOLLOW,
-    O_PATH, O_TRUNC, S_IALLUGO, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
-    S_IFSOCK, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, S_IXGRP, Timespec, VALID_OPEN_FLAGS, Vfs,
+    KResult, Kstat, MAX_LFS_FILESIZE, MAX_NON_LFS, MAY_APPEND, MAY_EXEC, MAY_READ, MAY_WRITE,
+    NAME_MAX, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_DSYNC, O_EXCL,
+    O_NOATIME, O_NOCTTY, O_NOFOLLOW, O_PATH, O_TRUNC, S_IALLUGO, S_IFBLK, S_IFCHR, S_IFDIR,
+    S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, S_IXGRP,
+    Timespec, VALID_OPEN_FLAGS, Vfs,
     file::{CharDev, Dentry, File, FileKind},
     mkdev, new_decode_dev,
     path::{self, LOOKUP_DIRECTORY, LOOKUP_FOLLOW, LastKind, WALK_TRAILING, Walk},
@@ -52,6 +53,36 @@ pub struct Env {
     pub umask: u32,
     /// `task_tgid_vnr(current)`: what `/proc/self` names (0 for the kernel).
     pub tgid: i32,
+}
+
+/// A truncation `inode_newsize_ok` refuses: `EFBIG`, and `SIGXFSZ` when the reason was the
+/// caller's `RLIMIT_FSIZE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewSizeRefused {
+    pub signal: bool,
+}
+
+/// `inode_newsize_ok` for a non-negative `length`: growing past `rlimit` (`RLIM_INFINITY` is
+/// `u64::MAX`) is `EFBIG` with `SIGXFSZ`, then growing past `s_maxbytes` is `EFBIG`; a size at or
+/// below `i_size` is no growth (the swap file case does not exist here).
+///
+/// # Errors
+/// [`NewSizeRefused`].
+pub const fn inode_newsize_ok(
+    i_size: u64,
+    length: u64,
+    s_maxbytes: u64,
+    rlimit: u64,
+) -> Result<(), NewSizeRefused> {
+    if i_size < length {
+        if rlimit != u64::MAX && length > rlimit {
+            return Err(NewSizeRefused { signal: true });
+        }
+        if length > s_maxbytes {
+            return Err(NewSizeRefused { signal: false });
+        }
+    }
+    Ok(())
 }
 
 /// `UTIME_NOW` / `UTIME_OMIT` (include/linux/stat.h): the special `tv_nsec` values of `utimensat`.
@@ -900,24 +931,25 @@ impl Vfs {
         Ok(())
     }
 
-    /// `vfs_truncate`.
+    /// `vfs_truncate` of a tmpfs inode without the `RLIMIT_FSIZE` check (the callers are the
+    /// initramfs unpacker and the tests; the system calls run [`Vfs::truncate_check`],
+    /// [`Vfs::newsize_ok`] and the setattr of the node themselves).
     ///
     /// # Errors
-    /// `EISDIR`, `EINVAL`, `EACCES`.
+    /// `EISDIR`, `EINVAL`, `EACCES`, `EROFS`.
     pub fn truncate(&mut self, env: &Env, inode: InodeId, length: u64) -> KResult<()> {
+        debug_assert!(!inode.is_proc(), "a procfs node has its own setattr");
         self.truncate_check(env, inode)?;
-        if inode.is_proc() {
-            return Ok(()); // `proc_setattr` ignores ATTR_SIZE
-        }
         self.do_truncate(&env.cred, inode, length);
         Ok(())
     }
 
-    /// The checks of `vfs_truncate` before `do_truncate`: the type and the
-    /// write permission.
+    /// The checks of `vfs_truncate` before `do_truncate`: the type, the write permission, and
+    /// then `mnt_want_write` (a caller without the permission gets `EACCES` on a read-only mount,
+    /// not `EROFS`).
     ///
     /// # Errors
-    /// `EISDIR`, `EINVAL`, `EACCES`.
+    /// `EISDIR`, `EINVAL`, `EACCES`, `EROFS`.
     pub fn truncate_check(&self, env: &Env, inode: InodeId) -> KResult<()> {
         if self.fs.is_dir(inode) {
             return Err(Errno::EISDIR);
@@ -925,9 +957,47 @@ impl Vfs {
         if self.fs.file_type(inode) != S_IFREG {
             return Err(Errno::EINVAL);
         }
-        // vfs_truncate: `mnt_want_write`, then `inode_permission`.
-        self.fs.want_write(inode)?;
-        self.fs.permission(env, inode, MAY_WRITE)
+        // vfs_truncate: `inode_permission`, then `mnt_want_write`.
+        self.fs.permission(env, inode, MAY_WRITE)?;
+        self.fs.want_write(inode)
+    }
+
+    /// `setattr_prepare`'s `inode_newsize_ok` for a truncation of `inode` to `length` by a caller
+    /// whose `RLIMIT_FSIZE` is `rlimit` (`RLIM_INFINITY` is `u64::MAX`): the size cannot grow
+    /// past the limit (`SIGXFSZ`), nor past the superblock's `s_maxbytes` (`MAX_LFS_FILESIZE`,
+    /// except procfs, which keeps the `MAX_NON_LFS` default).
+    ///
+    /// # Errors
+    /// `EFBIG`; [`NewSizeRefused::signal`] when the caller must also get `SIGXFSZ`.
+    pub fn newsize_ok(
+        &self,
+        inode: InodeId,
+        length: u64,
+        rlimit: u64,
+    ) -> Result<(), NewSizeRefused> {
+        let s_maxbytes = if inode.is_proc() {
+            MAX_NON_LFS
+        } else {
+            MAX_LFS_FILESIZE
+        };
+        inode_newsize_ok(
+            self.fs.i_size(inode),
+            length,
+            u64::try_from(s_maxbytes).unwrap_or(0),
+            rlimit,
+        )
+    }
+
+    /// `setattr_copy` of `ATTR_MTIME | ATTR_CTIME` on a procfs node (`ftruncate`, `O_TRUNC`):
+    /// both times become the current time. `ATTR_SIZE` changes nothing there: no procfs
+    /// `setattr` resizes anything, so the size stays what the entry reports.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn proc_touch(&mut self, inode: InodeId) -> KResult<()> {
+        debug_assert!(inode.is_proc());
+        let now = self.fs.clock_now();
+        self.fs.ns.proc.set_stamp(inode, now)
     }
 
     /// `do_truncate` after `inode_newsize_ok`: `dentry_needs_remove_privs`
@@ -1189,8 +1259,16 @@ impl Vfs {
         }
         self.may_open(env, inode, acc_mode, open_flag)?;
         let file = self.vfs_open(env, inode, open_flag, dentry)?;
-        if do_truncate && !inode.is_proc() {
-            self.do_truncate(&env.cred, inode, 0); // handle_truncate (0 is always within RLIMIT_FSIZE)
+        if do_truncate {
+            // handle_truncate: `inode_newsize_ok` of 0 always passes.
+            if inode.is_proc() {
+                if let Err(errno) = self.proc_touch(inode) {
+                    self.fput(file);
+                    return Err(errno);
+                }
+            } else {
+                self.do_truncate(&env.cred, inode, 0);
+            }
         }
         Ok(file)
     }

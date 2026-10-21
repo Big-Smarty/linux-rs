@@ -658,12 +658,12 @@ impl Vfs {
             } else {
                 // The ids return when the last pin goes (`reap`); if the
                 // parking fails the ids are leaked, never reused wrongly.
-                let _ = self.fs.ns.defer_release(sb, mount.id);
+                let _ = self.fs.ns.defer_release(sb, mount.id, mount.flags);
             }
         } else {
             self.fs.tmp_mut().detach_sb(sb);
             if self.fs.tmp().has_sb(sb) {
-                let _ = self.fs.ns.defer_release(sb, mount.id);
+                let _ = self.fs.ns.defer_release(sb, mount.id, mount.flags);
             } else {
                 self.fs.ns.free_mnt_id(mount.id);
                 self.fs.ns.free_sb(sb);

@@ -77,6 +77,7 @@ pub const fn exec_file(id: u64) -> FileInfo {
         swapfile: false,
         append_only: false,
         can_mmap: true,
+        mmap_error: None,
         mmap_size_max: i64::MAX.cast_unsigned(),
         mmap_sync: false,
         hugepages: false,

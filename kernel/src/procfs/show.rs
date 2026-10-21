@@ -345,7 +345,7 @@ fn status(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
             show.tasks.task_tgid_vnr(task),
         ),
     )?;
-    if let Some(mm) = &view.mm {
+    if let Some(mm) = show.vfs.fs.ns.proc.mm_of(node.tgid) {
         // task_mem
         let total_rss = mm.rss_anon + mm.rss_file + mm.rss_shmem;
         let hiwater_vm = mm.hiwater_vm.max(mm.total_vm);
@@ -452,7 +452,7 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     {
         (utime, stime) = (show.host.cpu_time)(sched);
     }
-    let mm = view.mm.as_ref();
+    let mm = show.vfs.fs.ns.proc.mm_of(node.tgid);
     let (tty_nr, tty_pgrp): (i64, i64) = if t.ctty {
         // new_encode_dev(ttyS0 = 4:64)
         (4 << 8 | 64, i64::from(show.host.tty_pgrp))
@@ -550,8 +550,8 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
 }
 
 fn statm(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
-    let (_, view) = pid_view(show, node)?;
-    let Some(mm) = &view.mm else {
+    pid_view(show, node)?;
+    let Some(mm) = show.vfs.fs.ns.proc.mm_of(node.tgid) else {
         return seq.put(b"0 0 0 0 0 0 0\n");
     };
     let shared = mm.rss_file + mm.rss_shmem;
@@ -625,8 +625,8 @@ fn pad_to(line: &mut Seq, start: usize, width: usize) -> KResult<()> {
 }
 
 fn maps(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
-    let (_, view) = pid_view(show, node)?;
-    let Some(mm) = &view.mm else {
+    pid_view(show, node)?;
+    let Some(mm) = show.vfs.fs.ns.proc.mm_of(node.tgid) else {
         return Ok(());
     };
     for vma in mm.vmas.iter() {
