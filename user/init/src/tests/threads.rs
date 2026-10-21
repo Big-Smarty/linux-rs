@@ -2190,6 +2190,31 @@ fn resource_limits(t: &mut T) {
         get(RLIMIT_CORE),
         [1000, 8192],
     );
+    // A sibling thread's pid names the same limits.
+    READY.store(0, SeqCst);
+    GATE.store(0, SeqCst);
+    let sibling = spawn(
+        |_| {
+            set_and_wake(&READY, 1);
+            wait_for(&GATE, 1);
+            0
+        },
+        0,
+    );
+    wait_for(&READY, 1);
+    let (new, mut old) = ([2000u64, 8192], [0u64; 2]);
+    let r = sys(
+        Sysno::prlimit64,
+        &[sibling.tid, RLIMIT_CORE, addr(&new), addr_mut(&mut old)],
+    );
+    t.eq(
+        "prlimit64-of-a-sibling-thread",
+        (r.is_ok(), old, get(RLIMIT_CORE)),
+        (true, [1000, 8192], [2000, 8192]),
+    );
+    set_and_wake(&GATE, 1);
+    sibling.join();
+    let _ = set(RLIMIT_CORE, [1000, 8192]);
     // A process copies them at fork and then keeps its own.
     let sub = fork_child(|| {
         let inherited = get(RLIMIT_CORE) == [1000, 8192];

@@ -290,6 +290,22 @@ fn rlimit_bytes(limit: Rlimit) -> [u8; 16] {
     bytes
 }
 
+/// [`find_task`] for state that belongs to the thread group (the resource limits): any thread of
+/// the caller's group answers with the caller's, which is the group's. Another process's
+/// limits are reachable through the task list but not through here yet (the permission rules
+/// of `check_prlimit_permission`), so that stops the kernel loudly.
+fn find_group_task<C: Context>(ctx: &mut C, pid: i32) -> Result<(), Stop> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let tasks = ctx.tasks();
+    match tasks.list.find_task_by_vpid(pid) {
+        None => Err(Errno::ESRCH.into()),
+        Some(task) if tasks.list.same_thread_group(task, tasks.current) => Ok(()),
+        Some(_) => Err(Stop::Unimplemented),
+    }
+}
+
 fn get_rlimit_arg<C: Context>(ctx: &mut C, pointer: u64) -> Result<Rlimit, Stop> {
     let mut bytes = [0u8; 16];
     if copy_from_user(ctx, &mut bytes, pointer) != 0 {
@@ -339,7 +355,7 @@ fn prlimit64<C: Context>(ctx: &mut C, pid: i32, resource: u32, new: u64, old: u6
     } else {
         Some(get_rlimit_arg(ctx, new)?)
     };
-    find_task(ctx, pid)?;
+    find_group_task(ctx, pid)?;
     let previous = do_prlimit(ctx, resource, new)?;
     // The old value is written after the new one took effect, as in Linux.
     if old != 0 && copy_to_user(ctx, old, &rlimit_bytes(previous)) != 0 {
@@ -1302,6 +1318,45 @@ mod tests {
         assert_eq!(call(&mut t, Sysno::prlimit64, &[0, 7, 0, 0]), ok(0));
         // `pid_t` truncation: 1 << 32 is pid 0.
         assert_eq!(call(&mut t, Sysno::prlimit64, &[1 << 32, 7, 0, 0]), ok(0));
+    }
+
+    #[test]
+    fn prlimit64_of_a_sibling_thread_is_the_groups_and_another_process_stops() {
+        use crate::task::tasklist::{CloneParams, ForkParams};
+        let mut t = user_task();
+        let fork = ForkParams {
+            exit_signal: 17,
+            clear_sighand: false,
+        };
+        let thread = t
+            .tasks
+            .clone_task(
+                t.current,
+                CloneParams {
+                    fork,
+                    thread: true,
+                    share_sighand: true,
+                    reset_altstack: true,
+                },
+            )
+            .unwrap();
+        let tid = u64::try_from(t.tasks.task_pid_vnr(thread)).unwrap();
+        put(
+            &mut t,
+            BUF + 32,
+            &[7, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            call(&mut t, Sysno::prlimit64, &[tid, 4, BUF + 32, BUF + 48]),
+            ok(0)
+        );
+        assert_eq!(limit(&mut t, 4), (ok(0), Rlimit { cur: 7, max: 9 }));
+        let child = t.tasks.fork(t.current, fork).unwrap();
+        let pid = u64::try_from(t.tasks.task_pid_vnr(child)).unwrap();
+        assert!(matches!(
+            dispatch(&mut t, Sysno::prlimit64 as u64, [pid, 4, 0, 0, 0, 0]),
+            Outcome::Unimplemented(_)
+        ));
     }
 
     #[test]
