@@ -633,6 +633,8 @@ pub struct ProcState {
     pub pids: Vec<PidFacts>,
     /// [`Tasklist::epoch`] the mirror was built for.
     pub epoch: u64,
+    /// [`Tasklist::epoch`] the views were last pruned at ([`ProcState::prune`]).
+    pruned_epoch: u64,
     /// `(tgid, view)`, sorted by tgid.
     views: Vec<(i32, TaskView)>,
     /// `pde->size` of `/proc/cmdline`: the command line length plus one.
@@ -673,6 +675,18 @@ impl ProcState {
         self.pids = pids;
         self.epoch = tasks.epoch();
         Ok(())
+    }
+
+    /// Drop the views of released thread groups without building the mirror
+    /// (no procfs exists, so nothing reads it, but the views of exited tasks
+    /// must not pile up). Cheap when the task list did not change.
+    pub fn prune(&mut self, tasks: &Tasklist) {
+        if self.pruned_epoch == tasks.epoch() {
+            return;
+        }
+        self.views
+            .retain(|(tgid, _)| tasks.find_task_by_vpid(*tgid).is_some());
+        self.pruned_epoch = tasks.epoch();
     }
 
     /// The facts of a thread group.

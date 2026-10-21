@@ -1849,6 +1849,7 @@ impl Context for Syscall<'_> {
         let process = self.shared.get();
         // Nothing reads the mirror or a view before a procfs is mounted.
         if !process.vfs.fs.ns.has_proc() {
+            process.vfs.fs.ns.proc.prune(&process.tasks);
             return;
         }
         // A refusal keeps the previous mirror: lookups of the newest pids may
