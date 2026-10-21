@@ -141,7 +141,7 @@ pub struct Group {
     /// `signal->notify_count` (`de_thread`).
     pub(super) notify_count: i32,
     /// `signal->group_exec_task`.
-    pub(super) group_exec_task: Option<TaskId>,
+    pub(super) exec_task: Option<TaskId>,
     /// `signal->leader`: a session leader.
     pub(super) session_leader: bool,
     /// `signal->tty != NULL`: the console tty is the controlling terminal (there is one tty, so
@@ -356,7 +356,7 @@ impl Group {
             quick_threads: 0,
             curr_target: TaskId::DANGLING,
             notify_count: 0,
-            group_exec_task: None,
+            exec_task: None,
             session_leader: false,
             ctty: false,
             tty_old_pgrp: None,
@@ -803,9 +803,7 @@ impl Tasklist {
             (t.group_leader, t.group, t.sighand)
         };
         let group_dead = leader == id;
-        let Some(task) = self.tasks.remove(id) else {
-            return None;
-        };
+        let task = self.tasks.remove(id)?;
         debug_assert!(task.first_child.is_none(), "release_task with children");
         // The members: the other threads' view of `curr_target` and `notify_count`.
         let mut empty_group = false;
@@ -815,7 +813,7 @@ impl Tasklist {
                 if g.notify_count > 0 {
                     g.notify_count -= 1;
                     if g.notify_count == 0
-                        && let Some(waiting) = g.group_exec_task
+                        && let Some(waiting) = g.exec_task
                     {
                         w.de_thread_event(waiting);
                     }
@@ -1250,9 +1248,9 @@ impl Tasklist {
         let ids = self.signal_ids(task, curr)?;
         let t = self.tasks.get_mut(task)?;
         Some(State {
-            hand: &mut *self.sighands.get_mut(t.sighand)?.hand,
-            sig: &mut *self.groups.get_mut(t.group)?.sig,
-            me: &mut *t.thread,
+            hand: &mut self.sighands.get_mut(t.sighand)?.hand,
+            sig: &mut self.groups.get_mut(t.group)?.sig,
+            me: &mut t.thread,
             pid: ids.pid,
             tgid: ids.tgid,
             uid: ids.uid,

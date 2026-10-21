@@ -107,7 +107,7 @@ fn get_futex_key<C: Context>(
     rw: Access,
 ) -> Result<Key, Errno> {
     let size = 4u64;
-    if uaddr % size != 0 {
+    if !uaddr.is_multiple_of(size) {
         return Err(Errno::EINVAL);
     }
     // access_ok(uaddr, size): the pinned Linux accepts an address up to and including
@@ -430,34 +430,32 @@ pub(super) fn restart<C: Context>(ctx: &mut C, block: RestartBlock) -> i64 {
 fn futex_lock_pi<C: Context>(ctx: &mut C, uaddr: u64, flags: Flags) -> Sys {
     get_futex_key(ctx, uaddr, flags, Access::Write)?;
     let vpid = ctx.futex().tid;
-    loop {
-        // futex_lock_pi_atomic
-        let Some(uval) = read_u32(ctx, uaddr) else {
-            return Err(Errno::EFAULT.into());
-        };
-        if uval & FUTEX_TID_MASK == vpid {
-            return Err(Errno::EDEADLK.into());
-        }
-        if uval & FUTEX_TID_MASK == 0 {
-            // We take over the futex, preserving the owner-died bit.
-            let new = (uval & FUTEX_OWNER_DIED) | vpid;
-            if !write_u32(ctx, uaddr, new) {
-                return Err(Errno::EFAULT.into());
-            }
-            return Ok(0);
-        }
-        // First waiter: the waiters bit is set before attaching to the owner.
-        let waiting = uval | FUTEX_WAITERS;
-        if waiting != uval && !write_u32(ctx, uaddr, waiting) {
-            return Err(Errno::EFAULT.into());
-        }
-        let owner = i32::try_from(uval & FUTEX_TID_MASK).unwrap_or(0);
-        let exists = ctx.tasks().list.find_task_by_vpid(owner).is_some();
-        if !exists {
-            return Err(Errno::ESRCH.into());
-        }
-        return Err(Stop::Unimplemented);
+    // futex_lock_pi_atomic
+    let Some(uval) = read_u32(ctx, uaddr) else {
+        return Err(Errno::EFAULT.into());
+    };
+    if uval & FUTEX_TID_MASK == vpid {
+        return Err(Errno::EDEADLK.into());
     }
+    if uval & FUTEX_TID_MASK == 0 {
+        // We take over the futex, preserving the owner-died bit.
+        let new = (uval & FUTEX_OWNER_DIED) | vpid;
+        if !write_u32(ctx, uaddr, new) {
+            return Err(Errno::EFAULT.into());
+        }
+        return Ok(0);
+    }
+    // First waiter: the waiters bit is set before attaching to the owner.
+    let waiting = uval | FUTEX_WAITERS;
+    if waiting != uval && !write_u32(ctx, uaddr, waiting) {
+        return Err(Errno::EFAULT.into());
+    }
+    let owner = i32::try_from(uval & FUTEX_TID_MASK).unwrap_or(0);
+    let exists = ctx.tasks().list.find_task_by_vpid(owner).is_some();
+    if !exists {
+        return Err(Errno::ESRCH.into());
+    }
+    Err(Stop::Unimplemented)
 }
 
 /// `futex_unlock_pi(uaddr, flags)` when no task waits in the kernel (there is no way to wait
@@ -693,7 +691,7 @@ fn handle_futex_death<C: Context>(
     pending_op: bool,
 ) -> Result<(), ()> {
     // Futex address must be 32bit aligned.
-    if uaddr % 4 != 0 {
+    if !uaddr.is_multiple_of(4) {
         return Err(());
     }
     let vpid = ctx.futex().tid;
@@ -1081,7 +1079,7 @@ mod tests {
     fn argument_errors_in_linuxs_order() {
         let mut t = t();
         put(&mut t, W, 1);
-        let wait = FUTEX_WAIT as u64 | PRIVATE;
+        let wait = u64::from(FUTEX_WAIT) | PRIVATE;
         assert_eq!(futex(&mut t, &[W, wait, 0]), neg(Errno::EAGAIN));
         assert_eq!(futex(&mut t, &[W + 1, wait, 1]), neg(Errno::EINVAL));
         assert_eq!(futex(&mut t, &[0, wait, 1]), neg(Errno::EFAULT));
@@ -1135,8 +1133,8 @@ mod tests {
         assert_eq!(t.futex_wakes.0.last(), Some(&6));
         // Bitsets: no common bit, a common bit.
         t.futexes.queue(key(W), 0b110, 7, 0);
-        assert_eq!(futex(&mut t, &[W, 10 | PRIVATE, 5, 0, 0, 0b001]), 0);
-        assert_eq!(futex(&mut t, &[W, 10 | PRIVATE, 5, 0, 0, 0b100]), 1);
+        assert_eq!(futex(&mut t, &[W, 0xa | PRIVATE, 5, 0, 0, 0b001]), 0);
+        assert_eq!(futex(&mut t, &[W, 0xa | PRIVATE, 5, 0, 0, 0b100]), 1);
     }
 
     #[test]
@@ -1221,7 +1219,7 @@ mod tests {
         let start = t.now;
         // Nothing wakes it: the fake clock jumps to the deadline.
         assert_eq!(
-            futex(&mut t, &[W, FUTEX_WAIT as u64 | PRIVATE, 0, 0x2000]),
+            futex(&mut t, &[W, u64::from(FUTEX_WAIT) | PRIVATE, 0, 0x2000]),
             neg(Errno::ETIMEDOUT)
         );
         assert!(t.now >= start + 20_000_000);
@@ -1231,7 +1229,7 @@ mod tests {
         t.state.hand.actions[usize::from(SIGUSR1) - 1].handler = 0x4000;
         let deadline = t.now + 20_000_000;
         assert_eq!(
-            futex(&mut t, &[W, FUTEX_WAIT as u64 | PRIVATE, 0, 0x2000]),
+            futex(&mut t, &[W, u64::from(FUTEX_WAIT) | PRIVATE, 0, 0x2000]),
             -ERESTART_RESTARTBLOCK
         );
         let block = t.clocks.restarts.last().copied().unwrap();
@@ -1335,10 +1333,10 @@ mod tests {
         // A lock a task that does not exist holds: the waiters bit is set, ESRCH.
         put(&mut t, W, 4000);
         assert_eq!(futex(&mut t, &[W, lock.0]), neg(Errno::ESRCH));
-        assert_eq!(get(&mut t, W), 4000 | FUTEX_WAITERS);
+        assert_eq!(get(&mut t, W), 0xfa0 | FUTEX_WAITERS);
         // One that exists would need an rt_mutex: a loud stop.
         put(&mut t, W, 1 | FUTEX_OWNER_DIED);
-        let held = t.tgid + 0; // the caller's own pid is not "another task"
+        let held = t.tgid; // the caller's own pid is not "another task"
         let _ = held;
         let child = t
             .tasks
@@ -1360,24 +1358,24 @@ mod tests {
         );
         // The requeue operations check first; with no waiter they are a no-op.
         assert_eq!(
-            futex(&mut t, &[W, 11 | PRIVATE, 0, 0, W]),
+            futex(&mut t, &[W, 0xb | PRIVATE, 0, 0, W]),
             neg(Errno::EINVAL)
         );
         assert_eq!(
-            futex(&mut t, &[W, 12 | PRIVATE, 1, 1, W, 0]),
+            futex(&mut t, &[W, 0xc | PRIVATE, 1, 1, W, 0]),
             neg(Errno::EINVAL)
         );
         assert_eq!(
-            futex(&mut t, &[W, 12 | PRIVATE, 2, 1, W + 4, 0]),
+            futex(&mut t, &[W, 0xc | PRIVATE, 2, 1, W + 4, 0]),
             neg(Errno::EINVAL),
             "one waiter to wake"
         );
         put(&mut t, W, 3);
         assert_eq!(
-            futex(&mut t, &[W, 12 | PRIVATE, 1, 1, W + 4, 4]),
+            futex(&mut t, &[W, 0xc | PRIVATE, 1, 1, W + 4, 4]),
             neg(Errno::EAGAIN)
         );
-        assert_eq!(futex(&mut t, &[W, 12 | PRIVATE, 1, 1, W + 4, 3]), 0);
+        assert_eq!(futex(&mut t, &[W, 0xc | PRIVATE, 1, 1, W + 4, 3]), 0);
     }
 
     #[test]
@@ -1422,11 +1420,11 @@ mod tests {
         assert_eq!(waitv(&mut t, 1, 0, BAD, 1), neg(Errno::EFAULT));
         // futex_wake / futex_wait.
         assert_eq!(
-            call(&mut t, Sysno::futex_wake, &[W, 1, 1, private32 as u64]),
+            call(&mut t, Sysno::futex_wake, &[W, 1, 1, u64::from(private32)]),
             0
         );
         assert_eq!(
-            call(&mut t, Sysno::futex_wake, &[W, 0, 1, private32 as u64]),
+            call(&mut t, Sysno::futex_wake, &[W, 0, 1, u64::from(private32)]),
             neg(Errno::EINVAL)
         );
         assert_eq!(
@@ -1434,7 +1432,7 @@ mod tests {
             neg(Errno::EINVAL)
         );
         assert_eq!(
-            call(&mut t, Sysno::futex_wake, &[W, 1, 0, private32 as u64]),
+            call(&mut t, Sysno::futex_wake, &[W, 1, 0, u64::from(private32)]),
             0,
             "STRICT: zero is zero"
         );
@@ -1442,7 +1440,7 @@ mod tests {
             call(
                 &mut t,
                 Sysno::futex_wait,
-                &[W, 4, 1, private32 as u64, 0, 0]
+                &[W, 4, 1, u64::from(private32), 0, 0]
             ),
             neg(Errno::EAGAIN)
         );

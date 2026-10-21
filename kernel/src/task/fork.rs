@@ -84,6 +84,10 @@ pub struct CloneArgs {
 
 /// What the binary needs to build a plain copy of the calling process: the
 /// part of [`CloneArgs`] that survived [`CloneArgs::request`].
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per CLONE_* bit the request carries"
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForkRequest {
     /// `args->exit_signal`.

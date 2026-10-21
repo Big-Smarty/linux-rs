@@ -167,11 +167,7 @@ impl Tasklist {
         };
         // "else if (sig->group_exec_task) exit_code = 0;": an `execve` of another thread is
         // collapsing the group and owns the other threads' deaths.
-        if group_exit.is_none()
-            && self
-                .group_of(task)
-                .is_some_and(|g| g.group_exec_task.is_some())
-        {
+        if group_exit.is_none() && self.group_of(task).is_some_and(|g| g.exec_task.is_some()) {
             return 0;
         }
         // "if (signal_group_exit(sig)) exit_code = sig->group_exit_code; else start it".
@@ -329,7 +325,7 @@ impl Tasklist {
         // mt-exec, de_thread() is waiting for the group leader.
         let waiting = self
             .group_of(task)
-            .and_then(|g| (g.notify_count < 0).then_some(g.group_exec_task).flatten());
+            .and_then(|g| (g.notify_count < 0).then_some(g.exec_task).flatten());
         if let Some(waiting) = waiting {
             w.de_thread_event(waiting);
         }

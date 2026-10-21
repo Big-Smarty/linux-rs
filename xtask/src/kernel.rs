@@ -979,6 +979,15 @@ const DEBUG_CASES: &[DebugCase] = &[
     // flags, stacking and lazy detach, the layout and files of /proc and /proc/<pid>, sysctls
     // (`user/init` group `procfs`; the last check remounts the root read-only and back).
     oracle_case!(procfs),
+    // Threads: `clone`/`clone3` with `CLONE_THREAD` and the sharing flags, one `mm`/`files`/`fs`/
+    // `sighand` for the group, tids and pids, thread- and process-directed signals, `exit` against
+    // `exit_group`, the zombie leader, `execve` from a thread, per-thread FPU state (`user/init`
+    // group `threads`, recorded on the pinned Linux 6.18.57).
+    oracle_case!(threads),
+    // futex(2) and futex2: wait, wake, bitsets, requeue, wake-op, timeouts and restarts, private
+    // and shared keys, signals, robust lists, the argument checks of the priority-inheritance
+    // operations, `futex_waitv` (`user/init` group `futex`, recorded on the pinned Linux 6.18.57).
+    oracle_case!(futex),
     // 200 fork/exit/wait rounds: nothing is left behind (`user/init` mode `forkleak`).
     // Pool exhaustion and every unwinding path of `copy_process` (this kernel only: Linux's limit
     // is `max_threads`, not a stack pool).
@@ -8663,7 +8672,7 @@ mod tests {
         }
         let groups = [
             "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe", "xstate", "tty",
-            "ttyin", "ttykbd", "names", "busybox", "dynelf", "procfs",
+            "ttyin", "ttykbd", "names", "busybox", "dynelf", "procfs", "threads", "futex",
         ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),

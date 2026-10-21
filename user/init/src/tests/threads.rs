@@ -55,7 +55,6 @@ pub(super) const CLONE_VM: usize = 0x100;
 pub(super) const CLONE_FS: usize = 0x200;
 pub(super) const CLONE_FILES: usize = 0x400;
 pub(super) const CLONE_SIGHAND: usize = 0x800;
-pub(super) const CLONE_PARENT: usize = 0x8000;
 pub(super) const CLONE_THREAD: usize = 0x1_0000;
 pub(super) const CLONE_NEWNS: usize = 0x2_0000;
 pub(super) const CLONE_SYSVSEM: usize = 0x4_0000;

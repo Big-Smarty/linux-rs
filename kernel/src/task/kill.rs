@@ -73,7 +73,7 @@ impl Tasklist {
             && c.egid == t.sgid
             && c.egid == t.gid;
         let privileged = c.cap_kill;
-        (same || privileged) && (t_dumpable(self, target) || privileged)
+        privileged || same && t_dumpable(self, target)
     }
 
     /// `check_kill_permission(sig, info, t)` for a signal sent by `sender`
@@ -145,7 +145,6 @@ impl Tasklist {
             if !state.prepare(sig, State::forces(&info)) {
                 // Dropped: ignored, or the group is dying. The stop and continue effects on
                 // the target already happened.
-                drop(state);
                 self.job_control_released(target, was_stopped, sig, curr, w);
                 return Ok(());
             }

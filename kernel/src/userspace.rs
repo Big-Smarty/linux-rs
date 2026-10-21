@@ -808,23 +808,15 @@ type FsId = Id<FsShared>;
 impl Process {
     /// The address space `id` names. A task's ids stay valid for as long as it exists.
     fn mm(&mut self, id: MmId) -> &mut MmStruct {
-        match self.mms.get_mut(id) {
-            Some(mm) => mm,
-            None => {
-                crate::log!("FAIL a task works in an address space that does not exist\n");
-                crate::fail();
-            }
-        }
+        must(&mut self.mms, id)
     }
 
     fn mm_ref(&self, id: MmId) -> &MmStruct {
-        match self.mms.get(id) {
-            Some(mm) => mm,
-            None => {
-                crate::log!("FAIL a task works in an address space that does not exist\n");
-                crate::fail();
-            }
-        }
+        let Some(mm) = self.mms.get(id) else {
+            crate::log!("FAIL a task works in an address space that does not exist\n");
+            crate::fail();
+        };
+        mm
     }
 }
 
@@ -1620,7 +1612,7 @@ mod leak {
 }
 
 /// A page-table error of a copy or a fresh tree: only exhaustion is a legitimate failure.
-fn tables_errno(error: paging::Error, what: &str) -> Errno {
+fn tables_errno(error: &paging::Error, what: &str) -> Errno {
     if matches!(error, paging::Error::Memory(_)) {
         Errno::ENOMEM
     } else {
@@ -1735,7 +1727,7 @@ impl Syscall<'_> {
                 Ok(tables) => Some((space, tables)),
                 Err(error) => {
                     drop(space);
-                    return Err(tables_errno(error, "fork page tables"));
+                    return Err(tables_errno(&error, "fork page tables"));
                 }
             }
         };
@@ -1925,13 +1917,11 @@ impl Syscall<'_> {
 
 /// An object of an arena that a task names and so must exist.
 fn must<T>(arena: &mut Arena<T>, id: Id<T>) -> &mut T {
-    match arena.get_mut(id) {
-        Some(object) => object,
-        None => {
-            crate::log!("FAIL a task names a shared object that does not exist\n");
-            crate::fail();
-        }
-    }
+    let Some(object) = arena.get_mut(id) else {
+        crate::log!("FAIL a task names a shared object that does not exist\n");
+        crate::fail();
+    };
+    object
 }
 
 /// Free a page-table tree that no task owns (a failed fork or exec, the last user of an
@@ -2125,7 +2115,7 @@ impl Context for Syscall<'_> {
             .tables
             .user_space()
             .empty_tree()
-            .map_err(|error| tables_errno(error, "exec tree"))?;
+            .map_err(|error| tables_errno(&error, "exec tree"))?;
         let space = Mm::new(&old.env);
         let mut groups = Vec::new();
         groups.try_reserve_exact(1).map_err(|_| Errno::ENOMEM)?;
@@ -2442,6 +2432,13 @@ impl Console for ConsoleSink {
     }
 }
 
+/// The task's own state; the box itself is freed on return (`do_exit` does not return: a box
+/// left to its scope would leak).
+fn into_own(boxed: Box<TaskLocal>) -> Owned {
+    let TaskLocal { own } = *boxed;
+    own
+}
+
 /// `mmput`: the task lets go of its address space; the last user frees it and the pins its
 /// mappings held (`exit_mmap`).
 fn mmput(process: &mut Process, id: MmId, group_gone: Option<i32>) {
@@ -2487,6 +2484,58 @@ fn exit_mm(process: &mut Process, own: &mut Owned, group_gone: Option<i32>) {
         }
     }
     mmput(process, own.mm, group_gone);
+}
+
+/// `exit_files` and `exit_fs`: the task lets go of its descriptor table and filesystem context;
+/// the last user closes the descriptors and drops the root and working directory.
+fn exit_files_fs(process: &mut Process, own: &Owned) {
+    let Process {
+        vfs,
+        files_structs,
+        fs_structs,
+        ..
+    } = process;
+    let files = must(files_structs, own.files);
+    files.users -= 1;
+    if files.users == 0
+        && let Some(FilesStruct { mut fdt, .. }) = files_structs.remove(own.files)
+    {
+        vfs.close_files(&mut fdt);
+    }
+    let fs = must(fs_structs, own.fs);
+    fs.users -= 1;
+    if fs.users == 0
+        && let Some(FsShared { fs, .. }) = fs_structs.remove(own.fs)
+    {
+        vfs.put_fs(&fs);
+    }
+}
+
+/// The tty half of `do_exit`: the console's last close, and `disassociate_ctty(1)` when the
+/// group is dead.
+fn exit_tty(process: &mut Process, me: TaskId, group_dead: bool) {
+    let Process {
+        tasks,
+        wake,
+        vfs,
+        tty,
+        ..
+    } = process;
+    syscall::tty::housekeeping(vfs, tty, tasks);
+    let console_open = vfs.tty_files().1 > 0;
+    let hung = group_dead
+        && kernel::tty::jobctl::disassociate_ctty(
+            tty,
+            tasks,
+            me,
+            wake,
+            &mut crate::ttyin::Wire(&mut ConsoleSink),
+            true,
+            console_open,
+        );
+    if hung {
+        vfs.tty_hangup_files();
+    }
 }
 
 /// `do_exit` of the calling task: `exit` (`group` false) or `do_group_exit`
@@ -2540,7 +2589,7 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
         crate::log!("FAIL exiting task has no state slot={}\n", slot);
         crate::fail();
     };
-    let TaskLocal { mut own } = *boxed;
+    let mut own = into_own(boxed);
     // exit_mm: CR3 moves to the kernel tree before the user tree is freed.
     let kernel = KERNEL_ROOT.load(Ordering::Acquire);
     // SAFETY: `kernel` is the root of the kernel-only tree kept in
@@ -2554,28 +2603,7 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
     exit_mm(&mut shared, &mut own, group_dead.then_some(tgid));
     // exit_files / exit_fs: the descriptors and the root and working directory, when this was
     // the last task to use them.
-    {
-        let Process {
-            vfs,
-            files_structs,
-            fs_structs,
-            ..
-        } = &mut *shared;
-        let files = must(files_structs, own.files);
-        files.users -= 1;
-        if files.users == 0
-            && let Some(FilesStruct { mut fdt, .. }) = files_structs.remove(own.files)
-        {
-            vfs.close_files(&mut fdt);
-        }
-        let fs = must(fs_structs, own.fs);
-        fs.users -= 1;
-        if fs.users == 0
-            && let Some(FsShared { fs, .. }) = fs_structs.remove(own.fs)
-        {
-            vfs.put_fs(&fs);
-        }
-    }
+    exit_files_fs(&mut shared, &own);
     // The address space, descriptors and filesystem context are gone for /proc when the last
     // thread of the group is.
     if group_dead {
@@ -2583,30 +2611,7 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
     }
     // `disassociate_ctty(1)` of a session leader (after `exit_files`, before
     // `exit_notify`), and the tty's last close if this exit was it.
-    {
-        let Process {
-            tasks,
-            wake,
-            vfs,
-            tty,
-            ..
-        } = &mut *shared;
-        syscall::tty::housekeeping(vfs, tty, tasks);
-        let console_open = vfs.tty_files().1 > 0;
-        let hung = group_dead
-            && kernel::tty::jobctl::disassociate_ctty(
-                tty,
-                tasks,
-                own.me,
-                wake,
-                &mut crate::ttyin::Wire(&mut ConsoleSink),
-                true,
-                console_open,
-            );
-        if hung {
-            vfs.tty_hangup_files();
-        }
-    }
+    exit_tty(&mut shared, own.me, group_dead);
     // An end of a pipe closed with the last descriptor wakes the other side.
     wake_sleepers(&mut shared);
     // The task's CPU time is what its parent's wait reports (cputime_adjust).
@@ -3661,11 +3666,12 @@ pub fn teardown() {
     }
     // The address space of every task that is left (`exit_mmap`).
     if let Some(mut process) = process {
-        let ids: Vec<MmId> = process.mms.iter().map(|(id, _)| id).collect();
-        for id in ids {
-            if let Some(mm) = process.mms.remove(id) {
-                destroy_tables(mm.tables);
-            }
+        loop {
+            let next = process.mms.iter().next().map(|(id, _)| id);
+            let Some(mm) = next.and_then(|id| process.mms.remove(id)) else {
+                break;
+            };
+            destroy_tables(mm.tables);
         }
     }
     let _ = LOAD.take();

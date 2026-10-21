@@ -467,7 +467,7 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
         utime += u;
         stime += s;
     }
-    let (cutime, cstime) = show.tasks.children_cputime(task);
+    let (waited_user, waited_system) = show.tasks.children_cputime(task);
     let mm = show.vfs.fs.ns.proc.mm_of(node.tgid);
     let (tty_nr, tty_pgrp): (i64, i64) = if show.tasks.has_ctty(task) {
         // new_encode_dev(ttyS0 = 4:64)
@@ -503,8 +503,8 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     field(0)?; // cmaj_flt
     field(i128::from(nsec_to_clock_t(utime)))?;
     field(i128::from(nsec_to_clock_t(stime)))?;
-    field(i128::from(nsec_to_clock_t(cutime)))?;
-    field(i128::from(nsec_to_clock_t(cstime)))?;
+    field(i128::from(nsec_to_clock_t(waited_user)))?;
+    field(i128::from(nsec_to_clock_t(waited_system)))?;
     field(i128::from(20 + view.nice))?; // priority
     field(i128::from(view.nice))?;
     field(i128::from(show.tasks.group_thread_count(task)))?; // num_threads

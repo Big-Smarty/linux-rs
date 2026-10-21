@@ -46,12 +46,12 @@ impl Tasklist {
             return Ok(DeThread::Alone);
         }
         let g = self.group_of(tsk).ok_or(Errno::ESRCH)?;
-        if g.sig.group_exit.is_some() || g.group_exec_task.is_some() {
+        if g.sig.group_exit.is_some() || g.exec_task.is_some() {
             return Err(Errno::EAGAIN);
         }
         let leader = self.thread_group_leader(tsk);
         if let Some(g) = self.group_mut(tsk) {
-            g.group_exec_task = Some(tsk);
+            g.exec_task = Some(tsk);
             g.sig.exec_collapsing = true;
         }
         let count = self.zap_other_threads(tsk, w);
@@ -86,7 +86,7 @@ impl Tasklist {
     /// The `killed:` exit of `de_thread`: a fatal signal arrived while waiting.
     pub fn de_thread_abort(&mut self, tsk: TaskId) {
         if let Some(g) = self.group_mut(tsk) {
-            g.group_exec_task = None;
+            g.exec_task = None;
             g.sig.exec_collapsing = false;
             g.notify_count = 0;
         }
@@ -113,7 +113,7 @@ impl Tasklist {
             t.exit_signal = SIGCHLD;
         }
         if let Some(g) = self.group_mut(tsk) {
-            g.group_exec_task = None;
+            g.exec_task = None;
             g.sig.exec_collapsing = false;
             g.notify_count = 0;
         }

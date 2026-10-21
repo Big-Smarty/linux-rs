@@ -313,6 +313,9 @@ impl Futexes {
     /// `nr_wake` waiters of `key1` are woken, the next `nr_requeue` move to `key2` (to the end
     /// of the queue, behind the waiters already there). The number woken plus requeued
     /// (`task_count`).
+    ///
+    /// # Panics
+    /// Never in practice: the `push_within_capacity` that follows a `remove` has room.
     pub fn requeue(
         &mut self,
         key1: &Key,
