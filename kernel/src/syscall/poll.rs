@@ -7,10 +7,9 @@
 // (`vfs_poll`, `DEFAULT_POLLMASK`), include/uapi/asm-generic/poll.h, fs/pipe.c
 // (`pipe_poll` 660), drivers/tty/n_tty.c (`n_tty_poll`).
 // Transformation: the poll table is the task's one wait key: a task that must
-// sleep sleeps once on `sched::PIPE_KEY` (every pipe change wakes it) with the
-// timeout as its timer, then scans every descriptor again, so it needs no
-// per-file wait entries and no `poll_freewait`. A change of the console tty wakes
-// the same key as a pipe change.
+// sleep sleeps once on `sched::POLL_KEY` (every pipe, console tty or mount-table
+// change wakes it) with the timeout as its timer, then scans every descriptor
+// again, so it needs no per-file wait entries and no `poll_freewait`.
 #![forbid(unsafe_code)]
 //! `poll(2)`: readiness of pipes, the console and files that have no `->poll`.
 //!
@@ -29,7 +28,7 @@
 
 use super::{Context, Outcome, Stop, Sys, outcome, time::RestartBlock, time::RestartFn};
 use crate::{
-    sched::PIPE_KEY,
+    sched::POLL_KEY,
     signal::wait::signal_pending_synced,
     usercopy::{access_ok, copy_from_user, put_user},
     vfs::file::{CharDev, FileKind},
@@ -244,7 +243,7 @@ fn do_poll<C: Context>(ctx: &mut C, fds: &mut [PollFd], end: End) -> Sys {
         }
         // `poll_schedule_timeout`: asleep until a pipe changes, a signal, or
         // the end; only the timer running out counts as a timeout.
-        ctx.wait(PIPE_KEY, deadline);
+        ctx.wait(POLL_KEY, deadline);
         if deadline.is_some_and(|d| ctx.now_ns() >= d) {
             timed_out = true;
         }

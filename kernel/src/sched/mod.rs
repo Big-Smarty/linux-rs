@@ -66,8 +66,8 @@ pub const CLASS_TEST: u32 = u32::MAX;
 pub const CLASS_CHLDEXIT: u32 = 1;
 
 /// Wait-key class of the pipe wait queues (`pipe_inode_info::rd_wait` and
-/// `wr_wait`) and of `poll` sleepers on pipes: one key for every pipe
-/// (id 0, [`PIPE_KEY`]). Every state change of any pipe wakes all of its
+/// `wr_wait`): one key for every pipe (id 0, [`PIPE_KEY`]; the `poll` sleepers have
+/// [`POLL_KEY`]). Every state change of any pipe wakes all of its
 /// sleepers, who re-check their condition (spurious wake-ups are legal by
 /// construction). shortcut: one key and a wake-all instead of a queue per pipe
 /// end with exclusive waiters, so which of several blocked readers gets the
@@ -80,8 +80,8 @@ pub const PIPE_KEY: WaitKey = WaitKey::new(CLASS_PIPE, 0);
 
 /// Wait-key class of the console tty's wait queues (`tty->read_wait`,
 /// `tty->write_wait`, the read/write mutexes): one key, [`TTY_KEY`]. A change of
-/// the tty wakes every sleeper on it (and the `poll` sleepers, which share
-/// [`PIPE_KEY`]); each re-checks its condition.
+/// the tty wakes every sleeper on it and the `poll` sleepers ([`POLL_KEY`]); each
+/// re-checks its condition.
 pub const CLASS_TTY: u32 = 3;
 
 /// The key every tty sleeper uses ([`CLASS_TTY`]).
@@ -90,6 +90,17 @@ pub const TTY_KEY: WaitKey = WaitKey::new(CLASS_TTY, 0);
 /// Wait-key class of `vfork_done` (`struct completion`): the id is the slot of the sleeping
 /// parent (`CLONE_VFORK`); its child wakes it when it gives the address space back.
 pub const CLASS_VFORK: u32 = 4;
+
+/// Wait-key class of the `poll` sleepers (the poll table's wait entries on every file's wait
+/// queue, `poll_wait`): one key, [`POLL_KEY`]. A pipe change, a change of the console tty and a
+/// change of the mount table wake it, so a `poll` sees what changed. It is not the pipe readers'
+/// and writers' key: a task blocked in `read(2)` of a pipe is not woken by a tty or mount event
+/// that has nothing to do with its pipe (it would show as `R (running)` in `/proc/<pid>/status`
+/// until the scheduler next runs it: the `procfs` group's `child-status-ids` row).
+pub const CLASS_POLL: u32 = 5;
+
+/// The key every `poll` sleeper uses ([`CLASS_POLL`]).
+pub const POLL_KEY: WaitKey = WaitKey::new(CLASS_POLL, 0);
 
 /// A task handle: slot index plus the slot's generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
