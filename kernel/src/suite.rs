@@ -23,7 +23,7 @@
 pub const ORACLE_EXPECTED: &[u8] = include_bytes!("../../xtask/oracle/expected.tsv");
 
 /// Oracle groups the kernel can run today, in run order. `xstate` drives AVX-512 and the
-/// protection keys, `busybox` runs the host's x86-64-v4 BusyBox from a second initramfs module:
+/// protection keys, `busybox` runs the host's x86-64-v4 `BusyBox` from a second initramfs module:
 /// where the CPU or the stick lacks what they need they are reported unavailable, not failed
 /// (`baremetal::unavailable_reason`). `tty`, `ttyin` and `ttykbd` are not here: they drive the
 /// console device itself (a serial line, the PS/2 keyboard), which the suite's framebuffer console

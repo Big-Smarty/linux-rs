@@ -38,11 +38,11 @@ pub(super) enum Expect {
 
 /// The start of the reason of a group the CPU cannot run (`the CPU has no avx512f`).
 pub(super) const CPU_LACKS: &str = "the CPU has no ";
-/// The reason of `busybox` on a stick without the BusyBox module.
+/// The reason of `busybox` on a stick without the `BusyBox` module.
 pub(super) const NO_BUSYBOX: &str = "no busybox module on the stick";
 
 /// The groups of a normal run on a CPU model without AVX-512 and protection keys (QEMU TCG
-/// `qemu64`) from a stick without the BusyBox module, in the kernel's order: all pass except
+/// `qemu64`) from a stick without the `BusyBox` module, in the kernel's order: all pass except
 /// `xstate` (the CPU) and `busybox` (the stick), which are unavailable.
 pub(super) const ALL_PASS: &[(&str, Expect)] = &[
     ("ids", Expect::Pass),
@@ -62,7 +62,7 @@ pub(super) const ALL_PASS: &[(&str, Expect)] = &[
 /// `busybox` alone, from a stick that has the module, on a CPU without XSAVE and AVX-512 (TCG
 /// `qemu64`): the module is there, so the CPU is the reason.
 pub(super) const BUSYBOX_CPU: &[(&str, Expect)] = &[("busybox", Expect::Unavailable(CPU_LACKS))];
-/// The same on a host CPU (`-cpu host` with AVX-512 and PKU) from a stick with the BusyBox
+/// The same on a host CPU (`-cpu host` with AVX-512 and PKU) from a stick with the `BusyBox`
 /// module: `xstate` and `busybox` run and pass.
 pub(super) const ALL_PASS_HOST: &[(&str, Expect)] = &[
     ("ids", Expect::Pass),
@@ -395,7 +395,7 @@ pub(super) fn record(
 /// no forced video mode (the firmware's own mode, whatever the monitor is). The command line
 /// spells out the kernel's defaults (`baremetal::DEFAULT_PAUSE_MS`, `DEFAULT_TIMEOUT_S`) so
 /// that `/proc/cmdline`, which the `procfs` group's `cmdline-*` rows read, is not empty; the
-/// pinned Linux recorded those rows with a non-empty command line. The BusyBox module is
+/// pinned Linux recorded those rows with a non-empty command line. The `BusyBox` module is
 /// listed only when the tree has it (`busybox` is `unavailable` without).
 fn limine_conf(busybox: bool) -> String {
     let mut conf = String::from(
@@ -418,8 +418,12 @@ pub(super) fn build_id(root: &Path) -> String {
     )
 }
 
-fn readme(id: &str, kernel_sha: &str, busybox: &Result<super::BusyboxModule, String>) -> String {
-    let (busybox_files, copy_extra, busybox_note) = match busybox {
+/// The README's file line, the `cp` argument and the `BUSYBOX` paragraph of a tree with (or
+/// without) the `BusyBox` module.
+fn busybox_readme(
+    busybox: &Result<super::BusyboxModule, String>,
+) -> (&'static str, &'static str, String) {
+    match busybox {
         Ok(module) => (
             "  busybox.cpio           generated archive holding the host's BusyBox (see BUSYBOX)\n",
             "busybox.cpio ",
@@ -435,7 +439,11 @@ fn readme(id: &str, kernel_sha: &str, busybox: &Result<super::BusyboxModule, Str
                 "\nBUSYBOX\n  This tree has no busybox.cpio ({reason}), so the group `busybox` is N/A\n  (neither pass nor fail) on the summary screen.\n"
             ),
         ),
-    };
+    }
+}
+
+fn readme(id: &str, kernel_sha: &str, busybox: &Result<super::BusyboxModule, String>) -> String {
+    let (busybox_files, copy_extra, busybox_note) = busybox_readme(busybox);
     format!(
         "\
 linux-rs bare-metal test suite (decision A21)
@@ -713,7 +721,7 @@ struct Tree {
     id: String,
     /// `(path on the stick, sha256)`, in `SHA256SUMS` order.
     hashes: Vec<(&'static str, String)>,
-    /// The BusyBox module's evidence, or why the stick has none.
+    /// The `BusyBox` module's evidence, or why the stick has none.
     busybox: Result<super::BusyboxModule, String>,
 }
 
@@ -1012,6 +1020,7 @@ mod tests {
 
     /// A serial log the kernel would print for `groups` (a passing group repeats
     /// the pinned Linux's lines for it), with a correct digest.
+    #[allow(clippy::too_many_lines)] // one straight list of the lines the kernel prints
     fn log_of(groups: &[(&str, Expect)]) -> String {
         let mut log = String::from("firmware noise\n");
         let begin = log.len();

@@ -293,7 +293,7 @@ enum Cause {
     /// Not run: it needs the monotonic clock and `timer::init` failed.
     NoClock,
     /// Not run: the CPU lacks a feature the group needs, has AMX state it does not cover, or the
-    /// stick has no BusyBox module (neither a pass nor a failure); the text is the whole reason
+    /// stick has no `BusyBox` module (neither a pass nor a failure); the text is the whole reason
     /// ("the CPU has no avx512f", "no busybox module ...").
     Unavailable(&'static str),
 }
@@ -852,11 +852,11 @@ fn first_missing(needs: &[(&'static str, bool)]) -> Option<&'static str> {
 }
 
 /// Why this machine cannot run `group`, or `None`: the first CPU feature it lacks (`the CPU has no
-/// <flag>`), AMX where the recorded rows assume none, or (`busybox`) a stick without the BusyBox
+/// <flag>`), AMX where the recorded rows assume none, or (`busybox`) a stick without the `BusyBox`
 /// module. Only two groups have needs, both because of what their `/init` executes:
 /// * `xstate` reads and writes the AVX-512 registers and the protection-key register, and checks
 ///   the `XSAVE` frame that holds them;
-/// * `busybox` runs the host's BusyBox, a static x86-64-v4 program (`xtask`'s
+/// * `busybox` runs the host's `BusyBox`, a static x86-64-v4 program (`xtask`'s
 ///   `fixture::BUSYBOX_CPU_FLAGS`): AVX-512 F/BW/CD/DQ/VL on an OS that saves the ZMM state
 ///   (`XSAVE`), and `getrandom` draws on the CPU's generator (`hw_random_u64`: `RDSEED` or `RDRAND`,
 ///   a CPU with neither stops loudly, there is no CRNG). Its program and data files are the second
