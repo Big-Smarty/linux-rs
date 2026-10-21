@@ -370,7 +370,7 @@ pub fn image() -> ! {
         seen.statm2.size() == own_statm.size(),
     ]
     .map(|ok| if ok { b'1' } else { b'0' });
-    let _ = super::sys(Sysno::write, &[200, addr(&result), result.len()]);
+    let _ = super::sys(Sysno::write, &[1, addr(&result), result.len()]);
     super::super::die(0)
 }
 
@@ -393,8 +393,10 @@ pub(super) fn exec(t: &mut T) {
     let mut fds = [0u32; 2];
     let _ = super::sys(Sysno::pipe2, &[addr_mut(&mut fds), 0]);
     let (r, w) = (fds[0] as usize, fds[1] as usize);
+    // The image says hello on its standard output like every image of /init does, and then
+    // reports: both go to the pipe, and keep off the console.
     let child = spawn(|| {
-        let _ = super::sys(Sysno::dup2, &[w, 200]);
+        let _ = super::sys(Sysno::dup2, &[w, 1]);
         let argv = [addr(b"/init\0"), addr(b"procvfork\0"), 0];
         let envp = [0usize; 1];
         let _ = super::sys(Sysno::execve, &[addr(b"/init\0"), addr(&argv), addr(&envp)]);
@@ -402,11 +404,13 @@ pub(super) fn exec(t: &mut T) {
     });
     let _ = close(w);
     let status = wait4(child as isize, 0).1;
-    let mut got = [b'?'; 5];
-    let n = super::read(r, &mut got).unwrap_or(0);
+    const HELLO: &[u8] = b"init: hello from userspace\n";
+    let mut text = [b'?'; HELLO.len() + 5];
+    let n = super::read(r, &mut text).unwrap_or(0);
+    let got = &text[HELLO.len().min(n)..];
     let _ = close(r);
     t.eq("vfork-exec-status", status, 0);
-    t.eq("vfork-exec-report-length", n, 5);
+    t.eq("vfork-exec-report-length", n, HELLO.len() + 5);
     for (i, name) in [
         "vfork-exec-cmdline",
         "vfork-exec-maps",
@@ -417,6 +421,6 @@ pub(super) fn exec(t: &mut T) {
     .into_iter()
     .enumerate()
     {
-        t.eq(name, got[i], b'1');
+        t.eq(name, got.get(i).copied(), Some(b'1'));
     }
 }
