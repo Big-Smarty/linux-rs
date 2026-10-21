@@ -110,8 +110,9 @@ const S_IFLNK: u32 = 0o120_000;
 
 /// The files `user/init`'s `fs` and `proc` oracle tests read (name, mode, nlink, data), archived
 /// after `/dev`, `/init` and `/linuxrc` in this order (parents first). The data is part of the
-/// oracle contract: `xtask/oracle/expected.tsv` and the `fs` checks name these bytes.
-pub(crate) const TEST_FILES: [(&str, u32, u32, &[u8]); 7] = [
+/// oracle contract: `xtask/oracle/expected.tsv` and the `fs` checks name these bytes. `proc` and
+/// `mnt/a` .. `mnt/h` are the empty mount points of the `procfs` group.
+pub(crate) const TEST_FILES: [(&str, u32, u32, &[u8]); 17] = [
     ("fixture", 0o040_755, 3, b""),
     ("fixture/hello.txt", 0o100_644, 1, b"hello, oracle\n"),
     ("fixture/empty", 0o100_644, 1, b""),
@@ -119,6 +120,16 @@ pub(crate) const TEST_FILES: [(&str, u32, u32, &[u8]); 7] = [
     ("fixture/sub", 0o040_755, 2, b""),
     ("fixture/sub/nested.txt", 0o100_644, 1, b"nested\n"),
     ("fixture/link", 0o120_777, 1, b"hello.txt"),
+    ("proc", 0o040_755, 2, b""),
+    ("mnt", 0o040_755, 10, b""),
+    ("mnt/a", 0o040_755, 2, b""),
+    ("mnt/b", 0o040_755, 2, b""),
+    ("mnt/c", 0o040_755, 2, b""),
+    ("mnt/d", 0o040_755, 2, b""),
+    ("mnt/e", 0o040_755, 2, b""),
+    ("mnt/f", 0o040_755, 2, b""),
+    ("mnt/g", 0o040_755, 2, b""),
+    ("mnt/h", 0o040_755, 2, b""),
 ];
 
 /// The deterministic newc initramfs: `/dev` (directory), `/init` (the ELF), `/linuxrc` -> `/init`,
@@ -534,13 +545,23 @@ mod tests {
                 ("fixture/sub", 0o040_755, 2, 0),
                 ("fixture/sub/nested.txt", 0o100_644, 1, 7),
                 ("fixture/link", 0o120_777, 1, 9),
+                ("proc", 0o040_755, 2, 0),
+                ("mnt", 0o040_755, 10, 0),
+                ("mnt/a", 0o040_755, 2, 0),
+                ("mnt/b", 0o040_755, 2, 0),
+                ("mnt/c", 0o040_755, 2, 0),
+                ("mnt/d", 0o040_755, 2, 0),
+                ("mnt/e", 0o040_755, 2, 0),
+                ("mnt/f", 0o040_755, 2, 0),
+                ("mnt/g", 0o040_755, 2, 0),
+                ("mnt/h", 0o040_755, 2, 0),
                 ("TRAILER!!!", 0, 1, 0)
             ]
         );
         assert_eq!(found[1].3, init);
         assert_eq!(found[2].3, b"/init");
         // Sequential inode numbers 0, 1, 2 (write_cpio); the trailer has ino 0, mode 0, nlink 1.
-        let inodes = [0, 1, 2, 3, 10].map(|i| hex(&archive[entry_offset(&archive, i) + 6..][..8]));
+        let inodes = [0, 1, 2, 3, 20].map(|i| hex(&archive[entry_offset(&archive, i) + 6..][..8]));
         assert_eq!(inodes, [0, 1, 2, 3, 0]);
     }
 
@@ -619,7 +640,7 @@ mod tests {
         ))
         .unwrap();
         let counts = archive_counts(4096, &facts);
-        assert!(counts.starts_with("reserved=4096 bytes=4096 records=11 files=10 regular=5 symlinks=2 trailers=1 skipped=0 elf=1 loads=2 interpreters=0 "));
+        assert!(counts.starts_with("reserved=4096 bytes=4096 records=21 files=20 regular=5 symlinks=2 trailers=1 skipped=0 elf=1 loads=2 interpreters=0 "));
         assert!(archive_counts(4097, &facts).starts_with("reserved=8192 bytes=4097 "));
         assert!(archive_counts(0, &facts).starts_with("reserved=4096 bytes=0 "));
     }

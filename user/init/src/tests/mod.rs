@@ -45,6 +45,7 @@ pub mod mm;
 pub mod names;
 pub mod pipe;
 pub mod proc;
+pub mod procfs;
 pub mod signal;
 pub mod smoke;
 pub mod time;
@@ -375,6 +376,7 @@ pub fn run_mode(mode: &[u8]) -> bool {
         b"ttykbd" => ttyin::run_kbd(),
         // Real BusyBox commands (needs the second initramfs module and, on the host, AVX-512).
         b"bbrun" => busybox::run(),
+        b"procfs" => procfs::run(),
         _ => return false,
     };
     conclude(ok);

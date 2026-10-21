@@ -945,6 +945,10 @@ const DEBUG_CASES: &[DebugCase] = &[
     // The PS/2 keyboard (QMP `send-key` at the i8042): the default US keymap through the tty
     // (`user/init` group `ttykbd`; the Linux reference runs it with a vt console).
     oracle_input_case!(ttykbd),
+    // mount(2), umount2(2) and /proc: the mount table, tmpfs and proc options, remounts, propagation
+    // flags, stacking and lazy detach, the layout and files of /proc and /proc/<pid>, sysctls
+    // (`user/init` group `procfs`; the last check remounts the root read-only and back).
+    oracle_case!(procfs),
     // 200 fork/exit/wait rounds: nothing is left behind (`user/init` mode `forkleak`).
     // Pool exhaustion and every unwinding path of `copy_process` (this kernel only: Linux's limit
     // is `max_threads`, not a stack pool).
@@ -8457,7 +8461,7 @@ mod tests {
         }
         let groups = [
             "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe", "xstate", "tty",
-            "ttyin", "ttykbd", "names", "busybox",
+            "ttyin", "ttykbd", "names", "busybox", "procfs",
         ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),

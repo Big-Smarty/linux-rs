@@ -480,7 +480,8 @@ fn stat_family(t: &mut T) {
     t.eq(
         "stat-root",
         (root.mode, root.nlink, root.uid, root.gid),
-        (S_IFDIR | 0o1777, 5, 0, 0),
+        // /dev, /root, /fixture, /proc and /mnt
+        (S_IFDIR | 0o1777, 7, 0, 0),
     );
     t.eq("stat-root-same-dev", root.dev, init.dev);
     let (_, fixture) = stat_path(b"/fixture\0");
@@ -751,7 +752,7 @@ fn directories(t: &mut T) {
     t.eq(
         "getdents-root-order",
         &names[..n],
-        b"fixture,linuxrc,init,root,dev".as_slice(),
+        b"mnt,proc,fixture,linuxrc,init,root,dev".as_slice(),
     );
     let n = list(b"/fixture\0", &mut names).unwrap_or(0);
     t.eq(
