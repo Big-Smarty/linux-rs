@@ -1151,8 +1151,17 @@ const COMMANDS: &[Cmd] = cmds![
     ("hostname", ["hostname"]),
     ("nproc", ["nproc"]),
     ("stat-fs", ["stat", "-f", "-c", "%T %S %n", "/"]),
-    ("ls-ldn", ["ls", "-ldn", "/dev/null", "/tmp"]),
-    ("ls-dev", ["ls", "-l", "/dev"]),
+    (
+        "stat-devices",
+        [
+            "stat",
+            "-c",
+            "%F %a %u %g %t %T %n",
+            "/dev/null",
+            "/dev/console"
+        ]
+    ),
+    ("ls-dev", ["ls", "/dev"]),
     (
         "ls-tmp-empty",
         [

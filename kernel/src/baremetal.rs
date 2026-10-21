@@ -69,7 +69,7 @@ use kernel::suite::{
     self, Fnv64, GROUPS, GroupReport, ORACLE_EXPECTED, RowBudget, Text, UNSUPPORTED,
     civil_from_unix, hex16,
 };
-use raw_cpuid::{CpuId, ExtendedFeatures, ExtendedProcessorFeatureIdentifiers};
+use raw_cpuid::{CpuId, ExtendedFeatures, ExtendedProcessorFeatureIdentifiers, FeatureInfo};
 
 /// Identifies this build on the summary: set by `xtask baremetal-suite`
 /// (`LINUX_RS_BUILD_ID`, the source commit and whether the tree was clean).
@@ -852,7 +852,7 @@ fn unavailable_reason(group: &str) -> Option<&'static str> {
     let basic = cpuid.get_feature_info();
     let extended = cpuid.get_extended_feature_info();
     let missing = [
-        ("xsave", basic.as_ref().is_some_and(|f| f.has_xsave())),
+        ("xsave", basic.as_ref().is_some_and(FeatureInfo::has_xsave)),
         (
             "avx512f",
             extended.as_ref().is_some_and(ExtendedFeatures::has_avx512f),

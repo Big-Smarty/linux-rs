@@ -1957,7 +1957,18 @@ fn vfork(t: &mut T) {
     let at = 0x6000_0000_0000usize;
     let argv = [addr(b"/init\0"), addr(b"execd\0"), 0];
     let envp = [0usize; 1];
+    // The child execs this program, which says hello on its standard output: keep that off the console.
+    let _ = sys(
+        Sysno::mknod,
+        &[addr(b"/dev/null\0"), 0o20_666, (1 << 8) | 3],
+    );
+    let null = open(b"/dev/null\0", O_RDWR, 0).unwrap_or(99);
+    let saved = sys(Sysno::dup, &[1]).unwrap_or(99);
+    let _ = sys(Sysno::dup2, &[null, 1]);
     let pid = vfork_map_exec(at, addr(b"/init\0"), addr(&argv), addr(&envp));
+    let _ = sys(Sysno::dup2, &[saved, 1]);
+    close(saved);
+    close(null);
     t.holds("vfork-exec-pid", pid.is_ok(), &pid, "a child pid");
     t.eq(
         "vfork-child-mapping-visible-to-parent",
