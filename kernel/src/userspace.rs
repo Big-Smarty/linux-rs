@@ -1635,6 +1635,10 @@ impl Syscall<'_> {
 }
 
 /// The address space a forked child starts with.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a local of one fork, moved once; boxing would add a fallible allocation to the common path"
+)]
 enum ChildMemory {
     /// `dup_mmap`: its own copy.
     Copy { space: Mm, tables: Tables },

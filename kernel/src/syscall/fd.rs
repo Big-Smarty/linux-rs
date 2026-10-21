@@ -187,6 +187,9 @@ impl Dest {
 /// bytes the kernel already holds.
 pub(super) struct Src {
     data: SrcData,
+    /// One buffer of `write(2)`/`pwrite64(2)` (`Src::one`), not the segments of an iovec: a
+    /// `->write` sees it even when it is empty.
+    plain: bool,
     seg: usize,
     used: u64,
     pub(super) remaining: u64,
@@ -203,6 +206,7 @@ impl Src {
         try_push(&mut segs, (base, len))?;
         Ok(Self {
             data: SrcData::User(segs),
+            plain: true,
             seg: 0,
             used: 0,
             remaining: len,
@@ -214,6 +218,7 @@ impl Src {
         let remaining = bytes.len() as u64;
         Self {
             data: SrcData::Kernel(bytes),
+            plain: false,
             seg: 0,
             used: 0,
             remaining,
@@ -254,6 +259,22 @@ impl Src {
             }
         }
         done
+    }
+
+    /// The buffer of a plain `write(2)`, consumed whole, empty or not (`vfs_write` calls `->write`
+    /// for a zero count too).
+    fn plain_buffer(&mut self) -> Option<(u64, u64)> {
+        let SrcData::User(segs) = &self.data else {
+            return None;
+        };
+        if !self.plain {
+            return None;
+        }
+        let (base, len) = segs[0];
+        self.plain = false;
+        self.seg = segs.len();
+        self.remaining = 0;
+        Some((base + self.used, len - self.used))
     }
 
     /// The next non-empty user segment, consumed whole (`do_loop_readv_writev`'s walk); `None`
@@ -354,6 +375,7 @@ fn import_iovec_src<C: Context>(ctx: &mut C, vec: u64, vlen: u64) -> Result<Src,
     let (segs, remaining) = import_segs(ctx, vec, vlen)?;
     Ok(Src {
         data: SrcData::User(segs),
+        plain: false,
         seg: 0,
         used: 0,
         remaining,
@@ -748,6 +770,9 @@ fn write_loop<C: Context>(
     src: &mut Src,
     mut write: impl FnMut(&mut C, u64, u64) -> Sys,
 ) -> Sys {
+    if let Some((base, len)) = src.plain_buffer() {
+        return write(ctx, base, len);
+    }
     let mut ret: i64 = 0;
     while let Some((base, len)) = src.next_segment() {
         match write(ctx, base, len) {
