@@ -85,15 +85,17 @@ const DEFAULT_PAUSE_MS: usize = 6000;
 /// slow framebuffer should not come near this.
 const DEFAULT_TIMEOUT_S: u64 = 120;
 /// Groups that sleep on the monotonic clock and so cannot run without it.
-const NEEDS_CLOCK: [&str; 9] = [
-    "time", "signal", "fork", "proc", "jobctl", "pipe", "xstate", "procfs", "busybox",
+const NEEDS_CLOCK: [&str; 12] = [
+    "time", "signal", "fork", "proc", "jobctl", "pipe", "threads", "futex", "xstate", "procfs",
+    "busybox", "dynelf",
 ];
-const CAPTURE_BYTES: usize = 256 * 1024;
+const CAPTURE_BYTES: usize = 512 * 1024;
 const MAX_PROOFS: usize = 40;
 /// Inventory facts the summary repeats: cpu, memory, platform, time, display, pci, adapters.
 const KEYS: usize = 7;
 const NONE: usize = usize::MAX;
 const MAX_GROUPS: usize = 16;
+const _: () = assert!(GROUPS.len() <= MAX_GROUPS);
 /// Extra `suite_groups=` words of the QEMU harness: `/init` modes that end a
 /// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not; a
 /// loop that never ends; the same loop in a child while init waits for it, so the time bound
@@ -392,9 +394,19 @@ impl Results {
 }
 
 static RESULTS: IrqMutex<Results> = IrqMutex::new(Results::new());
+/// A boot module kept for the groups: which of the suite's optional modules it is and its bytes
+/// in pieces (a heap block is at most 4 MiB, a module of host programs is several times that).
+pub struct Archive {
+    pub kind: suite::Module,
+    pub chunks: Vec<Vec<u8>>,
+}
+
+/// The largest piece of a retained module.
+const ARCHIVE_CHUNK: usize = 1 << 20;
+
 /// Heap copies of the boot modules (the loader's copies are unreadable once the
 /// owned tables are active); each group unpacks them again.
-static ARCHIVES: IrqMutex<Vec<Vec<u8>>> = IrqMutex::new(Vec::new());
+static ARCHIVES: IrqMutex<Vec<Archive>> = IrqMutex::new(Vec::new());
 static PAUSE_MS: AtomicUsize = AtomicUsize::new(DEFAULT_PAUSE_MS);
 static TIMEOUT_S: AtomicU64 = AtomicU64::new(DEFAULT_TIMEOUT_S);
 /// Raw TSC value at which the running group times out, 0 while none runs.
@@ -479,14 +491,32 @@ pub unsafe fn retain_archives(boot: &BootInfo) -> bool {
         let Ok(bytes) = (unsafe { boot.module_bytes(span) }) else {
             return false;
         };
-        let mut copy = Vec::new();
-        if copy.try_reserve_exact(bytes.len()).is_err() || archives.try_reserve(1).is_err() {
+        let mut chunks = Vec::new();
+        if chunks
+            .try_reserve_exact(bytes.len().div_ceil(ARCHIVE_CHUNK))
+            .is_err()
+            || archives.try_reserve(1).is_err()
+        {
             return false;
         }
-        for &byte in bytes {
-            let _ = copy.push_within_capacity(byte);
+        for piece in bytes.chunks(ARCHIVE_CHUNK) {
+            let mut copy = Vec::new();
+            if copy.try_reserve_exact(piece.len()).is_err() {
+                return false;
+            }
+            for &byte in piece {
+                let _ = copy.push_within_capacity(byte);
+            }
+            let _ = chunks.push_within_capacity(copy);
         }
-        let _ = archives.push_within_capacity(copy);
+        // (The base archive is always the first module; the others are told apart by content,
+        // the loader gives the kernel no names.)
+        let kind = if index == 0 {
+            suite::Module::Other
+        } else {
+            suite::module_kind(bytes)
+        };
+        let _ = archives.push_within_capacity(Archive { kind, chunks });
     }
     true
 }
@@ -857,8 +887,8 @@ fn first_missing(needs: &[(&'static str, bool)]) -> Option<&'static str> {
 }
 
 /// Why this machine cannot run `group`, or `None`: the first CPU feature it lacks (`the CPU has no
-/// <flag>`), AMX where the recorded rows assume none, or (`busybox`) a stick without the `BusyBox`
-/// module. Only two groups have needs, both because of what their `/init` executes:
+/// <flag>`), AMX where the recorded rows assume none, or (`busybox`, `dynelf`) a stick without
+/// the group's module. Only three groups have needs, all because of what their `/init` executes:
 /// * `xstate` reads and writes the AVX-512 registers and the protection-key register, and checks
 ///   the `XSAVE` frame that holds them;
 /// * `busybox` runs the host's `BusyBox`, a static x86-64-v4 program (`xtask`'s
@@ -867,11 +897,15 @@ fn first_missing(needs: &[(&'static str, bool)]) -> Option<&'static str> {
 ///   a CPU with neither stops loudly, there is no CRNG). Its program and data files are the second
 ///   Limine module, which `xtask baremetal-suite` adds only for the exact program the rows were
 ///   recorded with; without it the group would fail with `/bin/busybox` missing, which is no
-///   result about this kernel.
+///   result about this kernel;
+/// * `dynelf` runs the host's dynamically linked programs (coreutils, `bash`, Python, `xz`, ...),
+///   which are x86-64-v4 builds with glibc: the same CPU needs as `busybox`, and its own module
+///   (`dynamic.cpio`), added only when every host file matches the digest the rows were recorded
+///   with.
 ///
 /// (`/init` of every other group runs on any x86-64 CPU.)
 fn unavailable_reason(group: &str) -> Option<&'static str> {
-    if group != "xstate" && group != "busybox" {
+    if !matches!(group, "xstate" | "busybox" | "dynelf") {
         return None;
     }
     let cpuid = CpuId::new();
@@ -879,13 +913,22 @@ fn unavailable_reason(group: &str) -> Option<&'static str> {
     let extended = cpuid.get_extended_feature_info();
     let ext = |has: fn(&ExtendedFeatures) -> bool| extended.as_ref().is_some_and(has);
     let xsave = basic.as_ref().is_some_and(FeatureInfo::has_xsave);
-    if group == "busybox" {
+    if let Some(module) = suite::module_of_group(group) {
         let random = basic.as_ref().is_some_and(FeatureInfo::has_rdrand)
             || ext(ExtendedFeatures::has_rdseed);
+        let stick = ARCHIVES
+            .lock()
+            .iter()
+            .skip(1)
+            .any(|archive| archive.kind == module);
         return first_missing(&[
             (
-                "no busybox module on the stick (no matching host program)",
-                ARCHIVES.lock().len() > 1,
+                if module == suite::Module::Busybox {
+                    "no busybox module on the stick (no matching host program)"
+                } else {
+                    "no dynelf module on the stick (no matching host programs)"
+                },
+                stick,
             ),
             ("the CPU has no xsave", xsave),
             ("the CPU has no avx512f", ext(ExtendedFeatures::has_avx512f)),

@@ -750,6 +750,62 @@ const COMMANDS: &[Cmd] = cmds![
             "cat /proc/self/maps | cut -d' ' -f1,2,6- | sed -n '1,40p'"
         ]
     ),
+    // Programs that make threads (glibc `pthread_create`: `clone3`, a stack with a guard region
+    // from `mprotect` or `madvise(MADV_GUARD_INSTALL)`, `madvise(MADV_DONTNEED)` when the stack
+    // is released, futex joins, robust lists). Python's `_thread` needs no library file besides
+    // the interpreter; `sort` starts threads for 128K lines or more; `xz -T` one worker per
+    // block.
+    (
+        "python-thread",
+        "/usr/bin/python3",
+        [
+            "python3",
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            "import _thread\nlock = _thread.allocate_lock()\nlock.acquire()\nres = []\ndef work():\n    res.append(sum(range(100000)))\n    lock.release()\n_thread.start_new_thread(work, ())\nlock.acquire()\nprint(res)"
+        ]
+    ),
+    (
+        "python-threads",
+        "/usr/bin/python3",
+        [
+            "python3",
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            "import _thread\ndone = _thread.allocate_lock()\nmutex = _thread.allocate_lock()\nres = {}\nleft = [4]\ndef work(k):\n    s = sum(i * k for i in range(20000))\n    with mutex:\n        res[k] = s\n        left[0] -= 1\n        if left[0] == 0:\n            done.release()\ndone.acquire()\nfor k in (1, 2, 3, 4):\n    _thread.start_new_thread(work, (k,))\ndone.acquire()\nprint(sorted(res.items()), _thread.get_ident() != 0)"
+        ]
+    ),
+    (
+        "sort-parallel",
+        "/usr/bin/bash",
+        [
+            "bash",
+            "-c",
+            "seq 1 200000 | sort -rn --parallel=2 | sed -n '1p;$p'"
+        ]
+    ),
+    (
+        "sort-parallel-four",
+        "/usr/bin/bash",
+        [
+            "bash",
+            "-c",
+            "seq 1 300000 | sort -n --parallel=4 -S 16M | tail -n 2"
+        ]
+    ),
+    (
+        "xz-threads",
+        "/usr/bin/bash",
+        [
+            "bash",
+            "-c",
+            "seq 1 20000 | xz -1 -T2 --block-size=16384 -c | xz -dc | wc -l"
+        ]
+    ),
 ];
 
 fn cstr(path: &str, buf: &mut [u8; 128]) -> usize {

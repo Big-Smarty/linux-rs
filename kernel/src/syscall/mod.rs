@@ -165,6 +165,11 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     /// `current->mm`: the VMA set, the rules' limits and the page tables the
     /// memory syscalls edit.
     fn address_space(&mut self) -> AddressSpace<'_>;
+    /// The caller's `PKRU` (`read_pkru()`), which `arch_vma_access_permitted` consults for
+    /// `MADV_POPULATE_*`. Zero (nothing denied) where the CPU has no protection keys.
+    fn pkru(&self) -> u32 {
+        0
+    }
     /// `fget(fd)` for `mmap`: the facts `do_mmap` reads from the open file, or
     /// `None` for a closed descriptor (`-EBADF`).
     fn mmap_file(&mut self, fd: u32) -> Option<Mappable> {

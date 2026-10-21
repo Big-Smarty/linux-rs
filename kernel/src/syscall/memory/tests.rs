@@ -80,7 +80,7 @@ fn mmap_decodes_offset_descriptor_and_unsupported_requests() {
 }
 
 #[test]
-fn madvise_checks_then_walks_then_stops_for_unimplemented_advice() {
+fn madvise_checks_then_walks_then_applies_the_advice() {
     let mut t = task();
     let base = match dispatch(&mut t, Sysno::mmap as u64, [0, 3 * P, RW, ANON, 0, 0]) {
         Outcome::Return(a) => a.cast_unsigned(),
@@ -118,14 +118,194 @@ fn madvise_checks_then_walks_then_stops_for_unimplemented_advice() {
         assert_eq!(madvise(base, 0, advice), neg(Errno::EINVAL), "{advice}");
     }
     assert_eq!(madvise(base, P, 0x1_0000_0000), Outcome::Return(0));
-    // Valid behaviours this kernel does not implement stop loudly.
-    for advice in [
-        1, 2, 3, 4, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 24, 102, 103,
+    // Every valid advice has an answer for an ordinary anonymous range; REMOVE has no file.
+    for advice in [1, 2, 3, 4, 8, 10, 11, 16, 17, 18, 19, 20, 21, 24, 102, 103] {
+        assert_eq!(madvise(base, P, advice), Outcome::Return(0), "{advice}");
+    }
+    assert_eq!(madvise(base, P, 9), neg(Errno::EINVAL));
+    // The flag advice split the VMA exactly like the model does.
+    assert_eq!(madvise(base + P, P, 1), Outcome::Return(0));
+    assert_eq!(madvise(base, 4 * P, 1), neg(Errno::ENOMEM));
+    drop(madvise);
+    let vmas = t.mm.vmas().iter().filter(|v| v.start >= base).count();
+    assert_eq!(vmas, 1, "RANDOM on the whole range merged it again");
+}
+
+#[test]
+fn madvise_stops_loudly_where_the_model_cannot_answer() {
+    let mut t = task();
+    let base = match dispatch(&mut t, Sysno::mmap as u64, [0, 3 * P, RW, ANON, 0, 0]) {
+        Outcome::Return(a) => a.cast_unsigned(),
+        other => panic!("{other:?}"),
+    };
+    let call =
+        |t: &mut _, advice: u64| dispatch(t, Sysno::madvise as u64, [base, P, advice, 0, 0, 0]);
+    // After a private /dev/zero mapping the model cannot tell it from anonymous memory, and
+    // REMOVE (EACCES) and WIPEONFORK (EINVAL) would answer differently for it.
+    assert_eq!(call(&mut t, 18), Outcome::Return(0));
+    t.vfs.note_zero_mapping();
+    for advice in [9, 18] {
+        assert_eq!(call(&mut t, advice), Outcome::Unimplemented(28), "{advice}");
+    }
+    assert_eq!(call(&mut t, 4), Outcome::Return(0));
+}
+
+#[test]
+fn madvise_populate_faults_pages_in_one_vma_at_a_time() {
+    let mut t = task();
+    let base = match dispatch(&mut t, Sysno::mmap as u64, [0, 4 * P, RW, ANON, 0, 0]) {
+        Outcome::Return(a) => a.cast_unsigned(),
+        other => panic!("{other:?}"),
+    };
+    let none = match dispatch(&mut t, Sysno::mmap as u64, [0, P, 0, ANON, 0, 0]) {
+        Outcome::Return(a) => a.cast_unsigned(),
+        other => panic!("{other:?}"),
+    };
+    let populate = |t: &mut _, start: u64, len: u64, advice: u64| {
+        dispatch(t, Sysno::madvise as u64, [start, len, advice, 0, 0, 0])
+    };
+    // The fake user memory has no pages: the first page that cannot be reached ends the call
+    // with the error of its fault (a VMA hole is ENOMEM, an ordinary page ENOMEM, a mapping
+    // that refuses the access EINVAL).
+    assert_eq!(populate(&mut t, base, P, 22), neg(Errno::ENOMEM));
+    for i in 0..4 {
+        t.pages.map(base + i * P, true);
+    }
+    assert_eq!(populate(&mut t, base, 4 * P, 22), Outcome::Return(0));
+    assert_eq!(populate(&mut t, base, 4 * P, 23), Outcome::Return(0));
+    assert_eq!(
+        populate(&mut t, base, 5 * P, 23),
+        neg(Errno::ENOMEM),
+        "the hole after the VMA"
+    );
+    assert_eq!(populate(&mut t, none, P, 22), neg(Errno::EINVAL));
+    assert_eq!(populate(&mut t, none, P, 23), neg(Errno::EINVAL));
+    assert_eq!(populate(&mut t, 0x1000, P, 23), neg(Errno::ENOMEM));
+    assert_eq!(populate(&mut t, base, 0, 23), Outcome::Return(0));
+    assert_eq!(populate(&mut t, base + 1, P, 23), neg(Errno::EINVAL));
+    // A guard page ends the walk with EFAULT.
+    assert_eq!(
+        dispatch(
+            &mut t,
+            Sysno::madvise as u64,
+            [base + 2 * P, P, 102, 0, 0, 0]
+        ),
+        Outcome::Return(0)
+    );
+    t.pages.0.remove(&(base + 2 * P));
+    assert_eq!(populate(&mut t, base, 4 * P, 22), neg(Errno::EFAULT));
+}
+
+#[test]
+fn process_madvise_checks_then_needs_a_pidfd_that_cannot_exist() {
+    let mut t = task();
+    let pm = |t: &mut _, pidfd: u64, vec: u64, vlen: u64, flags: u64| {
+        dispatch(
+            t,
+            Sysno::process_madvise as u64,
+            [pidfd, vec, vlen, 20, flags, 0],
+        )
+    };
+    // iovecs at 0x4000: { 0x5000, 0x1000 }, { 0x6000, 0x1000 }, { 0x7000, -1 }
+    for (i, (base, len)) in [(0x5000u64, 0x1000u64), (0x6000, 0x1000), (0x7000, u64::MAX)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut raw = [0u8; 16];
+        raw[..8].copy_from_slice(&base.to_le_bytes());
+        raw[8..].copy_from_slice(&len.to_le_bytes());
+        t.pages.map(0x4000, true);
+        crate::usercopy::copy_to_user(&mut t, 0x4000 + i as u64 * 16, &raw);
+    }
+    // flags first (as an unsigned int), then the vector, then the pidfd.
+    assert_eq!(pm(&mut t, 0, 0x4000, 1, 1), neg(Errno::EINVAL));
+    assert_eq!(pm(&mut t, 0, 0xdead, 5000, 0x8000_0000), neg(Errno::EINVAL));
+    assert_eq!(pm(&mut t, 0, 0x4000, 1025, 0), neg(Errno::EINVAL));
+    assert_eq!(pm(&mut t, 0, 0x7fff_ffff_f000, 1, 0), neg(Errno::EFAULT));
+    // A negative length is EINVAL as the vector is copied, before any base is checked.
+    assert_eq!(pm(&mut t, 0, 0x4020, 1, 0), neg(Errno::EINVAL));
+    assert_eq!(pm(&mut t, 0, 0x4000, 3, 0), neg(Errno::EINVAL));
+    // No pidfd exists: a descriptor that is open, closed or negative (but for the two
+    // `PIDFD_SELF_*` values, below) is EBADF.
+    assert_eq!(pm(&mut t, 0, 0x4000, 2, 0), neg(Errno::EBADF));
+    assert_eq!(pm(&mut t, u64::MAX, 0x4000, 2, 0), neg(Errno::EBADF));
+    assert_eq!(pm(&mut t, 77, 0, 0, 0), neg(Errno::EBADF));
+    // `unsigned nr_segs`: the upper half of the register is dropped.
+    assert_eq!(pm(&mut t, 0, 0x4000, 0x1_0000_0002, 0), neg(Errno::EBADF));
+    assert_eq!(pm(&mut t, 0, 0xdead, 0x1_0000_0000, 0), neg(Errno::EBADF));
+}
+
+#[test]
+fn process_madvise_self_pidfds_run_the_vector_on_the_callers_space() {
+    const SELF_THREAD: u64 = (-10000i64).cast_unsigned();
+    const SELF_GROUP: u64 = (-10001i64).cast_unsigned();
+    let mut t = task();
+    let base = match dispatch(&mut t, Sysno::mmap as u64, [0, 3 * P, RW, ANON, 0, 0]) {
+        Outcome::Return(a) => a.cast_unsigned(),
+        other => panic!("{other:?}"),
+    };
+    t.pages.map(0x4000, true);
+    let put = |t: &mut _, segments: &[(u64, u64)]| {
+        for (i, (seg_base, len)) in segments.iter().enumerate() {
+            let mut raw = [0u8; 16];
+            raw[..8].copy_from_slice(&seg_base.to_le_bytes());
+            raw[8..].copy_from_slice(&len.to_le_bytes());
+            crate::usercopy::copy_to_user(t, 0x4000 + i as u64 * 16, &raw);
+        }
+        segments.len() as u64
+    };
+    let pm = |t: &mut _, pidfd: u64, vlen: u64, advice: u64| {
+        dispatch(
+            t,
+            Sysno::process_madvise as u64,
+            [pidfd, 0x4000, vlen, advice, 0, 0],
+        )
+    };
+    let n = put(&mut t, &[(base, P), (base + P, 2 * P)]);
+    // `int pidfd`: the upper half of the register is dropped.
+    for pidfd in [
+        SELF_THREAD,
+        SELF_GROUP,
+        (1 << 32) | (SELF_THREAD & 0xffff_ffff),
     ] {
         assert_eq!(
-            madvise(base, P, advice),
-            Outcome::Unimplemented(28),
-            "{advice}"
+            pm(&mut t, pidfd, n, 20),
+            Outcome::Return((3 * P).cast_signed())
         );
     }
+    for pidfd in [
+        (-10002i64).cast_unsigned(),
+        (-9999i64).cast_unsigned(),
+        0,
+        77,
+    ] {
+        assert_eq!(pm(&mut t, pidfd, n, 20), neg(Errno::EBADF), "{pidfd:#x}");
+    }
+    // The first failing segment ends it: the bytes before it, or its error if none.
+    let n = put(&mut t, &[(base, P), (base + 1, P), (base + P, P)]);
+    assert_eq!(
+        pm(&mut t, SELF_THREAD, n, 20),
+        Outcome::Return(P.cast_signed())
+    );
+    let n = put(&mut t, &[(base + 1, P), (base, P)]);
+    assert_eq!(pm(&mut t, SELF_THREAD, n, 20), neg(Errno::EINVAL));
+    let n = put(&mut t, &[(base + 3 * P, P)]);
+    assert_eq!(pm(&mut t, SELF_THREAD, n, 20), neg(Errno::ENOMEM));
+    // Only while bytes are left: a trailing empty segment is not looked at, a leading one is.
+    let n = put(&mut t, &[(base, P), (base + 1, 0)]);
+    assert_eq!(
+        pm(&mut t, SELF_THREAD, n, 20),
+        Outcome::Return(P.cast_signed())
+    );
+    let n = put(&mut t, &[(base + 1, 0), (base, P)]);
+    assert_eq!(pm(&mut t, SELF_THREAD, n, 20), neg(Errno::EINVAL));
+    let n = put(&mut t, &[(base + 3 * P, P)]);
+    // The advice is judged per segment: an empty vector is 0 whatever it is.
+    assert_eq!(pm(&mut t, SELF_GROUP, 0, 12), Outcome::Return(0));
+    assert_eq!(pm(&mut t, SELF_GROUP, n, 12), neg(Errno::EINVAL));
+    // A leader that has exited has no address space left: ESRCH for the group, not the thread.
+    let leader = t.tasks.group_leader(t.current);
+    t.tasks.task_mut(leader).unwrap().exit_state = crate::task::tasklist::ExitState::Zombie;
+    assert_eq!(pm(&mut t, SELF_GROUP, n, 20), neg(Errno::ESRCH));
+    assert_eq!(pm(&mut t, SELF_THREAD, n, 20), neg(Errno::ENOMEM));
 }

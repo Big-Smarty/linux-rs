@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Linux 6.18.57 (2ff600d29ee478d0a8d46ef8a58afb5e038fe692): arch/x86/mm/fault.c
 // (`handle_page_fault`, `do_kern_addr_fault`, `do_user_addr_fault`,
-// `access_error`, `bad_area_*`, `pgtable_bad`), mm/mmap_lock.c
+// `access_error`, `bad_area_*`, `pgtable_bad`, `mm_fault_error`), mm/mmap_lock.c
 // (`lock_mm_and_find_vma`, `lock_vma_under_rcu`), mm/mmap.c
 // (`expand_stack_locked`), mm/memory.c (`handle_mm_fault`,
-// `handle_pte_fault`, `do_anonymous_page`, `do_wp_page`), mm/gup.c
+// `handle_pte_fault`, `handle_pte_marker`, `do_anonymous_page`, `do_wp_page`), mm/gup.c
 // (`populate_vma_page_range`, `__mm_populate`). GPL-2.0.
 // Transformation: the per-VMA-lock fast path and the mmap-lock path have the
 // same outcome for one task and are one path; retries, signals pending, the
@@ -107,6 +107,8 @@ enum Step {
     Oom,
     Bus,
     NeedsFile,
+    /// `handle_pte_marker` of a guard: `VM_FAULT_SIGSEGV`, `bad_area_nosemaphore`.
+    Guard,
 }
 
 /// `access_error` (arch/x86/mm/fault.c:1048): `true` = refuse with `SEGV_ACCERR`.
@@ -186,6 +188,7 @@ impl Mm {
             Err(Step::Oom) => FaultOutcome::Oom,
             Err(Step::Bus) => FaultOutcome::Bus { address },
             Err(Step::NeedsFile) => FaultOutcome::NeedsFile { address, write },
+            Err(Step::Guard) => segv(SegvCode::MapErr),
         }
     }
 
@@ -204,7 +207,9 @@ impl Mm {
         // loader (and the future page cache) installs the pages it owns as
         // private frames. A present one is exactly what `wp_page_copy` would
         // have produced, so only the write-protect upgrade below applies.
-        if !v.is_anonymous() && !matches!(pt.lookup(page), Pte::Anon { .. }) {
+        // (A guard marker is a non-present entry of any VMA: `do_swap_page` ->
+        // `handle_pte_marker` kills the access whatever the mapping is.)
+        if !v.is_anonymous() && !matches!(pt.lookup(page), Pte::Anon { .. } | Pte::Guard) {
             return Err(Step::NeedsFile);
         }
         match pt.lookup(page) {
@@ -234,6 +239,7 @@ impl Mm {
                     pt.make_writable(page);
                 }
             }
+            Pte::Guard => return Err(Step::Guard),
         }
         Ok(())
     }
@@ -241,7 +247,9 @@ impl Mm {
     /// `mm_populate` / `__mm_populate` with `ignore_errors`: fault in the
     /// pages of `[start, start + len)` that lie in accessible anonymous VMAs,
     /// writing where `populate_vma_page_range` sets `FOLL_WRITE`
-    /// (`(vm_flags & (VM_WRITE | VM_SHARED)) == VM_WRITE`). Errors are ignored.
+    /// (`(vm_flags & (VM_WRITE | VM_SHARED)) == VM_WRITE`). Errors are ignored, but the first
+    /// failing page (a guard marker, no memory) ends its VMA: `__get_user_pages` stops there and
+    /// the retry at that page fails with nothing done, so `ignore_errors` moves to the next VMA.
     pub fn populate(&mut self, pt: &mut (impl UserPages + ?Sized), start: u64, len: u64) {
         let end = start.saturating_add(len);
         let mut idx = self.lower(start);
@@ -256,7 +264,9 @@ impl Mm {
                 let write = (v.flags & (VmFlags::WRITE | VmFlags::SHARED)) == VmFlags::WRITE;
                 let mut a = v.start.max(page_floor(start));
                 while a < v.end.min(end) {
-                    let _ = self.fault_one(pt, idx, a, write);
+                    if self.fault_one(pt, idx, a, write).is_err() {
+                        break;
+                    }
                     a += PAGE_SIZE;
                 }
             }

@@ -43,12 +43,31 @@ pub(crate) struct Hw {
 #[derive(Default)]
 pub(crate) struct Fake {
     pub(crate) pages: BTreeMap<u64, Hw>,
+    /// Resident pages that are still the file's page-cache page (`resident_file_pages`).
+    pub(crate) files: alloc::collections::BTreeSet<u64>,
     pub(crate) fail_maps: Option<u32>,
     /// `move_pages` fails (a destination table could not be allocated).
     pub(crate) fail_moves: bool,
 }
 
 impl Fake {
+    /// The pages of the range (the populated ones only: ranges can span 2^35 pages); markers go
+    /// too when `markers`.
+    fn remove_range(&mut self, start: u64, pages: u64, markers: bool) -> u64 {
+        let end = start.saturating_add(pages.saturating_mul(P));
+        let keys: Vec<u64> = self.pages.range(start..end).map(|(k, _)| *k).collect();
+        let mut freed = 0;
+        for k in keys {
+            if !markers && self.pages[&k].kind == Pte::Guard {
+                continue;
+            }
+            if let Some(h) = self.pages.remove(&k) {
+                freed += u64::from(matches!(h.kind, Pte::Anon { .. }));
+            }
+            self.files.remove(&k);
+        }
+        freed
+    }
     fn budget(&mut self) -> Result<(), OutOfMemory> {
         match &mut self.fail_maps {
             Some(0) => Err(OutOfMemory),
@@ -99,16 +118,42 @@ impl UserPages for Fake {
         }
     }
     fn unmap(&mut self, start: u64, pages: u64) -> u64 {
-        // Walk the populated pages only: the ranges can span 2^35 pages.
-        let end = start.saturating_add(pages.saturating_mul(P));
-        let keys: Vec<u64> = self.pages.range(start..end).map(|(k, _)| *k).collect();
-        let mut freed = 0;
-        for k in keys {
-            if let Some(h) = self.pages.remove(&k) {
-                freed += u64::from(matches!(h.kind, Pte::Anon { .. }));
+        self.remove_range(start, pages, true)
+    }
+    fn zap(&mut self, start: u64, pages: u64) -> u64 {
+        self.remove_range(start, pages, false)
+    }
+    fn install_guards(&mut self, start: u64, pages: u64) -> Result<(), OutOfMemory> {
+        for i in 0..pages {
+            self.budget()?;
+            let page = start + i * P;
+            if self.pages.get(&page).map(|h| h.kind) != Some(Pte::Guard) {
+                self.pages.insert(
+                    page,
+                    Hw {
+                        kind: Pte::Guard,
+                        prot: PageProt {
+                            accessible: false,
+                            write: false,
+                            exec: false,
+                        },
+                    },
+                );
             }
         }
-        freed
+        Ok(())
+    }
+    fn remove_guards(&mut self, start: u64, pages: u64) {
+        let end = start.saturating_add(pages.saturating_mul(P));
+        self.pages
+            .retain(|k, h| !(*k >= start && *k < end && h.kind == Pte::Guard));
+    }
+    fn resident_file_pages(&self, start: u64, pages: u64) -> u64 {
+        let end = start.saturating_add(pages.saturating_mul(P));
+        self.files
+            .range(start..end)
+            .filter(|k| self.pages.contains_key(k))
+            .count() as u64
     }
     fn move_pages(
         &mut self,
@@ -2010,4 +2055,704 @@ fn mremap_failing_page_table_move_keeps_the_old_mapping() {
     assert!(w.pt.pages.contains_key(&lower));
     let _ = upper;
     w.check_invariants();
+}
+
+// ---- madvise ------------------------------------------------------------
+
+impl W {
+    /// `do_madvise` for everything but `MADV_POPULATE_*`.
+    fn madvise(&mut self, a: u64, len: u64, advice: i32) -> Result<(), Madvise> {
+        match madvise_range(a, len, advice).map_err(Madvise::Errno)? {
+            None => Ok(()),
+            Some(end) => self.mm.madvise(&self.env, &mut self.pt, a, end, advice),
+        }
+    }
+    /// A private file mapping of file 7 (a tmpfs file here, `VM_MAYWRITE` set) at `addr`.
+    fn file_map(&mut self, addr: u64, pages: u64, flags: VmFlags) {
+        self.mm
+            .mmap_region(&self.env, &mut self.pt, Some(7), addr, pages * P, flags, 0)
+            .unwrap();
+    }
+    fn lines(&self) -> Vec<(u64, u64)> {
+        self.mm.vmas().iter().map(|v| (v.start, v.end)).collect()
+    }
+}
+
+const E_INVAL: Madvise = Madvise::Errno(Errno::EINVAL);
+const E_NOMEM: Madvise = Madvise::Errno(Errno::ENOMEM);
+
+/// src: mm/madvise.c `madvise_behavior_valid` (+ oracle `madvise.accepts-*`/`invalid-advice-*`):
+/// exactly these values, none of the KSM, THP and memory-failure ones.
+#[test]
+fn madvise_behavior_valid_is_the_declared_configurations_set() {
+    let valid = [
+        0, 1, 2, 3, 4, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 24, 102, 103,
+    ];
+    for advice in -3..130 {
+        assert_eq!(
+            madvise_behavior_valid(advice),
+            valid.contains(&advice),
+            "{advice}"
+        );
+    }
+    assert!(!madvise_behavior_valid(i32::MIN) && !madvise_behavior_valid(-1));
+}
+
+/// src: mm/madvise.c `is_valid_madvise`, `madvise_should_skip`, `madvise_do_behavior`
+/// (oracle `madvise.unaligned-start-*`, `len-*`).
+#[test]
+fn madvise_range_checks_in_linux_order() {
+    let a = 0x7000_0000_0000;
+    assert_eq!(madvise_range(a, 3 * P, 4), Ok(Some(a + 3 * P)));
+    assert_eq!(madvise_range(a, 1, 4), Ok(Some(a + P)));
+    assert_eq!(madvise_range(a, 0, 4), Ok(None));
+    // The advice is judged first, then the alignment, then the length.
+    assert_eq!(madvise_range(a + 1, 0, 12), Err(Errno::EINVAL));
+    assert_eq!(madvise_range(a + 1, 0, 4), Err(Errno::EINVAL));
+    assert_eq!(madvise_range(a, 0, 12), Err(Errno::EINVAL));
+    // PAGE_ALIGN wrapping to zero, and the end wrapping.
+    assert_eq!(madvise_range(a, u64::MAX, 4), Err(Errno::EINVAL));
+    assert_eq!(madvise_range(a, u64::MAX - 4094, 4), Err(Errno::EINVAL));
+    assert_eq!(madvise_range(a, u64::MAX - 4095, 4), Err(Errno::EINVAL));
+    assert_eq!(
+        madvise_range(0, u64::MAX - 4095, 0),
+        Ok(Some(u64::MAX - 4095))
+    );
+    assert_eq!(madvise_range(u64::MAX - 4095, P, 0), Err(Errno::EINVAL));
+}
+
+/// src: mm/madvise.c `madvise_walk_vmas` (oracle `madvise.hole-*`, `error-*`): every VMA of the
+/// range is processed, a hole is `ENOMEM` once the rest was done, the first error ends the walk.
+#[test]
+fn madvise_walk_processes_the_mapped_parts_and_reports_holes() {
+    let mut w = W::new();
+    let a = w.map(0, 5 * P, RW, ANON).unwrap();
+    for i in 0..5 {
+        assert!(w.writable(a + i * P));
+    }
+    w.munmap(a + 2 * P, P).unwrap();
+    assert_eq!(w.madvise(a, 5 * P, MADV_DONTNEED), Err(E_NOMEM));
+    let kinds = |w: &W| {
+        (0..5)
+            .map(|i| w.pt.pages.contains_key(&(a + i * P)))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(kinds(&w), [false; 5], "both sides were zapped");
+    // A hole first, last, and nothing but a hole.
+    assert!(w.writable(a) && w.writable(a + P));
+    assert_eq!(w.madvise(a - P, 3 * P, MADV_DONTNEED), Err(E_NOMEM));
+    assert!(!w.pt.pages.contains_key(&a));
+    assert!(w.writable(a));
+    assert_eq!(w.madvise(a, 3 * P, MADV_DONTNEED), Err(E_NOMEM));
+    assert!(!w.pt.pages.contains_key(&a));
+    assert_eq!(w.madvise(a + 2 * P, P, MADV_DONTNEED), Err(E_NOMEM));
+    assert_eq!(w.madvise(a + 5 * P, P, MADV_DONTNEED), Err(E_NOMEM));
+    assert_eq!(w.madvise(0x1000, P, MADV_NORMAL), Err(E_NOMEM));
+    // An error ends the walk: [X][locked Y][Z].
+    let x = w.map(0x5000_0000_0000, P, RW, ANON).unwrap();
+    w.map(x + P, P, RW, ANON | MAP_LOCKED).unwrap();
+    w.map(x + 2 * P, P, RW, ANON).unwrap();
+    for i in [0, 1, 2] {
+        assert!(w.writable(x + i * P));
+    }
+    assert_eq!(w.madvise(x, 3 * P, MADV_DONTNEED), Err(E_INVAL));
+    let present = |w: &W, i: u64| w.pt.pages.contains_key(&(x + i * P));
+    assert_eq!(
+        (present(&w, 0), present(&w, 1), present(&w, 2)),
+        (false, true, true)
+    );
+    // The same with a hole in front: the error wins over the remembered ENOMEM.
+    assert_eq!(w.madvise(x - P, 4 * P, MADV_DONTNEED), Err(E_INVAL));
+    assert_eq!(w.madvise(x, 3 * P, MADV_DONTNEED_LOCKED), Ok(()));
+    assert_eq!(w.madvise(x, 3 * P, MADV_FREE), Err(E_INVAL));
+    w.check_invariants();
+}
+
+/// src: mm/madvise.c `madvise_dontneed_free`, `madvise_free_single_vma`, `madvise_cold`,
+/// `madvise_pageout` and `can_madv_lru_vma` (oracle `madvise.locked-*`, `free-*`).
+#[test]
+fn madvise_refuses_what_linux_refuses_per_vma() {
+    let mut w = W::new();
+    let a = w.map(0, P, RW, ANON).unwrap();
+    let l = w.map(0, P, RW, ANON | MAP_LOCKED).unwrap();
+    let f = 0x5000_0000_0000;
+    w.file_map(f, 2, VmFlags::DATA_DEFAULT);
+    for (advice, plain, locked, file) in [
+        (MADV_DONTNEED, Ok(()), Err(E_INVAL), Ok(())),
+        (MADV_DONTNEED_LOCKED, Ok(()), Ok(()), Ok(())),
+        (MADV_FREE, Ok(()), Err(E_INVAL), Err(E_INVAL)),
+        (MADV_COLD, Ok(()), Err(E_INVAL), Ok(())),
+        (MADV_PAGEOUT, Ok(()), Err(E_INVAL), Ok(())),
+        (MADV_WILLNEED, Ok(()), Ok(()), Ok(())),
+        (MADV_RANDOM, Ok(()), Ok(()), Ok(())),
+        (MADV_WIPEONFORK, Ok(()), Ok(()), Err(E_INVAL)),
+        (MADV_KEEPONFORK, Ok(()), Ok(()), Ok(())),
+        (MADV_DONTDUMP, Ok(()), Ok(()), Ok(())),
+        (
+            MADV_REMOVE,
+            Err(E_INVAL),
+            Err(E_INVAL),
+            Err(Madvise::Errno(Errno::EACCES)),
+        ),
+        (MADV_GUARD_INSTALL, Ok(()), Err(E_INVAL), Ok(())),
+        (MADV_GUARD_REMOVE, Ok(()), Ok(()), Ok(())),
+    ] {
+        assert_eq!(w.madvise(a, P, advice), plain, "plain {advice}");
+        assert_eq!(w.madvise(l, P, advice), locked, "locked {advice}");
+        assert_eq!(w.madvise(f, 2 * P, advice), file, "file {advice}");
+    }
+    // A shared writable file mapping cannot exist yet, and a MADV_REMOVE of one stops.
+    let s = 0x5100_0000_0000;
+    w.file_map(
+        s,
+        1,
+        VmFlags::DATA_DEFAULT | VmFlags::SHARED | VmFlags::MAYSHARE,
+    );
+    assert_eq!(
+        w.madvise(s, P, MADV_REMOVE),
+        Err(Madvise::Unsupported(MadviseUnsupported::RemoveSharedFile))
+    );
+    // A read-only shared mapping (VM_SHARED and VM_MAYWRITE cleared by do_mmap): EACCES.
+    let r = 0x5200_0000_0000;
+    w.file_map(
+        r,
+        1,
+        VmFlags(VmFlags::READ.0 | VmFlags::MAYREAD.0 | VmFlags::MAYEXEC.0 | VmFlags::MAYSHARE.0),
+    );
+    assert_eq!(
+        w.madvise(r, P, MADV_REMOVE),
+        Err(Madvise::Errno(Errno::EACCES))
+    );
+    assert_eq!(w.madvise(r, P, MADV_WIPEONFORK), Err(E_INVAL));
+    w.check_invariants();
+}
+
+/// src: mm/madvise.c `madvise_pageout`/`madvise_cold_or_pageout_pte_range`: without swap an
+/// anonymous page stays, a clean page-cache page is unmapped (the resident counters show it),
+/// which needs the rmap to be exact: stop.
+#[test]
+fn pageout_of_resident_file_pages_stops_instead_of_guessing() {
+    let mut w = W::new();
+    let f = 0x5000_0000_0000;
+    w.file_map(f, 3, VmFlags::DATA_DEFAULT);
+    assert_eq!(
+        w.madvise(f, 3 * P, MADV_PAGEOUT),
+        Ok(()),
+        "nothing resident"
+    );
+    w.pt.pages.insert(
+        f + P,
+        Hw {
+            kind: Pte::Anon { writable: false },
+            prot: page_prot(VmFlags::DATA_DEFAULT),
+        },
+    );
+    w.pt.files.insert(f + P);
+    assert_eq!(
+        w.madvise(f, 3 * P, MADV_PAGEOUT),
+        Err(Madvise::Unsupported(MadviseUnsupported::PageoutFilePages))
+    );
+    assert_eq!(
+        w.madvise(f + 2 * P, P, MADV_PAGEOUT),
+        Ok(()),
+        "another page"
+    );
+    assert_eq!(
+        w.madvise(f, 3 * P, MADV_COLD),
+        Ok(()),
+        "COLD only moves LRU lists"
+    );
+    assert!(w.pt.pages.contains_key(&(f + P)));
+    // An anonymous page is never touched.
+    let a = w.map(0, P, RW, ANON).unwrap();
+    assert!(w.writable(a));
+    assert_eq!(w.madvise(a, P, MADV_PAGEOUT), Ok(()));
+    assert!(w.pt.pages.contains_key(&a));
+}
+
+/// src: mm/madvise.c `madvise_update_vma` -> mm/vma.c `vma_modify_flags` (oracle
+/// `madvise.random-splits` ... `mixed-clear-merges-both-sides`): the advice that only sets flags
+/// splits and merges VMAs like `mprotect`, and a request that changes nothing does nothing.
+#[test]
+fn flag_advice_splits_and_merges_vmas() {
+    let mut w = W::new();
+    let a = w.map(0, 6 * P, RW, ANON).unwrap();
+    let whole = std::vec![(a, a + 6 * P)];
+    assert_eq!(w.lines().iter().filter(|l| l.0 == a).count(), 1);
+    w.madvise(a + 2 * P, P, MADV_RANDOM).unwrap();
+    let split = |w: &W| {
+        w.lines()
+            .into_iter()
+            .filter(|l| l.0 >= a && l.0 < a + 6 * P)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        split(&w),
+        [
+            (a, a + 2 * P),
+            (a + 2 * P, a + 3 * P),
+            (a + 3 * P, a + 6 * P)
+        ]
+    );
+    assert!(
+        w.mm.find_vma(a + 2 * P)
+            .unwrap()
+            .flags
+            .contains(VmFlags::RAND_READ)
+    );
+    // SEQUENTIAL replaces RANDOM on the same page; NORMAL merges the three back.
+    w.madvise(a + 2 * P, P, MADV_SEQUENTIAL).unwrap();
+    let v = *w.mm.find_vma(a + 2 * P).unwrap();
+    assert!(v.flags.contains(VmFlags::SEQ_READ) && !v.flags.contains(VmFlags::RAND_READ));
+    w.madvise(a + 2 * P, P, MADV_NORMAL).unwrap();
+    assert_eq!(split(&w), whole);
+    // Setting what is set changes nothing (not even the version).
+    w.madvise(a, 6 * P, MADV_DONTFORK).unwrap();
+    let stamp = w.mm.vma_stamp();
+    w.madvise(a, 6 * P, MADV_DONTFORK).unwrap();
+    assert_eq!(w.mm.vma_stamp(), stamp);
+    // Different flags on neighbouring pages stay apart; clearing the odd one out merges all.
+    w.madvise(a + P, P, MADV_DONTDUMP).unwrap();
+    assert_eq!(split(&w).len(), 3);
+    w.madvise(a, 6 * P, MADV_DODUMP).unwrap();
+    assert_eq!(split(&w), whole);
+    w.madvise(a, 6 * P, MADV_DOFORK).unwrap();
+    assert_eq!(
+        w.mm.find_vma(a).unwrap().flags,
+        VmFlags::DATA_DEFAULT | VmFlags::ACCOUNT
+    );
+    // The flags of the walk that merges with the next VMA: nothing is applied twice.
+    w.madvise(a, 3 * P, MADV_WIPEONFORK).unwrap();
+    w.madvise(a + 3 * P, 3 * P, MADV_WIPEONFORK).unwrap();
+    assert_eq!(split(&w), whole);
+    assert_eq!(w.madvise(a, 6 * P, MADV_KEEPONFORK), Ok(()));
+    assert_eq!(split(&w), whole);
+    w.check_invariants();
+}
+
+/// src: mm/madvise.c `madvise_vma_behavior` (`DOFORK`/`KEEPONFORK`/`DODUMP` refusals) and
+/// `madvise_update_vma`; mm/mmap.c `do_mmap` (`MAP_DROPPABLE` sets `VM_WIPEONFORK|VM_DONTDUMP`).
+#[test]
+fn flag_advice_refusals() {
+    let mut w = W::new();
+    let d = w.map(0, 2 * P, RW, MAP_DROPPABLE | MAP_ANONYMOUS).unwrap();
+    assert!(w.mm.find_vma(d).unwrap().flags.contains(VmFlags::DROPPABLE));
+    assert_eq!(w.madvise(d, 2 * P, MADV_KEEPONFORK), Err(E_INVAL));
+    assert_eq!(w.madvise(d, 2 * P, MADV_DODUMP), Err(E_INVAL));
+    assert_eq!(w.madvise(d, 2 * P, MADV_DONTDUMP), Ok(()));
+    assert_eq!(w.madvise(d, 2 * P, MADV_WIPEONFORK), Ok(()));
+    // DOFORK of an I/O VMA, DODUMP of a special one.
+    w.mm.vmas[0].flags |= VmFlags::IO;
+    let io = w.mm.vmas[0].start;
+    assert_eq!(w.madvise(io, P, MADV_DOFORK), Err(E_INVAL));
+    assert_eq!(w.madvise(io, P, MADV_DODUMP), Err(E_INVAL));
+    assert_eq!(w.madvise(io, P, MADV_DONTFORK), Ok(()));
+}
+
+/// src: mm/madvise.c `madvise_vma_behavior`: `-ENOMEM` from `madvise_update_vma` (a split over
+/// `max_map_count`) is reported as `-EAGAIN`; the other advice keeps `ENOMEM` (oracle: none, the
+/// limit is 65530 there).
+#[test]
+fn a_split_over_max_map_count_is_eagain() {
+    let mut w = W::new();
+    let a = w.map(0, 4 * P, RW, ANON).unwrap();
+    w.env.max_map_count = w.mm.map_count() as u32;
+    assert_eq!(
+        w.madvise(a + P, P, MADV_RANDOM),
+        Err(Madvise::Errno(Errno::EAGAIN))
+    );
+    assert_eq!(
+        w.lines().iter().filter(|l| l.0 == a).count(),
+        1,
+        "nothing changed"
+    );
+    // Not a flag change: no split is needed, so no limit applies.
+    assert_eq!(w.madvise(a + P, P, MADV_DONTNEED), Ok(()));
+    assert_eq!(
+        w.madvise(a, 4 * P, MADV_RANDOM),
+        Ok(()),
+        "whole VMA: no split"
+    );
+}
+
+/// src: mm/madvise.c `guard_install_set_pte`, `guard_remove_pte_entry`, mm/memory.c
+/// `zap_nonpresent_ptes` and `handle_pte_marker` (oracle `madvise.install`, `remove`,
+/// `dontneed-over-guard`, `guard-prot-none`, `after-munmap-no-guard`).
+#[test]
+fn guard_markers_install_remove_survive_zaps_and_end_in_sigsegv() {
+    let mut w = W::new();
+    let a = w.map(0, 8 * P, RW, ANON).unwrap();
+    for i in 0..6 {
+        assert!(w.writable(a + i * P));
+    }
+    assert_eq!(w.madvise(a + P, 4 * P, MADV_GUARD_INSTALL), Ok(()));
+    let kind = |w: &W, i: u64| w.pt.lookup(a + i * P);
+    assert_eq!(kind(&w, 0), Pte::Anon { writable: true });
+    for i in 1..5 {
+        assert_eq!(kind(&w, i), Pte::Guard, "page {i}");
+    }
+    assert_eq!(kind(&w, 5), Pte::Anon { writable: true });
+    assert_eq!(kind(&w, 6), Pte::Absent);
+    assert!(
+        w.mm.find_vma(a)
+            .unwrap()
+            .flags
+            .contains(VmFlags::MAYBE_GUARD)
+    );
+    // The access: SEGV_MAPERR at the exact address, for a read and a write, a kernel access too.
+    assert_eq!(
+        w.fault(a + P + 9, PF_WRITE),
+        FaultOutcome::Segv {
+            code: SegvCode::MapErr,
+            address: a + P + 9
+        }
+    );
+    assert_eq!(
+        w.fault(a + 2 * P, 0),
+        FaultOutcome::Segv {
+            code: SegvCode::MapErr,
+            address: a + 2 * P
+        }
+    );
+    assert_eq!(
+        w.mm.handle_user_fault(&w.env, &mut w.pt, a + 3 * P, 0),
+        FaultOutcome::Segv {
+            code: SegvCode::MapErr,
+            address: a + 3 * P
+        }
+    );
+    // Zapping, freeing and the other hints leave the markers.
+    for advice in [
+        MADV_DONTNEED,
+        MADV_FREE,
+        MADV_COLD,
+        MADV_PAGEOUT,
+        MADV_WILLNEED,
+        MADV_RANDOM,
+    ] {
+        assert_eq!(w.madvise(a, 8 * P, advice), Ok(()), "{advice}");
+        assert_eq!(kind(&w, 2), Pte::Guard, "after {advice}");
+    }
+    assert_eq!(kind(&w, 0), Pte::Absent, "DONTNEED took the data");
+    // Installing again, over markers and a populated page, is fine; the data goes.
+    assert!(w.writable(a));
+    assert_eq!(w.madvise(a, 3 * P, MADV_GUARD_INSTALL), Ok(()));
+    assert_eq!(
+        (kind(&w, 0), kind(&w, 1), kind(&w, 2)),
+        (Pte::Guard, Pte::Guard, Pte::Guard)
+    );
+    // Removing: only markers go, nothing else changes.
+    assert_eq!(w.madvise(a + 2 * P, 4 * P, MADV_GUARD_REMOVE), Ok(()));
+    assert_eq!(
+        (kind(&w, 1), kind(&w, 2), kind(&w, 3), kind(&w, 4)),
+        (Pte::Guard, Pte::Absent, Pte::Absent, Pte::Absent)
+    );
+    assert_eq!(kind(&w, 5), Pte::Absent, "DONTNEED took this one too");
+    assert!(w.writable(a + 2 * P));
+    // PROT_NONE: the access error comes first.
+    w.mprotect(a, 8 * P, PROT_NONE).unwrap();
+    assert_eq!(
+        w.fault(a + P, 0),
+        FaultOutcome::Segv {
+            code: SegvCode::AccErr,
+            address: a + P
+        }
+    );
+    w.mprotect(a, 8 * P, RW).unwrap();
+    assert_eq!(kind(&w, 1), Pte::Guard, "mprotect keeps the marker");
+    // munmap drops it, and a new mapping there has none.
+    w.munmap(a, 8 * P).unwrap();
+    assert_eq!(w.pt.lookup(a + P), Pte::Absent);
+    let b = w.map(a, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    assert!(w.writable(b + P));
+    w.check_invariants();
+}
+
+/// src: mm/madvise.c `madvise_guard_install` (`is_valid_guard_vma`, `VM_MAYBE_GUARD`,
+/// `anon_vma_prepare`) and `madvise_guard_remove` (`allow_locked`), and out of memory in the page
+/// table walk (oracle `madvise.install-locked`, `remove-locked`, `install-over-hole`).
+#[test]
+fn guard_install_checks_the_vma_and_reports_out_of_memory() {
+    let mut w = W::new();
+    let l = w.map(0, 2 * P, RW, ANON | MAP_LOCKED).unwrap();
+    assert_eq!(w.madvise(l, 2 * P, MADV_GUARD_INSTALL), Err(E_INVAL));
+    assert!(
+        !w.mm
+            .find_vma(l)
+            .unwrap()
+            .flags
+            .contains(VmFlags::MAYBE_GUARD),
+        "refused before the flag"
+    );
+    assert_eq!(w.madvise(l, 2 * P, MADV_GUARD_REMOVE), Ok(()));
+    // An anonymous VMA gets its anon_vma; a hole is ENOMEM after the mapped part was done.
+    let a = w.map(0, 4 * P, RW, ANON).unwrap();
+    w.munmap(a + 2 * P, P).unwrap();
+    assert_eq!(w.mm.find_vma(a).unwrap().anon, None);
+    assert_eq!(w.madvise(a, 4 * P, MADV_GUARD_INSTALL), Err(E_NOMEM));
+    assert!(w.mm.find_vma(a).unwrap().anon.is_some());
+    // Both VMAs of the range were done: [a, a+2P) and [a+3P, a+4P).
+    let kinds: Vec<Pte> = (0..4).map(|i| w.pt.lookup(a + i * P)).collect();
+    assert_eq!(kinds, [Pte::Guard, Pte::Guard, Pte::Absent, Pte::Guard]);
+}
+
+/// src: mm/vma.c `vma_merge_new_range`/`vma_expand`/`vma_merge_existing_range` and
+/// include/linux/mm.h `VM_STICKY` (oracle `madvise.guard-vma-merges-with-a-new-neighbour`): a VMA
+/// that may hold guards still merges, and the merged VMA keeps the flag.
+#[test]
+fn vm_maybe_guard_is_sticky_and_never_blocks_a_merge() {
+    let mut w = W::new();
+    let a = w
+        .map(0x5000_0000_0000, 2 * P, RW, ANON | MAP_FIXED)
+        .unwrap();
+    assert_eq!(w.madvise(a, P, MADV_GUARD_INSTALL), Ok(()));
+    let b = w.map(a + 2 * P, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    assert_eq!(w.lines().iter().filter(|l| l.0 == a).count(), 1, "merged");
+    assert_eq!(w.mm.find_vma(b).unwrap().start, a);
+    assert!(
+        w.mm.find_vma(b)
+            .unwrap()
+            .flags
+            .contains(VmFlags::MAYBE_GUARD)
+    );
+    // Merging in front takes the flag too.
+    let c = w.map(a - 2 * P, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    assert_eq!(w.mm.find_vma(c).unwrap().start, c);
+    assert_eq!(w.mm.find_vma(c).unwrap().end, a + 4 * P);
+    assert!(
+        w.mm.find_vma(c)
+            .unwrap()
+            .flags
+            .contains(VmFlags::MAYBE_GUARD)
+    );
+    // A split keeps it on both halves.
+    w.mprotect(a, P, PROT_READ).unwrap();
+    for v in
+        w.mm.vmas()
+            .iter()
+            .filter(|v| v.start >= c && v.end <= a + 4 * P)
+    {
+        assert!(v.flags.contains(VmFlags::MAYBE_GUARD), "{v:?}");
+    }
+    w.check_invariants();
+}
+
+/// src: mm/vma.c:1696-1703 (`vma_modify_flags` hands the merged VMA's flags back through
+/// `vm_flags_ptr`, "sticky flags may have been retained"), mm/madvise.c:165-186
+/// (`madvise_update_vma`), mm/mprotect.c (`mprotect_fixup`): a flag change that merges into a
+/// neighbour that may hold guards keeps `VM_MAYBE_GUARD`, for `madvise` and `mprotect` alike.
+#[test]
+fn a_flag_change_that_merges_into_a_guarded_neighbour_keeps_the_sticky_flag() {
+    let mut w = W::new();
+    let at = 0x5000_0000_0000;
+    // madvise: the neighbour has DONTFORK and a guard; the new flags make the other half equal.
+    let a = w.map(at, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    w.madvise(a, 2 * P, MADV_DONTFORK).unwrap();
+    w.madvise(a, P, MADV_GUARD_INSTALL).unwrap();
+    let b = w.map(a + 2 * P, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    assert_eq!(w.mm.find_vma(b).unwrap().start, b, "not merged yet");
+    w.madvise(b, 2 * P, MADV_DONTFORK).unwrap();
+    let merged = *w.mm.find_vma(b).unwrap();
+    assert_eq!((merged.start, merged.end), (a, a + 4 * P));
+    assert!(merged.flags.contains(VmFlags::MAYBE_GUARD), "{merged:?}");
+    // mprotect: the same through the other caller of `vma_modify`.
+    let c = w.map(at + 0x100_0000, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    w.madvise(c, P, MADV_GUARD_INSTALL).unwrap();
+    let d = w
+        .map(c + 2 * P, 2 * P, PROT_READ, ANON | MAP_FIXED)
+        .unwrap();
+    assert_eq!(w.mm.find_vma(d).unwrap().start, d, "not merged yet");
+    w.mprotect(d, 2 * P, RW).unwrap();
+    let merged = *w.mm.find_vma(d).unwrap();
+    assert_eq!((merged.start, merged.end), (c, c + 4 * P));
+    assert!(merged.flags.contains(VmFlags::MAYBE_GUARD), "{merged:?}");
+    w.check_invariants();
+}
+
+/// src: mm/gup.c:1925-1990 (`__mm_populate` with `ignore_errors`), `populate_vma_page_range`:
+/// the first page that cannot be faulted in (a guard marker) ends its VMA, the pages after it
+/// are not populated, the next VMA is.
+#[test]
+fn populate_ends_a_vma_at_the_first_page_that_fails() {
+    let mut w = W::new();
+    let a = w
+        .map(0x5000_0000_0000, 4 * P, RW, ANON | MAP_FIXED)
+        .unwrap();
+    let b = w
+        .map(a + 4 * P, 2 * P, PROT_READ, ANON | MAP_FIXED)
+        .unwrap();
+    w.madvise(a + P, P, MADV_GUARD_INSTALL).unwrap();
+    w.mm.populate(&mut w.pt, a, 6 * P);
+    let kinds: Vec<Pte> = (0..6).map(|i| w.pt.lookup(a + i * P)).collect();
+    assert_eq!(kinds[1], Pte::Guard);
+    assert_ne!(kinds[0], Pte::Absent);
+    assert_eq!((kinds[2], kinds[3]), (Pte::Absent, Pte::Absent));
+    assert_ne!(w.pt.lookup(b), Pte::Absent, "the next VMA is populated");
+}
+
+/// src: kernel/fork.c `dup_mmap` (`VM_DONTCOPY`, `VM_WIPEONFORK`) and mm/mmap.c
+/// `vm_stat_account` (oracle `madvise.dontfork-*`, `wipeonfork-*`).
+#[test]
+fn dup_leaves_out_dontfork_and_wipes_wipeonfork() {
+    let mut w = W::new();
+    let a = w
+        .map(0x5000_0000_0000, 6 * P, RW, ANON | MAP_FIXED)
+        .unwrap();
+    for i in 0..6 {
+        assert!(w.writable(a + i * P));
+    }
+    w.madvise(a + P, 2 * P, MADV_DONTFORK).unwrap();
+    w.madvise(a + 4 * P, P, MADV_WIPEONFORK).unwrap();
+    let (total, data) = (w.mm.total_vm, w.mm.data_vm);
+    let child = w.mm.dup(&w.env).unwrap();
+    assert_eq!(
+        (w.mm.total_vm, w.mm.data_vm),
+        (total, data),
+        "parent untouched"
+    );
+    assert_eq!((child.total_vm, child.data_vm), (total - 2, data - 2));
+    assert!(
+        child.find_vma(a + P).is_none_or(|v| v.start > a + P),
+        "no DONTFORK range"
+    );
+    assert_eq!(child.find_vma(a).unwrap().end, a + P);
+    let wiped = child.find_vma(a + 4 * P).unwrap();
+    assert!(wiped.flags.contains(VmFlags::WIPEONFORK) && wiped.anon.is_none());
+    assert!(child.find_vma(a).unwrap().anon.is_some());
+    assert!(!Mm::copies_pages(wiped.flags));
+    assert!(!Mm::copies_pages(VmFlags::DONTCOPY));
+    assert!(Mm::copies_pages(
+        VmFlags::DATA_DEFAULT | VmFlags::MAYBE_GUARD
+    ));
+    // The charge of a copied VM_ACCOUNT range is the copied ones only.
+    let tiny = Env::init(5, 0);
+    assert_eq!(w.mm.dup(&tiny).err(), Some(Errno::ENOMEM));
+    let drop_all = {
+        let mut m = Mm::new(&w.env);
+        m.insert_vm_struct(
+            &w.env,
+            Vma {
+                start: a,
+                end: a + 64 * P,
+                flags: VmFlags::DATA_DEFAULT | VmFlags::ACCOUNT | VmFlags::DONTCOPY,
+                pgoff: 0,
+                file: None,
+                anon: None,
+            },
+        )
+        .unwrap();
+        m
+    };
+    assert!(
+        drop_all.dup(&Env::init(1, 0)).is_ok(),
+        "a left-out VMA is not charged"
+    );
+}
+
+/// src: mm/gup.c `faultin_page_range` + `check_vma_flags` + `__get_user_pages` with
+/// `FOLL_MADV_POPULATE` and `vm_fault_to_errno` (oracle `madvise.populate-*`).
+#[test]
+fn populate_span_follows_gups_checks() {
+    let mut w = W::new();
+    let a = w.map(0, 2 * P, RW, ANON).unwrap();
+    let ro = w.map(0, P, PROT_READ, ANON).unwrap();
+    let none = w.map(0, P, PROT_NONE, ANON).unwrap();
+    let wo = w.map(0, P, PROT_WRITE, ANON).unwrap();
+    let env = w.env;
+    let span = |w: &W, at, end, write| w.mm.populate_span(&env, at, end, write);
+    assert_eq!(
+        span(&w, a, a + 10 * P, false),
+        Ok(a + 2 * P),
+        "one VMA at a time"
+    );
+    assert_eq!(span(&w, a + P, a + 2 * P, true), Ok(a + 2 * P));
+    assert_eq!(span(&w, ro, ro + P, false), Ok(ro + P));
+    assert_eq!(span(&w, ro, ro + P, true), Err(Errno::EINVAL));
+    assert_eq!(span(&w, none, none + P, false), Err(Errno::EINVAL));
+    assert_eq!(span(&w, none, none + P, true), Err(Errno::EINVAL));
+    assert_eq!(span(&w, wo, wo + P, false), Err(Errno::EINVAL));
+    assert_eq!(span(&w, wo, wo + P, true), Ok(wo + P));
+    assert_eq!(
+        span(&w, 0x1000, 0x2000, false),
+        Err(Errno::ENOMEM),
+        "no VMA: no skipping"
+    );
+    assert_eq!(span(&w, a + 2 * P, a + 4 * P, false), Err(Errno::ENOMEM));
+    // Protection keys: the task's PKRU denies key 0.
+    let denied = Env {
+        ospke: true,
+        pkru: 1,
+        ..env
+    };
+    assert_eq!(
+        w.mm.populate_span(&denied, a, a + P, false),
+        Err(Errno::EINVAL)
+    );
+    let write_disabled = Env {
+        ospke: true,
+        pkru: 2,
+        ..env
+    };
+    assert_eq!(
+        w.mm.populate_span(&write_disabled, a, a + P, false),
+        Ok(a + P)
+    );
+    assert_eq!(
+        w.mm.populate_span(&write_disabled, a, a + P, true),
+        Err(Errno::EINVAL)
+    );
+    // The error of a page that could not be faulted in.
+    assert_eq!(w.mm.populate_error(&w.pt, a), Errno::ENOMEM);
+    w.madvise(a, P, MADV_GUARD_INSTALL).unwrap();
+    assert_eq!(w.mm.populate_error(&w.pt, a), Errno::EFAULT);
+    let f = 0x5000_0000_0000;
+    w.file_map(f, 1, VmFlags::DATA_DEFAULT);
+    assert_eq!(w.mm.populate_error(&w.pt, f), Errno::EFAULT, "SIGBUS");
+}
+
+/// model: `UserPages::unmap` drops guard markers and `zap` keeps them, the exact difference
+/// between `munmap` and `MADV_DONTNEED` (mm/memory.c `zap_drop_markers`).
+#[test]
+fn zap_keeps_markers_and_unmap_drops_them() {
+    let mut pt = Fake::default();
+    pt.install_guards(0x1000, 3).unwrap();
+    pt.map_anon_page(
+        0x4000,
+        PageProt {
+            accessible: true,
+            write: true,
+            exec: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(pt.zap(0x1000, 3), 0);
+    assert_eq!(pt.lookup(0x2000), Pte::Guard);
+    assert_eq!(pt.zap(0x4000, 1), 1);
+    pt.remove_guards(0x2000, 1);
+    assert_eq!(
+        (pt.lookup(0x1000), pt.lookup(0x2000), pt.lookup(0x3000)),
+        (Pte::Guard, Pte::Absent, Pte::Guard)
+    );
+    assert_eq!(pt.unmap(0x1000, 3), 0);
+    assert_eq!(pt.lookup(0x1000), Pte::Absent);
+    // Table exhaustion: the pages before the failing one are guards, the data after it stays.
+    pt.map_anon_page(
+        0x12_000,
+        PageProt {
+            accessible: true,
+            write: true,
+            exec: false,
+        },
+    )
+    .unwrap();
+    pt.fail_maps = Some(2);
+    assert_eq!(pt.install_guards(0x10_000, 4), Err(OutOfMemory));
+    assert_eq!(
+        (
+            pt.lookup(0x10_000),
+            pt.lookup(0x11_000),
+            pt.lookup(0x12_000)
+        ),
+        (Pte::Guard, Pte::Guard, Pte::Anon { writable: true })
+    );
 }

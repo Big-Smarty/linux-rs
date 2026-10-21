@@ -85,6 +85,10 @@ const MAPPED: u64 = PRESENT | PROTNONE;
 /// after which the page is `RssAnon` whatever a later `mprotect` does to the
 /// write bit; see [`rss_class`].
 const FILE: u64 = 1 << 9;
+/// Software bit marking a guard page (`PTE_MARKER_GUARD`, `madvise(MADV_GUARD_INSTALL)`): a
+/// non-present, non-`PROT_NONE` user leaf that holds no frame. Touching the page is a
+/// `SIGSEGV`; `fork` copies it, `mremap` moves it, `MADV_DONTNEED` keeps it, `munmap` drops it.
+const GUARD: u64 = 1 << 10;
 const NX: u64 = 1 << 63;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 const LARGE: u64 = 2 * 1024 * 1024;
@@ -97,6 +101,17 @@ const fn frame_bits(entry: u64) -> u64 {
     } else {
         entry & ADDRESS
     }
+}
+
+/// Whether a leaf entry is a guard marker.
+const fn is_guard(entry: u64) -> bool {
+    entry & (PRESENT | GUARD) == GUARD
+}
+
+/// A leaf entry that `fork`, `mremap` and `munmap` must treat as the task's: a user page
+/// (present or `PROT_NONE`) or a guard marker.
+const fn is_user_leaf(entry: u64) -> bool {
+    entry & USER != 0 && (entry & MAPPED != 0 || is_guard(entry))
 }
 
 /// A leaf entry for `frame` with `flags` (`pfn_pte`): the frame is complemented
@@ -746,8 +761,10 @@ impl Tables {
     /// `dup_mmap` -> `copy_page_range` (eager): a new tree ([`Tables::fork_template`])
     /// with a private copy of every mapped user page of this one, same
     /// protection. The shared zero page stays shared, a `PROT_NONE` page stays
-    /// `PROT_NONE` (its frame is copied), absent pages stay absent; accessed
-    /// and dirty bits are not carried. On failure everything made is freed and
+    /// `PROT_NONE` (its frame is copied), absent pages stay absent, a guard marker is copied;
+    /// accessed and dirty bits are not carried. `vmas` are this tree's VMAs: the pages of a
+    /// `VM_DONTCOPY` or `VM_WIPEONFORK` VMA are left behind
+    /// ([`kernel::mm::Mm::copies_pages`]). On failure everything made is freed and
     /// this tree is unchanged.
     ///
     /// shortcut: copy-on-write is the upgrade (per-frame counts and a
@@ -759,7 +776,11 @@ impl Tables {
     ///
     /// # Errors
     /// Frame exhaustion (`Error::Memory`).
-    pub fn fork_user(&self, allocator: &mut Allocator<'_>) -> Result<Self, Error> {
+    pub fn fork_user(
+        &self,
+        allocator: &mut Allocator<'_>,
+        vmas: &[kernel::mm::Vma],
+    ) -> Result<Self, Error> {
         let mut child = self.fork_template(allocator)?;
         let mut failure: Option<Error> = None;
         let (zero, direct_map) = (self.zero, self.direct_map);
@@ -770,11 +791,29 @@ impl Tables {
             // SAFETY: `slot` is a PTE of this tree (see `for_each_user_slot`);
             // a volatile read creates no reference and sees hardware A/D bits.
             let entry = unsafe { ptr::read_volatile(slot) };
-            if entry & MAPPED == 0 || entry & USER == 0 {
+            if !is_user_leaf(entry) {
+                return;
+            }
+            // `dup_mmap`: nothing of a `VM_DONTCOPY` VMA (it is not in the child) or a
+            // `VM_WIPEONFORK` VMA ("a clean slate") is copied.
+            let covering = vmas.partition_point(|vma| vma.end <= address);
+            if !vmas
+                .get(covering)
+                .is_some_and(|vma| vma.start <= address && kernel::mm::Mm::copies_pages(vma.flags))
+            {
+                return;
+            }
+            let flags = entry & !ADDRESS & !(ACCESSED | DIRTY);
+            // A guard marker holds no frame: it is copied as it is (`copy_nonpresent_pte`).
+            if is_guard(entry) {
+                if let Err(error) =
+                    child.map(allocator, Virtual(address), Physical(0), flags, false)
+                {
+                    failure = Some(error);
+                }
                 return;
             }
             let frame = Physical(frame_bits(entry));
-            let flags = entry & !ADDRESS & !(ACCESSED | DIRTY);
             let outcome = if Some(frame) == zero {
                 child.map(allocator, Virtual(address), frame, flags, false)
             } else {
@@ -1000,7 +1039,7 @@ impl Tables {
                     // SAFETY: `pointer` returns a valid, aligned PTE slot of this tree inside
                     // the direct map; a volatile read creates no reference (as `mm_resident`).
                     let entry = unsafe { ptr::read_volatile(slot) };
-                    if entry & MAPPED != 0 && entry & USER != 0 {
+                    if is_user_leaf(entry) {
                         return Some(address);
                     }
                 }
@@ -1095,7 +1134,9 @@ impl Tables {
         // direct map; a volatile read creates no reference and observes
         // hardware accessed/dirty updates.
         let entry = unsafe { ptr::read_volatile(slot) };
-        if entry & MAPPED == 0 {
+        if is_guard(entry) {
+            Pte::Guard
+        } else if entry & MAPPED == 0 {
             Pte::Absent
         } else if Some(Physical(frame_bits(entry))) == self.zero {
             Pte::ZeroPage
@@ -1234,10 +1275,26 @@ impl Tables {
         tlb::flush(VirtAddr::new(page));
     }
 
-    /// Remove every mapping in the range, invalidate it on this CPU and return
-    /// the data frames (never the zero page) to the allocator. Returns how many
-    /// data frames were freed.
+    /// Remove every mapping in the range, guard markers included, invalidate it on this CPU and
+    /// return the data frames (never the zero page) to the allocator. Returns how many data
+    /// frames were freed.
     pub fn mm_unmap(&mut self, allocator: &mut Allocator<'_>, start: u64, pages: u64) -> u64 {
+        self.mm_clear(allocator, start, pages, true)
+    }
+
+    /// As [`Tables::mm_unmap`] but guard markers stay (`zap_page_range_single` without
+    /// `ZAP_FLAG_DROP_MARKER`: `MADV_DONTNEED`).
+    pub fn mm_zap(&mut self, allocator: &mut Allocator<'_>, start: u64, pages: u64) -> u64 {
+        self.mm_clear(allocator, start, pages, false)
+    }
+
+    fn mm_clear(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        start: u64,
+        pages: u64,
+        markers: bool,
+    ) -> u64 {
         let zero = self.zero;
         let mut freed = 0;
         let (mut anon, mut shmem) = (0, 0);
@@ -1248,7 +1305,14 @@ impl Tables {
             let entry = unsafe { AtomicU64::from_ptr(slot) };
             let seen = entry.load(Ordering::Acquire);
             // Never clear what is not a user page (the audit reports it).
-            if seen & MAPPED == 0 || seen & USER == 0 {
+            if !is_user_leaf(seen) {
+                return;
+            }
+            // A guard marker holds no frame and was never cached by the TLB.
+            if is_guard(seen) {
+                if markers {
+                    entry.store(0, Ordering::Release);
+                }
                 return;
             }
             let old = entry.swap(0, Ordering::AcqRel);
@@ -1279,6 +1343,64 @@ impl Tables {
         self.rss_anon -= anon;
         self.rss_shmem -= shmem;
         freed
+    }
+
+    /// `madvise_guard_install`: every page of the range becomes a guard marker. A populated page
+    /// is zapped just before its marker is written (`zap_page_range_single`: its data is gone),
+    /// markers already there stay, page tables are allocated for the rest.
+    ///
+    /// # Errors
+    /// Table exhaustion (`Error::Memory`): the pages before the failing one are guards, the
+    /// others (data included) are as they were.
+    pub fn mm_install_guards(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        start: u64,
+        pages: u64,
+    ) -> Result<(), Error> {
+        for done in 0..pages {
+            let page = done
+                .checked_mul(PAGE)
+                .and_then(|n| start.checked_add(n))
+                .ok_or(Error::Overflow)?;
+            match self.mm_lookup(page) {
+                kernel::mm::Pte::Guard => continue,
+                kernel::mm::Pte::Absent => {}
+                // Zapping page by page keeps the data of the pages after a failing one.
+                kernel::mm::Pte::ZeroPage | kernel::mm::Pte::Anon { .. } => {
+                    self.mm_zap(allocator, page, 1);
+                }
+            }
+            // `guard_install_set_pte`: the marker is written into an empty slot; the hardware
+            // never walks a non-present entry, so no invalidation is needed.
+            self.map(allocator, Virtual(page), Physical(0), USER | GUARD, false)?;
+        }
+        Ok(())
+    }
+
+    /// `guard_remove_pte_entry`: clear the guard markers of the range.
+    pub fn mm_remove_guards(&mut self, start: u64, pages: u64) {
+        self.for_each_user_slot(start, pages, |_, slot| {
+            // SAFETY: as in `mm_clear`.
+            let entry = unsafe { AtomicU64::from_ptr(slot) };
+            if is_guard(entry.load(Ordering::Acquire)) {
+                entry.store(0, Ordering::Release);
+            }
+        });
+    }
+
+    /// The resident pages of the range that are still the file's page-cache page ([`FILE`], not
+    /// written since): what `MADV_PAGEOUT` would unmap.
+    #[must_use]
+    pub fn mm_file_pages(&self, start: u64, pages: u64) -> u64 {
+        let zero = self.zero;
+        let mut count = 0;
+        self.for_each_user_slot(start, pages, |_, slot| {
+            // SAFETY: `for_each_user_slot` hands out a valid, aligned PTE slot of this tree inside
+            // the direct map; a volatile read creates no reference.
+            count += rss_class(zero, unsafe { ptr::read_volatile(slot) }).1;
+        });
+        count
     }
 
     /// `move_page_tables`: move the user entries of `pages` pages from `old_start` to
@@ -1341,8 +1463,8 @@ impl Tables {
         // updates.
         let entry = unsafe { AtomicU64::from_ptr(slot) };
         let seen = entry.load(Ordering::Acquire);
-        // Never move what is not a user page.
-        if seen & MAPPED == 0 || seen & USER == 0 {
+        // Never move what is not a user page; a guard marker moves with the pages.
+        if !is_user_leaf(seen) {
             return Ok(());
         }
         // Build the destination first (it may need tables): a failure leaves the source alone.
@@ -1492,6 +1614,23 @@ macro_rules! mm_pages {
             fn unmap(&mut self, start: u64, pages: u64) -> u64 {
                 self.parts(|tables, frames| tables.mm_unmap(frames, start, pages))
             }
+            fn zap(&mut self, start: u64, pages: u64) -> u64 {
+                self.parts(|tables, frames| tables.mm_zap(frames, start, pages))
+            }
+            fn install_guards(
+                &mut self,
+                start: u64,
+                pages: u64,
+            ) -> Result<(), kernel::mm::OutOfMemory> {
+                self.parts(|tables, frames| tables.mm_install_guards(frames, start, pages))
+                    .map_err(out_of_memory)
+            }
+            fn remove_guards(&mut self, start: u64, pages: u64) {
+                self.parts(|tables, _| tables.mm_remove_guards(start, pages));
+            }
+            fn resident_file_pages(&self, start: u64, pages: u64) -> u64 {
+                Backing::tables(self).mm_file_pages(start, pages)
+            }
             fn protect(&mut self, start: u64, pages: u64, prot: kernel::mm::PageProt) {
                 self.parts(|tables, _| tables.mm_protect(start, pages, prot));
             }
@@ -1561,8 +1700,8 @@ impl UserSpace<'_> {
     ///
     /// # Errors
     /// Frame exhaustion.
-    pub fn fork_tables(&mut self) -> Result<Tables, Error> {
-        self.parts(|tables, frames| tables.fork_user(frames))
+    pub fn fork_tables(&mut self, vmas: &[kernel::mm::Vma]) -> Result<Tables, Error> {
+        self.parts(|tables, frames| tables.fork_user(frames, vmas))
     }
 }
 

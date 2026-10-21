@@ -211,6 +211,18 @@ impl Vfs {
         Ok(())
     }
 
+    /// `dup_mmap` takes no reference for a `VM_DONTCOPY` VMA: after [`Vfs::pin_clone`], drop the
+    /// pins of `owner` whose description none of its VMAs maps (`mapped` says which are mapped).
+    pub fn pin_retain(&mut self, owner: u32, mapped: impl Fn(u64) -> bool) {
+        let mut index = self.pins.len();
+        while index > 0 {
+            index -= 1;
+            if self.pins[index].owner == owner && !mapped(self.pin_id(index)) {
+                self.unpin(index);
+            }
+        }
+    }
+
     /// `exit_mmap`'s `fput(vma->vm_file)`: address space `owner` is gone.
     pub fn unpin_all(&mut self, owner: u32) {
         let mut index = self.pins.len();

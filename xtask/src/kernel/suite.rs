@@ -32,7 +32,7 @@ pub(super) enum Expect {
     Fail,
     /// Not run because the CPU or the stick lacks what the group needs: neither a pass nor a
     /// failure. The text is the start of the kernel's reason (`baremetal::unavailable_reason`),
-    /// [`CPU_LACKS`] or [`NO_BUSYBOX`].
+    /// [`CPU_LACKS`] [`NO_BUSYBOX`] or [`NO_DYNELF`].
     Unavailable(&'static str),
 }
 
@@ -40,10 +40,12 @@ pub(super) enum Expect {
 pub(super) const CPU_LACKS: &str = "the CPU has no ";
 /// The reason of `busybox` on a stick without the `BusyBox` module.
 pub(super) const NO_BUSYBOX: &str = "no busybox module on the stick";
+/// The reason of `dynelf` on a stick without the module of host programs.
+pub(super) const NO_DYNELF: &str = "no dynelf module on the stick";
 
 /// The groups of a normal run on a CPU model without AVX-512 and protection keys (QEMU TCG
-/// `qemu64`) from a stick without the `BusyBox` module, in the kernel's order: all pass except
-/// `xstate` (the CPU) and `busybox` (the stick), which are unavailable.
+/// `qemu64`) from a stick without the host-program modules, in the kernel's order: all pass
+/// except `xstate` (the CPU), `busybox` and `dynelf` (the stick), which are unavailable.
 pub(super) const ALL_PASS: &[(&str, Expect)] = &[
     ("ids", Expect::Pass),
     ("time", Expect::Pass),
@@ -55,15 +57,21 @@ pub(super) const ALL_PASS: &[(&str, Expect)] = &[
     ("proc", Expect::Pass),
     ("jobctl", Expect::Pass),
     ("pipe", Expect::Pass),
+    ("threads", Expect::Pass),
+    ("futex", Expect::Pass),
     ("xstate", Expect::Unavailable(CPU_LACKS)),
     ("procfs", Expect::Pass),
     ("busybox", Expect::Unavailable(NO_BUSYBOX)),
+    ("dynelf", Expect::Unavailable(NO_DYNELF)),
 ];
-/// `busybox` alone, from a stick that has the module, on a CPU without XSAVE and AVX-512 (TCG
-/// `qemu64`): the module is there, so the CPU is the reason.
-pub(super) const BUSYBOX_CPU: &[(&str, Expect)] = &[("busybox", Expect::Unavailable(CPU_LACKS))];
-/// The same on a host CPU (`-cpu host` with AVX-512 and PKU) from a stick with the `BusyBox`
-/// module: `xstate` and `busybox` run and pass.
+/// `busybox` and `dynelf`, from a stick that has both modules, on a CPU without XSAVE and AVX-512
+/// (TCG `qemu64`): the modules are there, so the CPU is the reason.
+pub(super) const MODULES_CPU: &[(&str, Expect)] = &[
+    ("busybox", Expect::Unavailable(CPU_LACKS)),
+    ("dynelf", Expect::Unavailable(CPU_LACKS)),
+];
+/// The same on a host CPU (`-cpu host` with AVX-512 and PKU) from a stick with both modules:
+/// `xstate`, `busybox` and `dynelf` run and pass.
 pub(super) const ALL_PASS_HOST: &[(&str, Expect)] = &[
     ("ids", Expect::Pass),
     ("time", Expect::Pass),
@@ -75,9 +83,12 @@ pub(super) const ALL_PASS_HOST: &[(&str, Expect)] = &[
     ("proc", Expect::Pass),
     ("jobctl", Expect::Pass),
     ("pipe", Expect::Pass),
+    ("threads", Expect::Pass),
+    ("futex", Expect::Pass),
     ("xstate", Expect::Pass),
     ("procfs", Expect::Pass),
     ("busybox", Expect::Pass),
+    ("dynelf", Expect::Pass),
 ];
 /// A run that selects six probes ending abnormally (a SIGSEGV, an unimplemented
 /// syscall, a loop that outruns the one-second group bound, that loop in a child while init
@@ -395,14 +406,18 @@ pub(super) fn record(
 /// no forced video mode (the firmware's own mode, whatever the monitor is). The command line
 /// spells out the kernel's defaults (`baremetal::DEFAULT_PAUSE_MS`, `DEFAULT_TIMEOUT_S`) so
 /// that `/proc/cmdline`, which the `procfs` group's `cmdline-*` rows read, is not empty; the
-/// pinned Linux recorded those rows with a non-empty command line. The `BusyBox` module is
-/// listed only when the tree has it (`busybox` is `unavailable` without).
-fn limine_conf(busybox: bool) -> String {
+/// pinned Linux recorded those rows with a non-empty command line. The `BusyBox` module and the
+/// module of host programs are listed only when the tree has them (`busybox` and `dynelf` are
+/// `unavailable` without), in that order after the archive.
+fn limine_conf(busybox: bool, dynamic: bool) -> String {
     let mut conf = String::from(
         "timeout: 5\n\n/linux-rs bare-metal suite (A21)\n    protocol: limine\n    path: boot():/linux-rs-kernel\n    cmdline: suite_pause_ms=6000 suite_timeout_s=120\n    module_path: boot():/initramfs.cpio\n    module_string: initramfs.cpio\n",
     );
     if busybox {
         conf.push_str("    module_path: boot():/busybox.cpio\n    module_string: busybox.cpio\n");
+    }
+    if dynamic {
+        conf.push_str("    module_path: boot():/dynamic.cpio\n    module_string: dynamic.cpio\n");
     }
     conf
 }
@@ -442,8 +457,40 @@ fn busybox_readme(
     }
 }
 
-fn readme(id: &str, kernel_sha: &str, busybox: &Result<super::BusyboxModule, String>) -> String {
-    let (busybox_files, copy_extra, busybox_note) = busybox_readme(busybox);
+/// The README's file line, the `cp` argument and the `DYNELF` paragraph of a tree with (or
+/// without) the module of host programs.
+fn dynamic_readme(
+    dynamic: &Result<super::DynamicModule, String>,
+) -> (&'static str, &'static str, String) {
+    match dynamic {
+        Ok(module) => (
+            "  dynamic.cpio           generated archive holding the host's glibc programs (see DYNELF)\n",
+            "dynamic.cpio ",
+            format!(
+                "\nDYNELF\n  This tree carries dynamic.cpio: {} files that were installed on the machine that\n  built the tree (coreutils, bash, grep, sed, gawk, gzip, tar, xz, Python 3.14, the loader\n  ld-linux-x86-64.so.2 and the shared objects they need, some of Python's library; the\n  sha256 of the list of files and digests is {}). They are the exact files the\n  pinned Linux's output was recorded with; they are read at build time and never committed.\n  The group `dynelf` runs them as dynamically linked programs, compares their output with the\n  pinned Linux's and also runs programs that make threads. They are built for x86-64-v4, so\n  the group runs only where the CPU has XSAVE, AVX-512 F/BW/CD/DQ/VL and RDSEED or RDRAND;\n  otherwise it is N/A (neither pass nor fail).\n",
+                module.files, module.inputs_sha256
+            ),
+        ),
+        Err(reason) => (
+            "",
+            "",
+            format!(
+                "\nDYNELF\n  This tree has no dynamic.cpio ({reason}), so the group `dynelf` is N/A\n  (neither pass nor fail) on the summary screen.\n"
+            ),
+        ),
+    }
+}
+
+fn readme(
+    id: &str,
+    kernel_sha: &str,
+    busybox: &Result<super::BusyboxModule, String>,
+    dynamic: &Result<super::DynamicModule, String>,
+) -> String {
+    let (busybox_files, busybox_copy, busybox_note) = busybox_readme(busybox);
+    let (dynamic_files, dynamic_copy, dynamic_note) = dynamic_readme(dynamic);
+    let copy_extra = format!("{busybox_copy}{dynamic_copy}");
+    let (busybox_files, dynamic_files) = (busybox_files.to_owned(), dynamic_files.to_owned());
     format!(
         "\
 linux-rs bare-metal test suite (decision A21)
@@ -457,11 +504,13 @@ WHAT THIS IS
   with Limine 12.9.3 (the BOOTX64.EFI of your /usr/share/limine). The kernel
   runs its boot self-tests, prints a hardware inventory (CPU, memory map, ACPI,
   APIC/timers, framebuffers, PCI ids), runs the oracle syscall groups ids,
-  time, mm, fs, names, signal, fork, proc, jobctl, pipe, xstate, procfs and
-  busybox each as a fresh /init on a fresh rootfs, compares each group's output
-  line by line with what the pinned Linux 6.18.57 printed, and ends on a summary
-  screen. xstate (AVX-512 and protection keys) and busybox (an x86-64-v4 program)
-  run only on a CPU that has what they execute and are otherwise N/A.
+  time, mm, fs, names, signal, fork, proc, jobctl, pipe, threads, futex, xstate,
+  procfs, busybox and dynelf each as a fresh /init on a fresh rootfs, compares each
+  group's output line by line with what the pinned Linux 6.18.57 printed, and ends
+  on a summary screen. xstate (AVX-512 and protection keys), busybox (an x86-64-v4
+  program) and dynelf (x86-64-v4 glibc programs and Python) run only on a CPU that
+  has what they execute and, for the last two, a stick that carries their module;
+  otherwise they are N/A.
   The tty groups are not run: they test the console through a serial line and
   scripted PS/2 keys, which a framebuffer console cannot be given.
 
@@ -493,8 +542,8 @@ WHAT YOU DO (the tool never writes to a block device; you do the copy)
      A desktop may automount it again after formatting: unmount that mount
      before step 3 (or use its mount point instead of /mnt below).
   3. Mount it and, from inside this directory (the one holding EFI/,
-     limine.conf, linux-rs-kernel and initramfs.cpio, and busybox.cpio if the
-     list under FILES has it), copy the tree and
+     limine.conf, linux-rs-kernel and initramfs.cpio, and busybox.cpio and
+     dynamic.cpio if the list under FILES has them), copy the tree and
      check the files:
          sudo mount /dev/sdX1 /mnt
          sudo cp -r EFI limine.conf linux-rs-kernel initramfs.cpio {copy_extra}/mnt/
@@ -533,8 +582,8 @@ FILES
                          line repeats the kernel's defaults so /proc/cmdline is not empty
   linux-rs-kernel        the suite kernel (freestanding + baremetal-suite)
   initramfs.cpio         generated archive holding the harness /init
-{busybox_files}  SHA256SUMS             sha256 of every file above
-{busybox_note}"
+{busybox_files}{dynamic_files}  SHA256SUMS             sha256 of every file above
+{busybox_note}{dynamic_note}"
     )
 }
 
@@ -629,7 +678,7 @@ fn tree_image(
         disk_sha256_initial,
         kernel_image_sha256: verified["linux-rs-kernel"].clone(),
         limine_image_sha256: verified["EFI/BOOT/BOOTX64.EFI"].clone(),
-        module_image_sha256: ["initramfs.cpio", "busybox.cpio"]
+        module_image_sha256: ["initramfs.cpio", "busybox.cpio", "dynamic.cpio"]
             .into_iter()
             .filter_map(|name| verified.get(name).map(|hash| (name, hash.clone())))
             .collect(),
@@ -723,6 +772,8 @@ struct Tree {
     hashes: Vec<(&'static str, String)>,
     /// The `BusyBox` module's evidence, or why the stick has none.
     busybox: Result<super::BusyboxModule, String>,
+    /// The host-program module's evidence, or why the stick has none.
+    dynamic: Result<super::DynamicModule, String>,
 }
 
 impl Tree {
@@ -777,9 +828,27 @@ fn stage_tree(output: &Output, tools: &QemuTools, suite_build: &Build) -> io::Re
         }
         Err(_) => None,
     };
+    // The same for the module of host programs (`Fixtures::generate` checked every file).
+    let dynamic = match &tools.fixtures.dynamic {
+        Ok(module) => {
+            let hash = put(
+                output,
+                tools,
+                &tools.fixtures.dir.join(super::Module::Dynamic.file()),
+                &tree.join("dynamic.cpio"),
+            )?;
+            if hash != module.module_sha256 {
+                return Err(invalid(
+                    "dynamic.cpio changed between generation and staging",
+                ));
+            }
+            Some(hash)
+        }
+        Err(_) => None,
+    };
     write_new(
         &tree.join("limine.conf"),
-        limine_conf(busybox.is_some()).as_bytes(),
+        limine_conf(busybox.is_some(), dynamic.is_some()).as_bytes(),
     )?;
     let conf = file_hash(
         &output.root,
@@ -793,21 +862,26 @@ fn stage_tree(output: &Output, tools: &QemuTools, suite_build: &Build) -> io::Re
         ("initramfs.cpio", initramfs),
     ];
     hashes.extend(busybox.map(|hash| ("busybox.cpio", hash)));
+    hashes.extend(dynamic.map(|hash| ("dynamic.cpio", hash)));
     let mut sums = String::new();
     for (name, hash) in &hashes {
         writeln!(sums, "{hash}  {name}").map_err(io::Error::other)?;
     }
     write_new(&tree.join("SHA256SUMS"), sums.as_bytes())?;
-    let busybox = tools.fixtures.busybox.clone();
+    let (busybox, dynamic) = (
+        tools.fixtures.busybox.clone(),
+        tools.fixtures.dynamic.clone(),
+    );
     write_new(
         &tree.join("README.txt"),
-        readme(&id, &kernel, &busybox).as_bytes(),
+        readme(&id, &kernel, &busybox, &dynamic).as_bytes(),
     )?;
     Ok(Tree {
         dir: tree,
         id,
         hashes,
         busybox,
+        dynamic,
     })
 }
 
@@ -820,6 +894,24 @@ struct Report<'a> {
     screen: &'a Path,
     format: &'a str,
     pages: usize,
+}
+
+/// The manifest entries of the two optional modules (their evidence, or why the tree has none).
+fn module_manifest(manifest: &mut BTreeMap<String, String>, tree: &Tree) {
+    match &tree.busybox {
+        Ok(module) => {
+            manifest_value(manifest, "sha256_busybox_program", &module.program_sha256);
+            manifest_value(manifest, "sha256_busybox_module", &module.module_sha256);
+        }
+        Err(reason) => manifest_value(manifest, "busybox_unavailable", reason),
+    }
+    match &tree.dynamic {
+        Ok(module) => {
+            manifest_value(manifest, "sha256_dynamic_inputs", &module.inputs_sha256);
+            manifest_value(manifest, "sha256_dynamic_module", &module.module_sha256);
+        }
+        Err(reason) => manifest_value(manifest, "dynamic_unavailable", reason),
+    }
 }
 
 fn write_report(report: &Report<'_>) -> io::Result<()> {
@@ -870,21 +962,7 @@ fn write_report(report: &Report<'_>) -> io::Result<()> {
             hash,
         );
     }
-    match &tree.busybox {
-        Ok(module) => {
-            manifest_value(
-                &mut manifest,
-                "sha256_busybox_program",
-                &module.program_sha256,
-            );
-            manifest_value(
-                &mut manifest,
-                "sha256_busybox_module",
-                &module.module_sha256,
-            );
-        }
-        Err(reason) => manifest_value(&mut manifest, "busybox_unavailable", reason),
-    }
+    module_manifest(&mut manifest, tree);
     manifest_value(&mut manifest, "sha256_init_elf", (*init_sha256).to_owned());
     manifest_value(
         &mut manifest,
@@ -1033,6 +1111,8 @@ mod tests {
             if let Expect::Unavailable(why) = expect {
                 let reason = if why == NO_BUSYBOX {
                     format!("{NO_BUSYBOX} (no matching host program)")
+                } else if why == NO_DYNELF {
+                    format!("{NO_DYNELF} (no matching host programs)")
                 } else {
                     format!("{why}avx512f")
                 };
@@ -1135,7 +1215,7 @@ mod tests {
     fn a_log_the_kernel_would_print_is_accepted() {
         judge(&log_of(ALL_PASS), ALL_PASS).unwrap();
         judge(&log_of(ALL_PASS_HOST), ALL_PASS_HOST).unwrap();
-        judge(&log_of(BUSYBOX_CPU), BUSYBOX_CPU).unwrap();
+        judge(&log_of(MODULES_CPU), MODULES_CPU).unwrap();
         judge(&log_of(STOPS), STOPS).unwrap();
     }
 
@@ -1157,8 +1237,10 @@ mod tests {
         assert!(error.contains("must be unavailable"), "{error}");
         let error = judge(&log, &[("xstate", Expect::Unavailable(NO_BUSYBOX))]).unwrap_err();
         assert!(error.contains("must be unavailable"), "{error}");
+        let error = judge(&log, &[("dynelf", Expect::Unavailable(NO_BUSYBOX))]).unwrap_err();
+        assert!(error.contains("must be unavailable"), "{error}");
         // The summary counts it separately.
-        let error = judge(&log.replace("unavailable=2", "unavailable=1"), ALL_PASS).unwrap_err();
+        let error = judge(&log.replace("unavailable=3", "unavailable=2"), ALL_PASS).unwrap_err();
         assert!(error.contains("SUITE complete"), "{error}");
         // One character of the captured transcript changes: the digest no longer fits.
         let error =
@@ -1206,8 +1288,8 @@ mod tests {
 
     #[test]
     fn the_limine_config_has_one_entry_a_countdown_and_no_forced_mode() {
-        for busybox in [false, true] {
-            let conf = limine_conf(busybox);
+        for (busybox, dynamic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let conf = limine_conf(busybox, dynamic);
             assert!(conf.contains("timeout: 5"));
             assert_eq!(conf.matches("\n/").count(), 1);
             assert!(!conf.contains("resolution"));
@@ -1215,28 +1297,46 @@ mod tests {
             assert!(conf.contains("module_path: boot():/initramfs.cpio"));
             // The procfs group reads /proc/cmdline: the line must exist.
             assert!(conf.contains("\n    cmdline: suite_pause_ms=6000 suite_timeout_s=120\n"));
-            // The second module is listed exactly when the tree has it, after the archive.
+            // The other modules are listed exactly when the tree has them, after the archive.
             assert_eq!(conf.contains("busybox.cpio"), busybox);
+            assert_eq!(conf.contains("dynamic.cpio"), dynamic);
+            let at = |name| conf.find(&format!("module_path: boot():/{name}"));
             if busybox {
-                assert!(
-                    conf.find("module_path: boot():/initramfs.cpio")
-                        < conf.find("module_path: boot():/busybox.cpio")
-                );
+                assert!(at("initramfs.cpio") < at("busybox.cpio"));
+            }
+            if dynamic {
+                assert!(at("initramfs.cpio") < at("dynamic.cpio"));
+            }
+            if busybox && dynamic {
+                assert!(at("busybox.cpio") < at("dynamic.cpio"));
             }
         }
     }
 
     #[test]
-    fn the_readme_names_the_busybox_module_only_when_the_tree_has_it() {
-        let module = super::super::BusyboxModule {
+    fn the_readme_names_the_host_modules_only_when_the_tree_has_them() {
+        let busybox = super::super::BusyboxModule {
             program_sha256: "ab".repeat(32),
             module_sha256: "cd".repeat(32),
         };
-        let with = readme("id", "k", &Ok(module));
+        let dynamic = super::super::DynamicModule {
+            module_sha256: "ef".repeat(32),
+            inputs_sha256: "12".repeat(32),
+            files: 99,
+        };
+        let with = readme("id", "k", &Ok(busybox.clone()), &Ok(dynamic.clone()));
         assert!(with.contains(&"ab".repeat(32)) && with.contains("busybox.cpio  "));
-        assert!(with.contains("initramfs.cpio busybox.cpio /mnt/"));
-        let without = readme("id", "k", &Err("no program".to_owned()));
+        assert!(with.contains(&"12".repeat(32)) && with.contains("dynamic.cpio  "));
+        assert!(with.contains("99 files"));
+        assert!(with.contains("initramfs.cpio busybox.cpio dynamic.cpio /mnt/"));
+        let no_busybox: Result<super::super::BusyboxModule, String> = Err("no program".to_owned());
+        let no_dynamic: Result<super::super::DynamicModule, String> = Err("no files".to_owned());
+        let without = readme("id", "k", &no_busybox, &no_dynamic);
         assert!(!without.contains("busybox.cpio  ") && without.contains("no program"));
+        assert!(!without.contains("dynamic.cpio  ") && without.contains("no files"));
         assert!(without.contains("initramfs.cpio /mnt/"));
+        let only_dynamic = readme("id", "k", &no_busybox, &Ok(dynamic));
+        assert!(only_dynamic.contains("initramfs.cpio dynamic.cpio /mnt/"));
+        assert!(!only_dynamic.contains("busybox.cpio  "));
     }
 }

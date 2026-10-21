@@ -51,8 +51,18 @@ impl VmFlags {
     pub const MAYSHARE: Self = Self(0x80);
     pub const GROWSDOWN: Self = Self(0x100);
     pub const PFNMAP: Self = Self(0x400);
+    /// `VM_MAYBE_GUARD` (bit 11): the VMA may hold guard markers
+    /// (`madvise(MADV_GUARD_INSTALL)`). Sticky: it never blocks a merge and the merged VMA
+    /// keeps it ([`VmFlags::STICKY`]).
+    pub const MAYBE_GUARD: Self = Self(0x800);
     pub const LOCKED: Self = Self(0x2000);
     pub const IO: Self = Self(0x4000);
+    /// `VM_SEQ_READ` / `VM_RAND_READ` (`MADV_SEQUENTIAL` / `MADV_RANDOM`): read-ahead hints
+    /// that nothing here uses, kept because they decide how VMAs split and merge.
+    pub const SEQ_READ: Self = Self(0x8000);
+    pub const RAND_READ: Self = Self(0x1_0000);
+    /// `VM_DONTCOPY` (`MADV_DONTFORK`): the VMA is not copied to a forked child.
+    pub const DONTCOPY: Self = Self(0x2_0000);
     pub const DONTEXPAND: Self = Self(0x4_0000);
     pub const LOCKONFAULT: Self = Self(0x8_0000);
     pub const ACCOUNT: Self = Self(0x10_0000);
@@ -76,10 +86,11 @@ impl VmFlags {
     pub const DATA_DEFAULT: Self = Self(0x1 | 0x2 | 0x10 | 0x20 | 0x40);
     /// `VM_STACK_FLAGS`.
     pub const STACK_FLAGS: Self = Self(Self::STACK.0 | Self::DATA_DEFAULT.0 | Self::ACCOUNT.0);
-    /// `VM_IGNORE_MERGE` (`VM_STICKY`): `VM_SOFTDIRTY` is 0 without
-    /// `CONFIG_MEM_SOFT_DIRTY` and `VM_MAYBE_GUARD` is never set (no
-    /// `MADV_GUARD_INSTALL` yet), so nothing is ignored.
-    pub const IGNORE_MERGE: Self = Self(0);
+    /// `VM_STICKY`: flags a merged VMA has when either side had them (`VM_SOFTDIRTY` is 0
+    /// without `CONFIG_MEM_SOFT_DIRTY`, leaving `VM_MAYBE_GUARD`).
+    pub const STICKY: Self = Self::MAYBE_GUARD;
+    /// `VM_IGNORE_MERGE` (`VM_STICKY`): flags that two VMAs may differ in and still merge.
+    pub const IGNORE_MERGE: Self = Self::STICKY;
 
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
@@ -122,6 +133,28 @@ impl BitAndAssign for VmFlags {
         self.0 &= rhs.0;
     }
 }
+
+/// `MADV_*` (include/uapi/asm-generic/mman-common.h; `int behavior`).
+pub const MADV_NORMAL: i32 = 0;
+pub const MADV_RANDOM: i32 = 1;
+pub const MADV_SEQUENTIAL: i32 = 2;
+pub const MADV_WILLNEED: i32 = 3;
+pub const MADV_DONTNEED: i32 = 4;
+pub const MADV_FREE: i32 = 8;
+pub const MADV_REMOVE: i32 = 9;
+pub const MADV_DONTFORK: i32 = 10;
+pub const MADV_DOFORK: i32 = 11;
+pub const MADV_DONTDUMP: i32 = 16;
+pub const MADV_DODUMP: i32 = 17;
+pub const MADV_WIPEONFORK: i32 = 18;
+pub const MADV_KEEPONFORK: i32 = 19;
+pub const MADV_COLD: i32 = 20;
+pub const MADV_PAGEOUT: i32 = 21;
+pub const MADV_POPULATE_READ: i32 = 22;
+pub const MADV_POPULATE_WRITE: i32 = 23;
+pub const MADV_DONTNEED_LOCKED: i32 = 24;
+pub const MADV_GUARD_INSTALL: i32 = 102;
+pub const MADV_GUARD_REMOVE: i32 = 103;
 
 /// mm/vma.h `is_exec_mapping`.
 #[must_use]

@@ -13,7 +13,7 @@
 //! woken ones have recorded their results. Everything else is a single call with its result.
 
 use core::sync::atomic::{
-    AtomicIsize, AtomicU32, AtomicUsize,
+    AtomicI64, AtomicIsize, AtomicU32, AtomicUsize,
     Ordering::{Relaxed, SeqCst},
 };
 
@@ -71,6 +71,16 @@ fn clock(id: usize) -> i64 {
     let mut ts = [0i64; 2];
     let _ = sys(Sysno::clock_gettime, &[id, addr_mut(&mut ts)]);
     ts[0] * 1_000_000_000 + ts[1]
+}
+
+/// An absolute `CLOCK_MONOTONIC` deadline `secs` seconds from now, as the address of a
+/// `struct timespec` that stays valid (the next call replaces it).
+fn deadline_in(secs: i64) -> usize {
+    static DEADLINE: [AtomicI64; 2] = [const { AtomicI64::new(0) }; 2];
+    let at = timespec(clock(MONOTONIC) + secs * 1_000_000_000);
+    DEADLINE[0].store(at[0], SeqCst);
+    DEADLINE[1].store(at[1], SeqCst);
+    addr(&DEADLINE)
 }
 
 fn timespec(ns: i64) -> [i64; 2] {
@@ -1810,13 +1820,16 @@ fn begin_waitv(i: usize, words: &[usize], timeout: usize) -> Thread {
 /// them when several were before it ran (`futex_unqueue_multiple`), and its entries do not take
 /// the queue room that other tasks' plain waits need.
 fn waitv_sleepers(t: &mut T) {
+    // Relative for the plain waits; `futex_waitv` takes an absolute `CLOCK_MONOTONIC` time, so
+    // its deadline is made from the clock each time (a fixed one would be past on a machine
+    // that has been up for a while, as the bare-metal suite's is).
     static LIMIT: [i64; 2] = [3, 0];
     let limit = addr(&LIMIT);
     let (a, b) = (at(60), at(61));
     word(60).store(0, SeqCst);
     word(61).store(0, SeqCst);
     fresh();
-    let th = begin_waitv(0, &[a, b], limit);
+    let th = begin_waitv(0, &[a, b], deadline_in(5));
     t.eq(
         "waitv-woken-index-is-returned",
         fx(b, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
@@ -1826,7 +1839,7 @@ fn waitv_sleepers(t: &mut T) {
     t.eq("waitv-sleeper-returned-the-index", result(0), 1);
     finish(&[th]);
     fresh();
-    let th = begin_waitv(0, &[a, b], limit);
+    let th = begin_waitv(0, &[a, b], deadline_in(5));
     t.eq(
         "waitv-first-entry-index",
         fx(a, FUTEX_WAKE | PRIVATE, 1, 0, 0, 0),
@@ -1842,7 +1855,7 @@ fn waitv_sleepers(t: &mut T) {
         ("waitv-highest-index-woken-last", a, b),
     ] {
         fresh();
-        let th = begin_waitv(0, &[a, b], limit);
+        let th = begin_waitv(0, &[a, b], deadline_in(5));
         t.eq(
             name,
             fx(
@@ -1868,7 +1881,7 @@ fn waitv_sleepers(t: &mut T) {
     word(70).store(0, SeqCst);
     word(71).store(0, SeqCst);
     fresh();
-    let big = begin_waitv(0, &words, limit);
+    let big = begin_waitv(0, &words, deadline_in(5));
     let ths = [
         begin_timed(1, p, FUTEX_WAIT | PRIVATE, 0, 0, limit),
         begin_timed(2, q, FUTEX_WAIT | PRIVATE, 0, 0, limit),

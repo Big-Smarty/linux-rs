@@ -988,6 +988,10 @@ const DEBUG_CASES: &[DebugCase] = &[
     // and shared keys, signals, robust lists, the argument checks of the priority-inheritance
     // operations, `futex_waitv` (`user/init` group `futex`, recorded on the pinned Linux 6.18.57).
     oracle_case!(futex),
+    // madvise(2) and process_madvise(2): argument checks and the VMA walk, every advice of the
+    // declared configuration, guard regions, fork behaviour, populate and the resident-set
+    // counters (`user/init` group `madvise`, recorded on the pinned Linux 6.18.57).
+    oracle_case!(madvise),
     // 200 fork/exit/wait rounds: nothing is left behind (`user/init` mode `forkleak`).
     // Pool exhaustion and every unwinding path of `copy_process` (this kernel only: Linux's limit
     // is `max_threads`, not a stack pool).
@@ -1112,21 +1116,21 @@ const SUITE_CASES: &[DebugCase] = &[
         framebuffers: 2,
         plat: Q35_TCG,
     },
-    // The BusyBox module is on the stick but `qemu64` has no XSAVE or AVX-512: the group is
-    // unavailable for the CPU's sake, and nothing else runs.
+    // The BusyBox and host-program modules are on the stick but `qemu64` has no XSAVE or AVX-512:
+    // both groups are unavailable for the CPU's sake, and nothing else runs.
     DebugCase {
-        name: "baremetal-suite-busybox-cpu",
-        cmdline: Some("suite_pause_ms=50 suite_groups=busybox"),
+        name: "baremetal-suite-modules-cpu",
+        cmdline: Some("suite_pause_ms=50 suite_groups=busybox,dynelf"),
         cpu: "qemu64",
         expected_exit: 33,
         required: SUCCESS_MARKERS,
         forbid_success: false,
-        modules: &[Module::Archive, Module::Busybox],
-        user: User::Suite(suite::BUSYBOX_CPU),
+        modules: &[Module::Archive, Module::Busybox, Module::Dynamic],
+        user: User::Suite(suite::MODULES_CPU),
         framebuffers: 1,
         plat: Q35_TCG,
     },
-    // The host CPU with the BusyBox module: `xstate`, `procfs` and `busybox` run and pass.
+    // The host CPU with both modules: `xstate`, `procfs`, `busybox` and `dynelf` run and pass.
     DebugCase {
         name: "baremetal-suite-kvm",
         cmdline: Some("suite_pause_ms=50"),
@@ -1134,7 +1138,7 @@ const SUITE_CASES: &[DebugCase] = &[
         expected_exit: 33,
         required: SUCCESS_MARKERS,
         forbid_success: false,
-        modules: &[Module::Archive, Module::Busybox],
+        modules: &[Module::Archive, Module::Busybox, Module::Dynamic],
         user: User::Suite(suite::ALL_PASS_HOST),
         framebuffers: 1,
         plat: Platform {
@@ -3592,6 +3596,7 @@ struct BusyboxModule {
 }
 
 /// The generated `dynamic.cpio` and the evidence of the host files inside it.
+#[derive(Clone)]
 struct DynamicModule {
     /// SHA-256 of the whole module.
     module_sha256: String,
@@ -8705,6 +8710,7 @@ mod tests {
         let groups = [
             "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe", "xstate", "tty",
             "ttyin", "ttykbd", "names", "busybox", "dynelf", "procfs", "threads", "futex",
+            "madvise",
         ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),

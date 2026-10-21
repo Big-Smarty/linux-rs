@@ -486,6 +486,7 @@ pub(crate) const DYNAMIC_PROGRAMS: &[&str] = &[
     "wc",
     "whoami",
     "xargs",
+    "xz",
     "yes",
 ];
 
@@ -776,6 +777,10 @@ pub(crate) const DYNAMIC_PINS: &[(&str, &str)] = &[
         "cc7e58da54ad0e016cb4c827cc071ebb656e9408584b1deddfbb6ffd8e56361a",
     ),
     (
+        "usr/bin/xz",
+        "4182bfda9f5658a1dba84788983df3c8a5dc80df971a8d1de7126523c95b4e6f",
+    ),
+    (
         "usr/bin/yes",
         "5c36362472df1383922c0d8cc466c495b370841d4be77c4c78d4764bdea72326",
     ),
@@ -806,6 +811,10 @@ pub(crate) const DYNAMIC_PINS: &[(&str, &str)] = &[
     (
         "usr/lib/libgmp.so.10",
         "69be619014fdf981ed7d0e1148a9c2082f42531ec8736f543b3c8928e11133cf",
+    ),
+    (
+        "usr/lib/liblzma.so.5",
+        "229f1b4044fb1c6a4ef9a1f95748d096536d5c3c7808a0266960c1fac0302d38",
     ),
     (
         "usr/lib/libm.so.6",
