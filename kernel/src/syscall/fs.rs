@@ -41,6 +41,7 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         Sysno::open => open(ctx, AT_FDCWD, a[0], a[1], a[2]),
         Sysno::openat => open(ctx, dfd(a[0]), a[1], a[2], a[3]),
         Sysno::mknod => mknod(ctx, AT_FDCWD, a[0], a[1], a[2]),
+        Sysno::mknodat => mknod(ctx, dfd(a[0]), a[1], a[2], a[3]),
         Sysno::access => faccessat(ctx, AT_FDCWD, a[0], a[1], 0),
         Sysno::faccessat => faccessat(ctx, dfd(a[0]), a[1], a[2], 0),
         Sysno::faccessat2 => faccessat(ctx, dfd(a[0]), a[1], a[2], a[3]),
@@ -54,7 +55,9 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         Sysno::newfstatat => newfstatat(ctx, dfd(a[0]), a[1], a[2], a[3]),
         Sysno::fstat => fstat(ctx, a[0], a[1]),
         Sysno::statx => statx(ctx, dfd(a[0]), a[1], a[2], a[3], a[4]),
-        Sysno::unlink => unlink(ctx, a[0]),
+        Sysno::statfs => statfs(ctx, a[0], a[1]),
+        Sysno::fstatfs => fstatfs(ctx, a[0], a[1]),
+        Sysno::unlink => unlink(ctx, AT_FDCWD, a[0]),
         _ => return None,
     };
     Some(outcome(sysno as u32, result))
@@ -120,6 +123,10 @@ pub(super) fn env_for<C: Context>(ctx: &mut C, dfd: i32, path: &[u8]) -> Result<
         #[allow(clippy::cast_sign_loss)]
         let id = files.fdt.get(dfd as u32).ok_or(Errno::EBADF)?;
         match files.vfs.files.get(id).inode {
+            // `path_init`: `*s && !d_can_lookup(dentry)` is ENOTDIR before any walk.
+            Some(inode) if !path.is_empty() && !files.vfs.fs.inode(inode).is_dir() => {
+                return Err(Errno::ENOTDIR);
+            }
             Some(inode) => inode,
             None if path.is_empty() => fs.pwd,
             None => return Err(Errno::ENOTDIR),
@@ -178,9 +185,10 @@ fn mknod<C: Context>(ctx: &mut C, dfd: i32, path: u64, mode: u64, dev: u64) -> S
     Ok(0)
 }
 
-fn unlink<C: Context>(ctx: &mut C, path: u64) -> Sys {
+/// `do_unlinkat` after the flag check: `unlink` (`AT_FDCWD`) and `unlinkat`.
+pub(super) fn unlink<C: Context>(ctx: &mut C, dfd: i32, path: u64) -> Sys {
     let name = getname(ctx, path, false)?;
-    let env = env_for(ctx, AT_FDCWD, &name)?;
+    let env = env_for(ctx, dfd, &name)?;
     ctx.files().vfs.unlink(&env, &name)?;
     Ok(0)
 }
@@ -432,5 +440,80 @@ fn statx<C: Context>(ctx: &mut C, dfd: i32, path: u64, flags: u64, mask: u64, bu
         vfs_statx(ctx, dfd, name.as_deref().unwrap_or(&[]), flags)?
     };
     put_statx(ctx, buf, &st, mask)?;
+    Ok(0)
+}
+
+// ---- statfs ----------------------------------------------------------------------------
+
+/// `TMPFS_MAGIC` (include/uapi/linux/magic.h): the type of tmpfs and of the rootfs.
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+/// `PIPEFS_MAGIC`: the file system of pipe descriptors.
+const PIPEFS_MAGIC: u64 = 0x5049_5045;
+/// `ST_VALID`: the only flag of the rootfs mount (`calculate_f_flags`: no mount flags,
+/// no `SB_SYNCHRONOUS`/`SB_MANDLOCK`).
+const ST_VALID: u64 = 0x20;
+
+/// `do_statfs_native`: the 120-byte x86-64 `struct statfs` of the rootfs
+/// (`shmem_statfs`, `vfs_statfs`).
+fn put_statfs<C: Context>(ctx: &mut C, addr: u64, pipefs: bool) -> Result<(), Errno> {
+    // pipefs answers with `simple_statfs`: the magic, the block size and name length only.
+    let st = if pipefs {
+        crate::vfs::tmpfs::Statfs {
+            blocks: 0,
+            bfree: 0,
+            files: 0,
+            ffree: 0,
+        }
+    } else {
+        ctx.files().vfs.fs.statfs()
+    };
+    let words: [u64; 15] = [
+        if pipefs { PIPEFS_MAGIC } else { TMPFS_MAGIC },
+        crate::vfs::PAGE_SIZE as u64,
+        st.blocks,
+        st.bfree,
+        st.bfree,
+        st.files,
+        st.ffree,
+        // f_fsid: `uuid_to_fsid(sb->s_uuid)`; Linux draws the uuid at mount time, this
+        // kernel has no entropy pool at that point, so the id is 0.
+        0,
+        crate::vfs::NAME_MAX as u64,
+        // f_frsize (`vfs_statfs`/`statfs_by_dentry` default it to f_bsize) and f_flags.
+        crate::vfs::PAGE_SIZE as u64,
+        ST_VALID,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let mut out = [0u8; 120];
+    for (chunk, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    if copy_to_user(ctx, addr, &out) != 0 {
+        return Err(Errno::EFAULT);
+    }
+    Ok(())
+}
+
+/// `SYSCALL_DEFINE2(statfs)`: `user_statfs` follows symlinks.
+fn statfs<C: Context>(ctx: &mut C, path: u64, buf: u64) -> Sys {
+    let name = getname(ctx, path, false)?;
+    let env = env_for(ctx, AT_FDCWD, &name)?;
+    ctx.files().vfs.lookup(&env, &name, LOOKUP_FOLLOW)?;
+    put_statfs(ctx, buf, false)?;
+    Ok(0)
+}
+
+/// `SYSCALL_DEFINE2(fstatfs)`: `fd_statfs` takes `O_PATH` descriptors too.
+fn fstatfs<C: Context>(ctx: &mut C, fd: u64, buf: u64) -> Sys {
+    #[allow(clippy::cast_possible_truncation)]
+    let id = ctx.files().fdt.get(fd as u32).ok_or(Errno::EBADF)?;
+    let pipefs = matches!(
+        ctx.files().vfs.files.get(id).kind,
+        crate::vfs::file::FileKind::Pipe { .. }
+    );
+    put_statfs(ctx, buf, pipefs)?;
     Ok(0)
 }

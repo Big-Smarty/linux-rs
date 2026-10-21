@@ -48,6 +48,24 @@ pub struct Env {
     pub umask: u32,
 }
 
+/// `UTIME_NOW` / `UTIME_OMIT` (include/linux/stat.h): the special `tv_nsec` values of `utimensat`.
+pub const UTIME_NOW: i64 = (1 << 30) - 1;
+pub const UTIME_OMIT: i64 = (1 << 30) - 2;
+
+/// `renameat2` flags (include/uapi/linux/fcntl.h).
+pub const RENAME_NOREPLACE: u32 = 1;
+pub const RENAME_EXCHANGE: u32 = 2;
+pub const RENAME_WHITEOUT: u32 = 4;
+
+/// What [`Vfs::rename`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Renamed {
+    Done,
+    /// Every check passed, but `RENAME_EXCHANGE`/`RENAME_WHITEOUT` is not
+    /// ported: the caller stops loudly.
+    Unsupported,
+}
+
 /// `struct open_flags` after `build_open_flags`.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenFlags {
@@ -456,9 +474,28 @@ impl Vfs {
     /// `ENOENT` (also for an unlinked source), `EEXIST`, `EPERM` (directory),
     /// `EACCES`, `ENOSPC`, `ENOMEM` and path errors.
     pub fn link(&mut self, env: &Env, old: &[u8], old_flags: u32, new: &[u8]) -> KResult<()> {
-        let source = self.lookup(env, old, old_flags)?;
-        let (dir, name) = self.prepare_create(env, new, false)?;
-        self.may_create(env, dir)?;
+        self.link_at(env, old, old_flags, env, new)
+    }
+
+    /// `do_linkat` after the names were read: `old` is resolved in `old_env`
+    /// by `old_flags`, `new` is created in `new_env`'s view (`filename_lookup`,
+    /// then `filename_create`, then `vfs_link`).
+    ///
+    /// # Errors
+    /// As [`Vfs::link`].
+    pub fn link_at(
+        &mut self,
+        old_env: &Env,
+        old: &[u8],
+        old_flags: u32,
+        new_env: &Env,
+        new: &[u8],
+    ) -> KResult<()> {
+        let source = self.lookup(old_env, old, old_flags)?;
+        let (dir, name) = self.prepare_create(new_env, new, false)?;
+        // vfs_link: may_create; (same superblock); IS_APPEND/IMMUTABLE;
+        // a directory (`!dir->i_op->link` is false, `S_ISDIR` is EPERM).
+        self.may_create(new_env, dir)?;
         let inode = self.fs.inode(source);
         if inode.is_dir() {
             return Err(Errno::EPERM);
@@ -467,6 +504,143 @@ impl Vfs {
             return Err(Errno::ENOENT);
         }
         self.fs.link(source, dir, &name)
+    }
+
+    /// `common_perm`-free `do_renameat2` after the pathnames were read, for
+    /// `flags` without `RENAME_EXCHANGE`/`RENAME_WHITEOUT` working yet.
+    ///
+    /// The order is Linux's: flag validity, the walks to both parents,
+    /// `EBUSY`/`EEXIST` for `.`/`..`/`/` final components, the lookups of the
+    /// source (`ENOENT`) and the target (`EEXIST` with `RENAME_NOREPLACE`),
+    /// the trailing-slash `ENOTDIR`s, `EINVAL`/`ENOTEMPTY` for a source or
+    /// target that is the common ancestor chain, then `vfs_rename`'s own checks.
+    ///
+    /// # Errors
+    /// The `rename(2)` errors.
+    pub fn rename(
+        &mut self,
+        old: KResult<(Env, Vec<u8>)>,
+        new: KResult<(Env, Vec<u8>)>,
+        flags: u32,
+    ) -> KResult<Renamed> {
+        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0 && flags & RENAME_EXCHANGE != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let exchange = flags & RENAME_EXCHANGE != 0;
+        // `filename_parentat` for the old name, then for the new one: an error
+        // of resolving the second (a bad directory descriptor, a name that
+        // could not be read) is only seen after the first walk succeeded.
+        let (old_env, old) = old?;
+        let from = path::parent_of(&self.fs, &old_env, &old)?;
+        let (new_env, new) = new?;
+        let to = path::parent_of(&self.fs, &new_env, &new)?;
+        let (old_env, new_env) = (&old_env, &new_env);
+        if from.kind != LastKind::Norm {
+            return Err(Errno::EBUSY);
+        }
+        if to.kind != LastKind::Norm {
+            return Err(if flags & RENAME_NOREPLACE != 0 {
+                Errno::EEXIST
+            } else {
+                Errno::EBUSY
+            });
+        }
+        // lock_rename: the child of one parent that is an ancestor of the other.
+        let trap = if from.dir == to.dir {
+            None
+        } else {
+            self.d_ancestor(from.dir, to.dir)
+                .or_else(|| self.d_ancestor(to.dir, from.dir))
+        };
+        // lookup_one_qstr_excl for the source (must exist) ...
+        let source = self
+            .rename_lookup(from.dir, &from.name, false, false)?
+            .ok_or(Errno::ENOENT)?;
+        // ... and for the target (LOOKUP_CREATE unless exchanging; LOOKUP_EXCL for NOREPLACE).
+        let target =
+            self.rename_lookup(to.dir, &to.name, !exchange, flags & RENAME_NOREPLACE != 0)?;
+        if exchange && !target.is_some_and(|t| self.fs.inode(t).is_dir()) && to.trailing_slash {
+            return Err(Errno::ENOTDIR);
+        }
+        let is_dir = self.fs.inode(source).is_dir();
+        if !is_dir && (from.trailing_slash || (!exchange && to.trailing_slash)) {
+            return Err(Errno::ENOTDIR);
+        }
+        if trap == Some(source) {
+            return Err(Errno::EINVAL);
+        }
+        if target.is_some() && trap == target {
+            return Err(if exchange {
+                Errno::EINVAL
+            } else {
+                Errno::ENOTEMPTY
+            });
+        }
+        // vfs_rename
+        if target == Some(source) {
+            return Ok(Renamed::Done);
+        }
+        self.may_delete(old_env, from.dir, source, is_dir)?;
+        match target {
+            None => self.may_create(new_env, to.dir)?,
+            Some(t) => {
+                let t_is_dir = self.fs.inode(t).is_dir();
+                self.may_delete(new_env, to.dir, t, if exchange { t_is_dir } else { is_dir })?;
+            }
+        }
+        if to.dir != from.dir {
+            if is_dir {
+                permission(self.fs.inode(source), &old_env.cred, MAY_WRITE)?;
+            }
+            if let Some(t) = target
+                && exchange
+                && self.fs.inode(t).is_dir()
+            {
+                permission(self.fs.inode(t), &old_env.cred, MAY_WRITE)?;
+            }
+        }
+        if flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+            return Ok(Renamed::Unsupported);
+        }
+        self.fs.rename(from.dir, &from.name, to.dir, &to.name)?;
+        Ok(Renamed::Done)
+    }
+
+    /// `d_ancestor(p1, p2)`: the child of `p1` on the way from `p2` to the
+    /// root (`p2` itself when it is a child of `p1`), or `None`.
+    fn d_ancestor(&self, p1: InodeId, p2: InodeId) -> Option<InodeId> {
+        let mut p = p2;
+        while p != self.fs.root() {
+            let parent = self.fs.parent(p);
+            if parent == p1 {
+                return Some(p);
+            }
+            p = parent;
+        }
+        None
+    }
+
+    /// `lookup_one_qstr_excl` for `rename`: the entry, or `None` for a missing
+    /// one that `create` allows. A dead directory has no dentries (`ENOENT`),
+    /// a name beyond `NAME_MAX` fails in `simple_lookup`.
+    fn rename_lookup(
+        &self,
+        dir: InodeId,
+        name: &[u8],
+        create: bool,
+        excl: bool,
+    ) -> KResult<Option<InodeId>> {
+        match self.fs.lookup(dir, name) {
+            Some(_) if excl => Err(Errno::EEXIST),
+            Some(found) => Ok(Some(found)),
+            None if self.fs.is_dead(dir) => Err(Errno::ENOENT),
+            None if name.len() > NAME_MAX => Err(Errno::ENAMETOOLONG),
+            None if create => Ok(None),
+            None => Err(Errno::ENOENT),
+        }
     }
 
     // ---- removal -------------------------------------------------------------
@@ -525,11 +699,15 @@ impl Vfs {
 
     // ---- attribute changes ---------------------------------------------------
 
-    /// `chmod_common`.
+    /// `chmod_common` -> `notify_change(ATTR_MODE | ATTR_CTIME)`.
     ///
     /// # Errors
-    /// `EPERM` unless the caller owns the file or has `CAP_FOWNER`.
+    /// `EOPNOTSUPP` for a symbolic link (`notify_change`), `EPERM` unless the
+    /// caller owns the file or has `CAP_FOWNER` (`setattr_prepare`).
     pub fn chmod(&mut self, env: &Env, inode: InodeId, mode: u32) -> KResult<()> {
+        if self.fs.inode(inode).is_symlink() {
+            return Err(Errno::EOPNOTSUPP);
+        }
         if self.fs.inode(inode).uid != env.cred.fsuid && !env.cred.fowner {
             return Err(Errno::EPERM);
         }
@@ -537,17 +715,27 @@ impl Vfs {
         Ok(())
     }
 
-    /// `chown_common` (`u32::MAX` leaves an id unchanged).
+    /// `chown_common` (`u32::MAX` leaves an id unchanged) ->
+    /// `notify_change(ATTR_CTIME | ATTR_UID | ATTR_GID | ATTR_KILL_SUID |
+    /// ATTR_KILL_SGID)`: a non-directory loses `S_ISUID` and, by
+    /// `setattr_should_drop_sgid`, `S_ISGID`.
     ///
     /// # Errors
-    /// `EPERM` without `CAP_CHOWN` for any real change.
+    /// `EPERM` (`chown_ok`, `chgrp_ok`): the owner may only "change" the owner to
+    /// itself and the group to one it belongs to; anything else needs `CAP_CHOWN`.
     pub fn chown(&mut self, env: &Env, inode: InodeId, uid: u32, gid: u32) -> KResult<()> {
         let cur = self.fs.inode(inode);
-        let changes = (uid != u32::MAX && uid != cur.uid) || (gid != u32::MAX && gid != cur.gid);
-        if changes && !env.cred.chown {
+        let owner = cur.uid == env.cred.fsuid;
+        if uid != u32::MAX && !(owner && uid == cur.uid || env.cred.chown) {
             return Err(Errno::EPERM);
         }
-        self.fs.set_owner(inode, uid, gid);
+        // `vfsgid_in_group_p`: the file system group id (no supplementary groups yet).
+        if gid != u32::MAX
+            && !(owner && (gid == cur.gid || gid == env.cred.fsgid) || env.cred.chown)
+        {
+            return Err(Errno::EPERM);
+        }
+        self.fs.set_owner(inode, uid, gid, &env.cred);
         Ok(())
     }
 
@@ -556,11 +744,85 @@ impl Vfs {
         self.fs.set_times(inode, atime, mtime);
     }
 
+    /// `vfs_utimes` for `utimensat`/`futimens`/`utimes`/`utime`: `times` are the two
+    /// `(tv_sec, tv_nsec)` pairs (`None` for the current time). `UTIME_OMIT`
+    /// leaves a time alone, `UTIME_NOW` takes the current time.
+    ///
+    /// # Errors
+    /// `EINVAL` (`tv_nsec` out of range), `EPERM` (explicit times by a caller that
+    /// neither owns the file nor has `CAP_FOWNER`; the same when only one of the
+    /// two is `UTIME_NOW`), `EACCES` (current time by a caller without ownership
+    /// or write permission).
+    pub fn utimens(
+        &mut self,
+        env: &Env,
+        inode: InodeId,
+        times: Option<[(i64, i64); 2]>,
+    ) -> KResult<()> {
+        let valid = |nsec: i64| {
+            nsec == UTIME_OMIT || nsec == UTIME_NOW || (0..=999_999_999).contains(&nsec)
+        };
+        let mut times = times;
+        if let Some([a, m]) = times {
+            if !valid(a.1) || !valid(m.1) {
+                return Err(Errno::EINVAL);
+            }
+            if a.1 == UTIME_NOW && m.1 == UTIME_NOW {
+                times = None;
+            }
+        }
+        let owner_or_capable = {
+            let node = self.fs.inode(inode);
+            node.uid == env.cred.fsuid || env.cred.fowner
+        };
+        match times {
+            // ATTR_TOUCH (`may_setattr`): the owner, else write permission.
+            None => {
+                if !owner_or_capable {
+                    permission(self.fs.inode(inode), &env.cred, MAY_WRITE)?;
+                }
+                let now = self.fs.now();
+                self.fs.set_times(inode, now, now);
+            }
+            // ATTR_TIMES_SET (`setattr_prepare`): the owner or CAP_FOWNER.
+            Some([atime, mtime]) => {
+                if !owner_or_capable {
+                    return Err(Errno::EPERM);
+                }
+                let now = self.fs.now();
+                let at = |(sec, nsec): (i64, i64), current: Timespec| match nsec {
+                    UTIME_OMIT => current,
+                    UTIME_NOW => now,
+                    _ => Timespec {
+                        sec,
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        nsec: nsec as u32,
+                    },
+                };
+                let node = self.fs.inode(inode);
+                let (a, m) = (at(atime, node.atime), at(mtime, node.mtime));
+                self.fs.set_times(inode, a, m);
+            }
+        }
+        Ok(())
+    }
+
     /// `vfs_truncate`.
     ///
     /// # Errors
     /// `EISDIR`, `EINVAL`, `EACCES`.
     pub fn truncate(&mut self, env: &Env, inode: InodeId, length: u64) -> KResult<()> {
+        self.truncate_check(env, inode)?;
+        self.do_truncate(&env.cred, inode, length);
+        Ok(())
+    }
+
+    /// The checks of `vfs_truncate` before `do_truncate`: the type and the
+    /// write permission.
+    ///
+    /// # Errors
+    /// `EISDIR`, `EINVAL`, `EACCES`.
+    pub fn truncate_check(&self, env: &Env, inode: InodeId) -> KResult<()> {
         let node = self.fs.inode(inode);
         if node.is_dir() {
             return Err(Errno::EISDIR);
@@ -568,9 +830,7 @@ impl Vfs {
         if !node.is_reg() {
             return Err(Errno::EINVAL);
         }
-        permission(node, &env.cred, MAY_WRITE)?;
-        self.do_truncate(&env.cred, inode, length);
-        Ok(())
+        permission(node, &env.cred, MAY_WRITE)
     }
 
     /// `do_truncate` after `inode_newsize_ok`: `dentry_needs_remove_privs`

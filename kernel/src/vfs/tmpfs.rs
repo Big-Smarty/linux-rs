@@ -66,7 +66,7 @@ pub struct Child {
 }
 
 pub struct Dir {
-    /// Creation order, oldest first.
+    /// Creation order, oldest first (a renamed entry counts as created by the rename).
     pub children: Vec<Child>,
     pub parent: InodeId,
     /// `octx->next_offset`.
@@ -74,6 +74,37 @@ pub struct Dir {
     /// `IS_DEADDIR` (`S_DEAD`, set by `vfs_rmdir`): the directory was removed
     /// but is still pinned by a working directory or an open file.
     dead: bool,
+}
+
+impl Dir {
+    /// `simple_offset_add`'s `mtree_alloc_cyclic` over
+    /// `[DIR_OFFSET_MIN, DIR_OFFSET_MAX]`: the next free offset after the last
+    /// one handed out, wrapping.
+    ///
+    /// # Errors
+    /// `ENOSPC` when every offset is in use.
+    fn alloc_offset(&mut self) -> KResult<u32> {
+        let used = |offset: u32, children: &[Child]| children.iter().any(|c| c.offset == offset);
+        let mut offset = self.next_offset;
+        let mut tries = 0usize;
+        while used(offset, &self.children) || !(DIR_OFFSET_MIN..=DIR_OFFSET_MAX).contains(&offset) {
+            offset = if offset >= DIR_OFFSET_MAX {
+                DIR_OFFSET_MIN
+            } else {
+                offset + 1
+            };
+            tries += 1;
+            if tries > self.children.len() + 1 {
+                return Err(Errno::ENOSPC);
+            }
+        }
+        self.next_offset = if offset >= DIR_OFFSET_MAX {
+            DIR_OFFSET_MIN
+        } else {
+            offset + 1
+        };
+        Ok(offset)
+    }
 }
 
 /// A present page of a regular file.
@@ -156,6 +187,15 @@ pub struct Tmpfs {
     clock: fn() -> Timespec,
     /// `sb->s_dev`: an anonymous device (major 0).
     pub dev: u32,
+}
+
+/// What `shmem_statfs` reports besides the constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Statfs {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub files: u64,
+    pub ffree: u64,
 }
 
 /// The callback of [`Tmpfs::readdir`]: `(name, pos, ino, d_type)`, false when full.
@@ -402,26 +442,7 @@ impl Tmpfs {
             return Err(Errno::ENOTDIR);
         };
         d.children.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
-        // mtree_alloc_cyclic over [DIR_OFFSET_MIN, DIR_OFFSET_MAX]
-        let used = |offset: u32, children: &[Child]| children.iter().any(|c| c.offset == offset);
-        let mut offset = d.next_offset;
-        let mut tries = 0usize;
-        while used(offset, &d.children) || !(DIR_OFFSET_MIN..=DIR_OFFSET_MAX).contains(&offset) {
-            offset = if offset >= DIR_OFFSET_MAX {
-                DIR_OFFSET_MIN
-            } else {
-                offset + 1
-            };
-            tries += 1;
-            if tries > d.children.len() + 1 {
-                return Err(Errno::ENOSPC);
-            }
-        }
-        d.next_offset = if offset >= DIR_OFFSET_MAX {
-            DIR_OFFSET_MIN
-        } else {
-            offset + 1
-        };
+        let offset = d.alloc_offset()?;
         if d.children
             .push_within_capacity(Child {
                 name,
@@ -605,6 +626,124 @@ impl Tmpfs {
         Ok(())
     }
 
+    /// `shmem_rename2` for a plain rename (no `RENAME_EXCHANGE`/`RENAME_WHITEOUT`;
+    /// `RENAME_NOREPLACE` was decided by the lookup): move the entry `old_name` of
+    /// `old_dir` to `new_name` of `new_dir`, replacing the entry already there.
+    /// The moved entry keeps the directory offset of the entry it replaces
+    /// (`simple_offset_rename`: user space expects it unchanged), else takes a
+    /// fresh offset of `new_dir`; it becomes the newest entry of `new_dir`
+    /// (`d_move`). A replaced inode loses a link (`shmem_unlink`); a replaced
+    /// directory is marked dead (`vfs_rename`: `S_DEAD`). All allocations are
+    /// made before anything changes.
+    ///
+    /// # Errors
+    /// `ENOENT` (no such source), `ENOTEMPTY` (a non-empty target directory),
+    /// `ENOSPC`, `ENOMEM`.
+    pub fn rename(
+        &mut self,
+        old_dir: InodeId,
+        old_name: &[u8],
+        new_dir: InodeId,
+        new_name: &[u8],
+    ) -> KResult<()> {
+        let find = |fs: &Self, dir: InodeId, name: &[u8]| {
+            fs.inode(dir)
+                .dir()
+                .and_then(|d| d.children.iter().position(|c| c.name == name))
+        };
+        let src_at = find(self, old_dir, old_name).ok_or(Errno::ENOENT)?;
+        let src = self.inode(old_dir).dir().ok_or(Errno::ENOTDIR)?.children[src_at].inode;
+        let they_are_dirs = self.inode(src).is_dir();
+        let target = find(self, new_dir, new_name).map(|at| {
+            let child = &self.inode(new_dir).dir().map_or(&[][..], |d| &d.children)[at];
+            (child.inode, child.offset)
+        });
+        // simple_empty(new_dentry)
+        if let Some((victim, _)) = target
+            && self
+                .inode(victim)
+                .dir()
+                .is_some_and(|d| !d.children.is_empty())
+        {
+            return Err(Errno::ENOTEMPTY);
+        }
+        // Everything that can fail: the name, the room, the offset.
+        let name = try_copy(new_name)?;
+        let Body::Dir(nd) = &mut self.inode_mut(new_dir).body else {
+            return Err(Errno::ENOTDIR);
+        };
+        nd.children.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        let offset = match target {
+            Some((_, offset)) => offset,
+            None => nd.alloc_offset()?,
+        };
+        // From here on nothing fails.
+        let now = self.now();
+        if let Body::Dir(od) = &mut self.inode_mut(old_dir).body {
+            od.children.remove(src_at);
+        }
+        if let Some((victim, _)) = target {
+            // shmem_unlink(new_dir, new_dentry)
+            let victim_is_dir = self.inode(victim).is_dir();
+            if self.inode(victim).nlink > 1 && !victim_is_dir {
+                self.nr_inodes -= 1;
+            }
+            let at = find(self, new_dir, new_name).unwrap_or(0);
+            let nd = self.inode_mut(new_dir);
+            if let Body::Dir(d) = &mut nd.body {
+                d.children.remove(at);
+            }
+            nd.size -= BOGO_DIRENT_SIZE;
+            nd.mtime = now;
+            nd.ctime = now;
+            let gone = self.inode_mut(victim);
+            gone.nlink -= 1;
+            gone.ctime = now;
+            if they_are_dirs {
+                gone.nlink -= 1;
+                if let Body::Dir(d) = &mut gone.body {
+                    d.dead = true;
+                }
+                self.inode_mut(old_dir).nlink -= 1;
+            }
+        } else if they_are_dirs {
+            self.inode_mut(old_dir).nlink -= 1;
+            self.inode_mut(new_dir).nlink += 1;
+        }
+        let od = self.inode_mut(old_dir);
+        od.size -= BOGO_DIRENT_SIZE;
+        od.mtime = now;
+        od.ctime = now;
+        let nd = self.inode_mut(new_dir);
+        nd.size += BOGO_DIRENT_SIZE;
+        nd.mtime = now;
+        nd.ctime = now;
+        if let Body::Dir(d) = &mut nd.body {
+            // Room was reserved above and the replaced entry only freed some.
+            let _ = d.children.push_within_capacity(Child {
+                name,
+                inode: src,
+                offset,
+            });
+        }
+        self.inode_mut(src).ctime = now;
+        if they_are_dirs && old_dir != new_dir {
+            // The dentry's reference on its parent moves with it.
+            if let Body::Dir(d) = &mut self.inode_mut(src).body {
+                d.parent = new_dir;
+            }
+            self.iget(new_dir);
+            self.iput(old_dir);
+        }
+        if let Some((victim, _)) = target
+            && self.inode(victim).nlink == 0
+            && self.inode(victim).refs == 0
+        {
+            self.evict(victim);
+        }
+        Ok(())
+    }
+
     // ---- attributes --------------------------------------------------------
 
     /// `chmod_common`'s `ia_mode` plus `setattr_copy`: the permission, set-id
@@ -621,20 +760,35 @@ impl Tmpfs {
         inode.ctime = now;
     }
 
-    /// `chown_common`: `u32::MAX` leaves the id alone; a regular file loses its
-    /// set-id bits.
-    pub fn set_owner(&mut self, id: InodeId, uid: u32, gid: u32) {
+    /// `chown_common`'s `notify_change`: `u32::MAX` leaves the id alone. A
+    /// non-directory loses `S_ISUID` (`ATTR_KILL_SUID`) and `S_ISGID` when
+    /// `setattr_should_drop_sgid` says so (group-execute set, or the caller is
+    /// neither in the file's group nor has `CAP_FSETID`), judged before the
+    /// change; `setattr_copy` then drops `S_ISGID` of a changed mode again unless
+    /// the caller is in the file's new group or has `CAP_FSETID`.
+    pub fn set_owner(&mut self, id: InodeId, uid: u32, gid: u32, cred: &Cred) {
         let now = self.now();
         let inode = self.inode_mut(id);
+        let in_group_or_capable = |inode: &Inode| cred.fsgid == inode.gid || cred.fsetid;
+        let is_dir = inode.mode & S_IFMT == S_IFDIR;
+        let kill_user_id = !is_dir && inode.mode & S_ISUID != 0;
+        let kill_group_id = !is_dir
+            && inode.mode & S_ISGID != 0
+            && (inode.mode & S_IXGRP != 0 || !in_group_or_capable(inode));
         if uid != u32::MAX {
             inode.uid = uid;
         }
         if gid != u32::MAX {
             inode.gid = gid;
         }
-        if inode.mode & S_IFMT != S_IFDIR {
-            inode.mode &= !S_ISUID;
-            if inode.mode & S_IXGRP != 0 {
+        if kill_user_id || kill_group_id {
+            if kill_user_id {
+                inode.mode &= !S_ISUID;
+            }
+            if kill_group_id {
+                inode.mode &= !S_ISGID;
+            }
+            if !in_group_or_capable(inode) {
                 inode.mode &= !S_ISGID;
             }
         }
@@ -839,6 +993,31 @@ impl Tmpfs {
         inode.size = size;
         inode.mtime = now;
         inode.ctime = now;
+    }
+
+    /// `shmem_statfs`: the block and inode counts (`f_blocks`, `f_bfree` = `f_bavail`,
+    /// `f_files`, `f_ffree`; all zero for an unlimited size or inode count).
+    #[must_use]
+    pub fn statfs(&self) -> Statfs {
+        let (blocks, bfree) = if self.max_blocks != 0 {
+            (self.max_blocks, self.max_blocks - self.used_blocks)
+        } else {
+            (0, 0)
+        };
+        let (files, ffree) = if self.max_inodes != 0 {
+            (
+                self.max_inodes,
+                self.max_inodes.saturating_sub(self.nr_inodes),
+            )
+        } else {
+            (0, 0)
+        };
+        Statfs {
+            blocks,
+            bfree,
+            files,
+            ffree,
+        }
     }
 
     /// `mapping_seek_hole_data` over the present pages (`SEEK_DATA` /

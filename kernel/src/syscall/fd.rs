@@ -75,6 +75,9 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         Sysno::pwrite64 => pwrite64(ctx, a[0], a[1], a[2], a[3]),
         Sysno::readv => readv(ctx, a[0], a[1], a[2]),
         Sysno::preadv => preadv(ctx, a[0], a[1], a[2], a[3]),
+        Sysno::writev => writev(ctx, a[0], a[1], a[2]),
+        Sysno::sendfile => sendfile(ctx, a[0], a[1], a[2], a[3]),
+        Sysno::pwritev => pwritev(ctx, a[0], a[1], a[2], a[3]),
         Sysno::ioctl => ioctl(ctx, a[0], a[1], a[2]),
         // `SYSCALL_DEFINE1(pipe, ...)`: `do_pipe2(fildes, 0)`.
         Sysno::pipe => pipe2(ctx, a[0], 0),
@@ -174,8 +177,110 @@ impl Dest {
     }
 }
 
-/// `import_iovec` for `ITER_DEST`: the segments of `vlen` iovecs at `vec`.
-fn import_iovec<C: Context>(ctx: &mut C, vec: u64, vlen: u64) -> Result<Dest, Errno> {
+/// `iov_iter` for a write (`ITER_SOURCE`): sequential user segments read with the
+/// one fault-aware user copy, or (`ITER_BVEC` over a pipe's pages in `splice`)
+/// bytes the kernel already holds.
+pub(super) struct Src {
+    data: SrcData,
+    seg: usize,
+    used: u64,
+    pub(super) remaining: u64,
+}
+
+enum SrcData {
+    User(Vec<(u64, u64)>),
+    Kernel(Vec<u8>),
+}
+
+impl Src {
+    fn one(base: u64, len: u64) -> Result<Self, Errno> {
+        let mut segs = Vec::new();
+        try_push(&mut segs, (base, len))?;
+        Ok(Self {
+            data: SrcData::User(segs),
+            seg: 0,
+            used: 0,
+            remaining: len,
+        })
+    }
+
+    /// An iterator over bytes held in the kernel.
+    fn kernel(bytes: Vec<u8>) -> Self {
+        let remaining = bytes.len() as u64;
+        Self {
+            data: SrcData::Kernel(bytes),
+            seg: 0,
+            used: 0,
+            remaining,
+        }
+    }
+
+    /// `copy_from_iter`: fill `out` from the next bytes; returns the bytes
+    /// copied (short on a fault). The cursor advances by what was copied.
+    pub(super) fn copy_in<C: Context>(&mut self, ctx: &mut C, out: &mut [u8]) -> usize {
+        let segs = match &self.data {
+            SrcData::Kernel(bytes) => {
+                let from = self.used as usize;
+                let n = out.len().min(bytes.len() - from);
+                out[..n].copy_from_slice(&bytes[from..from + n]);
+                self.used += n as u64;
+                self.remaining -= n as u64;
+                return n;
+            }
+            SrcData::User(segs) => segs,
+        };
+        let mut done = 0;
+        while done < out.len() && self.seg < segs.len() {
+            let (base, len) = segs[self.seg];
+            let room = (len - self.used) as usize;
+            if room == 0 {
+                self.seg += 1;
+                self.used = 0;
+                continue;
+            }
+            let n = room.min(out.len() - done);
+            let missing = copy_from_user(ctx, &mut out[done..done + n], base + self.used);
+            let copied = n - missing;
+            done += copied;
+            self.used += copied as u64;
+            self.remaining -= copied as u64;
+            if missing != 0 {
+                break;
+            }
+        }
+        done
+    }
+
+    /// `iov_iter_revert`: give `n` consumed bytes back (`n` never exceeds what
+    /// was consumed since the cursor was last at that point).
+    pub(super) fn revert(&mut self, mut n: u64) {
+        self.remaining += n;
+        let SrcData::User(segs) = &self.data else {
+            self.used -= n;
+            return;
+        };
+        while n > 0 {
+            if self.used == 0 {
+                if self.seg == 0 {
+                    return;
+                }
+                self.seg -= 1;
+                self.used = segs[self.seg].1;
+            }
+            let back = n.min(self.used);
+            self.used -= back;
+            n -= back;
+        }
+    }
+}
+
+/// `__import_iovec`: the segments of `vlen` iovecs at `vec`, each range
+/// checked with `access_ok`, and the total clamped to `MAX_RW_COUNT`.
+fn import_segs<C: Context>(
+    ctx: &mut C,
+    vec: u64,
+    vlen: u64,
+) -> Result<(Vec<(u64, u64)>, u64), Errno> {
     if vlen > UIO_MAXIOV {
         return Err(Errno::EINVAL);
     }
@@ -206,11 +311,28 @@ fn import_iovec<C: Context>(ctx: &mut C, vec: u64, vlen: u64) -> Result<Dest, Er
         try_push(&mut segs, (base, len.max(0) as u64))?;
     }
     #[allow(clippy::cast_sign_loss)]
+    Ok((segs, total.max(0) as u64))
+}
+
+/// `import_iovec` for `ITER_DEST`.
+fn import_iovec<C: Context>(ctx: &mut C, vec: u64, vlen: u64) -> Result<Dest, Errno> {
+    let (segs, remaining) = import_segs(ctx, vec, vlen)?;
     Ok(Dest {
         segs,
         seg: 0,
         used: 0,
-        remaining: total.max(0) as u64,
+        remaining,
+    })
+}
+
+/// `import_iovec` for `ITER_SOURCE`.
+fn import_iovec_src<C: Context>(ctx: &mut C, vec: u64, vlen: u64) -> Result<Src, Errno> {
+    let (segs, remaining) = import_segs(ctx, vec, vlen)?;
+    Ok(Src {
+        data: SrcData::User(segs),
+        seg: 0,
+        used: 0,
+        remaining,
     })
 }
 
@@ -499,20 +621,74 @@ fn vfs_write<C: Context>(
         verify_area(*p, count)?;
     }
     let count = count.min(u64::from(MAX_RW_COUNT));
+    let mut src = Src::one(buf, count)?;
+    write_kind(ctx, view, &mut src, pos)
+}
+
+/// `do_writev`'s `vfs_writev` for the position `pos` (`None` for a stream).
+fn vfs_writev<C: Context>(
+    ctx: &mut C,
+    view: &View,
+    vec: u64,
+    vlen: u64,
+    pos: Option<&mut i64>,
+) -> Sys {
+    if view.mode & FMODE_WRITE == 0 {
+        return Err(Errno::EBADF.into());
+    }
+    if view.mode & FMODE_CAN_WRITE == 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    let mut src = import_iovec_src(ctx, vec, vlen)?;
+    if src.remaining == 0 {
+        return Ok(0);
+    }
+    if let Some(p) = pos.as_deref() {
+        verify_area(*p, src.remaining)?;
+    }
+    write_kind(ctx, view, &mut src, pos)
+}
+
+fn writev<C: Context>(ctx: &mut C, fd: u64, vec: u64, vlen: u64) -> Sys {
+    let view = fdget(ctx, fd, false)?;
+    let mut pos = view.pos;
+    let n = vfs_writev(ctx, &view, vec, vlen, Some(&mut pos))?;
+    set_pos(ctx, &view, pos);
+    Ok(n)
+}
+
+fn pwritev<C: Context>(ctx: &mut C, fd: u64, vec: u64, vlen: u64, pos_l: u64) -> Sys {
+    // pos_from_hilo on 64-bit: the high word shifts out entirely.
+    #[allow(clippy::cast_possible_wrap)]
+    let mut pos = pos_l as i64;
+    if pos < 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    let view = fdget(ctx, fd, false)?;
+    if view.mode & FMODE_PWRITE == 0 {
+        return Err(Errno::ESPIPE.into());
+    }
+    vfs_writev(ctx, &view, vec, vlen, Some(&mut pos))
+}
+
+/// The `->write_iter`/`->write` of the file kind.
+fn write_kind<C: Context>(ctx: &mut C, view: &View, src: &mut Src, pos: Option<&mut i64>) -> Sys {
     match view.kind {
         FileKind::Regular => {
             let (Some(pos), Some(inode)) = (pos, view.inode) else {
                 return Err(Errno::EINVAL.into());
             };
-            write_regular(ctx, view, inode, buf, count, pos)
+            write_regular(ctx, view, inode, src, pos)
         }
         FileKind::Char(CharDev::Console | CharDev::TtyAux | CharDev::TtyS0 | CharDev::HungUp) => {
-            tty::write(ctx, view, buf, count)
+            tty::write(ctx, view, src)
         }
         // write_null / write_zero: the data is discarded, never read.
-        FileKind::Char(CharDev::Null | CharDev::Zero) => Ok(i64::try_from(count).unwrap_or(0)),
+        FileKind::Char(CharDev::Null | CharDev::Zero) => {
+            Ok(i64::try_from(src.remaining).unwrap_or(0))
+        }
         FileKind::Char(CharDev::Full) => Err(Errno::ENOSPC.into()), // write_full
-        FileKind::Pipe { pipe, writer: true } => pipe_write(ctx, view, pipe, buf, count),
+        FileKind::Pipe { pipe, writer: true } => pipe_write(ctx, view, pipe, src),
         FileKind::Directory | FileKind::Pipe { .. } | FileKind::Path => Err(Errno::EBADF.into()),
         FileKind::Unsupported => Err(Stop::Unimplemented),
     }
@@ -524,10 +700,10 @@ fn write_regular<C: Context>(
     ctx: &mut C,
     view: &View,
     inode: InodeId,
-    buf: u64,
-    count: u64,
+    src: &mut Src,
     pos: &mut i64,
 ) -> Sys {
+    let count = src.remaining;
     if count == 0 {
         return Ok(0);
     }
@@ -570,8 +746,7 @@ fn write_regular<C: Context>(
         let start = (at as u64) + written;
         let offset = (start % PAGE_SIZE as u64) as usize;
         let chunk = ((PAGE_SIZE - offset) as u64).min(count - written) as usize;
-        let missing = copy_from_user(ctx, &mut bounce[..chunk], buf + written);
-        let copied = chunk - missing;
+        let copied = src.copy_in(ctx, &mut bounce[..chunk]);
         if copied == 0 {
             status = Some(Errno::EFAULT);
             break;
@@ -607,9 +782,9 @@ fn pipe_write<C: Context>(
     ctx: &mut C,
     view: &View,
     pipe: crate::vfs::PipeId,
-    buf: u64,
-    count: u64,
+    src: &mut Src,
 ) -> Sys {
+    let count = src.remaining;
     if count == 0 {
         return Ok(0);
     }
@@ -628,7 +803,7 @@ fn pipe_write<C: Context>(
         chars > 0 && !p.is_empty() && p.merge_room() >= chars
     };
     if mergeable {
-        if copy_from_user(ctx, &mut bounce[..chars], buf) != 0 {
+        if src.copy_in(ctx, &mut bounce[..chars]) != chars {
             return Err(Errno::EFAULT.into());
         }
         ctx.files().vfs.pipe_mut(pipe).merge(&bounce[..chars])?;
@@ -648,7 +823,7 @@ fn pipe_write<C: Context>(
         }
         if !ctx.files().vfs.pipe_ref(pipe).is_full() {
             let want = remaining.min(PAGE_SIZE as u64) as usize;
-            if copy_from_user(ctx, &mut bounce[..want], buf + ret) != 0 {
+            if src.copy_in(ctx, &mut bounce[..want]) != want {
                 if ret == 0 {
                     return Err(Errno::EFAULT.into());
                 }
@@ -688,6 +863,280 @@ fn pipe_write<C: Context>(
 fn pipe_writable<C: Context>(ctx: &mut C, pipe: crate::vfs::PipeId) -> bool {
     let p = ctx.files().vfs.pipe_ref(pipe);
     !p.is_full() || p.readers == 0
+}
+
+// ---- sendfile ------------------------------------------------------------------
+
+/// `SYSCALL_DEFINE4(sendfile64)` (x86-64 `sendfile`): `out_fd`/`in_fd` are `int`s,
+/// `offset` an optional `loff_t *` read before and written back after the copy.
+fn sendfile<C: Context>(ctx: &mut C, out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Sys {
+    if offset == 0 {
+        return do_sendfile(ctx, out_fd, in_fd, None, count);
+    }
+    let mut raw = [0u8; 8];
+    if copy_from_user(ctx, &mut raw, offset) != 0 {
+        return Err(Errno::EFAULT.into());
+    }
+    let mut pos = i64::from_le_bytes(raw);
+    let ret = do_sendfile(ctx, out_fd, in_fd, Some(&mut pos), count);
+    if copy_to_user(ctx, offset, &pos.to_le_bytes()) != 0 {
+        return Err(Errno::EFAULT.into());
+    }
+    ret
+}
+
+/// `do_sendfile` with `max == 0` (the smaller `s_maxbytes` of the two tmpfs files,
+/// `MAX_LFS_FILESIZE`). Input: a regular file (every other kind that splices stops
+/// loudly). Output: a pipe (`splice_file_to_pipe`: one pipe's worth), or a file
+/// (`do_splice_direct`: through a 16 page pipe until `count` or the end of the file)
+/// that has `->splice_write`: a regular file, the console tty, `/dev/null` and
+/// `/dev/zero`. The pipe pages are copies of the file bytes, not the page cache's pages.
+fn do_sendfile<C: Context>(
+    ctx: &mut C,
+    out_fd: u64,
+    in_fd: u64,
+    ppos: Option<&mut i64>,
+    count: u64,
+) -> Sys {
+    let input = fdget(ctx, in_fd, false)?;
+    if input.mode & FMODE_READ == 0 {
+        return Err(Errno::EBADF.into());
+    }
+    let mut cursor = match ppos.as_deref() {
+        None => input.pos,
+        Some(p) => {
+            if input.mode & FMODE_PREAD == 0 {
+                return Err(Errno::ESPIPE.into());
+            }
+            *p
+        }
+    };
+    verify_area(cursor, count)?;
+    let mut count = count.min(u64::from(MAX_RW_COUNT));
+    let output = fdget(ctx, out_fd, false)?;
+    if output.mode & FMODE_WRITE == 0 {
+        return Err(Errno::EBADF.into());
+    }
+    let mut out_pos = output.pos;
+    let max = MAX_LFS_FILESIZE;
+    if i128::from(cursor) + i128::from(count) > i128::from(max) {
+        if cursor >= max {
+            return Err(Errno::EOVERFLOW.into());
+        }
+        count = (max - cursor) as u64;
+    }
+    let moved = if let FileKind::Pipe { pipe, writer: true } = output.kind {
+        splice_file_to_pipe(ctx, &input, &output, pipe, &mut cursor, count)?
+    } else {
+        // do_splice_direct's own checks, then the rw_verify_area of do_sendfile.
+        verify_area(out_pos, count)?;
+        if output.flags & O_APPEND != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        splice_direct(ctx, &input, &output, &mut cursor, &mut out_pos, count)?
+    };
+    if moved > 0 {
+        set_pos(ctx, &output, out_pos);
+        match ppos {
+            Some(p) => *p = cursor,
+            None => set_pos(ctx, &input, cursor),
+        }
+    }
+    if cursor > max {
+        return Err(Errno::EOVERFLOW.into());
+    }
+    Ok(moved)
+}
+
+/// The bytes `shmem_file_splice_read` puts into a pipe with `free` empty slots:
+/// at most `len`, the file's end and what the slots hold (the first buffer is the
+/// rest of its page).
+fn splice_chunk(pos: i64, size: u64, len: u64, free: usize) -> usize {
+    let at = pos as u64;
+    if at >= size || free == 0 {
+        return 0;
+    }
+    let room = free as u64 * PAGE_SIZE as u64 - at % PAGE_SIZE as u64;
+    usize::try_from(len.min(size - at).min(room)).unwrap_or(0)
+}
+
+/// What `do_splice_read` finds behind `input`: the inode of a regular file (the
+/// only `->splice_read` ported), `-EINVAL` for the files without one (a pipe, a
+/// directory, `/dev/null`), or a `->splice_read` (`copy_splice_read` on a tty,
+/// `/dev/zero`, `/dev/full`) that is not ported.
+fn splice_source(input: &View) -> Result<InodeId, Stop> {
+    match (input.kind, input.inode) {
+        (FileKind::Regular, Some(inode)) => Ok(inode),
+        (FileKind::Directory | FileKind::Pipe { .. } | FileKind::Char(CharDev::Null), _) => {
+            Err(Errno::EINVAL.into())
+        }
+        _ => Err(Stop::Unimplemented),
+    }
+}
+
+/// `splice_file_to_pipe`: wait for room (`wait_for_space`), then `do_splice_read` once.
+fn splice_file_to_pipe<C: Context>(
+    ctx: &mut C,
+    input: &View,
+    output: &View,
+    pipe: crate::vfs::PipeId,
+    pos: &mut i64,
+    count: u64,
+) -> Sys {
+    loop {
+        let p = ctx.files().vfs.pipe_ref(pipe);
+        if p.readers == 0 {
+            ctx.state().send_sig(SIGPIPE);
+            return Err(Errno::EPIPE.into());
+        }
+        if !p.is_full() {
+            break;
+        }
+        if output.flags & O_NONBLOCK != 0 {
+            return Err(Errno::EAGAIN.into());
+        }
+        if let Err(restart) = wait_event_interruptible(ctx, PIPE_KEY, |c| pipe_writable(c, pipe)) {
+            return Ok(restart);
+        }
+    }
+    // do_splice_read: nothing to read is not an error, whatever the file.
+    if count == 0 {
+        return Ok(0);
+    }
+    let inode = splice_source(input)?;
+    let (size, free) = {
+        let vfs = &*ctx.files().vfs;
+        let p = vfs.pipe_ref(pipe);
+        (vfs.fs.inode(inode).size, p.max_usage - p.slots_used())
+    };
+    let total = splice_chunk(*pos, size, count, free);
+    let mut moved = 0usize;
+    let mut page = [0u8; PAGE_SIZE];
+    while moved < total {
+        let at = (*pos as u64) + moved as u64;
+        let take = (PAGE_SIZE - (at % PAGE_SIZE as u64) as usize).min(total - moved);
+        let got = ctx.files().vfs.fs.read(inode, at, &mut page[..take]);
+        if got == 0 {
+            break;
+        }
+        ctx.files().vfs.pipe_mut(pipe).push_spliced(&page[..got])?;
+        moved += got;
+    }
+    // shmem_file_splice_read ends in file_accessed(in).
+    if input.flags & O_NOATIME == 0 {
+        ctx.files().vfs.fs.touch_atime(inode);
+    }
+    *pos += moved as i64;
+    Ok(moved as i64)
+}
+
+/// `do_splice_direct` -> `splice_direct_to_actor`: the input must be seekable; read
+/// a chunk of at most a 16 page pipe from it, hand it to the output's
+/// `->splice_write`, repeat until `count` bytes, the end of the input or a short or
+/// failed write. The result is the bytes written, or the first error when nothing was.
+fn splice_direct<C: Context>(
+    ctx: &mut C,
+    input: &View,
+    output: &View,
+    pos: &mut i64,
+    out_pos: &mut i64,
+    count: u64,
+) -> Sys {
+    if input.mode & FMODE_LSEEK == 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    // Which outputs have a `->splice_write` (`do_splice_from` answers -EINVAL
+    // for the others, once there are data to write).
+    let splice_write = match output.kind {
+        FileKind::Regular
+        | FileKind::Char(
+            CharDev::Null
+            | CharDev::Zero
+            | CharDev::Console
+            | CharDev::TtyAux
+            | CharDev::TtyS0
+            | CharDev::HungUp,
+        ) => true,
+        FileKind::Char(CharDev::Full) | FileKind::Directory => false,
+        _ => return Err(Stop::Unimplemented),
+    };
+    let mut bytes: i64 = 0;
+    let mut left = count;
+    let mut failure: Option<Stop> = None;
+    while left > 0 {
+        let inode = match splice_source(input) {
+            Ok(inode) => inode,
+            Err(stop) => {
+                failure = Some(stop);
+                break;
+            }
+        };
+        let size = ctx.files().vfs.fs.inode(inode).size;
+        let chunk = splice_chunk(*pos, size, left, crate::vfs::pipe::PIPE_DEF_BUFFERS);
+        if chunk == 0 {
+            break;
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(chunk).map_err(|_| Errno::ENOMEM)?;
+        let mut page = [0u8; PAGE_SIZE];
+        while data.len() < chunk {
+            let at = *pos as u64 + data.len() as u64;
+            let take = (PAGE_SIZE - (at % PAGE_SIZE as u64) as usize).min(chunk - data.len());
+            let n = ctx.files().vfs.fs.read(inode, at, &mut page[..take]);
+            if n == 0 {
+                break;
+            }
+            for &byte in &page[..n] {
+                // The room was reserved above.
+                let _ = data.push_within_capacity(byte);
+            }
+        }
+        let read_len = data.len() as i64;
+        if read_len == 0 {
+            break;
+        }
+        let result = if splice_write {
+            let mut src = Src::kernel(data);
+            match output.kind {
+                FileKind::Regular => match output.inode {
+                    Some(out_inode) => write_regular(ctx, output, out_inode, &mut src, out_pos),
+                    None => Err(Errno::EINVAL.into()),
+                },
+                FileKind::Char(CharDev::Null | CharDev::Zero) => Ok(read_len),
+                _ => tty::write(ctx, output, &mut src),
+            }
+        } else {
+            Err(Errno::EINVAL.into()) // warn_unsupported(out, "write")
+        };
+        match result {
+            Ok(n) if n > 0 => {
+                bytes += n;
+                left -= n as u64;
+                *pos += n;
+                if n < read_len {
+                    break;
+                }
+            }
+            Ok(_) => break,
+            Err(stop) => {
+                failure = Some(stop);
+                break;
+            }
+        }
+    }
+    // `done:` -> file_accessed(in), whatever happened.
+    if input.flags & O_NOATIME == 0
+        && let Some(inode) = input.inode
+    {
+        ctx.files().vfs.fs.touch_atime(inode);
+    }
+    if bytes > 0 {
+        return Ok(bytes);
+    }
+    match failure {
+        Some(stop) => Err(stop),
+        None => Ok(0),
+    }
 }
 
 // ---- lseek --------------------------------------------------------------------

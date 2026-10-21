@@ -93,11 +93,13 @@ fn execveat<C: Context>(
     let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
     let opened = env_for(ctx, dfd, &path)
         .and_then(|env| open_exec_file(ctx.files().vfs, &env, &path, follow));
-    let (bytes, file) = match opened {
+    let (mut bytes, mut file) = match opened {
         Ok(opened) => opened,
         Err(errno) => return fail(errno),
     };
-    match prepare(ctx, dfd, &path, argv, envp, flags, file, bytes) {
+    // `file` is the description to release on every failure: a script replaces it
+    // with its interpreter's.
+    match prepare(ctx, dfd, &path, argv, envp, flags, &mut file, &mut bytes) {
         Ok(None) => {
             // AT_EXECVE_CHECK: the checks passed, nothing is executed.
             ctx.files().vfs.fput(file);
@@ -159,16 +161,21 @@ fn prepare<C: Context>(
     argv: u64,
     envp: u64,
     flags: u32,
-    file: crate::vfs::FileId,
-    bytes: Vec<u8>,
+    file: &mut crate::vfs::FileId,
+    bytes: &mut Vec<u8>,
 ) -> Result<Option<Prepared>, Prep> {
     // bprm->filename: the path as given, or the /dev/fd name of a path
     // relative to a descriptor.
-    let filename = if dfd == AT_FDCWD || path.first() == Some(&b'/') {
-        crate::vfs::try_copy(path)?
-    } else {
+    let relative = !(dfd == AT_FDCWD || path.first() == Some(&b'/'));
+    let filename = if relative {
         dev_fd_name(dfd, path)?
+    } else {
+        crate::vfs::try_copy(path)?
     };
+    // BINPRM_FLAGS_PATH_INACCESSIBLE: the script's own name will not exist after
+    // the exec (`/dev/fd/N/..` against a close-on-exec descriptor).
+    #[allow(clippy::cast_sign_loss)]
+    let inaccessible = relative && ctx.files().fdt.cloexec(dfd as u32);
     // `fatal_signal_pending(current)`: a group exit is under way.
     let fatal = |c: &mut C| c.state().sig.group_exit.is_some();
     let arg_count = count(ctx, argv, fatal)?;
@@ -200,8 +207,39 @@ fn prepare<C: Context>(
     if flags & AT_EXECVE_CHECK != 0 {
         return Ok(None);
     }
-    // exec_binprm: the binary formats, still before `begin_new_exec`.
-    let plan = plan_image(ctx.files().vfs, &bytes)?;
+    // exec_binprm: the binary formats, still before `begin_new_exec`. A `#!`
+    // script (`load_script`) rewrites the argument vector and restarts with
+    // its interpreter, at most six times (`depth > 5` is `ELOOP`).
+    let mut interp = crate::vfs::try_copy(&filename)?;
+    let mut depth = 0;
+    let plan = loop {
+        if depth > 5 {
+            return Err(Errno::ELOOP.into());
+        }
+        depth += 1;
+        let Some(line) = crate::exec::script::parse(bytes)? else {
+            break plan_image(ctx.files().vfs, bytes)?;
+        };
+        if inaccessible {
+            return Err(Errno::ENOENT.into());
+        }
+        // remove_arg_zero, then copy_string_kernel of the script's name, the
+        // optional argument and the interpreter, in front of the arguments.
+        used -= arg_strings.pop_first();
+        arg_strings.push_kernel(&interp, budget, &mut used)?;
+        if let Some(arg) = line.arg {
+            arg_strings.push_kernel(arg, budget, &mut used)?;
+        }
+        arg_strings.push_kernel(line.name, budget, &mut used)?;
+        interp = crate::vfs::try_copy(line.name)?;
+        // open_exec(i_name): relative to the caller's root and working directory.
+        let opened = env_for(ctx, AT_FDCWD, line.name)
+            .and_then(|env| open_exec_file(ctx.files().vfs, &env, line.name, true));
+        let (next_bytes, next_file) = opened?;
+        ctx.files().vfs.fput(*file);
+        *file = next_file;
+        *bytes = next_bytes;
+    };
     let machine = ctx.exec_aux();
     let aux = Aux {
         hwcap: machine.hwcap,
@@ -213,9 +251,10 @@ fn prepare<C: Context>(
     let (window, built) = build_window(&filename, &arg_strings, &env, &aux)?;
     // Everything the commit cannot afford to fail on is reserved now.
     ctx.files().vfs.reserve_pin()?;
+    ctx.exec_prepare_mm()?;
     Ok(Some(Prepared {
-        file,
-        bytes,
+        file: *file,
+        bytes: core::mem::take(bytes),
         plan,
         window,
         built,
@@ -269,7 +308,10 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &Prepared) -> Outcome {
     if let Some(old) = ctx.replace_exe_file(p.file) {
         ctx.files().vfs.fput(old);
     }
-    // exec_mmap: the old image's mappings go, a fresh address space replaces
+    // exec_mmap: a caller that borrows its address space (`vfork`) leaves it for its
+    // owner and takes the fresh one; any other task's old image is unmapped below.
+    ctx.exec_switch_mm();
+    // The old image's mappings go, a fresh address space replaces
     // the VMA set; then `setup_arg_pages` and `elf_load`.
     let mapped = {
         let AddressSpace { mm, env, pages } = ctx.address_space();
@@ -691,6 +733,146 @@ mod tests {
         let first = t.exe;
         assert_eq!(execve(&mut t, "/bin-init", &["x"], &[]), Outcome::Return(0));
         assert_ne!(t.exe, first);
+    }
+
+    /// `execveat` up to the point of no return: the `argv` strings the new image would start
+    /// with (read from the prepared stack block) and the file it would load, or the error.
+    fn exec_argv(
+        t: &mut Task,
+        dfd: i32,
+        path: &str,
+        argv: &[&str],
+        envp: &[&str],
+    ) -> Result<(std::vec::Vec<std::string::String>, crate::vfs::FileId), Errno> {
+        let name = cstr(t, PATH, path);
+        let a = vector(t, ARGV, argv);
+        let e = vector(t, ENVP, envp);
+        let path = getname(t, name, false)?;
+        let env = env_for(t, dfd, &path)?;
+        let (mut bytes, mut file) = open_exec_file(t.files().vfs, &env, &path, true)?;
+        let prepared = match prepare(t, dfd, &path, a, e, 0, &mut file, &mut bytes) {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => unreachable!("no AT_EXECVE_CHECK"),
+            Err(Prep::Errno(errno)) => {
+                t.files().vfs.fput(file);
+                return Err(errno);
+            }
+            Err(Prep::Restart | Prep::Unsupported) => panic!("unexpected restart or stop"),
+        };
+        // The window is the top of the stack: `argc`, then the `argv` pointers.
+        let base = crate::exec::stack::STACK_TOP - prepared.window.len() as u64;
+        let word = |at: u64| {
+            let at = (at - base) as usize;
+            u64::from_le_bytes(prepared.window[at..at + 8].try_into().unwrap())
+        };
+        let argc = word(prepared.built.sp);
+        let strings = (0..argc)
+            .map(|i| {
+                let from = (word(prepared.built.sp + 8 + 8 * i) - base) as usize;
+                let len = prepared.window[from..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap();
+                std::string::String::from_utf8(prepared.window[from..from + len].to_vec()).unwrap()
+            })
+            .collect();
+        Ok((strings, prepared.file))
+    }
+
+    fn argv_of(
+        t: &mut Task,
+        path: &str,
+        argv: &[&str],
+    ) -> Result<std::vec::Vec<std::string::String>, Errno> {
+        exec_argv(t, AT_FDCWD, path, argv, &["K=V"]).map(|(argv, _)| argv)
+    }
+
+    #[test]
+    fn a_script_runs_its_interpreter_with_the_rewritten_argument_vector() {
+        let mut t = t();
+        install(&mut t, "/interp", 0o755, &oracle());
+        install(&mut t, "/s", 0o755, b"#!/interp -x  arg  \nbody");
+        install(&mut t, "/plain-interp", 0o755, b"#!/interp\n");
+        install(&mut t, "/s2", 0o755, b"#!/s\n");
+        // argv[0] is replaced by the interpreter, its one argument (the rest of the line,
+        // trimmed) and the script's name, ahead of the remaining arguments.
+        assert_eq!(
+            argv_of(&mut t, "/s", &["ignored", "one", "two"]).unwrap(),
+            ["/interp", "-x  arg", "/s", "one", "two"]
+        );
+        assert_eq!(
+            argv_of(&mut t, "/plain-interp", &["x"]).unwrap(),
+            ["/interp", "/plain-interp"]
+        );
+        // An interpreter that is itself a script: `bprm->interp` is the previous interpreter's name.
+        assert_eq!(
+            argv_of(&mut t, "/s2", &["/s2", "y"]).unwrap(),
+            ["/interp", "-x  arg", "/s", "/s2", "y"]
+        );
+        // No argv at all: the empty argv[0] that is replaced.
+        assert_eq!(
+            argv_of(&mut t, "/s", &[]).unwrap(),
+            ["/interp", "-x  arg", "/s"]
+        );
+        // The program loaded is the interpreter's file, not the script's.
+        let (_, file) = exec_argv(&mut t, AT_FDCWD, "/s", &["s"], &[]).unwrap();
+        let loaded = t.vfs.files.get(file).inode.unwrap();
+        let (_, direct) = exec_argv(&mut t, AT_FDCWD, "/interp", &["i"], &[]).unwrap();
+        assert_eq!(t.vfs.files.get(direct).inode.unwrap(), loaded);
+        // And an exec of it really runs, under the script's name.
+        assert_eq!(
+            execve(&mut t, "/s", &["ignored", "one"], &["K=V"]),
+            Outcome::Return(0)
+        );
+        assert_eq!(&t.attrs.comm[..2], b"s\0");
+    }
+
+    #[test]
+    fn script_failures_are_the_interpreters_open_errors() {
+        let mut t = t();
+        install(&mut t, "/interp", 0o755, &oracle());
+        install(&mut t, "/missing", 0o755, b"#!/nowhere\n");
+        install(&mut t, "/noexec", 0o755, b"#!/data\n");
+        install(&mut t, "/data", 0o644, b"x");
+        install(&mut t, "/loop", 0o755, b"#!/loop\n");
+        install(&mut t, "/blank", 0o755, b"#!   \n");
+        install(&mut t, "/dir-interp", 0o755, b"#!/\n");
+        assert_eq!(argv_of(&mut t, "/missing", &["m"]), Err(Errno::ENOENT));
+        assert_eq!(argv_of(&mut t, "/noexec", &["m"]), Err(Errno::EACCES));
+        assert_eq!(argv_of(&mut t, "/blank", &["m"]), Err(Errno::ENOEXEC));
+        assert_eq!(argv_of(&mut t, "/dir-interp", &["m"]), Err(Errno::EACCES));
+        // A script that names itself: six rewrites, then ELOOP.
+        assert_eq!(argv_of(&mut t, "/loop", &["l"]), Err(Errno::ELOOP));
+        assert_eq!(execve(&mut t, "/loop", &["l"], &[]), neg(Errno::ELOOP));
+        assert!(t.started.is_none());
+        // A script reached through a close-on-exec directory descriptor will not exist after the
+        // exec, so the interpreter could not open it: ENOENT before anything is rewritten.
+        install(&mut t, "/s", 0o755, b"#!/interp\n");
+        let open_root = |t: &mut Task, flags: u32| {
+            let root = cstr(t, PATH + 0x800, "/");
+            let Outcome::Return(fd) = dispatch(
+                t,
+                Sysno::open as u64,
+                [root, u64::from(crate::vfs::O_RDONLY | flags), 0, 0, 0, 0],
+            ) else {
+                panic!()
+            };
+            fd as i32
+        };
+        let cloexec = open_root(&mut t, O_CLOEXEC);
+        assert_eq!(
+            exec_argv(&mut t, cloexec, "s", &["s"], &[]).map(|_| ()),
+            Err(Errno::ENOENT)
+        );
+        // Without close-on-exec it runs, and the script is named `/dev/fd/N/s`.
+        let plain = open_root(&mut t, 0);
+        assert_eq!(
+            exec_argv(&mut t, plain, "s", &["s"], &[]).unwrap().0,
+            [
+                std::string::String::from("/interp"),
+                std::format!("/dev/fd/{plain}/s")
+            ]
+        );
     }
 
     #[test]

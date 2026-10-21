@@ -439,7 +439,9 @@ impl Run<'_, '_> {
             sec: mtime,
             nsec: 0,
         };
-        if let Ok(inode) = self.vfs.lookup(&self.env, path, LOOKUP_FOLLOW) {
+        // `init_utimes`: `kern_path(filename, 0, ...)`, so a symlink's own times are
+        // set (an unpacked symlink keeps its archive time).
+        if let Ok(inode) = self.vfs.lookup(&self.env, path, 0) {
             self.vfs.utimes(inode, time, time);
         }
     }

@@ -1237,6 +1237,28 @@ pub struct UserSpace<'a> {
 }
 
 impl UserSpace<'_> {
+    /// The physical address of the PML4 this view borrows (what CR3 holds when it is active).
+    #[must_use]
+    pub fn root_address(&self) -> u64 {
+        self.tables.root_address()
+    }
+
+    /// `pgd_alloc` ([`Tables::fork_template`]): a new tree with an empty user half and this
+    /// tree's kernel half, for a task that has no address space of its own (yet).
+    ///
+    /// # Errors
+    /// Frame exhaustion.
+    pub fn empty_tree(&mut self) -> Result<Tables, Error> {
+        self.parts(|tables, frames| tables.fork_template(frames))
+    }
+
+    /// Exchange the tree this view borrows for `tables` and hand back the old one: the task's
+    /// address space changes owner (a `vfork` child borrowing its parent's, or giving it back).
+    /// The old tree is not freed; whoever receives it owns it.
+    pub fn replace_tables(&mut self, tables: Tables) -> Tables {
+        core::mem::replace(self.tables, tables)
+    }
+
     /// The page-table half of a fork ([`Tables::fork_user`]) with the frame
     /// allocator locked for the copy. The caller reserved its heap storage
     /// first (`services`: no heap allocation under `FRAMES`).

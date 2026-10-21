@@ -27,14 +27,19 @@
 //! [`Context`] offers by adding methods to the trait (the binary's `Process`
 //! implements it; tests use `testing::Task`), never by reaching for globals.
 
+mod attr;
+#[cfg(test)]
+mod busybox_tests;
 mod exec;
 mod fd;
 mod fs;
 mod ids;
 mod io;
 mod memory;
+mod namei;
 mod poll;
 mod process;
+mod random;
 mod signal;
 #[cfg(test)]
 mod testing;
@@ -160,6 +165,10 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     fn replace_exe_file(&mut self, file: FileId) -> Option<FileId>;
     /// `ELF_HWCAP` and fresh random bytes for the auxiliary vector.
     fn exec_aux(&mut self) -> ExecAux;
+    /// 64 bits from the CPU's hardware random generator (`RDSEED`, else
+    /// `RDRAND`, retried a bounded number of times), or `None` when the CPU has
+    /// none or it kept failing: the only entropy source (see `random`).
+    fn hw_random(&mut self) -> Option<u64>;
     /// `flush_thread` + `start_thread`: the FPU and the segment bases are reset
     /// and the registers become the initial user state at `ip`/`sp` (all other
     /// general registers zero), as `load_elf_binary` leaves them.
@@ -178,6 +187,21 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     /// `EAGAIN` (`max_threads`, `RLIMIT_NPROC`, pid space, no task slot or
     /// kernel stack), `ENOMEM`, as `copy_process`.
     fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, Errno>;
+    /// `bprm_mm_init` for a caller that works in an address space it borrows (a `vfork`
+    /// child): the fresh address space its `execve` will move to, made before the point of no
+    /// return so that a lack of memory is an `ENOMEM` of the call. Nothing for every other
+    /// task.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    fn exec_prepare_mm(&mut self) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// `exec_mmap` for a caller that borrows its address space: move to the one
+    /// [`Context::exec_prepare_mm`] made and give the borrowed one back to its owner, who
+    /// wakes (`mm_release` -> `complete_vfork_done`). Nothing for every other task, whose
+    /// address space the exec replaces in place.
+    fn exec_switch_mm(&mut self) {}
     /// `current_cred()` as the VFS needs it.
     fn cred(&mut self) -> Cred {
         Cred::of_task(&self.attrs().cred)
@@ -278,6 +302,9 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
     // One line per group, in table order of their first number.
     let outcome = fd::dispatch(ctx, sysno, args)
         .or_else(|| fs::dispatch(ctx, sysno, args))
+        .or_else(|| namei::dispatch(ctx, sysno, args))
+        .or_else(|| attr::dispatch(ctx, sysno, args))
+        .or_else(|| random::dispatch(ctx, sysno, args))
         .or_else(|| poll::dispatch(ctx, sysno, args))
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
@@ -352,8 +379,8 @@ mod tests {
     #[test]
     fn implemented_in_linux_but_not_here_is_reported_not_faked() {
         let mut task = task();
-        let writev = dispatch(&mut task, Sysno::writev as u64, [0; 6]);
-        assert_eq!(writev, Outcome::Unimplemented(20));
+        let setup = dispatch(&mut task, Sysno::io_uring_setup as u64, [0; 6]);
+        assert_eq!(setup, Outcome::Unimplemented(425));
         let mremap = dispatch(&mut task, Sysno::mremap as u64, [0; 6]);
         assert_eq!(mremap, Outcome::Unimplemented(25));
     }

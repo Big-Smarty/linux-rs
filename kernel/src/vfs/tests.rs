@@ -841,6 +841,7 @@ fn unpacks_directories_files_symlinks_and_devices_with_their_attributes() {
     archive.extend(newc("etc/link", 0o120_777, 1, 3, b"motd", (0, 0)));
     archive.extend(newc("dev/null", 0o020_666, 1, 4, b"", (1, 3)));
     archive.extend(newc("empty", 0o100_600, 1, 5, b"", (0, 0)));
+    archive.extend(newc("etc/dangling", 0o120_777, 1, 6, b"nowhere", (0, 0)));
     archive.extend(trailer());
     let (mut vfs, env, message) = unpacked(&archive);
     assert_eq!(message, None);
@@ -859,6 +860,15 @@ fn unpacks_directories_files_symlinks_and_devices_with_their_attributes() {
     assert_eq!(vfs.lookup(&env, b"/etc/link", LOOKUP_FOLLOW), Ok(motd));
     let link = vfs.lookup(&env, b"/etc/link", 0).unwrap();
     assert_eq!(vfs.fs.getattr(link).size, 4);
+    // `init_utimes` does not follow the link: the symlink itself has the archive time, the file
+    // it names keeps its own (here the same), and a dangling link is dated too.
+    let time = Timespec {
+        sec: 0x1234,
+        nsec: 0,
+    };
+    assert_eq!(vfs.fs.getattr(link).mtime, time);
+    let dangling = vfs.lookup(&env, b"/etc/dangling", 0).unwrap();
+    assert_eq!(vfs.fs.getattr(dangling).mtime, time);
     // Directory mtimes are applied after the whole archive (`dir_utime`).
     let etc = vfs.lookup(&env, b"/etc", 0).unwrap();
     assert_eq!(

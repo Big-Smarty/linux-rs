@@ -111,7 +111,7 @@ fn open_exec(vfs: &mut Vfs, path: &[u8]) -> Result<Vec<u8>, Errno> {
     Ok(bytes)
 }
 
-/// The shared tail of `load_script` and `load_elf_binary`'s `PT_INTERP` scan:
+/// The tail of `load_elf_binary`'s `PT_INTERP` scan:
 /// `open_exec(interpreter)` fails with its errno exactly as Linux does; an
 /// interpreter that opens is `unsupported` (running it is outside this slice).
 ///
@@ -131,21 +131,15 @@ pub fn interpreter_failure(
     }
 }
 
-/// Header, script and `PT_INTERP` acceptance of an executable image in the
-/// order the binary formats are tried (`#!`, then ELF): the load plan or the
-/// `execve` error. Everything up to here precedes `begin_new_exec`.
+/// Header and `PT_INTERP` acceptance of an ELF image: the load plan or the
+/// `execve` error. Scripts are the caller's (`load_script` rewrites the argument
+/// vector and restarts with the interpreter); everything up to here precedes
+/// `begin_new_exec`.
 ///
 /// # Errors
 /// `ENOEXEC` and the format errors of the plan, a failed interpreter lookup,
 /// or an unsupported-but-valid image.
 pub fn plan_image(vfs: &mut Vfs, file: &[u8]) -> Result<LoadPlan, LoadError> {
-    match super::script::interpreter(file) {
-        Err(errno) => return Err(LoadError::Errno(errno)),
-        Ok(Some(interpreter)) => {
-            return Err(interpreter_failure(vfs, interpreter, Unsupported::Script));
-        }
-        Ok(None) => {}
-    }
     match LoadPlan::new(file) {
         Err(LoadError::Unsupported(Unsupported::Interpreter)) => {
             // The plan checked the header and the `PT_INTERP` bytes (Linux
@@ -267,6 +261,17 @@ impl Strings {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.reversed.is_empty()
+    }
+
+    /// `remove_arg_zero`: drop the first string of the vector (the last copied)
+    /// and return the bytes it took (NUL included), for the caller's budget.
+    pub fn pop_first(&mut self) -> u64 {
+        let Some(first) = self.reversed.pop() else {
+            return 0;
+        };
+        let freed = first.len() as u64 + 1;
+        self.bytes = self.bytes.saturating_sub(freed);
+        freed
     }
 
     /// Copy one string (`copy_string_kernel`'s accounting) from `bytes`.

@@ -56,7 +56,7 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 use core::{
-    arch::x86_64::{__cpuid, _rdrand64_step, _rdtsc},
+    arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdseed64_step, _rdtsc},
     cell::UnsafeCell,
     iter,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -78,7 +78,7 @@ use kernel::{
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     ratelimit::RateLimit,
-    sched::{PIPE_KEY, SchedId, WaitKey, WakeMode},
+    sched::{CLASS_VFORK, PIPE_KEY, SchedId, TaskState, WaitKey, WakeMode},
     signal::{
         self, SIGSTOP, State,
         deliver::{self, Outcome as SignalOutcome},
@@ -215,6 +215,33 @@ pub struct Loaded {
 fn weak_random() -> [u8; 16] {
     // SAFETY: RDTSC executes at CPL0 on every x86-64 CPU and reads no memory.
     stack::weak_random(unsafe { _rdtsc() })
+}
+
+/// 64 bits from `RDSEED` (CPUID.7.0:EBX bit 18), else `RDRAND` (CPUID.1:ECX bit 30); each is
+/// retried ten times, Intel's guidance for a transient failure. `None` when neither exists
+/// or both keep failing.
+fn hw_random_u64() -> Option<u64> {
+    #[target_feature(enable = "rdrand")]
+    fn rdrand() -> Option<u64> {
+        let mut value = 0;
+        (_rdrand64_step(&mut value) == 1).then_some(value)
+    }
+    #[target_feature(enable = "rdseed")]
+    fn rdseed() -> Option<u64> {
+        let mut value = 0;
+        (_rdseed64_step(&mut value) == 1).then_some(value)
+    }
+    if __cpuid(0).eax >= 7 && __cpuid_count(7, 0).ebx & (1 << 18) != 0 {
+        // SAFETY: CPUID.7.0:EBX.RDSEED was just checked.
+        if let Some(value) = (0..10).find_map(|_| unsafe { rdseed() }) {
+            return Some(value);
+        }
+    }
+    if __cpuid(1).ecx & (1 << 30) != 0 {
+        // SAFETY: CPUID.1:ECX.RDRAND was just checked.
+        return (0..10).find_map(|_| unsafe { rdrand() });
+    }
+    None
 }
 
 /// RDRAND when present (CPUID.1:ECX bit 30), else a documented weak seed.
@@ -728,17 +755,79 @@ struct Owned {
     exec: u64,
     /// `current->files`.
     fdt: FdTable,
+    /// The key of the mappings' pins in the VFS (`Vfs::pin`): the identity of the address
+    /// space in use. A fresh one for every address space ([`next_pin_owner`]); a `vfork` child
+    /// works on its parent's until its `execve` or exit.
+    pin_owner: u32,
+    /// `current->vfork_done` (`CLONE_VFORK`): the parent sleeping until this task's `execve`
+    /// or exit, and whether this task works in the parent's address space.
+    vfork_parent: Option<Lender>,
+    /// `bprm->mm`: the fresh address space a `vfork` child's `execve` moves to, made before
+    /// the point of no return ([`Context::exec_prepare_mm`]).
+    pending_mm: Option<(Tables, Mm)>,
+    /// This task's address space is in use by its `vfork` child (the tree and VMA set in
+    /// `TaskLocal` are placeholders): its pins must outlive this task's exit.
+    lent_out: bool,
+}
+
+/// The parent of a `vfork` child.
+#[derive(Clone, Copy)]
+struct Lender {
+    sched: SchedId,
+    /// The child works in the parent's address space (`CLONE_VM`).
+    lent: bool,
 }
 
 impl Owned {
-    /// The key of this task's mapping pins in the VFS (`Vfs::pin`): the
-    /// scheduling slot, unique while the task lives.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "a slot index is below the pool size"
-    )]
+    /// The key of this task's address space in the VFS pin table.
     fn owner(&self) -> u32 {
-        self.sched.index() as u32
+        self.pin_owner
+    }
+}
+
+/// A fresh identity for an address space (`Vfs::pin`'s owner key): never a scheduling slot,
+/// which a later task reuses while a borrowed address space can outlive its first user.
+fn next_pin_owner() -> u32 {
+    static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What a `vfork` child gives back (`complete_vfork_done`): the parent's address space when it
+/// had borrowed it.
+struct Done {
+    lent: Option<Lent>,
+}
+
+struct Lent {
+    tables: Tables,
+    space: Mm,
+}
+
+/// `vfork_done` of each sleeping parent, by its scheduling slot. A leaf lock: nothing else is
+/// taken while it is held.
+static VFORK_DONE: services::IrqMutex<[Option<Done>; ktask::SLOTS]> =
+    services::IrqMutex::new([const { None }; ktask::SLOTS]);
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a slot index is below the pool size"
+)]
+fn vfork_done_key(parent: SchedId) -> WaitKey {
+    WaitKey::new(CLASS_VFORK, parent.index() as u32)
+}
+
+/// `complete_vfork_done`, called by the child when it execs or exits: the parent wakes (and
+/// takes back its address space). A parent that no longer exists (it was killed while it
+/// waited) cannot take it: the address space is freed here, with the mappings' pins it left.
+fn complete_vfork(lender: Lender, key: u32, lent: Option<Lent>, vfs: &mut Vfs) {
+    let alive = matches!(ktask::state(lender.sched), Some(state) if state != TaskState::Dead);
+    if alive {
+        VFORK_DONE.lock()[lender.sched.index()] = Some(Done { lent });
+        ktask::wake_up_key(vfork_done_key(lender.sched), WakeMode::Normal, 0);
+    } else if let Some(lent) = lent {
+        vfs.unpin_all(key);
+        destroy_tables(lent.tables);
+        drop(lent.space);
     }
 }
 
@@ -1099,8 +1188,18 @@ impl Syscall<'_> {
     /// last. The address space is copied eagerly (shortcut S2 of the process
     /// lane: copy-on-write is the upgrade).
     ///
+    /// `CLONE_VM | CLONE_VFORK` (`vfork`): the child gets no copy but the parent's own address
+    /// space (`copy_mm` shares it, `mm->mm_users`): its tree and VMA set move to the child,
+    /// the parent keeps an empty tree and VMA set as placeholders, and `wait_for_vfork_done`
+    /// puts the parent to sleep until the child's `execve` or exit hands them back. The two
+    /// never run at once, which is the whole sharing a `vfork` child may rely on.
+    ///
     /// Context: task, IF=0, on the parent's kernel stack; takes `PROCESS`
     /// (-> heap, -> `FRAMES` through the page-table copy).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fork, in the order of copy_process, each failure undoing the steps before it"
+    )]
     fn fork(&mut self, request: &ForkRequest) -> Result<i32, Errno> {
         let parent = self.own.me;
         let params = ForkParams::of(&self.own.attrs, request);
@@ -1115,21 +1214,33 @@ impl Syscall<'_> {
         let xstate = fpu::XBuf::from_live().map_err(|_| Errno::ENOMEM)?;
         // copy_process: RLIMIT_NPROC and max_threads (fork.c:2059, 2072).
         self.shared.get().tasks.fork_allowed(parent, params)?;
-        // copy_mm: the VMA model, then the pages.
-        let space = self.own.space.dup(&self.own.env)?;
-        let tables = self.space.fork_tables().map_err(|error| {
-            if matches!(error, paging::Error::Memory(_)) {
-                Errno::ENOMEM
-            } else {
-                crate::log!("FAIL fork page tables error={:?}\n", error);
-                crate::fail()
-            }
-        });
-        let tables = match tables {
-            Ok(tables) => tables,
-            Err(errno) => {
-                drop(space);
-                return Err(errno);
+        // copy_mm: the VMA model, then the pages; or, for a vfork, only the placeholder tree.
+        let memory = if request.share_vm {
+            let placeholder = self.space.empty_tree().map_err(|error| {
+                if matches!(error, paging::Error::Memory(_)) {
+                    Errno::ENOMEM
+                } else {
+                    crate::log!("FAIL vfork placeholder tree error={:?}\n", error);
+                    crate::fail()
+                }
+            })?;
+            ChildMemory::Lend { placeholder }
+        } else {
+            let space = self.own.space.dup(&self.own.env)?;
+            let tables = self.space.fork_tables().map_err(|error| {
+                if matches!(error, paging::Error::Memory(_)) {
+                    Errno::ENOMEM
+                } else {
+                    crate::log!("FAIL fork page tables error={:?}\n", error);
+                    crate::fail()
+                }
+            });
+            match tables {
+                Ok(tables) => ChildMemory::Copy { space, tables },
+                Err(errno) => {
+                    drop(space);
+                    return Err(errno);
+                }
             }
         };
         // sched_fork + copy_thread: slot, kernel stack, the child's registers
@@ -1139,26 +1250,36 @@ impl Syscall<'_> {
         if request.child_sp != 0 {
             regs.sp = request.child_sp;
         }
-        let Ok(sched) = ktask::prepare_fork(regs, tables.root_address(), xstate) else {
-            destroy_tables(tables);
+        let root = match &memory {
+            ChildMemory::Copy { tables, .. } => tables.root_address(),
+            ChildMemory::Lend { .. } => self.space.root_address(),
+        };
+        let Ok(sched) = ktask::prepare_fork(regs, root, xstate) else {
+            memory.discard();
             return Err(Errno::EAGAIN);
         };
-        let child_owner = u32::try_from(sched.index()).unwrap_or(u32::MAX);
+        let child_owner = if request.share_vm {
+            self.own.pin_owner
+        } else {
+            next_pin_owner()
+        };
         // copy_files / copy_fs / the mapping and executable references.
         let process = self.shared.get();
         let fdt = match process.vfs.dup_fd(&self.own.fdt) {
             Ok(fdt) => fdt,
             Err(errno) => {
                 ktask::cancel_new_task(sched);
-                destroy_tables(tables);
+                memory.discard();
                 return Err(errno);
             }
         };
-        if let Err(errno) = process.vfs.pin_clone(self.own.owner(), child_owner) {
+        if !request.share_vm
+            && let Err(errno) = process.vfs.pin_clone(self.own.owner(), child_owner)
+        {
             let mut fdt = fdt;
             process.vfs.close_files(&mut fdt);
             ktask::cancel_new_task(sched);
-            destroy_tables(tables);
+            memory.discard();
             return Err(errno);
         }
         let fs = process.vfs.dup_fs(&self.own.attrs.fs);
@@ -1170,10 +1291,12 @@ impl Syscall<'_> {
                 let mut fdt = fdt;
                 process.vfs.close_files(&mut fdt);
                 process.vfs.put_fs(&fs);
-                process.vfs.unpin_all(child_owner);
+                if !request.share_vm {
+                    process.vfs.unpin_all(child_owner);
+                }
                 process.vfs.fput(self.own.exe_file);
                 ktask::cancel_new_task(sched);
-                destroy_tables(tables);
+                memory.discard();
                 return Err(errno);
             }
         };
@@ -1185,6 +1308,16 @@ impl Syscall<'_> {
         attrs.clear_child_tid = request.clear_child_tid;
         attrs.robust_list = 0;
         let tid = pid.cast_unsigned();
+        let (tables, space) = match memory {
+            ChildMemory::Copy { space, tables } => (tables, space),
+            ChildMemory::Lend { placeholder } => {
+                // The child takes the real tree and VMA set, the parent the placeholders.
+                let tables = self.space.replace_tables(placeholder);
+                let space = core::mem::replace(&mut self.own.space, Mm::new(&self.own.env));
+                self.own.lent_out = true;
+                (tables, space)
+            }
+        };
         let local = Box::write(
             block,
             TaskLocal {
@@ -1201,6 +1334,13 @@ impl Syscall<'_> {
                     exe_file: self.own.exe_file,
                     exec: self.own.exec,
                     fdt,
+                    pin_owner: child_owner,
+                    vfork_parent: request.vfork.then_some(Lender {
+                        sched: self.own.sched,
+                        lent: request.share_vm,
+                    }),
+                    pending_mm: None,
+                    lent_out: false,
                 },
             },
         );
@@ -1208,7 +1348,54 @@ impl Syscall<'_> {
         // wake_up_new_task: the child is on the run queue; it first runs when
         // the parent next gives up the CPU.
         ktask::wake_up_new_task(sched);
+        if request.vfork {
+            self.wait_for_vfork_done();
+        }
         Ok(pid)
+    }
+
+    /// `wait_for_vfork_done`: sleep until the child has execed or exited (`TASK_KILLABLE`: only a
+    /// fatal signal ends the wait early), then take back the address space it borrowed. A parent
+    /// that stops waiting because it is being killed leaves the borrowed address space to the
+    /// child, who frees it when it lets go ([`complete_vfork`]).
+    fn wait_for_vfork_done(&mut self) {
+        let me = self.own.sched;
+        loop {
+            let done = VFORK_DONE.lock()[me.index()].take();
+            if let Some(Done { lent }) = done {
+                if let Some(Lent { tables, space }) = lent {
+                    let placeholder = self.space.replace_tables(tables);
+                    let placeholder_space = core::mem::replace(&mut self.own.space, space);
+                    self.own.lent_out = false;
+                    destroy_tables(placeholder);
+                    drop(placeholder_space);
+                }
+                return;
+            }
+            if signal::Task::state(self).fatal_signal_pending() {
+                return;
+            }
+            signal::Task::wait(self, vfork_done_key(me), None);
+        }
+    }
+}
+
+/// The address space a forked child starts with.
+enum ChildMemory {
+    /// `dup_mmap`: its own copy.
+    Copy { space: Mm, tables: Tables },
+    /// `CLONE_VM | CLONE_VFORK`: the parent's, moved in once the fork cannot fail any more;
+    /// meanwhile the parent's empty replacement.
+    Lend { placeholder: Tables },
+}
+
+impl ChildMemory {
+    /// The fork failed: free what was made.
+    fn discard(self) {
+        match self {
+            Self::Copy { tables, .. } => destroy_tables(tables),
+            Self::Lend { placeholder } => destroy_tables(placeholder),
+        }
     }
 }
 
@@ -1267,6 +1454,9 @@ impl Context for Syscall<'_> {
             hwcap: __cpuid(1).edx,
             random: random_bytes(),
         }
+    }
+    fn hw_random(&mut self) -> Option<u64> {
+        hw_random_u64()
     }
     fn start_thread(&mut self, ip: u64, sp: u64) {
         // flush_thread: the FPU returns to its initial state, TLS bases to 0.
@@ -1342,6 +1532,54 @@ impl Context for Syscall<'_> {
     }
     fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, Errno> {
         self.fork(request)
+    }
+    fn exec_prepare_mm(&mut self) -> Result<(), Errno> {
+        if !self.own.vfork_parent.is_some_and(|lender| lender.lent) || self.own.pending_mm.is_some()
+        {
+            return Ok(());
+        }
+        // bprm_mm_init: the new mm, its tree and VMA set.
+        let tables = self.space.empty_tree().map_err(|error| {
+            if matches!(error, paging::Error::Memory(_)) {
+                Errno::ENOMEM
+            } else {
+                crate::log!("FAIL exec tree error={:?}\n", error);
+                crate::fail()
+            }
+        })?;
+        self.own.pending_mm = Some((tables, Mm::new(&self.own.env)));
+        Ok(())
+    }
+    fn exec_switch_mm(&mut self) {
+        // exec_mmap -> exec_mm_release -> mm_release: `complete_vfork_done`.
+        let Some(lender) = self.own.vfork_parent.take() else {
+            return;
+        };
+        let lent = if lender.lent {
+            let Some((tables, space)) = self.own.pending_mm.take() else {
+                crate::log!("FAIL vfork child's exec without its new address space\n");
+                crate::fail();
+            };
+            let root = tables.root_address();
+            let borrowed_tables = self.space.replace_tables(tables);
+            let borrowed_space = core::mem::replace(&mut self.own.space, space);
+            // SAFETY: `root` is the live tree `empty_tree` made from this task's own, so its
+            // kernel half is the published one and maps this code, the stack and the heap; the
+            // BSP runs with IF=0 inside a system call; no PCID or global translations exist.
+            unsafe { cpu::activate_tables(root) };
+            ktask::set_current_cr3(root);
+            Some(Lent {
+                tables: borrowed_tables,
+                space: borrowed_space,
+            })
+        } else {
+            None
+        };
+        let key = self.own.pin_owner;
+        if lender.lent {
+            self.own.pin_owner = next_pin_owner();
+        }
+        complete_vfork(lender, key, lent, &mut self.shared.get().vfs);
     }
 }
 
@@ -1496,7 +1734,7 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
         crate::log!("FAIL exiting task has no state slot={}\n", slot);
         crate::fail();
     };
-    let (tables, own) = into_parts(boxed);
+    let (tables, mut own) = into_parts(boxed);
     // exit_mm: CR3 moves to the kernel tree before the user tree is freed.
     let kernel = KERNEL_ROOT.load(Ordering::Acquire);
     // SAFETY: `kernel` is the root of the kernel-only tree kept in
@@ -1505,13 +1743,33 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
     // the heap stay mapped; no PCID or global translations exist.
     unsafe { cpu::activate_tables(kernel) };
     ktask::set_current_cr3(kernel);
-    destroy_tables(tables);
-    let mut own = own;
     let mut shared = PROCESS.lock();
     let owner = own.owner();
-    // exit_mm / exit_files / exit_fs: the mappings' and the executable's
-    // references, every descriptor, the root and working directory.
-    shared.vfs.unpin_all(owner);
+    // exit_mm: a `vfork` child that never execed gives the address space it borrowed back
+    // (`mm_release`); everything else frees its own, and a vfork child's wake-up of its parent
+    // follows. A fresh address space made for an `execve` that did not happen goes too.
+    let borrowed = own.vfork_parent.take();
+    if let Some((fresh, _)) = own.pending_mm.take() {
+        destroy_tables(fresh);
+    }
+    match borrowed {
+        Some(lender) if lender.lent => {
+            let space = core::mem::replace(&mut own.space, Mm::new(&own.env));
+            complete_vfork(lender, owner, Some(Lent { tables, space }), &mut shared.vfs);
+        }
+        other => {
+            destroy_tables(tables);
+            // The mappings' pins go with the address space, unless a vfork child still has it.
+            if !own.lent_out {
+                shared.vfs.unpin_all(owner);
+            }
+            if let Some(lender) = other {
+                complete_vfork(lender, owner, None, &mut shared.vfs);
+            }
+        }
+    }
+    // exit_files / exit_fs: the executable's reference, every descriptor, the root and working
+    // directory.
     shared.vfs.fput(own.exe_file);
     shared.vfs.close_files(&mut own.fdt);
     shared.vfs.put_fs(&own.attrs.fs);
@@ -1555,6 +1813,18 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
         crate::fail();
     }
     drop(shared);
+    // A parent killed while its vfork child waited has an address space coming back that no
+    // one will take: free it (the child frees it itself when the parent is already gone).
+    let mine = own.sched.index();
+    let orphan = VFORK_DONE.lock()[mine].take();
+    if let Some(Done {
+        lent: Some(Lent { tables, space }),
+    }) = orphan
+    {
+        destroy_tables(tables);
+        drop(space);
+        PROCESS.lock().vfs.unpin_all(owner);
+    }
     drop(own);
     // do_task_dead: the next task releases this one's slot and stack.
     ktask::exit_current()
@@ -2588,6 +2858,7 @@ fn take_init_tables(init: &mut Loaded) -> Tables {
     tables
 }
 
+#[allow(clippy::too_many_lines, reason = "init's boot sequence, in order")]
 fn start(mut init: Loaded) {
     let mut tables = take_init_tables(&mut init);
     check_user_image(&init, &mut tables.user_space());
@@ -2685,6 +2956,10 @@ fn start(mut init: Loaded) {
                 exe_file: init.exec,
                 exec: u64::from(init.exec.index()),
                 fdt,
+                pin_owner: next_pin_owner(),
+                vfork_parent: None,
+                pending_mm: None,
+                lent_out: false,
             },
         })
         .map_err(|_| "init task state"),
