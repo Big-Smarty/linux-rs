@@ -128,6 +128,8 @@ pub struct Collect<'a> {
     pub attrs: &'a Attributes,
     pub fdt: &'a FdTable,
     pub files: &'a FileTable,
+    /// The address space, or `None` while a `vfork` child works in it (the task's own slot holds a
+    /// placeholder): the previous view's `mm` is kept, which is what the shared `mm_struct` showed.
     pub mm: Option<&'a Mm>,
     pub exe: Option<FileId>,
     /// `(anon, file, shmem)` resident pages and the page-table bytes of the
@@ -189,13 +191,15 @@ impl TaskView {
                 input.rss,
                 input.pgtables_bytes,
             )?),
-            None => None,
+            None => None, // kept below
         };
         self.fds.sync(self.fd_stamp, input.fdt, input.files)?;
         self.attrs = *input.attrs;
         self.has_fs = true;
         self.has_files = true;
-        self.mm = mm;
+        if input.mm.is_some() {
+            self.mm = mm;
+        }
         self.exe = input.exe.map(|file| exe_entry(file, input.files));
         self.fd_stamp = input.fdt.stamp();
         self.max_fds = u32::try_from(input.fdt.max_fds()).unwrap_or(u32::MAX);

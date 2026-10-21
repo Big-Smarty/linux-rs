@@ -1000,9 +1000,15 @@ fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Res
     // The argument and environment bytes are copied when the layout changes
     // (an `execve`) and kept otherwise.
     let layout = (own.space.arg_start, own.space.env_end);
+    // A parent whose address space is lent to its `vfork` child keeps the view it had (the
+    // child works in the same `mm_struct`; the slot holds a placeholder).
+    // shortcut: the sums behind `AnonPages`, `Mapped` and `PageTables` of /proc/meminfo count
+    // that shared address space twice until the child execs or exits (they are sums of views,
+    // not per-`mm` counters); revisit when `CLONE_VM` threads share views.
+    let lent = own.lent_out;
     let kept = process.vfs.fs.ns.proc.view(tgid).and_then(|view| {
         let mm = view.mm.as_ref()?;
-        ((mm.arg_start, mm.env_end) == layout && !view.args().is_empty())
+        (((mm.arg_start, mm.env_end) == layout || lent) && !view.args().is_empty())
             .then(|| view.args.clone())
             .flatten()
     });
@@ -1036,7 +1042,7 @@ fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Res
             attrs: &own.attrs,
             fdt: &own.fdt,
             files: &vfs.files,
-            mm: Some(&own.space),
+            mm: (!lent).then_some(&own.space),
             exe: Some(own.exe_file),
             rss: space.rss(),
             pgtables_bytes: space.table_bytes(),
