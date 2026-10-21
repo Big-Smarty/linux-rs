@@ -480,6 +480,7 @@ pub fn run() -> bool {
     delivery(&mut t);
     lifecycle(&mut t);
     fpu(&mut t);
+    cpu_time(&mut t);
     stress(&mut t);
     reap_all();
     t.finish()
@@ -512,7 +513,10 @@ fn identity(t: &mut T) {
     let ppid = sys(Sysno::getppid, &[]).unwrap_or(0);
     let pgid = sys(Sysno::getpgid, &[0]).unwrap_or(0);
     let sid = sys(Sysno::getsid, &[0]).unwrap_or(0);
-    // CLONE_CHILD_SETTID as well, so that the thread can read its own tid word at start.
+    // CLONE_CHILD_SETTID as well, so that the thread can read its own tid word at start. The
+    // join word starts as 0 and the thread stores its tid there when it first runs, so the
+    // join waits for the thread to say it is done (a join before the first run would see 0).
+    READY.store(0, SeqCst);
     let th = spawn_wired(
         THREAD_FLAGS | CLONE_CHILD_SETTID,
         Wiring {
@@ -532,11 +536,13 @@ fn identity(t: &mut T) {
                 sys(Sysno::set_tid_address, &[addr(&c.ctid)]).unwrap_or(usize::MAX),
                 SeqCst,
             );
+            set_and_wake(&READY, 1);
             7
         },
         0,
     )
     .unwrap_or(Thread { tid: 0, base: 0 });
+    wait_for(&READY, 1);
     t.holds(
         "clone-thread-returns-tid",
         th.tid != 0 && th.tid != me,
@@ -1379,7 +1385,11 @@ fn lifecycle(t: &mut T) {
 
     // execve from a thread that is not the leader: the others are gone, the thread has the
     // leader's pid, and the parent waits for the pid it knew.
+    // The new image prints the banner of every `/init`: its output goes to a pipe.
+    let (image_r, image_w) = pipe();
+    PIPES[1].store(image_w, SeqCst);
     let sub = fork_child(|| {
+        let _ = sys(Sysno::dup3, &[PIPES[1].load(SeqCst), 1, 0]);
         let _ = spawn(sleeper, 0);
         let _ = spawn(
             |_| {
@@ -1406,6 +1416,7 @@ fn lifecycle(t: &mut T) {
         wait4(sub as isize, 0),
         (Ok(sub), 0x1f << 8),
     );
+    let _ = (close(image_r), close(image_w));
 
     // Children belong to the group: a thread waits for the leader's child; with __WNOTHREAD it
     // cannot.
@@ -1724,5 +1735,64 @@ fn stress(t: &mut T) {
             .all(|(i, a)| all[..i].iter().all(|b| b.tid != a.tid) && a.tid != 0),
         all.map(|th| th.tid),
         "six different tids",
+    );
+}
+
+// ---- CPU time of a group ------------------------------------------------------------------
+
+/// `CLOCK_PROCESS_CPUTIME_ID` sums the group's threads, the finished ones included
+/// (`thread_group_cputime`); `CLOCK_THREAD_CPUTIME_ID` is the caller's own; `times(2)` reports
+/// the group (`thread_group_cputime_adjusted`).
+fn cpu_time(t: &mut T) {
+    const PROCESS_CPUTIME: usize = 2;
+    const THREAD_CPUTIME: usize = 3;
+    const BURN_NS: u64 = 40_000_000;
+    fn clock(id: usize) -> u64 {
+        let mut ts = [0i64; 2];
+        let _ = sys(Sysno::clock_gettime, &[id, addr_mut(&mut ts)]);
+        ts[0].cast_unsigned() * 1_000_000_000 + ts[1].cast_unsigned()
+    }
+    fn ticks() -> u64 {
+        let mut tms = [0u64; 4];
+        let _ = sys(Sysno::times, &[addr_mut(&mut tms)]);
+        tms[0] + tms[1]
+    }
+    static OWN: AtomicUsize = AtomicUsize::new(0);
+    let (process_before, ticks_before) = (clock(PROCESS_CPUTIME), ticks());
+    let th = spawn(
+        |_| {
+            let start = clock(THREAD_CPUTIME);
+            while clock(THREAD_CPUTIME) - start < BURN_NS {}
+            OWN.store((clock(THREAD_CPUTIME) - start) as usize, SeqCst);
+            0
+        },
+        0,
+    );
+    th.join();
+    let own = OWN.load(SeqCst) as u64;
+    t.holds(
+        "thread-burned-its-share",
+        own >= BURN_NS,
+        own,
+        "at least 40 ms of its own clock",
+    );
+    let process_after = clock(PROCESS_CPUTIME);
+    t.holds(
+        "process-cpu-clock-keeps-a-finished-thread",
+        process_after - process_before >= own,
+        (process_after - process_before, own),
+        "the group's clock grew by at least the thread's time",
+    );
+    t.holds(
+        "thread-cpu-clock-is-the-callers-own",
+        clock(THREAD_CPUTIME) <= process_after,
+        clock(THREAD_CPUTIME),
+        "no more than the process clock",
+    );
+    t.holds(
+        "times-includes-a-finished-thread",
+        ticks() - ticks_before >= 3,
+        ticks() - ticks_before,
+        "at least 3 ticks of 10 ms",
     );
 }

@@ -1695,6 +1695,12 @@ impl Syscall<'_> {
         // task structure, so it fails there too).
         let xstate = fpu::XBuf::from_live().map_err(|_| Errno::ENOMEM)?;
         let (mm_id, files_id, fs_id) = (self.own.mm, self.own.files, self.own.fs);
+        // The address space is shared with a new process: what `/proc` shows of the parent
+        // (the argument bytes, the layout) is brought up to date with the image it runs now,
+        // as Linux's files read the live `mm`.
+        if request.share_vm && !request.thread {
+            let _ = publish(self.shared.get(), self.own);
+        }
         let process = self.shared.get();
         // copy_process: RLIMIT_NPROC and max_threads (fork.c:2059, 2072).
         process.tasks.fork_allowed(parent, params.fork)?;
@@ -2202,6 +2208,14 @@ impl Context for Syscall<'_> {
                 unsafe { cpu::activate_tables(root) };
                 ktask::set_current_cr3(root);
             }
+            Some(PendingMm { exe: None, .. }) if old.users > 1 => {
+                crate::log!("FAIL exec of a shared address space without its executable\n");
+                crate::fail();
+            }
+            None if old.users > 1 => {
+                crate::log!("FAIL exec of a shared address space without a fresh one\n");
+                crate::fail();
+            }
             // The other users are gone by now (`de_thread`): the old address space is this
             // task's alone and the exec replaces its image in place; the fresh one is not
             // needed.
@@ -2215,10 +2229,6 @@ impl Context for Syscall<'_> {
                     let previous = core::mem::replace(&mut old.exe_file, file);
                     vfs.fput(previous);
                 }
-            }
-            None if old.users > 1 => {
-                crate::log!("FAIL exec of a shared address space without a fresh one\n");
-                crate::fail();
             }
             None => {}
         }
@@ -2328,6 +2338,53 @@ impl Context for Syscall<'_> {
     }
 }
 
+impl Syscall<'_> {
+    /// `thread_group_cputime` and `thread_group_cputime_adjusted` of the caller's group: every
+    /// live thread's account, the times the finished threads left in the group and those of a
+    /// thread that is exiting (folded by `do_exit` before the thread is released). The sample
+    /// and the `(utime, stime)` pair `times(2)` reports.
+    /// shortcut: a finished thread's runtime is its adjusted `utime + stime`, which is equal
+    /// to `sum_exec_runtime` by construction (`cputime_adjust`), but its tick-accounted user
+    /// and system parts are the adjusted ones, so `CPUCLOCK_VIRT` of a group that lost a
+    /// thread is the adjusted figure.
+    fn group_cpu(&mut self) -> (CpuSample, (u64, u64)) {
+        let now = timer::ktime_get_ns();
+        let me = self.own.me;
+        let tasks = &self.shared.get().tasks;
+        let (mut user, mut system) = tasks.dead_cputime(me);
+        let mut sample = CpuSample {
+            runtime_ns: user + system,
+            user_ns: user,
+            system_ns: system,
+        };
+        for thread in tasks.threads(me) {
+            let Some(task) = tasks.task(thread) else {
+                continue;
+            };
+            match task.sched {
+                Some(sched) if task.exit_state == task::tasklist::ExitState::Live => {
+                    let account = ktask::cpu_account(sched);
+                    let part = account.sample(now);
+                    sample.runtime_ns += part.runtime_ns;
+                    sample.user_ns += part.user_ns;
+                    sample.system_ns += part.system_ns;
+                    let (u, s) = account.adjusted(now);
+                    user += u;
+                    system += s;
+                }
+                _ => {
+                    sample.runtime_ns += task.utime_ns + task.stime_ns;
+                    sample.user_ns += task.utime_ns;
+                    sample.system_ns += task.stime_ns;
+                    user += task.utime_ns;
+                    system += task.stime_ns;
+                }
+            }
+        }
+        (sample, (user, system))
+    }
+}
+
 impl Clocks for Syscall<'_> {
     fn clock_state(&self) -> ClockState {
         timer::clock_state()
@@ -2345,8 +2402,11 @@ impl Clocks for Syscall<'_> {
     fn cpu_sample(&self) -> CpuSample {
         ktask::cpu_account(self.own.sched).sample(timer::ktime_get_ns())
     }
+    fn group_cpu_sample(&mut self) -> CpuSample {
+        self.group_cpu().0
+    }
     fn cpu_adjusted(&mut self) -> (u64, u64) {
-        ktask::cpu_account(self.own.sched).adjusted(timer::ktime_get_ns())
+        self.group_cpu().1
     }
     fn sleep_until(&mut self, deadline_ns: u64) -> Option<u64> {
         // `do_nanosleep`: asleep until the deadline or a pending signal.

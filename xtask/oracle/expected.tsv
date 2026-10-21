@@ -4149,10 +4149,14 @@ threads	check	group-is-killed-after-the-continue	init: test threads.group-is-kil
 threads	check	thread-starts-with-creators-fpu	init: test threads.thread-starts-with-creators-fpu ok
 threads	check	thread-fpu-survives-switches	init: test threads.thread-fpu-survives-switches ok
 threads	check	main-fpu-survives-switches	init: test threads.main-fpu-survives-switches ok
+threads	check	thread-burned-its-share	init: test threads.thread-burned-its-share ok
+threads	check	process-cpu-clock-keeps-a-finished-thread	init: test threads.process-cpu-clock-keeps-a-finished-thread ok
+threads	check	thread-cpu-clock-is-the-callers-own	init: test threads.thread-cpu-clock-is-the-callers-own ok
+threads	check	times-includes-a-finished-thread	init: test threads.times-includes-a-finished-thread ok
 threads	check	mutex-keeps-every-update	init: test threads.mutex-keeps-every-update ok
 threads	check	every-thread-ran-to-the-end	init: test threads.every-thread-ran-to-the-end ok
 threads	check	distinct-tids	init: test threads.distinct-tids ok
-threads	summary	-	init: tests threads passed=96 failed=0
+threads	summary	-	init: tests threads passed=100 failed=0
 futex	check	wait-value-mismatch	init: test futex.wait-value-mismatch ok
 futex	check	wait-value-mismatch-private	init: test futex.wait-value-mismatch-private ok
 futex	check	wait-null	init: test futex.wait-null ok

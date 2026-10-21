@@ -162,9 +162,16 @@ pub trait Clocks {
     fn set_restart_block(&mut self, block: RestartBlock);
     /// `current->restart_block` as stored by [`Self::set_restart_block`].
     fn restart_block(&self) -> RestartBlock;
-    /// `CPUCLOCK_SCHED`/`VIRT`/`PROF` inputs of the (only) task.
+    /// `CPUCLOCK_SCHED`/`VIRT`/`PROF` inputs of the calling thread.
     fn cpu_sample(&self) -> crate::cputime::CpuSample;
-    /// `thread_group_cputime_adjusted`: `(utime, stime)` in ns for `times(2)`.
+    /// The same inputs summed over the calling thread's group (`thread_group_cputime`: the
+    /// live threads and the finished ones), for `CLOCK_PROCESS_CPUTIME_ID`. A single-thread
+    /// group is the thread's own.
+    fn group_cpu_sample(&mut self) -> crate::cputime::CpuSample {
+        self.cpu_sample()
+    }
+    /// `thread_group_cputime_adjusted`: `(utime, stime)` in ns of the whole group for
+    /// `times(2)`.
     fn cpu_adjusted(&mut self) -> (u64, u64);
     /// Block until `CLOCK_MONOTONIC` reaches `deadline_ns`. `None` when the
     /// deadline was reached; `Some(remaining_ns)` when a signal interrupted it.
@@ -316,9 +323,12 @@ fn to_ktime((sec, nsec): Ts) -> i128 {
 /// name this thread group. `which` (`CPUCLOCK_WHICH`) 3 is invalid.
 fn cpu_clock_valid<C: Context>(ctx: &C, id: i32) -> Result<(), Errno> {
     let upid = !(id >> 3);
-    // shortcut: one single-threaded task, so the thread id equals the tgid.
-    // Replace with a pid/tid lookup when tasks exist.
-    if id & 3 >= 3 || (upid != 0 && i64::from(upid) != i64::from(ctx.tgid())) {
+    // shortcut: only the caller's own clocks (`pid` 0, its tgid, or with the thread bit its
+    // own tid); another task's, or another thread's of the group, needs the pid lookup
+    // (`pid_for_clock`).
+    let own = i64::from(upid) == i64::from(ctx.tgid())
+        || (id & 4 != 0 && i64::from(upid) == i64::from(ctx.tid()));
+    if id & 3 >= 3 || (upid != 0 && !own) {
         return Err(Errno::EINVAL);
     }
     Ok(())
@@ -354,7 +364,7 @@ impl Now {
 }
 
 /// The `clock_get_timespec` method, as nanoseconds.
-fn clock_get<C: Context>(ctx: &C, kclock: Kclock, id: i32) -> Result<i128, Errno> {
+fn clock_get<C: Context>(ctx: &mut C, kclock: Kclock, id: i32) -> Result<i128, Errno> {
     let now = Now {
         state: ctx.clock_state(),
     };
@@ -374,10 +384,16 @@ fn clock_get<C: Context>(ctx: &C, kclock: Kclock, id: i32) -> Result<i128, Errno
                 now.boot()
             }
         }
-        Kclock::Process | Kclock::Thread => i128::from(ctx.cpu_sample().runtime_ns),
+        Kclock::Process => i128::from(ctx.group_cpu_sample().runtime_ns),
+        Kclock::Thread => i128::from(ctx.cpu_sample().runtime_ns),
         Kclock::PosixCpu(id) => {
             cpu_clock_valid(ctx, id)?;
-            let sample = ctx.cpu_sample();
+            // The per-thread bit selects the thread's own clock, else the group's.
+            let sample = if id & 4 != 0 {
+                ctx.cpu_sample()
+            } else {
+                ctx.group_cpu_sample()
+            };
             i128::from(match id & 3 {
                 0 => sample.user_ns + sample.system_ns,
                 1 => sample.user_ns,
