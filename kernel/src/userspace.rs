@@ -1221,10 +1221,13 @@ struct Syscall<'a> {
 }
 
 /// `handle_mm_fault` for one user address: the model's decision, and for a
-/// page of a private file mapping (`NeedsFile`) `shmem_fault` + `do_cow_fault`:
-/// a private frame holding the file page ([`Vfs::fault_page`]; `SIGBUS` past
-/// `i_size`), mapped with the VMA's protection. `owner` is the faulting
-/// task's mapping-pin key.
+/// page of a private file mapping (`NeedsFile`) `shmem_fault` + `do_read_fault`
+/// / `do_cow_fault`: a private frame holding the file page ([`Vfs::fault_page`];
+/// `SIGBUS` past `i_size`). A read fault maps it read-only (`do_read_fault`
+/// maps the page-cache page without `FAULT_FLAG_WRITE`, so `RssShmem`; the
+/// first write takes the write-protect fault that copies it), a write fault
+/// with the VMA's protection (`do_cow_fault`, `RssAnon`). `owner` is the
+/// faulting task's mapping-pin key.
 fn user_fault(
     mm: &mut Mm,
     env: &Env,
@@ -1235,7 +1238,7 @@ fn user_fault(
     error: u64,
 ) -> FaultOutcome {
     let outcome = mm.handle_user_fault(env, space, address, error);
-    let FaultOutcome::NeedsFile { address, .. } = outcome else {
+    let FaultOutcome::NeedsFile { address, write } = outcome else {
         return outcome;
     };
     let page = address & !(PAGE - 1);
@@ -1258,10 +1261,14 @@ fn user_fault(
     let pgoff = vma.pgoff + ((page - vma.start) >> 12);
     match vfs.fault_page(owner, file, pgoff, &mut bytes) {
         Err(FileFault::Bus) => FaultOutcome::Bus { address },
-        Ok(()) => match space.install(page, mm::page_prot(vma.flags), true, &bytes) {
-            Ok(()) => FaultOutcome::Handled,
-            Err(mm::OutOfMemory) => FaultOutcome::Oom,
-        },
+        Ok(()) => {
+            let mut prot = mm::page_prot(vma.flags);
+            prot.write &= write;
+            match space.install(page, prot, true, &bytes) {
+                Ok(()) => FaultOutcome::Handled,
+                Err(mm::OutOfMemory) => FaultOutcome::Oom,
+            }
+        }
     }
 }
 

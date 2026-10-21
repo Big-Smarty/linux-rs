@@ -762,12 +762,17 @@ fn write_kind<C: Context>(ctx: &mut C, view: &View, src: &mut Src, pos: Option<&
 
 /// `do_loop_readv_writev` for a file with a `->write` but no `->write_iter`: one `write` per
 /// non-empty segment, stopping at the first short or failed one (an error only when nothing
-/// was written before). A kernel-held source is one segment.
+/// was written before). A `->write` takes a user buffer, so a kernel-held source has no segment to
+/// hand it: that stops the kernel loudly instead of writing zero bytes (no path reaches it today;
+/// a `splice` into a procfs file stops before this).
 fn write_loop<C: Context>(
     ctx: &mut C,
     src: &mut Src,
     mut write: impl FnMut(&mut C, u64, u64) -> Sys,
 ) -> Sys {
+    if matches!(src.data, SrcData::Kernel(_)) {
+        return Err(Stop::Unimplemented);
+    }
     if let Some((base, len)) = src.plain_buffer() {
         return write(ctx, base, len);
     }

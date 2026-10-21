@@ -79,9 +79,11 @@ const PROTNONE: u64 = 1 << 8;
 /// A leaf that holds a page: reachable (`PRESENT`) or `PROT_NONE`.
 const MAPPED: u64 = PRESENT | PROTNONE;
 /// Software bit (an `AVL` bit the hardware ignores): the page belongs to a file
-/// mapping ([`Tables::mm_install_page`] with `file`). With the write bit it
-/// decides whether a resident page counts as `RssAnon` (a private copy the
-/// task wrote) or `RssShmem` (the page-cache page); see [`rss_class`].
+/// mapping that is still the page-cache page ([`Tables::mm_install_page`] with
+/// `file` and no write access): it counts as `RssShmem`, and the private copy
+/// the first write makes ([`Tables::mm_make_writable`], `wp_page_copy`) clears it,
+/// after which the page is `RssAnon` whatever a later `mprotect` does to the
+/// write bit; see [`rss_class`].
 const FILE: u64 = 1 << 9;
 const NX: u64 = 1 << 63;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
@@ -192,13 +194,13 @@ pub struct Tables {
 
 /// What a leaf entry adds to `(RssAnon, RssShmem)` of an address space whose
 /// shared zero page is `zero`: nothing unless it is a present, non-zero page;
-/// a file page nobody wrote (hardware write bit clear) is the page-cache page
+/// a page that is still the file's ([`FILE`]) is the page-cache page
 /// (`MM_SHMEMPAGES`: every file here is on tmpfs), anything else a private
 /// anonymous frame.
 fn rss_class(zero: Option<Physical>, entry: u64) -> (u64, u64) {
     if entry & PRESENT == 0 || Some(Physical(entry & ADDRESS)) == zero {
         (0, 0)
-    } else if entry & FILE != 0 && entry & WRITE == 0 {
+    } else if entry & FILE != 0 {
         (0, 1)
     } else {
         (1, 0)
@@ -973,14 +975,14 @@ impl Tables {
     }
 
     /// The resident pages of `[start, start + pages * 4096)` that are not the
-    /// shared zero page: `(pages, writable pages)`. A walk over the present
-    /// tables only (`for_each_user_slot`): what `/proc/<pid>/status`'s `RssAnon`
-    /// and `RssShmem` were computed from before the counters, now the
+    /// shared zero page: `(pages, pages still the file's)`. A walk over the
+    /// present tables only (`for_each_user_slot`): what `/proc/<pid>/status`'s
+    /// `RssAnon` and `RssShmem` were computed from before the counters, now the
     /// self-test's cross-check ([`UserSpace::check_counters`]).
     #[cfg(feature = "qemu-self-test")]
     #[must_use]
     pub fn mm_resident(&self, start: u64, pages: u64) -> (u64, u64) {
-        let (mut present, mut writable) = (0, 0);
+        let (mut present, mut filed) = (0, 0);
         self.for_each_user_slot(start, pages, |_, slot| {
             // SAFETY: `for_each_user_slot` hands out a valid, aligned PTE slot
             // of this tree inside the direct map; a volatile read creates no
@@ -988,10 +990,10 @@ impl Tables {
             let entry = unsafe { ptr::read_volatile(slot) };
             if entry & PRESENT != 0 && Some(Physical(frame_bits(entry))) != self.zero {
                 present += 1;
-                writable += u64::from(entry & WRITE != 0);
+                filed += u64::from(entry & FILE != 0);
             }
         });
-        (present, writable)
+        (present, filed)
     }
 
     /// `mm_pgtables_bytes`: the PUD, PMD and PTE pages of the user half, by
@@ -1138,7 +1140,11 @@ impl Tables {
 
     /// Install a private frame holding `bytes` (the loader's page-cache
     /// stand-in); `accessible == false` keeps it behind a `PROT_NONE` PTE.
-    /// `file` marks a page of a file mapping ([`FILE`]).
+    /// `file` says the page is the file's page-cache page ([`FILE`], `RssShmem`):
+    /// it is ignored when `prot.write` is set, because a page installed
+    /// writable is the private copy a write fault made (`do_cow_fault`, `RssAnon`);
+    /// a read fault installs it read-only (`do_read_fault`) and the first write
+    /// copies it ([`Tables::mm_make_writable`]).
     ///
     /// # Errors
     /// As [`Tables::mm_map_anon`].
@@ -1157,7 +1163,7 @@ impl Tables {
             PRESENT | USER | if prot.write { WRITE } else { 0 } | if prot.exec { 0 } else { NX }
         } else {
             PROTNONE | USER | NX
-        } | if file { FILE } else { 0 };
+        } | if file && !prot.write { FILE } else { 0 };
         let result = self.map(allocator, Virtual(page), frame, flags, false);
         if result.is_err() {
             // SAFETY: as in `mm_map_anon`.
@@ -1166,7 +1172,9 @@ impl Tables {
         result
     }
 
-    /// `wp_page_reuse`: set the hardware write bit of the present private page.
+    /// `wp_page_reuse` / `wp_page_copy`: set the hardware write bit of the
+    /// present private page. A page that was still the file's becomes the
+    /// task's own copy ([`FILE`] cleared: `RssShmem` -> `RssAnon`).
     pub fn mm_make_writable(&mut self, page: u64) {
         let Ok(Some(slot)) = self.user_slot(page) else {
             return;
@@ -1177,10 +1185,10 @@ impl Tables {
         // Never on a not-present (PROT_NONE) entry, the zero page or a
         // supervisor entry: the model only asks for exclusive anonymous pages.
         while old & PRESENT != 0 && old & USER != 0 && Some(Physical(old & ADDRESS)) != self.zero {
-            match entry.compare_exchange_weak(old, old | WRITE, Ordering::AcqRel, Ordering::Acquire)
-            {
+            let new = (old | WRITE) & !FILE;
+            match entry.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
-                    self.account(old, old | WRITE);
+                    self.account(old, new);
                     break;
                 }
                 Err(current) => old = current,
@@ -1444,13 +1452,11 @@ impl UserSpace<'_> {
         );
         let (mut anon, mut shmem) = (0, 0);
         for vma in vmas {
-            let (present, writable) = self.tables.mm_resident(vma.start, vma.pages());
-            if vma.file.is_some() {
-                anon += writable;
-                shmem += present - writable;
-            } else {
-                anon += present;
-            }
+            // Only a file VMA may hold a page that is still the file's.
+            let (present, filed) = self.tables.mm_resident(vma.start, vma.pages());
+            let filed = if vma.file.is_some() { filed } else { 0 };
+            anon += present - filed;
+            shmem += filed;
         }
         assert_eq!(
             (anon, shmem),

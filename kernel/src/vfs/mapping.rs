@@ -24,9 +24,10 @@
 //!
 //! * shortcut: no page cache, so a `MAP_PRIVATE` file page is a private copy of
 //!   the tmpfs page taken when it is first touched (what `do_cow_fault` would
-//!   leave, also for a read fault, where Linux maps the shared page read-only
-//!   and a later write to the file shows through until the first private
-//!   write). A write or truncate of a file with a touched mapping therefore
+//!   leave; a read fault maps the copy read-only as `do_read_fault` maps the
+//!   page-cache page, so it counts as `RssShmem` and the first write copies it
+//!   again, but where Linux maps the shared page and a later write to the file
+//!   shows through until the first private write). A write or truncate of a file with a touched mapping therefore
 //!   sets [`Vfs::take_coherence_loss`], which the dispatcher turns into a loud
 //!   stop instead of letting the two diverge silently. A `MAP_SHARED` mapping
 //!   is created only through a description that cannot write (`VM_SHARED` is
