@@ -11,7 +11,10 @@
 // disabled: no mouse); no ACPI/PnP, DMI quirk or `i8042.*` module-parameter
 // handling; the keyboard is not reset or probed (it is left in the scancode set and
 // translation the firmware chose, which both `scancode::Atkbd` modes understand) and
-// its LEDs are not driven.
+// its LEDs are not driven. The status PARITY/TIMEOUT bits are not forwarded:
+// `atkbd_pre_receive_byte` (atkbd.c:427-440) returns PS2_PROCESS regardless of the
+// flags on x86 (the frame-error resync is `#if !defined(__i386__) && !defined
+// (__x86_64__)`), so a flagged byte is decoded as any other.
 //! The i8042 keyboard controller and its keyboard (PS/2), feeding the console tty.
 //!
 //! shortcut: no keyboard `RESET`/`GETID`/`SSCANSET` probe sequence and no hotplug
@@ -192,16 +195,17 @@ fn enable_keyboard() {
 
 /// Probe the controller, bring up the keyboard port and route its interrupt.
 /// Silent when there is no i8042 (a machine without PS/2 ports, USB legacy
-/// emulation off).
+/// emulation off). Returns whether the keyboard interrupt is routed, i.e. whether
+/// vector 0x31 may arrive.
 ///
 /// # Safety
 /// BSP, IF clear, after `timer::init` (the delay clock, the interrupt routes) and
 /// `cpu::install_descriptors`; the ports 0x60/0x64 are the PC keyboard
 /// controller's (no other owner exists in this kernel).
-pub(crate) unsafe fn init() {
+pub(crate) unsafe fn init() -> bool {
     let Some(translated) = controller_init() else {
         crate::log!("i8042: no controller\n");
-        return;
+        return false;
     };
     *STATE.lock() = Some(State {
         atkbd: Atkbd::new(translated),
@@ -212,8 +216,12 @@ pub(crate) unsafe fn init() {
         Ok(()) => {
             enable_keyboard();
             crate::log!("i8042: keyboard port enabled translated={}\n", translated);
+            true
         }
-        Err(error) => crate::log!("WARN i8042: keyboard interrupt not routed: {:?}\n", error),
+        Err(error) => {
+            crate::log!("WARN i8042: keyboard interrupt not routed: {:?}\n", error);
+            false
+        }
     }
 }
 
@@ -222,7 +230,13 @@ pub(crate) fn interrupt() {
     crate::timer::eoi_isa(IRQ);
     let mut bytes = [0u8; BUFFER_SIZE as usize];
     let mut n = 0;
-    while n < bytes.len() && in_byte(STATUS) & STR_OBF != 0 {
+    // Bound the controller reads, not the stored bytes: a controller that keeps OBF
+    // set (or streams auxiliary bytes) must not hold the CPU in hardirq. Linux reads
+    // one byte per interrupt; the batch is at most one `I8042_BUFFER_SIZE`.
+    for _ in 0..bytes.len() {
+        if in_byte(STATUS) & STR_OBF == 0 {
+            break;
+        }
         let aux = in_byte(STATUS) & STR_AUXDATA != 0;
         let data = in_byte(DATA);
         // The auxiliary port is never enabled; anything from it is dropped.

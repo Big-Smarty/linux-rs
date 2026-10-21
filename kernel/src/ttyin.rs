@@ -12,14 +12,16 @@
 // the input interrupts and emptied by [`flush`] under the process lock; there is
 // no `kworker`, the interrupt itself takes the lock (it can only arrive in ring 3
 // or in the idle halt, where no lock is held: `services`) and flushes at once;
-// anything it could not take is flushed by the next `tty_parts`. One 8250 (COM1,
+// input the line discipline had no room for is flushed by the next `tty_parts`
+// (and `^S`/`^Q` behind it act at once: `lookahead_bufs`). One 8250 (COM1,
 // IRQ4, QEMU builds only: a physical machine has no assumed serial port) and one
 // i8042 keyboard (IRQ1).
 //! Input of the console tty: the flip buffer and the interrupt glue.
 //!
-//! Lock order: `PROCESS` -> `RX` (a leaf). The interrupt handlers read the device,
-//! then take `PROCESS` (never `RX` first), so no handler waits for a lock the
-//! interrupted code holds (it cannot hold one: see `services`).
+//! Lock order: `PROCESS` -> `i8042::STATE` -> `RX` (a leaf; the keyboard path holds
+//! `STATE` across `push`, nothing takes them in the other order). The interrupt
+//! handlers read the device, then take `PROCESS` (never `RX` first), so no handler
+//! waits for a lock the interrupted code holds (it cannot hold one: see `services`).
 
 #![cfg_attr(
     feature = "baremetal-suite",
@@ -40,7 +42,10 @@ impl Host for Wire<'_> {
     }
 }
 
-/// `TTYB_DEFAULT_MEM_LIMIT` is 128 KiB of buffers; entries here are 2 bytes.
+/// Linux bounds the flip buffers by `TTYB_DEFAULT_MEM_LIMIT` (640 KiB of buffers,
+/// tty_buffer.c:31); this ring holds 4096 two-byte entries (8 KiB).
+/// shortcut: input beyond the ring is dropped much earlier than on Linux, grow
+/// the ring (or make it dynamic) if a workload pastes more than ~8 KiB at once.
 const RX_CAP: usize = 4096;
 
 /// The flip buffer: (byte, flag) pairs, oldest first.
@@ -48,6 +53,9 @@ struct Rx {
     entries: [u16; RX_CAP],
     head: usize,
     tail: usize,
+    /// `tty_buffer.lookahead` as an absolute index: entries below it were
+    /// offered to the discipline's `lookahead_buf` already.
+    lookahead: usize,
     dropped: u64,
 }
 
@@ -55,6 +63,7 @@ static RX: IrqMutex<Rx> = IrqMutex::new(Rx {
     entries: [0; RX_CAP],
     head: 0,
     tail: 0,
+    lookahead: 0,
     dropped: 0,
 });
 
@@ -70,9 +79,12 @@ impl Rx {
         self.head += 1;
     }
     fn peek(&self, bytes: &mut [u8], flags: &mut [u8]) -> usize {
-        let n = (self.head - self.tail).min(bytes.len());
+        self.peek_from(self.tail, bytes, flags)
+    }
+    fn peek_from(&self, from: usize, bytes: &mut [u8], flags: &mut [u8]) -> usize {
+        let n = (self.head - from).min(bytes.len());
         for i in 0..n {
-            [bytes[i], flags[i]] = self.entries[(self.tail + i) % RX_CAP].to_le_bytes();
+            [bytes[i], flags[i]] = self.entries[(from + i) % RX_CAP].to_le_bytes();
         }
         n
     }
@@ -111,8 +123,8 @@ pub(crate) unsafe fn init() {
         SERIAL.store(true, Ordering::Release);
     }
     // SAFETY: the caller's contract.
-    unsafe { crate::i8042::init() };
-    KEYBOARD.store(true, Ordering::Release);
+    let routed = unsafe { crate::i8042::init() };
+    KEYBOARD.store(routed, Ordering::Release);
 }
 
 /// Queue one received character with its status flag (`TTY_NORMAL`, `TTY_BREAK`,
@@ -122,8 +134,8 @@ pub(crate) fn push(byte: u8, flag: u8) {
 }
 
 /// `flush_to_ldisc`: hand the queued input to the line discipline. Input the
-/// discipline has no room for stays queued (the discipline asks to be kicked
-/// when a reader makes room: [`Tty::take_kick`]).
+/// discipline has no room for stays queued until the next `flush` (every tty
+/// entry and input interrupt calls it).
 pub(crate) fn flush(tty: &mut Tty, host: &mut dyn Host) {
     loop {
         let mut bytes = [0u8; 64];
@@ -135,8 +147,28 @@ pub(crate) fn flush(tty: &mut Tty, host: &mut dyn Host) {
         let used = tty.receive_buf(host, &bytes[..n], Some(&flags[..n]));
         RX.lock().advance(used);
         if used < n {
+            lookahead(tty, host);
             return;
         }
+    }
+}
+
+/// `lookahead_bufs`: offer everything queued and not yet offered to the
+/// discipline's `lookahead_buf` (`^S`/`^Q` behind a full input buffer).
+fn lookahead(tty: &mut Tty, host: &mut dyn Host) {
+    loop {
+        let mut bytes = [0u8; 64];
+        let mut flags = [0u8; 64];
+        let n = {
+            let mut rx = RX.lock();
+            rx.lookahead = rx.lookahead.max(rx.tail);
+            rx.peek_from(rx.lookahead, &mut bytes, &mut flags)
+        };
+        if n == 0 {
+            return;
+        }
+        tty.lookahead_flow_ctrl(host, &bytes[..n], Some(&flags[..n]));
+        RX.lock().lookahead += n;
     }
 }
 

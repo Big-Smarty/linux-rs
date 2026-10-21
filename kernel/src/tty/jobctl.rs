@@ -124,7 +124,8 @@ pub fn tiocsctty(
     }
     if tty.ctrl.session.is_some() {
         // This tty is already the controlling tty for another session group!
-        if arg == 1 && sys_admin {
+        // `int arg`: only the low 32 bits of the ioctl argument are compared.
+        if arg & 0xffff_ffff == 1 && sys_admin {
             tasks.session_clear_tty(tty.ctrl.session);
         } else {
             return Err(Errno::EPERM);

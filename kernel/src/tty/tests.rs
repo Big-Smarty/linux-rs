@@ -268,6 +268,19 @@ fn xoff_stops_output_and_xon_restarts_it() {
 }
 
 #[test]
+fn lookahead_applies_flow_control_in_advance() {
+    let (mut tty, mut host) = tty();
+    // XOFF seen in advance (the flip buffer had no room for it) stops output...
+    tty.lookahead_flow_ctrl(&mut host, b"\x13", None);
+    tty.write_pass(&mut host, b"held");
+    assert_eq!(host.wire, b"");
+    // The normal receive of the same byte skips it; the next XON restarts.
+    feed(&mut tty, &mut host, b"\x13");
+    feed(&mut tty, &mut host, b"\x11");
+    assert_eq!(host.wire, b"held");
+}
+
+#[test]
 fn break_with_brkint_raises_sigint() {
     let (mut tty, mut host) = tty();
     let mut t = tty.termios;

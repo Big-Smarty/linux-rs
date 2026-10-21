@@ -357,7 +357,9 @@ pub(super) fn read<C: Context>(ctx: &mut C, view: &View, dest: &mut Dest) -> Sys
 // ---- write ---------------------------------------------------------------------
 
 /// `n_tty_write` of one chunk: bytes consumed, or the reason none were.
-fn n_tty_write<C: Context>(ctx: &mut C, view: &View, buf: &[u8]) -> i64 {
+///
+/// `Err` is a loud stop propagated from the job-control check, never a result.
+fn n_tty_write<C: Context>(ctx: &mut C, view: &View, buf: &[u8]) -> Sys {
     let console = view.kind == FileKind::Char(CharDev::Console);
     // Job control check -- must be done at start (POSIX.1 7.1.1.4).
     if !console
@@ -365,9 +367,9 @@ fn n_tty_write<C: Context>(ctx: &mut C, view: &View, buf: &[u8]) -> i64 {
         && let Some(result) = check_change(ctx, SIGTTOU)
     {
         return match result {
-            Ok(value) => value,
-            Err(Stop::Errno(errno)) => neg(errno),
-            Err(Stop::Unimplemented) => 0,
+            Ok(value) => Ok(value),
+            Err(Stop::Errno(errno)) => Ok(neg(errno)),
+            Err(stop) => Err(stop),
         };
     }
     {
@@ -400,11 +402,11 @@ fn n_tty_write<C: Context>(ctx: &mut C, view: &View, buf: &[u8]) -> i64 {
         }
         ctx.wait(TTY_KEY, None);
     }
-    if done > 0 {
+    Ok(if done > 0 {
         i64::try_from(done).unwrap_or(i64::MAX)
     } else {
         retval
-    }
+    })
 }
 
 /// `tty_write` on a console-tty file, called by `vfs_write` after the descriptor,
@@ -438,13 +440,22 @@ pub(super) fn write<C: Context>(ctx: &mut C, view: &View, buffer: u64, count: u6
     let mut written = 0usize;
     let mut ret: i64 = 0;
     let mut chunk = [0u8; WRITE_CHUNK];
-    while remaining > 0 {
+    // `for (;;)` in iterate_tty_write: a zero-length write still reaches n_tty_write
+    // (TOSTOP check, echo flush, signal and hangup checks) once.
+    loop {
         let size = remaining.min(WRITE_CHUNK);
         if copy_from_user(ctx, &mut chunk[..size], at) != 0 {
             ret = neg(Errno::EFAULT);
             break;
         }
-        let consumed = n_tty_write(ctx, view, &chunk[..size]);
+        let consumed = match n_tty_write(ctx, view, &chunk[..size]) {
+            Ok(consumed) => consumed,
+            Err(stop) => {
+                let (tty, _, me) = env(ctx);
+                tty.write_unlock(me);
+                return Err(stop);
+            }
+        };
         if consumed <= 0 {
             ret = consumed;
             break;
@@ -913,7 +924,9 @@ fn ldisc_ioctl<C: Context>(ctx: &mut C, cmd: u32, arg: u64) -> Sys {
             put(ctx, arg, &raw)
         }
         TIOCSLCKTRMIOS => {
-            // checkpoint_restore_ns_capable(&init_user_ns)
+            // checkpoint_restore_ns_capable(&init_user_ns) is CAP_CHECKPOINT_RESTORE or
+            // CAP_SYS_ADMIN; shortcut: `Cred` models CAP_SYS_ADMIN only, extend with the
+            // credential model if CAP_CHECKPOINT_RESTORE is ever added.
             if !ctx.cred().sys_admin {
                 return Err(Errno::EPERM.into());
             }

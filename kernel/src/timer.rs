@@ -359,7 +359,8 @@ fn pit_rearm(now_ns: u64) {
 struct DeviceIrq {
     ioapics: Option<apic::Ioapics>,
     routes: [Option<kernel::firmware::IsaRoute>; 16],
-    destination: u8,
+    /// The boot CPU's APIC id when it fits the 8-bit IOAPIC destination field.
+    destination: Option<u8>,
     pic: bool,
 }
 
@@ -381,6 +382,9 @@ pub enum RouteError {
     NoIoapic,
     /// A line above 7 on the 8259 path (the cascade is not driven).
     Unsupported,
+    /// The boot CPU's APIC id does not fit the IOAPIC's 8-bit destination (x2APIC).
+    /// shortcut: no interrupt remapping, so such a CPU cannot be targeted.
+    BadDestination,
 }
 
 /// Route ISA interrupt `irq` to its vector (`ISA_IRQ_VECTOR(irq)`) on the boot CPU
@@ -417,9 +421,10 @@ pub unsafe fn route_isa_irq(irq: u8) -> Result<(), RouteError> {
         .flatten()
         .ok_or(RouteError::NoRoute)?;
     let ioapics = state.ioapics.as_ref().ok_or(RouteError::NoIoapic)?;
+    let destination = state.destination.ok_or(RouteError::BadDestination)?;
     // SAFETY: the caller's contract (BSP, IF clear, after `init`); the IOAPIC
     // pages are the ones `init` mapped.
-    unsafe { ioapics.route(route, ISA_IRQ_VECTOR_BASE + irq, state.destination) }
+    unsafe { ioapics.route(route, ISA_IRQ_VECTOR_BASE + irq, destination) }
         .map(|_| ())
         .ok_or(RouteError::NoIoapic)
 }
@@ -1241,9 +1246,7 @@ pub unsafe fn init(
 
     // Device interrupts (the console tty's UART and keyboard) are routed later
     // from these; the IOAPIC state survives `init`.
-    let destination = lapic
-        .as_ref()
-        .map_or(0, |l| u8::try_from(l.id).unwrap_or(0));
+    let destination = lapic.as_ref().map_or(Some(0), |l| u8::try_from(l.id).ok());
     let mut routes = [None; 16];
     if let Some(madt) = acpi.madt.as_ref() {
         for (irq, route) in routes.iter_mut().enumerate() {

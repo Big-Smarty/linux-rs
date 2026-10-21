@@ -24,7 +24,8 @@
 //!   is the order of `isig` and the job-control signals; nothing in here takes
 //!   a lock.
 //! * Wake-ups: [`Tty::take_events`] reports that a reader, writer or poller may
-//!   proceed; [`Tty::take_kick`] that the flip buffer must be flushed again.
+//!   proceed. The input worker's kick (`n_tty_kick_worker`) has no queue to run: the
+//!   embedder flushes its flip buffer on every tty entry (`ttyin::flush`).
 
 pub mod jobctl;
 pub mod keyboard;
@@ -121,7 +122,6 @@ pub struct Tty {
     ld: Ldata,
     port: Port,
     events: u32,
-    kick: bool,
     /// `atomic_read_lock` / `atomic_write_lock`.
     read_owner: Option<TaskId>,
     write_owner: Option<TaskId>,
@@ -158,7 +158,6 @@ impl Tty {
             ld: Ldata::new()?,
             port: Port::new()?,
             events: 0,
-            kick: false,
             read_owner: None,
             write_owner: None,
         };
@@ -189,11 +188,6 @@ impl Tty {
     /// pollers have something to re-check.
     pub fn take_events(&mut self) -> bool {
         core::mem::take(&mut self.events) != 0
-    }
-
-    /// The input worker stopped for lack of room and may run again.
-    pub fn take_kick(&mut self) -> bool {
-        core::mem::take(&mut self.kick)
     }
 
     /// `tty_write_lock(tty, ndelay)`: `false` when another writer owns the

@@ -1048,7 +1048,7 @@ fn background_reads(t: &mut T) {
 }
 
 fn background_writes(t: &mut T) {
-    let r = in_child::<14>(|o| {
+    let r = in_child::<15>(|o| {
         let _ = setsid();
         let fd = open(b"/dev/ttyS0\0", O_RDWR).unwrap_or(usize::MAX);
         let (_, orig) = getattr(fd);
@@ -1076,6 +1076,12 @@ fn background_writes(t: &mut T) {
         o[5] = bg_child(|| {
             let console = open(b"/dev/console\0", O_RDWR).unwrap_or(usize::MAX);
             write_status(console)
+        })
+        .1 as i64;
+        // A zero-length write still runs the line discipline's job-control check.
+        o[14] = bg_child(|| match write(fd, b"") {
+            Ok(_) => 0,
+            Err(e) => e.into_raw() as usize,
         })
         .1 as i64;
         let _ = setattr(fd, TCSETS, &orig);
@@ -1120,6 +1126,7 @@ fn background_writes(t: &mut T) {
             0,
             1,
             1,
+            i64::from(SIGTTOU_STOPPED),
         ],
     );
 }

@@ -579,8 +579,9 @@ impl kernel::tty::Host for TtyHost<'_> {
 /// tty and a host that can signal and transmit, then wake the sleepers it woke.
 ///
 /// Context: hardirq (IF=0), the interrupted code is ring 3 or the idle halt, so the
-/// lock is free (`services`); a lock that is held anyway (not expected) leaves the
-/// input in the flip buffer for the next `tty_parts`.
+/// lock is free (`services`). A lock that is held anyway is a bug: the closure is
+/// not run and the bytes it would have queued are lost (a keyboard scancode), or
+/// stay in the UART whose edge-triggered IRQ then never fires again (serial).
 #[cfg_attr(
     feature = "baremetal-suite",
     allow(dead_code, reason = "only the console tty's input interrupts use it")

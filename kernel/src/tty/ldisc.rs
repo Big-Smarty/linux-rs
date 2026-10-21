@@ -514,13 +514,12 @@ impl Tty {
         self.n_tty_kick_worker(h);
     }
 
-    /// `n_tty_kick_worker`: the input worker stopped for lack of room; the caller
-    /// must flush its flip buffer again ([`Tty::take_kick`]).
+    /// `n_tty_kick_worker`: the input worker stopped for lack of room and may run
+    /// again. shortcut: there is no worker to queue; the embedder flushes the flip
+    /// buffer on every tty entry and input interrupt (`ttyin::flush`), so input
+    /// left behind waits for the next tty syscall, poll or interrupt.
     fn n_tty_kick_worker(&mut self, _h: &mut dyn Host) {
-        if self.ld.no_room {
-            self.ld.no_room = false;
-            self.kick = true;
-        }
+        self.ld.no_room = false;
     }
 
     /// `n_tty_set_termios`: the line discipline learns of a termios change.
@@ -1376,6 +1375,23 @@ impl Tty {
     /// process input; returns how many bytes of `cp` were taken.
     pub fn receive_buf(&mut self, h: &mut dyn Host, cp: &[u8], fp: Option<&[u8]>) -> usize {
         self.receive_buf_common(h, cp, fp, true)
+    }
+
+    /// `n_tty_lookahead_flow_ctrl` (the ldisc `lookahead_buf` method): the flip
+    /// buffer calls it for input the discipline had no room for, so `^S`/`^Q`
+    /// (IXON) take effect before the buffered bytes are read. `cp` must not be
+    /// empty; the bytes are counted so the normal receive skips their flow
+    /// control (`__receive_buf`).
+    pub fn lookahead_flow_ctrl(&mut self, h: &mut dyn Host, cp: &[u8], fp: Option<&[u8]>) {
+        self.ld.lookahead_count += cp.len();
+        if self.termios.iflag & IXON == 0 {
+            return;
+        }
+        for (i, &c) in cp.iter().enumerate() {
+            if fp.is_none_or(|f| f[i] == TTY_NORMAL) {
+                self.receive_char_flow_ctrl(h, c, false);
+            }
+        }
     }
 
     /// `n_tty_receive_buf` (no flow control: `TIOCSTI`, the ldisc `receive_buf`
