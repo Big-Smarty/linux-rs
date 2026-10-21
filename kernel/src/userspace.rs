@@ -76,7 +76,7 @@ use kernel::{
         stack::{self, ARG_PAGES, Aux, ENVP, STACK_START, STACK_TOP, StackError},
     },
     futex::{FutexWaker, Futexes},
-    image::elf::{Elf, ET_DYN},
+    image::elf::ET_DYN,
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     procfs::{

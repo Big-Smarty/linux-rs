@@ -106,7 +106,7 @@ The flow was feature branch, pull request, review, fix rounds, then the integrat
 
 ### Routing at v0.2.0
 
-Thirty-five routed rows are `in_progress` and 2,588 are `not_started` of 2,623 (`xtask status` in the fresh clone; see [routed status](#routed-implementation-status)); the five-column schema and the two status values are unchanged. Rows route actual slices, not complete upstream prefixes. Crates added to the vendored set since v0.1.0: `buddy_system_allocator` 0.13.0 (23 vendored packages verified).
+Thirty-six routed rows are `in_progress` and 2,587 are `not_started` of 2,623 (`xtask status` in the fresh clone; see [routed status](#routed-implementation-status)); the five-column schema and the two status values are unchanged. Rows route actual slices, not complete upstream prefixes. Crates added to the vendored set since v0.1.0: `buddy_system_allocator` 0.13.0 (23 vendored packages verified).
 
 ### Not done in v0.2.0
 
@@ -184,7 +184,7 @@ The `/init` is the exact binary the pinned Linux 6.18.57 oracle ran in `target/l
 
 ### Routing
 
-Thirty-five routed rows are `in_progress` and 2,588 are `not_started` of 2,623 (see [routed status](#routed-implementation-status)); the five-column schema and the two status values are unchanged. Rows route actual slices, not complete upstream prefixes.
+Thirty-six routed rows are `in_progress` and 2,587 are `not_started` of 2,623 (see [routed status](#routed-implementation-status)); the five-column schema and the two status values are unchanged. Rows route actual slices, not complete upstream prefixes.
 
 ### Not done / blockers
 
