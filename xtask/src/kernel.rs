@@ -207,6 +207,9 @@ enum User {
     /// Runs one oracle syscall-test group (`-- <group>`, `user/init/src/tests`) to `init: ok`;
     /// every `init: test|tests|info` line equals the pinned Linux's ([`validate_oracle`]).
     Oracle(&'static str),
+    /// [`User::Oracle`] for a group whose output is the machine's, not `qemu64`'s: run under KVM
+    /// with `-cpu host` (SMEP/SMAP on, the XSAVE `AT_MINSIGSTKSZ` of the host).
+    OracleHost(&'static str),
     /// `-- forkleak`: 200 fork/exit/wait rounds; the counts line equals the pinned Linux's and
     /// the free RAM `sysinfo` reports is exactly the same before and after the rounds (every
     /// frame and kernel object came back).
@@ -311,6 +314,7 @@ const SUCCESS_MARKERS: &[&str] = &[
     USER_MM_RECORD,
     HEAP_RECORD,
     IRQ_GUARD_RECORD,
+    "CHECK xstate ok",
     "CHECK madt ok",
     "CHECK time-tables",
     "CHECK apic ok",
@@ -852,6 +856,29 @@ const DEBUG_CASES: &[DebugCase] = &[
     // wake-ups and its restart after a stop (`user/init` group `pipe`, recorded on the pinned
     // Linux 6.18.57).
     oracle_case!(pipe),
+    // The extended CPU state (`user/init` group `xstate`, recorded on the pinned Linux 6.18.57
+    // under KVM `-cpu host`): AVX-512 and `PKRU` registers across system calls, context switches,
+    // `fork` and `execve`, the `XSAVE` signal frame and its restore, `arch_prctl` permissions.
+    // The group needs an AVX-512 + PKU CPU, so it runs only where KVM does.
+    DebugCase {
+        name: "oracle-xstate",
+        cmdline: Some("-- xstate"),
+        cpu: "host",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::OracleHost("xstate"),
+        framebuffers: 1,
+        plat: Platform {
+            kvm: true,
+            mode: "x2apic",
+            reason: "hypervisor",
+            event: "lapic-deadline",
+            tsc_sources: &["pit", "hpet"],
+            ..Q35_TCG
+        },
+    },
     // 200 fork/exit/wait rounds: nothing is left behind (`user/init` mode `forkleak`).
     // Pool exhaustion and every unwinding path of `copy_process` (this kernel only: Linux's limit
     // is `max_threads`, not a stack pool).
@@ -4417,6 +4444,7 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
         User::ForkBomb | User::Segfault | User::Unimplemented | User::Oracle(_) => {
             (2, None, true, (false, false))
         }
+        User::OracleHost(_) => (2, None, false, (true, true)),
     };
     let audit = find.at(
         &|line| line.starts_with("CHECK userspace-audit ok user_pages="),
@@ -4431,8 +4459,16 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     );
     let exec_suffix = format!(" smep={execute_protection} smap={access_protection}");
     let summary = fixture::init_summary(init, argc);
+    // `AT_MINSIGSTKSZ` follows the XSAVE area size of the machine (`get_sigframe_size()`): 0x5a0
+    // without XSAVE, which is what the exact `qemu64` summary carries.
+    let minsigstksz = xstate_minsigstksz(lines)?;
+    if exact_summary && minsigstksz != 0x5a0 {
+        return Err(format!(
+            "an exact-summary case must run without XSAVE (AT_MINSIGSTKSZ {minsigstksz:#x})"
+        ));
+    }
     let summary_prefix = format!(
-        "init: argc={argc} argv0=/init pid=1 rsp_mod16=0 auxv=AT_MINSIGSTKSZ:0x5a0,AT_HWCAP:"
+        "init: argc={argc} argv0=/init pid=1 rsp_mod16=0 auxv=AT_MINSIGSTKSZ:{minsigstksz:#x},AT_HWCAP:"
     );
     let mut positions = vec![
         audit,
@@ -4463,7 +4499,7 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     if user == User::ForkBomb {
         positions.extend(forkbomb_records(&find)?);
     }
-    if let User::Oracle(group) = user {
+    if let User::Oracle(group) | User::OracleHost(group) = user {
         let (first, last) = validate_oracle(lines, group)?;
         positions.push(first);
         // A one-line group has first == last; strict ordering must not reject it.
@@ -4482,6 +4518,53 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     } else {
         Err("userspace records are out of order".to_owned())
     }
+}
+
+/// The `AT_MINSIGSTKSZ` the kernel must have given `/init`, derived from the one `CHECK xstate ok`
+/// record (`init_sigframe_size`: `sizeof(sigframe_ia32)` 732 + 15 + the FPU state of the frame
+/// (the XSAVE area, its trailing magic word and `fregs_state`, or 512 + 112 without XSAVE) + 63,
+/// rounded up to 16). The record itself must be self-consistent: without XSAVE the legacy
+/// numbers, with it x87 and SSE enabled and a compacted buffer no larger than the standard area.
+fn xstate_minsigstksz(lines: &[&str]) -> Result<u64, String> {
+    let record = unique_record(lines, "CHECK xstate ok")?;
+    let field = |key: &str| record_field(record, key).ok_or(format!("{record}: no {key}"));
+    let number = |key: &str| -> Result<u64, String> {
+        let text = field(key)?;
+        match text.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => text.parse(),
+        }
+        .map_err(|_| format!("{record}: {key} is not a number"))
+    };
+    let (mode, features) = (field("mode")?, number("features")?);
+    let (user, kernel) = (number("user_size")?, number("kernel_size")?);
+    let pkru = field("pkru")?;
+    if !matches!(pkru, "true" | "false") || field("fallback").is_err() {
+        return Err(format!("{record}: malformed"));
+    }
+    let xsave = match mode {
+        "Fxsave" => {
+            if (features, user, kernel, pkru) != (0, 512, 512, "false") {
+                return Err(format!("{record}: FXSAVE state is 512 bytes, no features"));
+            }
+            false
+        }
+        "Xsave" | "Xsaveopt" | "Xsavec" | "Xsaves" => {
+            if features & 3 != 3
+                || user < 576
+                || kernel < 576
+                || kernel > user
+                || user > 4096
+                || (pkru == "true") != (features & 0x200 != 0)
+            {
+                return Err(format!("{record}: inconsistent XSAVE configuration"));
+            }
+            true
+        }
+        _ => return Err(format!("{record}: unknown save mode `{mode}`")),
+    };
+    let fpu = user + if xsave { 4 } else { 0 } + 112;
+    Ok((732 + 15 + fpu + 63 + 15) & !15)
 }
 
 /// Rows of [`ORACLE_EXPECTED`] for `group` in file order: `(kind, exact stdout line)` where kind is
@@ -4716,7 +4799,11 @@ fn user_tail(
 ) -> Result<Vec<usize>, String> {
     const DEATH: &str = "Kernel panic - not syncing: Attempted to kill init! exitcode=";
     Ok(match user {
-        User::Ok { .. } | User::Oracle(_) | User::ForkLeak | User::ForkBomb => {
+        User::Ok { .. }
+        | User::Oracle(_)
+        | User::OracleHost(_)
+        | User::ForkLeak
+        | User::ForkBomb => {
             let mut tail = vec![find.exact("init: ok", "init: ok")?];
             if user == User::ForkLeak {
                 // Printed by the kernel when init exits, before the death panic.
@@ -7193,6 +7280,7 @@ mod tests {
             BUDDY_ORDER_RECORD,
             USER_MM_RECORD,
             HEAP_RECORD,
+            "CHECK xstate ok mode=Fxsave features=0x0 user_size=512 kernel_size=512 pkru=false fallback=none",
             "CHECK apic ok mode=xapic reason=default",
             "CHECK tsc ok khz=3000000 source=pit pit_tries=1 hpet_hz=100000000 rtc=true",
             "CHECK clockevent ok event=lapic-oneshot",
@@ -7983,6 +8071,75 @@ mod tests {
     }
 
     #[test]
+    fn xstate_record_gives_the_at_minsigstksz_of_the_machine() {
+        let minsigstksz = |record: &str| xstate_minsigstksz(&[record]);
+        // FXSAVE only: the 0x5a0 of every `qemu64` case.
+        assert_eq!(
+            minsigstksz(
+                "CHECK xstate ok mode=Fxsave features=0x0 user_size=512 kernel_size=512 pkru=false fallback=none"
+            ),
+            Ok(0x5a0)
+        );
+        // The AMD Zen 5 numbers the pinned Linux printed (`AT_MINSIGSTKSZ:0xd30`), and Intel's
+        // AVX-512 layout (0xe30, what TCG `-cpu max` and Skylake-X report).
+        assert_eq!(
+            minsigstksz(
+                "CHECK xstate ok mode=Xsaves features=0x2e7 user_size=2440 kernel_size=2440 pkru=true fallback=none"
+            ),
+            Ok(0xd30)
+        );
+        assert_eq!(
+            minsigstksz(
+                "CHECK xstate ok mode=Xsaveopt features=0x21f user_size=2696 kernel_size=2696 pkru=true fallback=none"
+            ),
+            Ok(0xe30)
+        );
+        // Inconsistent or malformed records are refused.
+        for bad in [
+            "CHECK xstate ok mode=Fxsave features=0x3 user_size=512 kernel_size=512 pkru=false fallback=none",
+            "CHECK xstate ok mode=Xsaves features=0x1 user_size=2440 kernel_size=2440 pkru=false fallback=none",
+            "CHECK xstate ok mode=Xsaves features=0x2e7 user_size=2440 kernel_size=2440 pkru=false fallback=none",
+            "CHECK xstate ok mode=Xsaves features=0x2e7 user_size=2440 kernel_size=2500 pkru=true fallback=none",
+            "CHECK xstate ok mode=Xsaves features=0x2e7 user_size=9000 kernel_size=2440 pkru=true fallback=none",
+            "CHECK xstate ok mode=Bogus features=0x2e7 user_size=2440 kernel_size=2440 pkru=true fallback=none",
+            "CHECK xstate ok mode=Xsaves features=0x2e7 user_size=2440 kernel_size=2440 pkru=true",
+        ] {
+            assert!(minsigstksz(bad).is_err(), "{bad}");
+        }
+        assert!(
+            xstate_minsigstksz(&[]).is_err(),
+            "a missing record is refused"
+        );
+        // A `qemu64` (exact-summary) case that ran with XSAVE is wrong.
+        let serial = success_serial().replace(
+            "mode=Fxsave features=0x0 user_size=512 kernel_size=512 pkru=false",
+            "mode=Xsaves features=0x2e7 user_size=2440 kernel_size=2440 pkru=true",
+        );
+        let process = ProcessResult {
+            exit_code: Some(33),
+            timed_out: false,
+        };
+        let (ok, why) = validate(DEBUG_CASES[0], &process, &serial);
+        assert!(
+            !ok && why.contains("exact-summary case must run without XSAVE"),
+            "{why}"
+        );
+        // A host case takes the record's AT_MINSIGSTKSZ.
+        let host = serial
+            .replace("smep=false smap=false", "smep=true smap=true")
+            .replace("AT_MINSIGSTKSZ:0x5a0", "AT_MINSIGSTKSZ:0xd30");
+        let mut kvm = case("kvm");
+        kvm.plat = Q35_TCG;
+        let (ok, why) = validate(kvm, &process, &host);
+        assert!(ok, "{why}");
+        let (ok, _) = validate(kvm, &process, &host.replace("0xd30", "0x5a0"));
+        assert!(
+            !ok,
+            "a frame size that does not follow the XSAVE size is refused"
+        );
+    }
+
+    #[test]
     fn oracle_expected_lines_are_consistent() {
         let mut rows = ORACLE_EXPECTED
             .lines()
@@ -8007,7 +8164,7 @@ mod tests {
             }
         }
         let groups = [
-            "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe",
+            "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe", "xstate",
         ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),
