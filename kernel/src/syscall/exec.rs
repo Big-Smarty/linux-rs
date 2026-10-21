@@ -322,26 +322,27 @@ fn dev_fd_name(fd: i32, path: &[u8]) -> Result<Vec<u8>, Errno> {
     Ok(name)
 }
 
+/// `bprm_execve`'s `out:` past the point of no return: the errno is stored, the task ends with
+/// SIGSEGV unless it is being killed already, and `free_bprm` releases `bprm->interpreter`
+/// always and `bprm->file` unless it already became `mm->exe_file` (`own_file`).
+fn die<C: Context>(ctx: &mut C, p: &mut Prepared, own_file: bool, errno: Errno) -> Outcome {
+    if own_file {
+        ctx.files().vfs.fput(p.file);
+    }
+    if let Some(interp) = p.interp.take() {
+        ctx.files().vfs.fput(interp.file);
+    }
+    if !ctx.state().fatal_signal_pending() {
+        ctx.state().force_fatal_sig(SIGSEGV);
+    }
+    fail(errno)
+}
+
 /// `begin_new_exec` and the tail of `load_elf_binary`: the point of no return.
 /// The old image is gone when the first step runs; every failure from here on
 /// is fatal to the task.
 fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
-    // bprm->point_of_no_return: from here an error ends the task with SIGSEGV (unless it is
-    // being killed already) after the errno is stored (`bprm_execve`). `free_bprm` releases
-    // `bprm->interpreter` on every failure and `bprm->file` unless it already became
-    // `mm->exe_file` (`own_file`).
-    let die = |ctx: &mut C, p: &mut Prepared, own_file: bool, errno: Errno| {
-        if own_file {
-            ctx.files().vfs.fput(p.file);
-        }
-        if let Some(interp) = p.interp.take() {
-            ctx.files().vfs.fput(interp.file);
-        }
-        if !ctx.state().fatal_signal_pending() {
-            ctx.state().force_fatal_sig(SIGSEGV);
-        }
-        fail(errno)
-    };
+    // bprm->point_of_no_return: from here an error is fatal to the task (`die`).
     // de_thread: every other thread of the group is killed and gone, and a thread that is not
     // the leader takes the leader's pid.
     if let Err(errno) = de_thread(ctx) {
