@@ -26,6 +26,7 @@ TABLES -> FRAMES                         (the kernel template tree only; a task'
 TASKLIST -> TIMERQ -> TIMER_HW
 any lock -> RQ
 PROCESS -> VFORK_DONE                       (a leaf: the address space a vfork child gives back to its parent)
+PROCESS -> VFORK_FORWARD                    (a leaf: the lender a dead vfork borrower owes the space to; never held with VFORK_DONE)
 ```
 
 * `TASKLIST` collapses `tasklist_lock`, `siglock` and `pidmap_lock` (a named coarsening; Linux orders them in that sequence and one CPU makes them one section). It must be IRQ-saving, because the interval-timer expiry will take it from hardirq.
