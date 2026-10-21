@@ -1985,7 +1985,7 @@ ws-mm-dmapool-c	mm/dmapool.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-dmapool-test-c	mm/dmapool_test.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-early-ioremap-c	mm/early_ioremap.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-execmem-c	mm/execmem.c	docs/subsystems/memory.md	P0	not_started
-ws-mm-fadvise-c	mm/fadvise.c	docs/subsystems/memory.md	P0	not_started
+ws-mm-fadvise-c	mm/fadvise.c	docs/subsystems/memory.md	P0	in_progress
 ws-mm-fail-page-alloc-c	mm/fail_page_alloc.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-failslab-c	mm/failslab.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-filemap-c	mm/filemap.c	docs/subsystems/memory.md	P0	not_started
@@ -2036,7 +2036,7 @@ ws-mm-mmu-gather-c	mm/mmu_gather.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mmu-notifier-c	mm/mmu_notifier.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mmzone-c	mm/mmzone.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-mprotect-c	mm/mprotect.c	docs/subsystems/memory.md	P0	in_progress
-ws-mm-mremap-c	mm/mremap.c	docs/subsystems/memory.md	P0	not_started
+ws-mm-mremap-c	mm/mremap.c	docs/subsystems/memory.md	P0	in_progress
 ws-mm-mseal-c	mm/mseal.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-msync-c	mm/msync.c	docs/subsystems/memory.md	P0	not_started
 ws-mm-nommu-c	mm/nommu.c	docs/subsystems/memory.md	P0	not_started
