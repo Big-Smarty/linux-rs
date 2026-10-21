@@ -134,9 +134,9 @@ Dependencies, not importance:
 | [README](../README.md) | Short current capability summary true at `main` (processes, threads, dynamic ELF, procfs, tty; what `/init` is), build and test commands near the top, history linked not repeated |
 | [Documentation index](README.md) | An index pointing at the authoritative current status; no withdrawn or superseded artifact described as current |
 | [Implementation](implementation.md#current-status) | A single "Current status" section at the top; every later section is chronological history, identified by commit or artifact |
-| [Architecture](architecture.md#implemented-architecture) | "Implemented architecture at main" (process state, global services, scheduler, VFS, memory ownership, locking exceptions), distinct from the proposed architecture |
+| [Architecture](architecture.md#implemented-architecture) | "Implemented architecture" (process state, global services, scheduler, VFS, memory ownership, locking exceptions), distinct from the proposed architecture |
 | [Toolchain](toolchain.md#compiler-selection-as-it-is-today), [kernel tooling](kernel-tooling.md#prerequisites-and-known-gaps) | Exact compiler selection today, host versus kernel toolchains, prerequisites, hard-coded firmware paths, fresh-clone procedure, the known gaps of items 1 and 6 |
-| [Verification](verification.md#what-each-command-establishes), [project audit](project-audit.md#current-state) | Reconciled counts; what each command establishes, split into host tests, candidate-kernel execution, reference-Linux observation and historical evidence not in the checkout |
+| [Verification](verification.md#what-each-command-establishes), [project audit](project-audit.md#current-state) | The `check`/`status` output at one commit; what each command establishes, split into host tests, candidate-kernel execution, reference-Linux observation and historical evidence not in the checkout |
 | [Dependencies](dependencies.md) | Contradictions with the manifests fixed (`syscalls` is a kernel dependency, `xtask` is not dependency-free, the direct kernel dependencies) |
 | [Compatibility](compatibility.md#current-support-matrix) | A concise current capability matrix kept separate from the full requirement |
 | [Roadmap](roadmap.md) | Points here for the day-to-day queue; inventory kept; stale snapshot cells corrected |
