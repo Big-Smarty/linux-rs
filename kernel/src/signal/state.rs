@@ -247,7 +247,43 @@ pub struct TaskSignals {
     pub thread: ThreadSignal,
 }
 
+/// The signal sets `/proc/<pid>/status` and `stat` print (`task_sig`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SigSets {
+    /// `pending.signal`, `signal->shared_pending.signal`, `blocked`.
+    pub pending: u64,
+    pub shared_pending: u64,
+    pub blocked: u64,
+    /// `collect_sigign_sigcatch`: handlers that are `SIG_IGN`, and neither
+    /// `SIG_IGN` nor `SIG_DFL`.
+    pub ignored: u64,
+    pub caught: u64,
+    /// Queued `siginfo` entries (`sigpending` of the user's ucounts, for this task).
+    pub queued: usize,
+}
+
 impl TaskSignals {
+    /// A read-only summary for `/proc`.
+    #[must_use]
+    pub fn sets(&self) -> SigSets {
+        let mut sets = SigSets {
+            pending: self.thread.private.signal.0,
+            shared_pending: self.signal.shared.signal.0,
+            blocked: self.thread.blocked.0,
+            queued: self.thread.private.len + self.signal.shared.len,
+            ..SigSets::default()
+        };
+        for (index, action) in self.hand.actions.iter().enumerate() {
+            let bit = 1u64 << index;
+            if action.handler == SIG_IGN {
+                sets.ignored |= bit;
+            } else if action.handler != SIG_DFL {
+                sets.caught |= bit;
+            }
+        }
+        sets
+    }
+
     /// The signal state of a newly created process (a forked child before it
     /// inherits, init at boot): default actions, nothing blocked or pending,
     /// altstack disabled (`sas_ss_reset`). `execve` is [`State::flush_on_exec`],

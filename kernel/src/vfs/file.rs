@@ -60,6 +60,9 @@ impl CharDev {
 pub enum FileKind {
     Regular,
     Directory,
+    /// A regular file of procfs (`seq_file` and the `proc_ops` of the entry):
+    /// `File::inode` is the node.
+    Proc,
     Char(CharDev),
     /// One end of a pipe; `writer` selects the write end.
     Pipe {
@@ -83,7 +86,27 @@ pub struct File {
     pub mode: u32,
     /// `f_pos`; the directory cookie for a directory.
     pub pos: i64,
+    /// A number unique to this open description for the life of the system
+    /// (never reused, unlike the arena slot): lets a handle that outlived its
+    /// file be recognised.
+    pub serial: u64,
+    /// The name the file was opened by (`f_path.dentry`): the directory it was
+    /// found in and the name there, for `d_path`.
+    pub dentry: Option<Dentry>,
+    /// The text of a procfs file as last generated and the position after the
+    /// last read (`seq_file`'s buffer and `read_pos`).
+    pub seq: Option<(alloc::vec::Vec<u8>, i64)>,
+    /// `seq_file.poll_event`: the mount namespace event `/proc/<pid>/mounts` and
+    /// `mountinfo` last reported to `poll` (taken when the file is opened).
+    pub poll_event: u64,
     refs: u32,
+}
+
+/// Where an open file was found (`struct dentry`: `d_parent` and `d_name`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Dentry {
+    pub parent: InodeId,
+    pub name: alloc::vec::Vec<u8>,
 }
 
 impl File {
@@ -95,6 +118,10 @@ impl File {
             flags,
             mode,
             pos: 0,
+            serial: 0,
+            dentry: None,
+            seq: None,
+            poll_event: 0,
             refs: 1,
         }
     }
@@ -105,6 +132,7 @@ impl File {
 pub struct FileTable {
     files: Vec<Option<File>>,
     free: Vec<u32>,
+    next_serial: u64,
 }
 
 impl FileTable {
@@ -112,7 +140,9 @@ impl FileTable {
     ///
     /// # Errors
     /// `ENOMEM`.
-    pub fn alloc(&mut self, file: File) -> KResult<FileId> {
+    pub fn alloc(&mut self, mut file: File) -> KResult<FileId> {
+        self.next_serial += 1;
+        file.serial = self.next_serial;
         if let Some(slot) = self.free.pop() {
             self.files[slot as usize] = Some(file);
             return Ok(FileId(slot));
@@ -135,6 +165,22 @@ impl FileTable {
             .get(id.0 as usize)
             .and_then(Option::as_ref)
             .expect("stale file handle")
+    }
+
+    /// The file in slot `id`, if the slot is occupied.
+    #[must_use]
+    pub fn try_get(&self, id: FileId) -> Option<&File> {
+        self.files.get(id.0 as usize).and_then(Option::as_ref)
+    }
+
+    /// The file behind a handle that may have outlived it: `None` when the
+    /// slot is empty or holds another description than the one with `serial`.
+    #[must_use]
+    pub fn get_checked(&self, id: FileId, serial: u64) -> Option<&File> {
+        self.files
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
+            .filter(|file| file.serial == serial)
     }
 
     /// Mutable access to the file behind a handle.
@@ -164,6 +210,11 @@ impl FileTable {
         // Losing the free-list slot on ENOMEM only wastes an arena entry.
         let _ = try_push(&mut self.free, id.0);
         file
+    }
+
+    /// Whether some open description satisfies `pred`.
+    pub fn has_writer(&self, pred: impl Fn(&File) -> bool) -> bool {
+        self.files.iter().flatten().any(pred)
     }
 
     /// Every open description (the tty hangup walks them).
@@ -197,6 +248,9 @@ pub struct FdTable {
     open: Vec<usize>,
     cloexec: Vec<usize>,
     next_fd: u32,
+    /// Bumped by every change of a descriptor, so `/proc/<pid>/fd` readers can tell their copy of
+    /// the table is stale.
+    generation: u64,
 }
 
 /// A descriptor number as syscalls carry it (`unsigned int`).
@@ -213,6 +267,12 @@ impl FdTable {
     #[must_use]
     pub fn get(&self, fd: Fd) -> Option<FileId> {
         self.fds.get(fd as usize).copied().flatten()
+    }
+
+    /// The change counter (see the field).
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// `get_close_on_exec`.
@@ -232,6 +292,7 @@ impl FdTable {
 
     /// `set_close_on_exec` / `__clear_close_on_exec` on an open descriptor.
     pub fn set_cloexec(&mut self, fd: Fd, on: bool) {
+        self.generation += 1;
         let bits = self.fds.len();
         if let Some(mut map) = Bitmap::new(&mut self.cloexec, bits) {
             map.replace(fd as usize, on);
@@ -287,6 +348,7 @@ impl FdTable {
     /// # Errors
     /// `EMFILE` when it would reach `end` (`RLIMIT_NOFILE`) or `NR_OPEN`.
     pub fn alloc_fd(&mut self, start: u32, end: u64, cloexec: bool) -> KResult<Fd> {
+        self.generation += 1;
         let mut fd = start.max(self.next_fd);
         let bits = self.fds.len();
         if (fd as usize) < bits
@@ -313,11 +375,13 @@ impl FdTable {
 
     /// `fd_install`: populate a descriptor [`FdTable::alloc_fd`] reserved.
     pub fn install(&mut self, fd: Fd, file: FileId) {
+        self.generation += 1;
         self.fds[fd as usize] = Some(file);
     }
 
     /// `put_unused_fd` / the bit clearing of `file_close_fd_locked`.
     fn release(&mut self, fd: Fd) {
+        self.generation += 1;
         let bits = self.fds.len();
         if let Some(mut map) = Bitmap::new(&mut self.open, bits) {
             map.replace(fd as usize, false);
@@ -348,6 +412,7 @@ impl FdTable {
     /// # Errors
     /// `EBUSY`.
     pub fn replace(&mut self, fd: Fd, file: FileId, cloexec: bool) -> KResult<Option<FileId>> {
+        self.generation += 1;
         let bits = self.fds.len();
         let reserved = Bitmap::new(&mut self.open, bits)
             .and_then(|map| map.get(fd as usize))
@@ -430,8 +495,8 @@ impl FsStruct {
     /// are taken by [`super::Vfs::new_fs_struct`], which the owner of the task
     /// calls once the rootfs exists and assigns over this value.
     pub const INIT: Self = Self {
-        root: InodeId(0),
-        pwd: InodeId(0),
+        root: InodeId::tmp(0),
+        pwd: InodeId::tmp(0),
         umask: 0o022,
     };
 }

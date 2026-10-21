@@ -852,6 +852,15 @@ static FAULT_ARMED: AtomicU64 = AtomicU64::new(0);
 /// *real* 8259 IRQ7/15, which stays an unexpected vector.
 fn external_interrupt(vector: u64, user: bool) -> bool {
     let base = u64::from(ISA_IRQ_VECTOR_BASE);
+    // `kstat_incr_irqs_this_cpu` / `inc_irq_stat`: the counters of /proc/stat
+    // and /proc/interrupts. Only deliveries that are handled are counted.
+    if (base..base + 16).contains(&vector) && vector != base + 7 && vector != base + 15 {
+        ISA_IRQS[(vector - base) as usize].fetch_add(1, Ordering::Relaxed);
+    } else if vector == u64::from(LOCAL_TIMER_VECTOR) {
+        LOCAL_TIMER_IRQS.fetch_add(1, Ordering::Relaxed);
+    } else if vector == u64::from(SPURIOUS_VECTOR) {
+        SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
+    }
     match vector {
         v if v == u64::from(SPURIOUS_VECTOR) => crate::apic::spurious_interrupt(),
         v if v == u64::from(ERROR_VECTOR) => crate::apic::error_interrupt(),
@@ -870,6 +879,27 @@ fn external_interrupt(vector: u64, user: bool) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Interrupts delivered per ISA line (`kstat_irqs`), local timer interrupts
+/// (`LOC`) and spurious ones (`SPU`, `irq_spurious_count`).
+static ISA_IRQS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+static LOCAL_TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
+static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
+
+/// `kstat_irqs(irq)` of an ISA line.
+#[must_use]
+pub fn isa_irq_count(irq: usize) -> u64 {
+    ISA_IRQS
+        .get(irq)
+        .map_or(0, |count| count.load(Ordering::Relaxed))
+}
+
+/// The architecture's interrupt statistics beyond the numbered lines
+/// (`arch_irq_stat_cpu`): the local timer and spurious interrupts.
+#[must_use]
+pub fn arch_irq_stat() -> u64 {
+    LOCAL_TIMER_IRQS.load(Ordering::Relaxed) + SPURIOUS_IRQS.load(Ordering::Relaxed)
 }
 
 /// Consecutive refused returns to ring 3 without an entry from ring 3 between,

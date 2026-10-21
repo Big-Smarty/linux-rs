@@ -66,7 +66,7 @@ fn inode_of(vfs: &Vfs, file: FileId) -> InodeId {
 fn names(vfs: &Vfs, dir: InodeId, from: i64) -> (Vec<(String, i64)>, i64) {
     let mut out = Vec::new();
     let mut pos = from;
-    vfs.fs.readdir(dir, &mut pos, &mut |name, off, _, _| {
+    vfs.fs.tmp().readdir(dir, &mut pos, &mut |name, off, _, _| {
         out.push((String::from_utf8_lossy(name).into_owned(), off));
         true
     });
@@ -467,7 +467,8 @@ fn creation_applies_the_umask_and_keeps_only_the_requested_bits() {
 fn open_flag_combinations_follow_do_filp_open() {
     let (mut vfs, env) = rootfs(1 << 10);
     let created = open(&mut vfs, &env, b"/f", O_CREAT | O_EXCL | O_RDWR, 0o600).unwrap();
-    vfs.fs.write(inode_of(&vfs, created), 0, b"xyz").unwrap();
+    let inode = inode_of(&vfs, created);
+    vfs.fs.write(inode, 0, b"xyz").unwrap();
     vfs.fput(created);
     assert_eq!(
         open(&mut vfs, &env, b"/f", O_CREAT | O_EXCL | O_RDWR, 0o600),

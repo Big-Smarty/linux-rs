@@ -36,7 +36,11 @@
 //! `handle_user_fault`), which reserves heap storage, then takes [`FRAMES`] as
 //! the leaf, i.e. the order above and nothing else (the kernel never
 //! dereferences a user address, so no hardware fault occurs under a lock). No
-//! lock is held across a callback.
+//! lock is held across a callback. A `/proc` read (`userspace::host_info`) takes
+//! two more leaves under `PROCESS`: `LOAD` (the load-average samples) and the
+//! `cpu_facts` cache (the CPUID snapshot of `/proc/cpuinfo`); each calls out of
+//! nothing, so the edges are `PROCESS` -> `LOAD` and `PROCESS` -> `cpu_facts`,
+//! and no edge leaves either.
 //!
 //! # Lock-order DAG for the task lane (designed before the code that needs it)
 //! The task list ([`kernel::task::Tasklist`]: tasks, pids, process groups,

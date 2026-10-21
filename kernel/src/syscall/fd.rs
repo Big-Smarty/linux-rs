@@ -43,7 +43,7 @@
 use alloc::vec::Vec;
 use syscalls::{Errno, Sysno};
 
-use super::{Context, MAX_RW_COUNT, Outcome, Stop, Sys, outcome, tty};
+use super::{Context, MAX_RW_COUNT, Outcome, Stop, Sys, outcome, procio, tty};
 use crate::{
     sched::PIPE_KEY,
     signal::{SIGPIPE, SIGXFSZ, wait::wait_event_interruptible},
@@ -151,6 +151,11 @@ impl Dest {
         })
     }
 
+    /// Bytes the caller's buffers still have room for.
+    pub(super) const fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
     /// Copy `data` to the next user bytes; returns the bytes copied (short on
     /// a fault). The cursor advances by what was copied.
     pub(super) fn copy_out<C: Context>(&mut self, ctx: &mut C, data: &[u8]) -> usize {
@@ -249,6 +254,25 @@ impl Src {
             }
         }
         done
+    }
+
+    /// The next non-empty user segment, consumed whole (`do_loop_readv_writev`'s walk); `None`
+    /// at the end and for bytes held in the kernel.
+    fn next_segment(&mut self) -> Option<(u64, u64)> {
+        let SrcData::User(segs) = &self.data else {
+            return None;
+        };
+        while self.seg < segs.len() {
+            let (base, len) = segs[self.seg];
+            let (from, room) = (self.used, len - self.used);
+            self.seg += 1;
+            self.used = 0;
+            if room != 0 {
+                self.remaining -= room;
+                return Some((base + from, room));
+            }
+        }
+        None
     }
 
     /// `iov_iter_revert`: give `n` consumed bytes back (`n` never exceeds what
@@ -445,6 +469,7 @@ fn read_kind<C: Context>(ctx: &mut C, view: &View, dest: &mut Dest, pos: Option<
             }
             result
         }
+        FileKind::Proc => procio::read(ctx, view, dest, pos),
         FileKind::Directory => Err(Errno::EISDIR.into()), // generic_read_dir
         FileKind::Char(CharDev::Null) => Ok(0),           // read_null
         FileKind::Char(CharDev::Zero | CharDev::Full) => Ok(read_zero(ctx, dest)?),
@@ -690,8 +715,51 @@ fn write_kind<C: Context>(ctx: &mut C, view: &View, src: &mut Src, pos: Option<&
         FileKind::Char(CharDev::Full) => Err(Errno::ENOSPC.into()), // write_full
         FileKind::Pipe { pipe, writer: true } => pipe_write(ctx, view, pipe, src),
         FileKind::Directory | FileKind::Pipe { .. } | FileKind::Path => Err(Errno::EBADF.into()),
-        FileKind::Unsupported => Err(Stop::Unimplemented),
+        // `proc_reg_write` of an entry without a `proc_write`.
+        FileKind::Proc
+            if view
+                .inode
+                .and_then(crate::procfs::ProcNode::of)
+                .is_some_and(|node| node.kind == crate::procfs::Kind::Global) =>
+        {
+            Err(Errno::EIO.into())
+        }
+        FileKind::Proc
+            if view
+                .inode
+                .and_then(crate::procfs::ProcNode::of)
+                .is_some_and(|node| node.kind == crate::procfs::Kind::Comm) =>
+        {
+            write_loop(ctx, src, |ctx, base, len| procio::comm_write(ctx, view, base, len))
+        }
+        // The other writers (the writable sysctls) are not ported: the
+        // write stops the kernel rather than succeed or fail as Linux does not.
+        FileKind::Proc | FileKind::Unsupported => Err(Stop::Unimplemented),
     }
+}
+
+/// `do_loop_readv_writev` for a file with a `->write` but no `->write_iter`: one `write` per
+/// non-empty segment, stopping at the first short or failed one (an error only when nothing
+/// was written before). A kernel-held source is one segment.
+fn write_loop<C: Context>(
+    ctx: &mut C,
+    src: &mut Src,
+    mut write: impl FnMut(&mut C, u64, u64) -> Sys,
+) -> Sys {
+    let mut ret: i64 = 0;
+    while let Some((base, len)) = src.next_segment() {
+        match write(ctx, base, len) {
+            Ok(n) => {
+                ret += n;
+                if u64::try_from(n).ok() != Some(len) {
+                    break;
+                }
+            }
+            Err(error) if ret == 0 => return Err(error),
+            Err(_) => break,
+        }
+    }
+    Ok(ret)
 }
 
 /// `shmem_file_write_iter`: `generic_write_checks`, `file_remove_privs`,
@@ -1193,6 +1261,22 @@ fn lseek<C: Context>(ctx: &mut C, fd: u64, offset: u64, whence: u64) -> Sys {
                 }
             }
         }
+        FileKind::Proc => {
+            return procio::lseek(ctx, &view, whence, offset)
+                .inspect(|&new| set_pos(ctx, &view, new));
+        }
+        FileKind::Directory if view.inode.is_some_and(InodeId::is_proc) => {
+            // generic_file_llseek on a procfs directory (i_size 0 here).
+            let target = match whence {
+                0 | 2 => offset,
+                1 => offset.wrapping_add(view.pos),
+                _ => return Err(Errno::EINVAL.into()),
+            };
+            if target < 0 {
+                return Err(Errno::EINVAL.into());
+            }
+            setpos(view.pos, target, MAX_LFS_FILESIZE)?
+        }
         FileKind::Directory => {
             // offset_dir_llseek: SET and CUR only.
             let target = match whence {
@@ -1422,7 +1506,7 @@ fn owner_or_capable<C: Context>(ctx: &mut C, view: &View) -> bool {
     let cred = ctx.cred();
     let vfs = &ctx.files().vfs;
     let owner = match (view.inode, view.kind) {
-        (Some(inode), _) => vfs.fs.inode(inode).uid,
+        (Some(inode), _) => vfs.fs.node_attr(inode).uid,
         (None, FileKind::Pipe { pipe, .. }) => vfs.pipe_ref(pipe).uid,
         (None, _) => return cred.fowner,
     };
@@ -1490,6 +1574,7 @@ const FS_IOC_PREALLOCATE: [u32; 5] = [
     0x4030_5839,
 ];
 
+#[allow(clippy::too_many_lines)] // one arm per ioctl family
 fn ioctl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
     let view = fdget(ctx, fd, false)?;
     #[allow(clippy::cast_possible_truncation)]
@@ -1519,7 +1604,7 @@ fn ioctl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
             return Ok(0);
         }
         FIOQSIZE => {
-            if let Some(inode) = view.inode {
+            if let Some(inode) = view.inode.filter(|inode| !inode.is_proc()) {
                 let node = ctx.files().vfs.fs.inode(inode);
                 if matches!(
                     node.mode & S_IFMT,
@@ -1575,6 +1660,19 @@ fn ioctl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
             };
             let size = i64::try_from(ctx.files().vfs.fs.inode(inode).size).unwrap_or(i64::MAX);
             let left = i32::try_from(size - view.pos).unwrap_or(i32::MAX);
+            return put(ctx, arg, &left.to_le_bytes());
+        }
+        // do_vfs_ioctl: any S_ISREG inode answers `i_size - f_pos` (procfs files: 0, or the
+        // `pde->size` of `cmdline`, minus the position, possibly negative).
+        FIONREAD if matches!(view.kind, FileKind::Proc) => {
+            let Some(inode) = view.inode else {
+                return Err(Errno::ENOTTY.into());
+            };
+            let st = ctx.files().vfs.fs.getattr(inode);
+            if st.mode & 0o170_000 != 0o100_000 {
+                return Err(Errno::ENOTTY.into());
+            }
+            let left = i32::try_from(st.size - view.pos).unwrap_or(i32::MAX);
             return put(ctx, arg, &left.to_le_bytes());
         }
         FIOASYNC => return Err(Stop::Unimplemented),
@@ -1671,6 +1769,18 @@ fn getdents64<C: Context>(ctx: &mut C, fd: u64, dirent: u64, count: u64) -> Sys 
         return Err(Errno::ENOENT.into()); // iterate_dir: IS_DEADDIR
     }
     // iterate_dir -> offset_readdir, collecting the filldir64 records.
+    let cred = ctx.cred();
+    let tgid = i32::try_from(ctx.tgid()).unwrap_or(0);
+    let env = {
+        let fs = ctx.files().fs;
+        crate::vfs::Env {
+            root: fs.root,
+            start: dir,
+            cred,
+            umask: fs.umask,
+            tgid,
+        }
+    };
     let mut out: Vec<u8> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
     let mut ats: Vec<i64> = Vec::new();
@@ -1712,10 +1822,11 @@ fn getdents64<C: Context>(ctx: &mut C, fd: u64, dirent: u64, count: u64) -> Sys 
             left -= reclen;
             true
         };
-        tmpfs.readdir(dir, &mut pos, &mut actor);
+        // A procfs directory whose pid is gone ends the call (`ENOENT`).
+        tmpfs.readdir(&env, dir, &mut pos, &mut actor)?;
     }
     // iterate_dir: file_accessed() follows the iteration, whatever it gave.
-    if view.flags & O_NOATIME == 0 {
+    if view.flags & O_NOATIME == 0 && !dir.is_proc() {
         ctx.files().vfs.fs.touch_atime(dir);
     }
     if starts.is_empty() {
@@ -1768,9 +1879,13 @@ fn ftruncate<C: Context>(ctx: &mut C, fd: u64, length: u64) -> Sys {
     let Some(inode) = view.inode else {
         return Err(Errno::EINVAL.into());
     };
-    let is_reg = ctx.files().vfs.fs.inode(inode).is_reg();
+    let is_reg = ctx.files().vfs.fs.file_type(inode) == crate::vfs::S_IFREG;
     if !is_reg || view.mode & FMODE_WRITE == 0 {
         return Err(Errno::EINVAL.into());
+    }
+    if inode.is_proc() {
+        // `proc_setattr` ignores ATTR_SIZE: truncating a procfs file is a no-op.
+        return Ok(0);
     }
     // `small` is false on 64-bit (the syscall passes 0), so MAX_NON_LFS never
     // applies. inode_newsize_ok (from notify_change): growing past

@@ -36,9 +36,11 @@ mod fs;
 mod ids;
 mod io;
 mod memory;
+mod mount;
 mod namei;
 mod poll;
 mod process;
+mod procio;
 mod random;
 mod reboot;
 mod signal;
@@ -61,6 +63,7 @@ use crate::{
 };
 use syscalls::{Errno, Sysno};
 
+pub use ids::{UTS_RELEASE, UTS_VERSION};
 pub use io::{MAX_RW_COUNT, TTY_CHUNK};
 pub use process::exit_code;
 pub use time::{ClockState, Clocks, Kclock, RestartBlock, RestartFn, clockid_to_kclock};
@@ -177,6 +180,22 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     /// `current->files`, `current->fs` (the same value as `attrs().fs`) and the
     /// mounted rootfs.
     fn files(&mut self) -> Files<'_>;
+    /// Bring the pid mirror of `/proc` up to date with the task list (the
+    /// lookups of the path walk cannot reach the task list themselves).
+    fn sync_proc(&mut self);
+    /// Run `f` over the system state the files of `/proc` show: the VFS, the
+    /// task list and the machine's counters, with the caller identified. The
+    /// error is the allocator's refusal to build the host snapshot.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    fn with_show<R>(
+        &mut self,
+        f: impl FnOnce(&crate::procfs::show::Show<'_>) -> R,
+    ) -> Result<R, Errno>;
+    /// The user memory facts of the caller's address space that `cmdline` and
+    /// `environ` need, read live: `(arg_start, arg_end, env_start, env_end)`.
+    fn mm_args(&mut self) -> Option<(u64, u64, u64, u64)>;
     /// `copy_process` followed by `wake_up_new_task` for a plain process copy
     /// ([`ForkRequest`]): the child gets its own copy of the address space,
     /// descriptor table, `fs_struct` and signal state, joins the task list as
@@ -300,11 +319,13 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
     {
         return Outcome::Return(error(Errno::ENOSYS));
     }
+    ctx.sync_proc();
     // One line per group, in table order of their first number.
     let outcome = fd::dispatch(ctx, sysno, args)
         .or_else(|| fs::dispatch(ctx, sysno, args))
         .or_else(|| namei::dispatch(ctx, sysno, args))
         .or_else(|| attr::dispatch(ctx, sysno, args))
+        .or_else(|| mount::dispatch(ctx, sysno, args))
         .or_else(|| random::dispatch(ctx, sysno, args))
         .or_else(|| reboot::dispatch(ctx, sysno, args))
         .or_else(|| poll::dispatch(ctx, sysno, args))
@@ -314,6 +335,10 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         .or_else(|| ids::dispatch(ctx, sysno, args))
         .or_else(|| time::dispatch(ctx, sysno, args))
         .or_else(|| signal::dispatch(ctx, sysno, args));
+    // A Linux behaviour of the mount or procfs code that is not ported.
+    if ctx.files().vfs.fs.ns.take_unimplemented() {
+        return Outcome::Unimplemented(number);
+    }
     // A write or truncate under a private copy of a mapped file page (see
     // `vfs::mapping`): the call has run, the kernel stops loudly rather than
     // let the copy and the file diverge from Linux's shared page.

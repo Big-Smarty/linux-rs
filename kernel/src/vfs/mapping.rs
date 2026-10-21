@@ -109,6 +109,7 @@ impl Vfs {
             // `full_fops` and `console_fops` have no `->mmap`; none of them is
             // `FOP_UNSIGNED_OFFSET` or a regular file: `ULONG_MAX`.
             FileKind::Directory
+            | FileKind::Proc
             | FileKind::Pipe { .. }
             | FileKind::Char(
                 CharDev::Console

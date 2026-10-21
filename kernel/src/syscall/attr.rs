@@ -107,14 +107,28 @@ fn fd_inode<C: Context>(ctx: &mut C, fd: u64) -> Result<(crate::vfs::ops::Env, I
     }
     let inode = view.inode.ok_or(Stop::Unimplemented)?;
     let cred = ctx.cred();
+    let tgid = i32::try_from(ctx.tgid()).unwrap_or(0);
     let files = ctx.files();
     let env = crate::vfs::ops::Env {
         root: files.fs.root,
         start: files.fs.pwd,
         cred,
         umask: files.fs.umask,
+        tgid,
     };
     Ok((env, inode))
+}
+
+/// The attribute changes of a procfs node (`proc_setattr`, `proc_notify_change`) are not
+/// ported: the call stops the kernel rather than answer as a tmpfs inode would.
+///
+/// shortcut: stops loudly, ported with the procfs `setattr` operations.
+fn not_proc(inode: InodeId) -> Result<(), Stop> {
+    if inode.is_proc() {
+        Err(Stop::Unimplemented)
+    } else {
+        Ok(())
+    }
 }
 
 // ---- chmod -----------------------------------------------------------------------------
@@ -132,12 +146,14 @@ fn fchmodat<C: Context>(ctx: &mut C, dfd: i32, path: u64, mode: u64, flags: u64)
         flags & AT_SYMLINK_NOFOLLOW != 0,
         flags & AT_EMPTY_PATH != 0,
     )?;
+    not_proc(inode)?;
     ctx.files().vfs.chmod(&env, inode, u32::from(mode as u16))?;
     Ok(0)
 }
 
 fn fchmod<C: Context>(ctx: &mut C, fd: u64, mode: u64) -> Sys {
     let (env, inode) = fd_inode(ctx, fd)?;
+    not_proc(inode)?;
     ctx.files().vfs.chmod(&env, inode, u32::from(mode as u16))?;
     Ok(0)
 }
@@ -157,6 +173,7 @@ fn fchownat<C: Context>(ctx: &mut C, dfd: i32, path: u64, user: u64, group: u64,
         flag & AT_SYMLINK_NOFOLLOW != 0,
         flag & AT_EMPTY_PATH != 0,
     )?;
+    not_proc(inode)?;
     ctx.files()
         .vfs
         .chown(&env, inode, user as u32, group as u32)?;
@@ -165,6 +182,7 @@ fn fchownat<C: Context>(ctx: &mut C, dfd: i32, path: u64, user: u64, group: u64,
 
 fn fchown<C: Context>(ctx: &mut C, fd: u64, user: u64, group: u64) -> Sys {
     let (env, inode) = fd_inode(ctx, fd)?;
+    not_proc(inode)?;
     ctx.files()
         .vfs
         .chown(&env, inode, user as u32, group as u32)?;
@@ -199,6 +217,7 @@ fn do_utimes<C: Context>(
             flags & AT_EMPTY_PATH != 0,
         )?
     };
+    not_proc(inode)?;
     ctx.files().vfs.utimens(&env, inode, times)?;
     Ok(0)
 }
@@ -267,6 +286,10 @@ fn truncate<C: Context>(ctx: &mut C, path: u64, length: u64) -> Sys {
     // vfs_truncate: type and write permission; then notify_change's
     // setattr_prepare -> inode_newsize_ok.
     ctx.files().vfs.truncate_check(&env, inode)?;
+    if inode.is_proc() {
+        // `proc_setattr` ignores ATTR_SIZE: truncating a procfs file is a no-op.
+        return Ok(0);
+    }
     let size = ctx.files().vfs.fs.inode(inode).size;
     if size < length as u64 {
         let limit = ctx.rlimit_fsize();
@@ -287,8 +310,12 @@ fn truncate<C: Context>(ctx: &mut C, path: u64, length: u64) -> Sys {
 fn fsync<C: Context>(ctx: &mut C, fd: u64) -> Sys {
     let view = fdget(ctx, fd, false)?;
     match view.kind {
+        // procfs has no `->fsync` (`proc_reg_file_ops`, `proc_dir_operations`).
+        FileKind::Directory if view.inode.is_some_and(InodeId::is_proc) => {
+            Err(Errno::EINVAL.into())
+        }
         FileKind::Regular | FileKind::Directory => Ok(0),
-        FileKind::Pipe { .. } | FileKind::Char(_) => Err(Errno::EINVAL.into()),
+        FileKind::Pipe { .. } | FileKind::Char(_) | FileKind::Proc => Err(Errno::EINVAL.into()),
         FileKind::Path => Err(Errno::EBADF.into()),
         FileKind::Unsupported => Err(Stop::Unimplemented),
     }

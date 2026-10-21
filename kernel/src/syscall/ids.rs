@@ -353,7 +353,7 @@ pub const UTS_RELEASE: &[u8] = b"6.18.57";
 const UNAME26_PATCH: &[u8] = b"78";
 /// `UTS_VERSION`: Linux prints `#<build number> <config flags> <build date>`;
 /// this kernel has no build counter or date source, so it names itself.
-const UTS_VERSION: &[u8] = b"#1 linux-rs";
+pub const UTS_VERSION: &[u8] = b"#1 linux-rs";
 const NEW_UTS_LEN: usize = 65;
 const UTS_FIELDS: [&[u8]; 6] = [
     b"Linux",    // UTS_SYSNAME

@@ -93,6 +93,11 @@ pub struct Built {
     /// `AT_EXECFN` string address.
     pub execfn: u64,
     pub random: u64,
+    /// `mm->arg_start`, `arg_end`, `env_start`, `env_end`.
+    pub arg_start: u64,
+    pub arg_end: u64,
+    pub env_start: u64,
+    pub env_end: u64,
 }
 
 struct Window<'a> {
@@ -255,6 +260,10 @@ pub fn build<'w>(
         argc: arg_count,
         execfn,
         random,
+        arg_start,
+        arg_end: env_start,
+        env_start,
+        env_end: execfn,
     })
 }
 

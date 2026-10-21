@@ -90,8 +90,9 @@ pub fn open_exec_file(
     let file = vfs.open(env, path, &exec_open(follow))?;
     let inode = vfs.files.get(file).inode;
     let bytes = match inode {
-        // do_open_execat: only regular files execute.
-        Some(inode) if vfs.fs.inode(inode).is_reg() => vfs.fs.read_all(inode),
+        // do_open_execat: only regular files execute (a procfs file has no execute bit, so
+        // `MAY_EXEC` already failed at the open; a procfs directory opens but is not regular).
+        Some(inode) if !inode.is_proc() && vfs.fs.inode(inode).is_reg() => vfs.fs.read_all(inode),
         _ => Err(Errno::EACCES),
     };
     match bytes {

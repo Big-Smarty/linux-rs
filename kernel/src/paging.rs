@@ -927,6 +927,61 @@ impl Tables {
         }
     }
 
+    /// The resident pages of `[start, start + pages * 4096)` that are not the
+    /// shared zero page: `(pages, writable pages)`. A walk over the present
+    /// tables only (`for_each_user_slot`), for `/proc/<pid>/status`'s `RssAnon`
+    /// and `RssShmem`.
+    #[must_use]
+    pub fn mm_resident(&self, start: u64, pages: u64) -> (u64, u64) {
+        let (mut present, mut writable) = (0, 0);
+        self.for_each_user_slot(start, pages, |_, slot| {
+            // SAFETY: `for_each_user_slot` hands out a valid, aligned PTE slot
+            // of this tree inside the direct map; a volatile read creates no
+            // reference and observes hardware accessed/dirty updates.
+            let entry = unsafe { ptr::read_volatile(slot) };
+            if entry & PRESENT != 0 && Some(Physical(frame_bits(entry))) != self.zero {
+                present += 1;
+                writable += u64::from(entry & WRITE != 0);
+            }
+        });
+        (present, writable)
+    }
+
+    /// `mm_pgtables_bytes`: the PUD, PMD and PTE pages of the user half.
+    #[must_use]
+    pub fn mm_table_pages(&self) -> u64 {
+        let mut count = 0u64;
+        for pgd in 0..256 {
+            let Ok(entry) = self.read(self.root, pgd) else {
+                continue;
+            };
+            if entry & PRESENT == 0 || entry & USER == 0 {
+                continue;
+            }
+            count += 1;
+            let pud = Physical(entry & ADDRESS);
+            for upper in 0..512 {
+                let Ok(entry) = self.read(pud, upper) else {
+                    continue;
+                };
+                if entry & PRESENT == 0 || entry & HUGE != 0 {
+                    continue;
+                }
+                count += 1;
+                let pmd = Physical(entry & ADDRESS);
+                for middle in 0..512 {
+                    let Ok(entry) = self.read(pmd, middle) else {
+                        continue;
+                    };
+                    if entry & PRESENT != 0 && entry & HUGE == 0 {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
     /// What the model sees at `page`.
     #[must_use]
     pub fn mm_lookup(&self, page: u64) -> kernel::mm::Pte {
@@ -1267,6 +1322,34 @@ impl UserSpace<'_> {
     /// Frame exhaustion.
     pub fn fork_tables(&mut self) -> Result<Tables, Error> {
         self.parts(|tables, frames| tables.fork_user(frames))
+    }
+}
+
+impl UserSpace<'_> {
+    /// `(anon, shmem)` resident pages of the address space with the VMAs
+    /// `vmas`, and the bytes of its page tables. A page of a file mapping that
+    /// the task has not written is the page-cache page (`MM_SHMEMPAGES`: every
+    /// file here is on tmpfs); a written one is a private copy
+    /// (`MM_ANONPAGES`).
+    #[must_use]
+    pub fn rss(&self, vmas: &[kernel::mm::Vma]) -> (u64, u64, u64) {
+        let (mut anon, mut shmem) = (0, 0);
+        for vma in vmas {
+            let (present, writable) = self.tables.mm_resident(vma.start, vma.pages());
+            if vma.file.is_some() {
+                anon += writable;
+                shmem += present - writable;
+            } else {
+                anon += present;
+            }
+        }
+        (anon, 0, shmem)
+    }
+
+    /// `mm_pgtables_bytes`.
+    #[must_use]
+    pub fn table_bytes(&self) -> u64 {
+        self.tables.mm_table_pages() * PAGE
     }
 }
 

@@ -29,7 +29,7 @@ use crate::{
     usercopy::{copy_from_user, copy_to_user, strncpy_from_user},
     vfs::{
         AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE,
-        AT_SYMLINK_NOFOLLOW, Kstat, O_LARGEFILE, PATH_MAX, major, minor, new_encode_dev,
+        AT_SYMLINK_NOFOLLOW, InodeId, Kstat, O_LARGEFILE, PATH_MAX, major, minor, new_encode_dev,
         ops::{Env, build_open_flags, stat_lookup_flags},
         path::{LOOKUP_DIRECTORY, LOOKUP_FOLLOW},
         try_copy,
@@ -113,6 +113,7 @@ fn getname_maybe_null<C: Context>(
 /// The `Env` for a walk of `path` relative to `dfd` (`path_init`).
 pub(super) fn env_for<C: Context>(ctx: &mut C, dfd: i32, path: &[u8]) -> Result<Env, Errno> {
     let cred = ctx.cred();
+    let tgid = i32::try_from(ctx.tgid()).unwrap_or(0);
     let files = ctx.files();
     let fs = *files.fs;
     let start = if path.first() == Some(&b'/') {
@@ -124,7 +125,7 @@ pub(super) fn env_for<C: Context>(ctx: &mut C, dfd: i32, path: &[u8]) -> Result<
         let id = files.fdt.get(dfd as u32).ok_or(Errno::EBADF)?;
         match files.vfs.files.get(id).inode {
             // `path_init`: `*s && !d_can_lookup(dentry)` is ENOTDIR before any walk.
-            Some(inode) if !path.is_empty() && !files.vfs.fs.inode(inode).is_dir() => {
+            Some(inode) if !path.is_empty() && !files.vfs.fs.is_dir(inode) => {
                 return Err(Errno::ENOTDIR);
             }
             Some(inode) => inode,
@@ -137,6 +138,7 @@ pub(super) fn env_for<C: Context>(ctx: &mut C, dfd: i32, path: &[u8]) -> Result<
         start,
         cred,
         umask: fs.umask,
+        tgid,
     })
 }
 
@@ -249,6 +251,7 @@ fn chdir<C: Context>(ctx: &mut C, path: u64) -> Sys {
 
 fn fchdir<C: Context>(ctx: &mut C, fd: u64) -> Sys {
     let cred = ctx.cred();
+    let tgid = i32::try_from(ctx.tgid()).unwrap_or(0);
     let files = ctx.files();
     #[allow(clippy::cast_possible_truncation)]
     let id = files.fdt.get(fd as u32).ok_or(Errno::EBADF)?;
@@ -258,6 +261,7 @@ fn fchdir<C: Context>(ctx: &mut C, fd: u64) -> Sys {
         start: dir,
         cred,
         umask: files.fs.umask,
+        tgid,
     };
     files.vfs.chdir_check(&env, dir)?;
     files.vfs.set_pwd(files.fs, dir);
@@ -290,7 +294,7 @@ fn readlinkat<C: Context>(ctx: &mut C, dfd: i32, path: u64, buf: u64, bufsiz: u6
     let env = env_for_at(ctx, dfd, &name)?;
     let vfs = ctx.files().vfs;
     let inode = vfs.lookup(&env, &name, 0)?;
-    if !vfs.fs.inode(inode).is_symlink() {
+    if !vfs.fs.is_symlink(inode) {
         return Err(if name.is_empty() {
             Errno::ENOENT
         } else {
@@ -298,12 +302,16 @@ fn readlinkat<C: Context>(ctx: &mut C, dfd: i32, path: u64, buf: u64, bufsiz: u6
         }
         .into());
     }
-    // do_readlinkat: touch_atime() precedes vfs_readlink().
-    vfs.fs.touch_atime(inode);
-    let crate::vfs::tmpfs::Body::Link(target) = &vfs.fs.inode(inode).body else {
-        return Err(Errno::EINVAL.into());
+    let target = if let Some(node) = crate::procfs::ProcNode::of(inode) {
+        super::procio::readlink(ctx, node)?
+    } else {
+        // do_readlinkat: touch_atime() precedes vfs_readlink().
+        vfs.fs.touch_atime(inode);
+        let crate::vfs::tmpfs::Body::Link(target) = &vfs.fs.inode(inode).body else {
+            return Err(Errno::EINVAL.into());
+        };
+        try_copy(target)?
     };
-    let target = try_copy(target)?;
     #[allow(clippy::cast_sign_loss)]
     let n = target.len().min(bufsiz as usize);
     if copy_to_user(ctx, buf, &target[..n]) != 0 {
@@ -387,7 +395,7 @@ fn vfs_statx<C: Context>(ctx: &mut C, dfd: i32, name: &[u8], flags: u32) -> Resu
     let env = env_for(ctx, dfd, name)?;
     let vfs = ctx.files().vfs;
     let inode = vfs.lookup(&env, name, stat_lookup_flags(flags))?;
-    Ok(vfs.fs.getattr(inode))
+    Ok(vfs.getattr(inode))
 }
 
 const STATX_BASIC_STATS: u32 = 0x7ff;
@@ -395,10 +403,9 @@ const STATX_BTIME: u32 = 0x800;
 const STATX_MNT_ID: u32 = 0x1000;
 const STATX_CHANGE_COOKIE: u32 = 1 << 30;
 const STATX_RESERVED: u32 = 0x8000_0000;
-/// `mnt_id` of the rootfs mount (an arbitrary allocated id in Linux).
-const ROOTFS_MNT_ID: u64 = 1;
 
 fn put_statx<C: Context>(ctx: &mut C, addr: u64, st: &Kstat, mask: u32) -> Result<(), Errno> {
+    let mnt_id = u64::from(st.mnt_id);
     let mut out = [0u8; 256];
     // generic_fillattr + shmem_getattr result mask, vfs_statx_path adds MNT_ID.
     let mut result = STATX_BASIC_STATS | STATX_MNT_ID;
@@ -431,7 +438,7 @@ fn put_statx<C: Context>(ctx: &mut C, addr: u64, st: &Kstat, mask: u32) -> Resul
     out[132..136].copy_from_slice(&minor(st.rdev).to_le_bytes());
     out[136..140].copy_from_slice(&major(st.dev).to_le_bytes());
     out[140..144].copy_from_slice(&minor(st.dev).to_le_bytes());
-    out[144..152].copy_from_slice(&ROOTFS_MNT_ID.to_le_bytes());
+    out[144..152].copy_from_slice(&mnt_id.to_le_bytes());
     if copy_to_user(ctx, addr, &out) != 0 {
         return Err(Errno::EFAULT);
     }
@@ -460,30 +467,27 @@ fn statx<C: Context>(ctx: &mut C, dfd: i32, path: u64, flags: u64, mask: u64, bu
 
 // ---- statfs ----------------------------------------------------------------------------
 
-/// `TMPFS_MAGIC` (include/uapi/linux/magic.h): the type of tmpfs and of the rootfs.
-const TMPFS_MAGIC: u64 = 0x0102_1994;
 /// `PIPEFS_MAGIC`: the file system of pipe descriptors.
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
-/// `ST_VALID`: the only flag of the rootfs mount (`calculate_f_flags`: no mount flags,
-/// no `SB_SYNCHRONOUS`/`SB_MANDLOCK`).
-const ST_VALID: u64 = 0x20;
 
-/// `do_statfs_native`: the 120-byte x86-64 `struct statfs` of the rootfs
-/// (`shmem_statfs`, `vfs_statfs`).
-fn put_statfs<C: Context>(ctx: &mut C, addr: u64, pipefs: bool) -> Result<(), Errno> {
-    // pipefs answers with `simple_statfs`: the magic, the block size and name length only.
-    let st = if pipefs {
-        crate::vfs::tmpfs::Statfs {
+/// `do_statfs_native`: the 120-byte x86-64 `struct statfs` of the filesystem `inode` is on
+/// (`vfs_statfs`: [`crate::vfs::fs::Fs::statfs`]), or of pipefs for a pipe (`None`).
+fn put_statfs<C: Context>(ctx: &mut C, addr: u64, inode: Option<InodeId>) -> Result<(), Errno> {
+    // pipefs answers with `simple_statfs`: the magic, the block size and name length only,
+    // on a mount without flags.
+    let st = match inode {
+        Some(inode) => ctx.files().vfs.fs.statfs(inode),
+        None => crate::vfs::fs::StatfsInfo {
+            magic: PIPEFS_MAGIC,
             blocks: 0,
             bfree: 0,
             files: 0,
             ffree: 0,
-        }
-    } else {
-        ctx.files().vfs.fs.statfs()
+            flags: crate::vfs::fs::ST_VALID,
+        },
     };
     let words: [u64; 15] = [
-        if pipefs { PIPEFS_MAGIC } else { TMPFS_MAGIC },
+        st.magic,
         crate::vfs::PAGE_SIZE as u64,
         st.blocks,
         st.bfree,
@@ -496,7 +500,7 @@ fn put_statfs<C: Context>(ctx: &mut C, addr: u64, pipefs: bool) -> Result<(), Er
         crate::vfs::NAME_MAX as u64,
         // f_frsize (`vfs_statfs`/`statfs_by_dentry` default it to f_bsize) and f_flags.
         crate::vfs::PAGE_SIZE as u64,
-        ST_VALID,
+        st.flags,
         0,
         0,
         0,
@@ -516,8 +520,8 @@ fn put_statfs<C: Context>(ctx: &mut C, addr: u64, pipefs: bool) -> Result<(), Er
 fn statfs<C: Context>(ctx: &mut C, path: u64, buf: u64) -> Sys {
     let name = getname(ctx, path, false)?;
     let env = env_for(ctx, AT_FDCWD, &name)?;
-    ctx.files().vfs.lookup(&env, &name, LOOKUP_FOLLOW)?;
-    put_statfs(ctx, buf, false)?;
+    let inode = ctx.files().vfs.lookup(&env, &name, LOOKUP_FOLLOW)?;
+    put_statfs(ctx, buf, Some(inode))?;
     Ok(0)
 }
 
@@ -525,10 +529,7 @@ fn statfs<C: Context>(ctx: &mut C, path: u64, buf: u64) -> Sys {
 fn fstatfs<C: Context>(ctx: &mut C, fd: u64, buf: u64) -> Sys {
     #[allow(clippy::cast_possible_truncation)]
     let id = ctx.files().fdt.get(fd as u32).ok_or(Errno::EBADF)?;
-    let pipefs = matches!(
-        ctx.files().vfs.files.get(id).kind,
-        crate::vfs::file::FileKind::Pipe { .. }
-    );
-    put_statfs(ctx, buf, pipefs)?;
+    let inode = ctx.files().vfs.files.get(id).inode;
+    put_statfs(ctx, buf, inode)?;
     Ok(0)
 }

@@ -191,6 +191,8 @@ pub fn map_segments(
     let mut elf_brk = 0u64;
     let mut start_data = 0u64;
     let mut end_data = 0u64;
+    let mut start_code = u64::MAX;
+    let mut end_code = 0u64;
     for (index, segment) in plan.segments().iter().enumerate() {
         let map_addr = elf_load(segment, index == 0, info, mm, env, pt)?;
         // BAD_ADDR(error)
@@ -199,6 +201,9 @@ pub fn map_segments(
         }
         let (k, filesz, memsz) = (segment.vaddr, segment.filesz, segment.memsz);
         start_data = start_data.max(k);
+        if segment.prot.exec {
+            start_code = start_code.min(k);
+        }
         // Check to see if the section's size will overflow the allowed task
         // size (set_brk can never work; avoids overflows below).
         if k >= TASK_SIZE_MAX
@@ -209,6 +214,9 @@ pub fn map_segments(
             return Err(failed(Errno::EINVAL));
         }
         end_data = end_data.max(k + filesz);
+        if segment.prot.exec {
+            end_code = end_code.max(k + filesz);
+        }
         elf_brk = elf_brk.max(k + memsz);
         install_file_pages(segment, file, pt)?;
     }
@@ -227,6 +235,8 @@ pub fn map_segments(
     mm.brk = mm.start_brk;
     mm.start_data = start_data;
     mm.end_data = end_data;
+    mm.start_code = start_code;
+    mm.end_code = end_code;
     Ok(())
 }
 

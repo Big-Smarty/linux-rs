@@ -92,6 +92,19 @@ pub struct Mm {
     pub brk: u64,
     pub start_data: u64,
     pub end_data: u64,
+    /// `mm->start_code`, `end_code`: the executable `PT_LOAD`s' extent.
+    pub start_code: u64,
+    pub end_code: u64,
+    /// `mm->start_stack`: the user stack pointer at the entry of the program.
+    pub start_stack: u64,
+    /// `mm->arg_start`, `arg_end`, `env_start`, `env_end`: the argument and
+    /// environment strings (`/proc/<pid>/cmdline`, `environ`).
+    pub arg_start: u64,
+    pub arg_end: u64,
+    pub env_start: u64,
+    pub env_end: u64,
+    /// `mm->hiwater_vm` (pages): the highest `total_vm` seen.
+    pub hiwater_vm: u64,
     /// `mm->total_vm`, `data_vm`, `exec_vm`, `stack_vm`, `locked_vm` (pages).
     pub total_vm: u64,
     pub data_vm: u64,
@@ -122,6 +135,14 @@ impl Mm {
             brk: 0,
             start_data: 0,
             end_data: 0,
+            start_code: 0,
+            end_code: 0,
+            start_stack: 0,
+            arg_start: 0,
+            arg_end: 0,
+            env_start: 0,
+            env_end: 0,
+            hiwater_vm: 0,
             total_vm: 0,
             data_vm: 0,
             exec_vm: 0,
@@ -174,6 +195,14 @@ impl Mm {
             brk: self.brk,
             start_data: self.start_data,
             end_data: self.end_data,
+            start_code: self.start_code,
+            end_code: self.end_code,
+            start_stack: self.start_stack,
+            arg_start: self.arg_start,
+            arg_end: self.arg_end,
+            env_start: self.env_start,
+            env_end: self.env_end,
+            hiwater_vm: self.hiwater_vm,
             total_vm: self.total_vm,
             data_vm: self.data_vm,
             exec_vm: self.exec_vm,
@@ -185,6 +214,23 @@ impl Mm {
             def_flags: VmFlags::NONE,
             next_anon,
         })
+    }
+
+    /// `create_elf_tables` / `load_elf_binary`: where the program's stack
+    /// pointer and its argument and environment strings are.
+    pub fn record_stack(
+        &mut self,
+        start_stack: u64,
+        arg_start: u64,
+        arg_end: u64,
+        env_start: u64,
+        env_end: u64,
+    ) {
+        self.start_stack = start_stack;
+        self.arg_start = arg_start;
+        self.arg_end = arg_end;
+        self.env_start = env_start;
+        self.env_end = env_end;
     }
 
     /// The VMAs in address order (`/proc/self/maps` order).
@@ -329,6 +375,7 @@ impl Mm {
     /// `vm_stat_account` (`npages` may be negative through `sub`).
     pub(super) fn stat_add(&mut self, flags: VmFlags, npages: u64) {
         self.total_vm += npages;
+        self.hiwater_vm = self.hiwater_vm.max(self.total_vm);
         if is_exec_mapping(flags) {
             self.exec_vm += npages;
         } else if is_stack_mapping(flags) {

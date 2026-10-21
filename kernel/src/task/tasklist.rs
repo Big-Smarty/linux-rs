@@ -76,6 +76,10 @@ pub struct CredSnapshot {
     pub uid: u32,
     pub euid: u32,
     pub suid: u32,
+    /// The group ids (`/proc/<pid>` ownership and `ptrace_may_access`).
+    pub gid: u32,
+    pub egid: u32,
+    pub sgid: u32,
     /// `ns_capable(CAP_KILL)`.
     pub cap_kill: bool,
     /// `capable(CAP_SYS_RESOURCE)` (the `RLIMIT_NPROC` bypass).
@@ -95,6 +99,9 @@ impl CredSnapshot {
             uid: cred.uid,
             euid: cred.euid,
             suid: cred.suid,
+            gid: cred.gid,
+            egid: cred.egid,
+            sgid: cred.sgid,
             cap_kill: root,
             cap_sys_resource: root,
         }
@@ -197,6 +204,11 @@ pub struct Tasklist {
     order: Vec<TaskId>,
     nr_threads: u32,
     max_threads: u32,
+    /// `total_forks`: tasks created since boot.
+    forks: u64,
+    /// Bumped by everything `/proc` mirrors: a task published or released, a
+    /// credential snapshot published ([`Tasklist::epoch`]).
+    epoch: u64,
 }
 
 impl Tasklist {
@@ -221,6 +233,8 @@ impl Tasklist {
             order: Vec::new(),
             nr_threads: 0,
             max_threads,
+            forks: 0,
+            epoch: 1,
         };
         let signals =
             Box::try_new(TaskSignals::new_init(rlimit_sigpending)).map_err(|_| Errno::ENOMEM)?;
@@ -306,6 +320,8 @@ impl Tasklist {
         }
         assert!(self.order.push_within_capacity(id).is_ok());
         self.nr_threads += 1;
+        self.forks += 1;
+        self.epoch += 1;
         Ok(id)
     }
 
@@ -432,6 +448,7 @@ impl Tasklist {
         }
         self.order.retain(|&t| t != id);
         self.nr_threads -= 1;
+        self.epoch += 1;
     }
 
     /// `free_pid` once the last link of every type is gone. `init_struct_pid`
@@ -468,6 +485,40 @@ impl Tasklist {
     #[must_use]
     pub const fn init_struct_pid(&self) -> PidId {
         self.init_pid
+    }
+
+    /// `total_forks`.
+    #[must_use]
+    pub const fn forks(&self) -> u64 {
+        self.forks
+    }
+
+    /// `idr_get_cursor(&pid_ns->idr) - 1`: the last pid handed out.
+    #[must_use]
+    pub fn last_pid(&self) -> i32 {
+        i32::try_from(self.table.cursor().saturating_sub(1)).unwrap_or(i32::MAX)
+    }
+
+    /// A counter that changes whenever a thread group appears or disappears or
+    /// its credentials change: the pid mirror of `/proc` is rebuilt when it
+    /// moves ([`crate::procfs::ProcState::sync`]).
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Mark the task list changed for `/proc` readers: a task became a zombie.
+    pub(super) fn touch_epoch(&mut self) {
+        self.epoch += 1;
+    }
+
+    /// Whether `get_dumpable(mm) == SUID_DUMP_USER` for the task. shortcut:
+    /// always true; `PR_SET_DUMPABLE` and set-id `execve` are not ported
+    /// (`syscall::ids` answers `PR_GET_DUMPABLE` with the constant), so no mm
+    /// can become undumpable. Make it state with the first of them.
+    #[must_use]
+    pub const fn dumpable(&self, _task: TaskId) -> bool {
+        true
     }
 
     /// Live and zombie tasks, `nr_threads`.
@@ -686,6 +737,12 @@ impl Tasklist {
         Some(self.tasks.get_mut(task)?.signals.view(ids))
     }
 
+    /// The `/proc` summary of a task's signal sets.
+    #[must_use]
+    pub fn signal_sets(&self, task: TaskId) -> Option<crate::signal::SigSets> {
+        Some(self.tasks.get(task)?.signals.sets())
+    }
+
     // ---- credentials ------------------------------------------------------------
 
     /// Publish `cred` as the snapshot cross-task readers see: at exec
@@ -693,6 +750,7 @@ impl Tasklist {
     pub fn publish_cred(&mut self, task: TaskId, cred: &Cred) {
         if let Some(t) = self.tasks.get_mut(task) {
             t.cred = CredSnapshot::of(cred);
+            self.epoch += 1;
         }
     }
 

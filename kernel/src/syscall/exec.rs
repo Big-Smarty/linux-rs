@@ -324,6 +324,13 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &Prepared) -> Outcome {
         unmapped.map_err(LoadError::Errno).and_then(|()| {
             insert_stack(mm, env, p.plan.exec_stack)?;
             map_segments(&p.plan, &p.bytes, &exec_file(id), mm, env, &mut *pages)?;
+            mm.record_stack(
+                p.built.sp,
+                p.built.arg_start,
+                p.built.arg_end,
+                p.built.env_start,
+                p.built.env_end,
+            );
             install_arguments(p, pages)
         })
     };
