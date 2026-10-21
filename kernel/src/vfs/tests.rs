@@ -1329,3 +1329,72 @@ fn procfs_has_the_non_lfs_maximum_and_keeps_the_times_a_setattr_stamped() {
     vfs.fs.reap();
     assert!(vfs.fs.ns.proc.stamp(version).is_none());
 }
+
+/// init/initramfs.c `write_buffer` is fed the flushes of a decompressor in any size: an image held
+/// in pieces (the suite's retained modules are in heap-sized chunks) makes the same tree as the
+/// whole, whichever way a header, a name, a file body or the padding is cut, and a second image
+/// after the first (with zero padding between them) is found in the next piece.
+#[test]
+fn unpacking_an_image_in_pieces_makes_the_same_tree_as_the_whole() {
+    let mut image = newc("dir", 0o040_755, 2, 1, b"", (0, 0));
+    image.extend(newc(
+        "dir/file",
+        0o100_644,
+        1,
+        2,
+        b"0123456789abcdef",
+        (0, 0),
+    ));
+    image.extend(newc("dir/link", 0o120_777, 1, 3, b"file", (0, 0)));
+    image.extend(newc("dir/empty", 0o100_600, 1, 4, b"", (0, 0)));
+    image.extend(newc("n", 0o100_755, 1, 5, b"x", (0, 0)));
+    image.extend(trailer());
+    // Zero padding to the next 4 bytes boundary of an image offset, then a second image whose
+    // first byte is `0` like the padding is not.
+    image.extend([0u8; 8]);
+    image.extend(newc("second", 0o100_644, 1, 6, b"two", (0, 0)));
+    image.extend(trailer());
+    let whole = unpacked(&image);
+    assert_eq!(whole.2, None);
+    let listing = |(vfs, env, _): &(Vfs, Env, Option<&'static str>)| {
+        [
+            "/dir",
+            "/dir/file",
+            "/dir/link",
+            "/dir/empty",
+            "/n",
+            "/second",
+        ]
+        .map(|path| {
+            vfs.lookup(env, path.as_bytes(), 0).ok().map(|inode| {
+                (
+                    vfs.fs.inode(inode).mode,
+                    if vfs.fs.inode(inode).is_reg() {
+                        vfs.fs.read_all(inode).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
+                )
+            })
+        })
+        .to_vec()
+    };
+    let want = listing(&whole);
+    assert!(want.iter().all(Option::is_some), "{want:?}");
+    for size in 1..=image.len() {
+        let (mut vfs, env) = rootfs(1 << 10);
+        let pieces: Vec<&[u8]> = image.chunks(size).collect();
+        let message = Unpacker::new().unpack_chunks(&mut vfs, &pieces);
+        assert_eq!(message, None, "pieces of {size}");
+        assert_eq!(listing(&(vfs, env, None)), want, "pieces of {size}");
+    }
+    // A damaged image is damaged in the same place however it is cut.
+    let mut bad = image.clone();
+    bad[0] = b'x';
+    let (mut vfs, _) = rootfs(1 << 10);
+    let pieces: Vec<&[u8]> = bad.chunks(7).collect();
+    assert_eq!(
+        Unpacker::new().unpack_chunks(&mut vfs, &pieces),
+        unpacked(&bad).2
+    );
+}

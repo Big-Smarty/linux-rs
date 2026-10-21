@@ -23,15 +23,71 @@
 pub const ORACLE_EXPECTED: &[u8] = include_bytes!("../../xtask/oracle/expected.tsv");
 
 /// Oracle groups the kernel can run today, in run order. `xstate` drives AVX-512 and the
-/// protection keys, `busybox` runs the host's x86-64-v4 `BusyBox` from a second initramfs module:
-/// where the CPU or the stick lacks what they need they are reported unavailable, not failed
-/// (`baremetal::unavailable_reason`). `tty`, `ttyin` and `ttykbd` are not here: they drive the
-/// console device itself (a serial line, the PS/2 keyboard), which the suite's framebuffer console
-/// on a physical machine is not.
-pub const GROUPS: [&str; 13] = [
-    "ids", "time", "mm", "fs", "names", "signal", "fork", "proc", "jobctl", "pipe", "xstate",
-    "procfs", "busybox",
+/// protection keys, `busybox` and `dynelf` run the host's x86-64-v4 programs (`BusyBox`; glibc
+/// programs and Python) from a second initramfs module: where the CPU or the stick lacks what they
+/// need they are reported unavailable, not failed (`baremetal::unavailable_reason`). `threads`
+/// and `futex` need nothing of the machine. `tty`, `ttyin` and `ttykbd` are not here: they drive
+/// the console device itself (a serial line, the PS/2 keyboard), which the suite's framebuffer
+/// console on a physical machine is not.
+pub const GROUPS: [&str; 16] = [
+    "ids", "time", "mm", "fs", "names", "signal", "fork", "proc", "jobctl", "pipe", "threads",
+    "futex", "xstate", "procfs", "busybox", "dynelf",
 ];
+
+/// An optional boot module of the stick besides the base `initramfs.cpio`: archives `xtask
+/// baremetal-suite` generates around host programs, one per group that needs them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Module {
+    /// `busybox.cpio`: the host's static `BusyBox` and its data files (group `busybox`).
+    Busybox,
+    /// `dynamic.cpio`: the host's dynamically linked programs and shared objects, the loader and
+    /// some Python modules (group `dynelf`).
+    Dynamic,
+    /// Anything else.
+    Other,
+}
+
+/// The optional module a group unpacks beside the base archive.
+#[must_use]
+pub fn module_of_group(group: &str) -> Option<Module> {
+    match group {
+        "busybox" => Some(Module::Busybox),
+        "dynelf" => Some(Module::Dynamic),
+        _ => None,
+    }
+}
+
+/// Which optional module a boot module is, from the names of its `newc` entries (the loader
+/// hands the kernel no module names): `bin/busybox` or `usr/bin/bash`, whichever comes first.
+/// Only entry headers are read, never the data; a malformed archive is `Other`.
+#[must_use]
+pub fn module_kind(archive: &[u8]) -> Module {
+    let field = |entry: usize, at: usize| -> Option<usize> {
+        let digits = archive.get(entry + at..entry + at + 8)?;
+        let text = core::str::from_utf8(digits).ok()?;
+        usize::from_str_radix(text, 16).ok()
+    };
+    let mut entry = 0;
+    while archive.get(entry..entry + 6) == Some(b"070701") {
+        let (Some(size), Some(name_size)) = (field(entry, 54), field(entry, 94)) else {
+            return Module::Other;
+        };
+        let name_at = entry + 110;
+        let Some(name) = archive.get(name_at..name_at.saturating_add(name_size)) else {
+            return Module::Other;
+        };
+        match name.strip_suffix(b"\0") {
+            Some(b"bin/busybox") => return Module::Busybox,
+            Some(b"usr/bin/bash") => return Module::Dynamic,
+            Some(b"TRAILER!!!") | None => return Module::Other,
+            Some(_) => {}
+        }
+        // The name is padded so that the data starts on 4 bytes, and the data likewise.
+        let data = (name_at + name_size).next_multiple_of(4);
+        entry = data.saturating_add(size).next_multiple_of(4);
+    }
+    Module::Other
+}
 
 /// Oracle groups that exist in `user/init` but are not run, with the reason
 /// that appears on the summary screen. The three tty groups test the console tty through a
@@ -504,6 +560,73 @@ mod tests {
         }
         out.extend_from_slice(b"init: ok\n");
         out
+    }
+
+    /// A `newc` archive of `(name, data)` entries, as `xtask` writes them (padding included).
+    fn newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut put = |name: &str, data: &[u8]| {
+            let hex = |n: usize| format!("{n:08x}");
+            out.extend_from_slice(b"070701");
+            for field in [
+                1usize,
+                0o100_644,
+                0,
+                0,
+                1,
+                0,
+                data.len(),
+                0,
+                0,
+                0,
+                0,
+                name.len() + 1,
+                0,
+            ] {
+                out.extend_from_slice(hex(field).as_bytes());
+            }
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            while out.len() % 4 != 0 {
+                out.push(0);
+            }
+            out.extend_from_slice(data);
+            while out.len() % 4 != 0 {
+                out.push(0);
+            }
+        };
+        for (name, data) in entries {
+            put(name, data);
+        }
+        put("TRAILER!!!", b"");
+        out
+    }
+
+    #[test]
+    fn optional_modules_are_told_apart_by_their_entry_names() {
+        let base = newc(&[("init", b"elf"), ("fixture/hello.txt", b"hello, oracle\n")]);
+        let busybox = newc(&[("bb", b""), ("bin/busybox", b"x"), ("bin/ls", b"busybox")]);
+        let dynamic = newc(&[("usr", b""), ("usr/bin", b""), ("usr/bin/bash", b"odd!!")]);
+        assert_eq!(module_kind(&base), Module::Other);
+        assert_eq!(module_kind(&busybox), Module::Busybox);
+        assert_eq!(module_kind(&dynamic), Module::Dynamic);
+        // Whatever precedes decides: a module carrying both names is the first one's.
+        let both = newc(&[("usr/bin/bash", b"a"), ("bin/busybox", b"b")]);
+        assert_eq!(module_kind(&both), Module::Dynamic);
+        // Hostile input never panics and is `Other`.
+        assert_eq!(module_kind(b""), Module::Other);
+        assert_eq!(module_kind(b"070701"), Module::Other);
+        assert_eq!(module_kind(&dynamic[..120]), Module::Other);
+        let mut huge = busybox.clone();
+        huge[54..62].copy_from_slice(b"ffffffff");
+        huge[94..102].copy_from_slice(b"ffffffff");
+        assert_eq!(module_kind(&huge), Module::Other);
+        let mut garbage = busybox;
+        garbage[54..62].copy_from_slice(b"zzzzzzzz");
+        assert_eq!(module_kind(&garbage), Module::Other);
+        assert_eq!(module_of_group("busybox"), Some(Module::Busybox));
+        assert_eq!(module_of_group("dynelf"), Some(Module::Dynamic));
+        assert_eq!(module_of_group("threads"), None);
     }
 
     #[test]

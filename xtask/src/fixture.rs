@@ -486,6 +486,7 @@ pub(crate) const DYNAMIC_PROGRAMS: &[&str] = &[
     "wc",
     "whoami",
     "xargs",
+    "xz",
     "yes",
 ];
 

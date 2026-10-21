@@ -146,11 +146,20 @@ impl Unpacker {
     /// first error Linux's `error()` recorded, if any. Entries processed before
     /// an error stay in the tree.
     pub fn unpack(&mut self, vfs: &mut Vfs, buf: &[u8]) -> Option<Message> {
+        self.unpack_chunks(vfs, &[buf])
+    }
+
+    /// [`Unpacker::unpack`] for an image held in pieces (the suite keeps module images in
+    /// chunks no larger than a heap block): the state machine is fed the pieces in order exactly
+    /// as `write_buffer` is fed the flushes of a decompressor, so a header, a name or a file can
+    /// end in one piece and go on in the next, and the tree is the one the whole image makes.
+    /// Concatenated images and padding between them are found as in `unpack`.
+    pub fn unpack_chunks(&mut self, vfs: &mut Vfs, chunks: &[&[u8]]) -> Option<Message> {
         let env = vfs.kernel_env();
         let mut run = Run {
             vfs,
             env,
-            buf,
+            buf: &[],
             victim: 0,
             byte_count: 0,
             state: State::Start,
@@ -167,30 +176,38 @@ impl Unpacker {
             links: Vec::new(),
             dirs: Vec::new(),
         };
-        let mut at = 0usize;
-        while run.message.is_none() && at < buf.len() {
-            let saved_offset = run.this_header;
-            if buf[at] == b'0' && run.this_header.trailing_zeros() >= 2 {
-                run.state = State::Start;
-                at += run.write_buffer(at);
-                continue;
+        for &buf in chunks {
+            run.buf = buf;
+            let mut at = 0usize;
+            while run.message.is_none() && at < buf.len() {
+                // Inside an image the machine takes whatever comes next.
+                if !matches!(run.state, State::Start | State::Reset) {
+                    at += run.write_buffer(at);
+                    continue;
+                }
+                let saved_offset = run.this_header;
+                if buf[at] == b'0' && run.this_header.trailing_zeros() >= 2 {
+                    run.state = State::Start;
+                    at += run.write_buffer(at);
+                    continue;
+                }
+                if buf[at] == 0 {
+                    at += 1;
+                    run.this_header += 1;
+                    continue;
+                }
+                run.this_header = 0;
+                // decompress_method: no decompressor is ported (named blocker).
+                if compression(&buf[at..]).is_some() {
+                    run.error(NOT_PORTED);
+                } else {
+                    run.error("invalid magic at start of compressed archive");
+                }
+                if run.state != State::Reset {
+                    run.error("junk at the end of compressed archive");
+                }
+                run.this_header = saved_offset;
             }
-            if buf[at] == 0 {
-                at += 1;
-                run.this_header += 1;
-                continue;
-            }
-            run.this_header = 0;
-            // decompress_method: no decompressor is ported (named blocker).
-            if compression(&buf[at..]).is_some() {
-                run.error(NOT_PORTED);
-            } else {
-                run.error("invalid magic at start of compressed archive");
-            }
-            if run.state != State::Reset {
-                run.error("junk at the end of compressed archive");
-            }
-            run.this_header = saved_offset;
         }
         run.dir_utime();
         let message = run.message;
