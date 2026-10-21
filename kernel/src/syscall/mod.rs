@@ -40,6 +40,7 @@ mod namei;
 mod poll;
 mod process;
 mod random;
+mod reboot;
 mod signal;
 #[cfg(test)]
 mod testing;
@@ -305,6 +306,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         .or_else(|| namei::dispatch(ctx, sysno, args))
         .or_else(|| attr::dispatch(ctx, sysno, args))
         .or_else(|| random::dispatch(ctx, sysno, args))
+        .or_else(|| reboot::dispatch(ctx, sysno, args))
         .or_else(|| poll::dispatch(ctx, sysno, args))
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))

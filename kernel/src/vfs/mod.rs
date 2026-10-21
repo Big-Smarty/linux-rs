@@ -292,6 +292,8 @@ pub struct Cred {
     pub fsetid: bool,
     /// `CAP_SYS_ADMIN`.
     pub sys_admin: bool,
+    /// `CAP_SYS_BOOT`.
+    pub sys_boot: bool,
 }
 
 impl Cred {
@@ -313,6 +315,7 @@ impl Cred {
             chown: root,
             fsetid: root,
             sys_admin: root,
+            sys_boot: root,
         }
     }
 
@@ -329,6 +332,7 @@ impl Cred {
             chown: true,
             fsetid: true,
             sys_admin: true,
+            sys_boot: true,
         }
     }
 }

@@ -22,9 +22,11 @@
 /// embeds the same file.
 pub const ORACLE_EXPECTED: &[u8] = include_bytes!("../../xtask/oracle/expected.tsv");
 
-/// Oracle groups the kernel can run today, in run order.
-pub const GROUPS: [&str; 9] = [
-    "ids", "time", "mm", "fs", "signal", "fork", "proc", "jobctl", "pipe",
+/// Oracle groups the kernel can run today, in run order. `xstate` drives AVX-512 and the
+/// protection keys: on a CPU without them it is reported unavailable, not failed
+/// (`baremetal::unavailable_reason`).
+pub const GROUPS: [&str; 11] = [
+    "ids", "time", "mm", "fs", "names", "signal", "fork", "proc", "jobctl", "pipe", "xstate",
 ];
 
 /// Oracle groups that exist in `user/init` but are not run, with the reason

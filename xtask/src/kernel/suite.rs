@@ -23,29 +23,57 @@ use std::time::{Duration, Instant};
 /// every group and the whole-RAM exhaustion walk under TCG).
 pub(super) const TIMEOUT: Duration = Duration::from_secs(180);
 
-/// The groups of a normal run, in the kernel's order, all expected to pass.
-pub(super) const ALL_PASS: &[(&str, bool)] = &[
-    ("ids", true),
-    ("time", true),
-    ("mm", true),
-    ("fs", true),
-    ("signal", true),
-    ("fork", true),
-    ("proc", true),
-    ("jobctl", true),
-    ("pipe", true),
+/// What a suite case expects of one group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Expect {
+    /// Runs and its output equals the pinned Linux's.
+    Pass,
+    /// Ends abnormally or differs (the probes).
+    Fail,
+    /// Not run because the CPU lacks what the group drives: neither a pass nor a failure.
+    Unavailable,
+}
+
+/// The groups of a normal run on a CPU model without AVX-512 and protection keys (QEMU TCG
+/// `qemu64`), in the kernel's order: all pass except `xstate`, which is unavailable.
+pub(super) const ALL_PASS: &[(&str, Expect)] = &[
+    ("ids", Expect::Pass),
+    ("time", Expect::Pass),
+    ("mm", Expect::Pass),
+    ("fs", Expect::Pass),
+    ("names", Expect::Pass),
+    ("signal", Expect::Pass),
+    ("fork", Expect::Pass),
+    ("proc", Expect::Pass),
+    ("jobctl", Expect::Pass),
+    ("pipe", Expect::Pass),
+    ("xstate", Expect::Unavailable),
+];
+/// The same on a host CPU (`-cpu host` with AVX-512 and PKU): `xstate` runs and passes.
+pub(super) const ALL_PASS_HOST: &[(&str, Expect)] = &[
+    ("ids", Expect::Pass),
+    ("time", Expect::Pass),
+    ("mm", Expect::Pass),
+    ("fs", Expect::Pass),
+    ("names", Expect::Pass),
+    ("signal", Expect::Pass),
+    ("fork", Expect::Pass),
+    ("proc", Expect::Pass),
+    ("jobctl", Expect::Pass),
+    ("pipe", Expect::Pass),
+    ("xstate", Expect::Pass),
 ];
 /// A run that selects six probes ending abnormally (a SIGSEGV, an unimplemented
 /// syscall, a loop that outruns the one-second group bound, that loop in a child while init
 /// waits, init exiting with a spinning child, a sleep nothing can end), then one real group.
-pub(super) const STOPS: &[(&str, bool)] = &[
-    ("fault", false),
-    ("io_uring", false),
-    ("spin", false),
-    ("spinchild", false),
-    ("orphan", false),
-    ("block", false),
-    ("ids", true),
+pub(super) const STOPS: &[(&str, Expect)] = &[
+    ("fault", Expect::Fail),
+    ("io_uring", Expect::Fail),
+    ("spin", Expect::Fail),
+    ("spinchild", Expect::Fail),
+    ("orphan", Expect::Fail),
+    ("block", Expect::Fail),
+    ("ids", Expect::Pass),
 ];
 
 /// Boot proofs the kernel records on the QEMU q35 cells, in order.
@@ -107,26 +135,27 @@ fn digest_in<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
 pub(super) fn validate(
     serial: &str,
     lines: &[&str],
-    groups: &[(&str, bool)],
+    groups: &[(&str, Expect)],
 ) -> Result<(), String> {
     check_proofs(lines)?;
     let mut cursor = 0;
-    let mut passed = 0;
-    for &(group, must_pass) in groups {
-        cursor = check_group(lines, group, must_pass, cursor)?;
-        passed += usize::from(must_pass);
+    let (mut passed, mut unavailable) = (0, 0);
+    for &(group, expect) in groups {
+        cursor = check_group(lines, group, expect, cursor)?;
+        passed += usize::from(expect == Expect::Pass);
+        unavailable += usize::from(expect == Expect::Unavailable);
     }
-    let ok = passed == groups.len();
+    let ok = passed + unavailable == groups.len();
     let complete = format!(
-        "SUITE complete ok={ok} groups={passed}/{} proofs={n}/{n}",
+        "SUITE complete ok={ok} groups={passed}/{} unavailable={unavailable} proofs={n}/{n}",
         groups.len(),
         n = PROOFS.len()
     );
     let complete_at = position(lines, cursor, &complete)?;
     // The failure detail is the last block of the screen: a stopped group's stop line is in it.
-    for &(group, must_pass) in groups {
+    for &(group, expect) in groups {
         let prefix = format!("  {group} stopped: FAIL ");
-        if !must_pass
+        if expect == Expect::Fail
             && matches!(group, "io_uring" | "spin" | "spinchild" | "block")
             && !lines[complete_at..]
                 .iter()
@@ -135,10 +164,15 @@ pub(super) fn validate(
             return Err(format!("summary has no `{prefix}...` failure detail row"));
         }
     }
-    let result_line = if ok {
+    let result_line = if ok && unavailable == 0 {
         format!(
             "RESULT: ALL PASS ({} groups, {} self-tests)",
             groups.len(),
+            PROOFS.len()
+        )
+    } else if ok {
+        format!(
+            "RESULT: ALL PASS ({passed} groups, {unavailable} unavailable on this CPU, {} self-tests)",
             PROOFS.len()
         )
     } else {
@@ -174,9 +208,31 @@ fn check_proofs(lines: &[&str]) -> Result<(), String> {
 fn check_group(
     lines: &[&str],
     group: &str,
-    must_pass: bool,
+    expect: Expect,
     cursor: usize,
 ) -> Result<usize, String> {
+    if expect == Expect::Unavailable {
+        // Never started: the kernel says why (`baremetal::unavailable_reason`) and records it.
+        let prefix = format!("SUITE group {group} result=");
+        let end = lines[cursor..]
+            .iter()
+            .position(|line| line.starts_with(&prefix))
+            .map(|offset| offset + cursor)
+            .ok_or_else(|| format!("group {group} has no result record"))?;
+        let result = lines[end];
+        let reason = "cause=\"unavailable on this CPU: no ";
+        if record_field(result, "result") != Some("unavailable") || !result.contains(reason) {
+            return Err(format!("group {group} must be unavailable: {result}"));
+        }
+        if lines[cursor..end]
+            .iter()
+            .any(|line| line.starts_with(&format!("SUITE group {group} start")))
+        {
+            return Err(format!("unavailable group {group} must not start"));
+        }
+        return Ok(end + 1);
+    }
+    let must_pass = expect == Expect::Pass;
     let started = format!("SUITE group {group} start uptime_s=");
     let start = lines[cursor..]
         .iter()
@@ -846,17 +902,23 @@ mod tests {
 
     /// A serial log the kernel would print for `groups` (a passing group repeats
     /// the pinned Linux's lines for it), with a correct digest.
-    fn log_of(groups: &[(&str, bool)]) -> String {
+    fn log_of(groups: &[(&str, Expect)]) -> String {
         let mut log = String::from("firmware noise\n");
         let begin = log.len();
         log.push_str("console: framebuffers used=1 reported=1 grid=160x50 limit=fb0\nlinux-rs bootstrap x86_64 limine-base=5 firmware=efi64\n");
         for name in PROOFS {
             writeln!(log, "PROOF {name} PASS").unwrap();
         }
-        let mut passed = 0;
-        for &(group, must_pass) in groups {
+        let (mut passed, mut unavailable) = (0, 0);
+        for &(group, expect) in groups {
+            if expect == Expect::Unavailable {
+                writeln!(log, "SUITE group {group} not run: the CPU has no avx512f").unwrap();
+                writeln!(log, "SUITE group {group} result=unavailable cause=\"unavailable on this CPU: no avx512f\" matched=0 expected=0 observed=0 mismatches=0 millis=0").unwrap();
+                unavailable += 1;
+                continue;
+            }
             writeln!(log, "SUITE group {group} start uptime_s=3").unwrap();
-            if must_pass {
+            if expect == Expect::Pass {
                 let rows = oracle_rows(group).map(|(_, line)| line).collect::<Vec<_>>();
                 for line in &rows {
                     writeln!(log, "{line}").unwrap();
@@ -885,13 +947,19 @@ mod tests {
             }
         }
         let digest = fnv1a(&log.as_bytes()[begin..]);
-        let (ok, n) = (passed == groups.len(), PROOFS.len());
+        let (ok, n) = (passed + unavailable == groups.len(), PROOFS.len());
         writeln!(log, "{SUMMARY_HEAD}abc   log digest {digest:016x}").unwrap();
-        if ok {
+        if ok && unavailable == 0 {
             writeln!(
                 log,
                 "RESULT: ALL PASS ({} groups, {n} self-tests)",
                 groups.len()
+            )
+            .unwrap();
+        } else if ok {
+            writeln!(
+                log,
+                "RESULT: ALL PASS ({passed} groups, {unavailable} unavailable on this CPU, {n} self-tests)"
             )
             .unwrap();
         } else {
@@ -909,7 +977,7 @@ mod tests {
         .unwrap();
         writeln!(
             log,
-            "SUITE complete ok={ok} groups={passed}/{} proofs={n}/{n}",
+            "SUITE complete ok={ok} groups={passed}/{} unavailable={unavailable} proofs={n}/{n}",
             groups.len()
         )
         .unwrap();
@@ -919,13 +987,13 @@ mod tests {
                 "FAILURE DETAIL (first rows only; the replay pages hold the rest)"
             )
             .unwrap();
-            for &(group, must_pass) in groups {
+            for &(group, expect) in groups {
                 let stop = match group {
                     "io_uring" => "FAIL syscall unimplemented nr=425",
                     "spin" | "spinchild" | "block" => "FAIL group timeout after 1 s",
                     _ => continue,
                 };
-                if !must_pass {
+                if expect == Expect::Fail {
                     writeln!(log, "  {group} stopped: {stop}").unwrap();
                 }
             }
@@ -934,7 +1002,7 @@ mod tests {
         log
     }
 
-    fn judge(log: &str, groups: &[(&str, bool)]) -> Result<(), String> {
+    fn judge(log: &str, groups: &[(&str, Expect)]) -> Result<(), String> {
         let lines = log.lines().collect::<Vec<_>>();
         validate(log, &lines, groups)
     }
@@ -942,6 +1010,7 @@ mod tests {
     #[test]
     fn a_log_the_kernel_would_print_is_accepted() {
         judge(&log_of(ALL_PASS), ALL_PASS).unwrap();
+        judge(&log_of(ALL_PASS_HOST), ALL_PASS_HOST).unwrap();
         judge(&log_of(STOPS), STOPS).unwrap();
     }
 
@@ -951,8 +1020,16 @@ mod tests {
         let error =
             judge(&log.replace("PROOF heap PASS", "PROOF heap FAIL"), ALL_PASS).unwrap_err();
         assert!(error.contains("heap"), "{error}");
-        let error = judge(&log, &[("ids", false)]).unwrap_err();
+        let error = judge(&log, &[("ids", Expect::Fail)]).unwrap_err();
         assert!(error.contains("must be fail"), "{error}");
+        // An unavailable group is not a pass, and a group that ran is not unavailable.
+        let error = judge(&log, &[("xstate", Expect::Pass)]).unwrap_err();
+        assert!(error.contains("xstate"), "{error}");
+        let error = judge(&log, &[("ids", Expect::Unavailable)]).unwrap_err();
+        assert!(error.contains("unavailable"), "{error}");
+        // The summary counts it separately.
+        let error = judge(&log.replace("unavailable=1", "unavailable=0"), ALL_PASS).unwrap_err();
+        assert!(error.contains("SUITE complete"), "{error}");
         // One character of the captured transcript changes: the digest no longer fits.
         let error =
             judge(&log.replacen("limine-base=5", "limine-base=6", 1), ALL_PASS).unwrap_err();

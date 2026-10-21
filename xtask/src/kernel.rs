@@ -157,6 +157,9 @@ enum Module {
     Empty,
     /// A valid archive with no `/init`.
     NoInit,
+    /// The second module of the `busybox` oracle group: the host's `BusyBox` program, its applet
+    /// links and the group's data files (`fixture::busybox_initramfs`).
+    Busybox,
 }
 
 impl Module {
@@ -166,6 +169,7 @@ impl Module {
             Self::Corrupt => "initramfs-corrupt.cpio",
             Self::Empty => "initramfs-empty.cpio",
             Self::NoInit => "initramfs-noinit.cpio",
+            Self::Busybox => "busybox.cpio",
         }
     }
 }
@@ -228,7 +232,7 @@ enum User {
     NoRoot,
     /// The kernel-run bare-metal suite (`suite`): the groups it runs, each with whether it must
     /// pass, in run order.
-    Suite(&'static [(&'static str, bool)]),
+    Suite(&'static [(&'static str, suite::Expect)]),
 }
 
 #[derive(Clone, Copy)]
@@ -862,6 +866,10 @@ const DEBUG_CASES: &[DebugCase] = &[
     oracle_case!(ids),
     oracle_case!(time),
     oracle_case!(fs),
+    // The system calls that create, remove, rename and describe names and move bytes between
+    // files: errno order, counts and attributes (`user/init` group `names`, recorded on the pinned
+    // Linux 6.18.57), including `#!` scripts and `vfork`.
+    oracle_case!(names),
     oracle_case!(signal),
     // Process creation and exit on the task model: `fork`/`clone`/`clone3` arguments and
     // inheritance, wait statuses, `SIGCHLD`, orphans, `execve` in a child (`user/init` group
@@ -894,6 +902,30 @@ const DEBUG_CASES: &[DebugCase] = &[
         forbid_success: false,
         modules: ARCHIVE_ONLY,
         user: User::OracleHost("xstate"),
+        framebuffers: 1,
+        plat: Platform {
+            kvm: true,
+            mode: "x2apic",
+            reason: "hypervisor",
+            event: "lapic-deadline",
+            tsc_sources: &["pit", "hpet"],
+            ..Q35_TCG
+        },
+    },
+    // Real, unmodified Linux userland: the host's BusyBox (v1.36.1, static, x86-64-v4) runs a list of
+    // about 280 commands (`user/init` group `busybox`, mode `-- bbrun`) and every command's exit
+    // status and output equals the pinned Linux 6.18.57's. A second initramfs module carries the
+    // program, its applet links and the data files; the case is `unavailable` without that exact
+    // program, KVM or AVX-512.
+    DebugCase {
+        name: "oracle-busybox",
+        cmdline: Some("-- bbrun"),
+        cpu: "host",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: &[Module::Archive, Module::Busybox],
+        user: User::OracleHost("busybox"),
         framebuffers: 1,
         plat: Platform {
             kvm: true,
@@ -1029,7 +1061,7 @@ const SUITE_CASES: &[DebugCase] = &[
         required: SUCCESS_MARKERS,
         forbid_success: false,
         modules: ARCHIVE_ONLY,
-        user: User::Suite(suite::ALL_PASS),
+        user: User::Suite(suite::ALL_PASS_HOST),
         framebuffers: 1,
         plat: Platform {
             kvm: true,
@@ -3468,8 +3500,18 @@ struct Fixtures {
     archive_sha256: String,
     corrupt_sha256: String,
     noinit_sha256: String,
+    /// The `busybox` group's second module, when the host can supply it; otherwise why not.
+    busybox: Result<BusyboxModule, String>,
     /// What the kernel must report for the generated archive and the built `/init`, by construction.
     expected: fixture::Expected,
+}
+
+/// The generated `busybox.cpio` and the evidence of the program inside it.
+struct BusyboxModule {
+    /// SHA-256 of the host program (`fixture::BUSYBOX_HOST_PATH`) copied into the module.
+    program_sha256: String,
+    /// SHA-256 of the whole module.
+    module_sha256: String,
 }
 
 impl Fixtures {
@@ -3484,12 +3526,43 @@ impl Fixtures {
             write_new(&path, bytes)?;
             file_hash(output, sha256sum, &path)
         };
+        // The host's BusyBox, the program the `busybox` group runs (never committed): the
+        // module is built only from exactly the program the expected lines were recorded with.
+        let mut busybox_counts = None;
+        let busybox = match fixture::busybox_input(
+            fixture::BUSYBOX_HOST_PATH,
+            &fs::read_to_string("/proc/cpuinfo").unwrap_or_default(),
+        ) {
+            Err(reason) => Err(reason),
+            Ok(program) => {
+                let program_sha256 =
+                    file_hash(output, sha256sum, Path::new(fixture::BUSYBOX_HOST_PATH))?;
+                if program_sha256 == fixture::BUSYBOX_SHA256 {
+                    let facts = fixture::elf_facts(&program)?;
+                    let module = fixture::busybox_initramfs(&program)?;
+                    let module_sha256 = write(Module::Busybox, &module)?;
+                    busybox_counts = Some(fixture::busybox_counts(module.len(), &facts));
+                    Ok(BusyboxModule {
+                        program_sha256,
+                        module_sha256,
+                    })
+                } else {
+                    Err(format!(
+                        "{} is sha256 {program_sha256}, not the BusyBox the expected lines were recorded with ({})",
+                        fixture::BUSYBOX_HOST_PATH,
+                        fixture::BUSYBOX_SHA256
+                    ))
+                }
+            }
+        };
         Ok(Self {
+            busybox,
             archive_sha256: write(Module::Archive, &archive)?,
             corrupt_sha256: write(Module::Corrupt, fixture::CORRUPT_MODULE)?,
             noinit_sha256: write(Module::NoInit, &fixture::initramfs_without_init()?)?,
             expected: fixture::Expected {
                 archive_counts: fixture::archive_counts(archive.len(), &facts),
+                busybox_counts,
                 init: facts,
             },
             dir,
@@ -3502,6 +3575,10 @@ impl Fixtures {
             Module::Corrupt => &self.corrupt_sha256,
             Module::NoInit => &self.noinit_sha256,
             Module::Empty => EMPTY_MODULE_SHA256,
+            Module::Busybox => self
+                .busybox
+                .as_ref()
+                .map_or("unavailable", |module| &module.module_sha256),
         }
     }
 }
@@ -3917,8 +3994,34 @@ fn kvm_usable() -> bool {
         .is_ok()
 }
 
+/// Why `case` cannot run on this host (it is then `unavailable`, not a failure): no usable
+/// `/dev/kvm` for a KVM case, a host CPU without the features its group drives (`xstate`:
+/// AVX-512 and protection keys), a missing or different `BusyBox` for the `busybox` group.
+fn unavailable_reason(case: &DebugCase, tools: &QemuTools) -> Option<String> {
+    if case.plat.kvm && !kvm_usable() {
+        return Some("/dev/kvm is not usable read/write".to_owned());
+    }
+    // `xstate` drives AVX-512 and protection keys: as a group of its own or inside a suite run
+    // on the host CPU, it needs a host that has them.
+    if (matches!(case.user, User::OracleHost("xstate"))
+        || matches!(case.user, User::Suite(groups) if groups.contains(&("xstate", suite::Expect::Pass))))
+        && let Some(flag) = fixture::missing_cpu_flag(
+            &fs::read_to_string("/proc/cpuinfo").unwrap_or_default(),
+            &fixture::XSTATE_CPU_FLAGS,
+        )
+    {
+        return Some(format!("the host CPU lacks {flag}"));
+    }
+    if case.modules.contains(&Module::Busybox)
+        && let Err(reason) = &tools.fixtures.busybox
+    {
+        return Some(reason.clone());
+    }
+    None
+}
+
 /// Run one case. Two exceptions to "one launch per case", both recorded:
-/// - a KVM case on a host without usable KVM is `unavailable`, not run;
+/// - a case the host cannot run (see [`unavailable_reason`]) is `unavailable`, not run;
 /// - a case whose only mismatch is the TSC calibration *source* (the quick PIT
 ///   calibration is timing sensitive and falls back to the HPET/PM timer under
 ///   heavy host load, which is correct kernel behaviour) is run once more in
@@ -3932,7 +4035,7 @@ fn run_debug_case(
     tools: &QemuTools,
     timeout: Duration,
 ) -> io::Result<CaseResult> {
-    if case.plat.kvm && !kvm_usable() {
+    if let Some(reason) = unavailable_reason(&case, tools) {
         let case_dir = output.join("cases").join(case.name);
         ensure_real_directory(&output.join("cases"))?;
         create_directory(&case_dir)?;
@@ -3940,11 +4043,7 @@ fn run_debug_case(
         manifest_value(&mut result, "schema", "1");
         manifest_value(&mut result, "case", case.name);
         manifest_value(&mut result, "status", "unavailable");
-        manifest_value(
-            &mut result,
-            "assertions",
-            "/dev/kvm is not usable read/write; case not run",
-        );
+        manifest_value(&mut result, "assertions", format!("{reason}; case not run"));
         write_manifest(&case_dir.join("result.tsv"), result)?;
         return Ok(CaseResult {
             name: case.name,
@@ -3954,7 +4053,7 @@ fn run_debug_case(
             expected_exit: case.expected_exit,
             observed_exit: None,
             timed_out: false,
-            diagnostic: "unavailable: /dev/kvm is not usable read/write".to_owned(),
+            diagnostic: format!("unavailable: {reason}"),
             output: case_dir,
         });
     }
@@ -4393,8 +4492,7 @@ fn validate_debug_case(
         return (false, diagnostic);
     }
     if !case.forbid_success
-        && let Err(diagnostic) =
-            validate_success_serial(&lines, case.modules, &expected.archive_counts)
+        && let Err(diagnostic) = validate_success_serial(&lines, case.modules, expected)
     {
         return (false, diagnostic);
     }
@@ -5020,7 +5118,7 @@ fn corrupt_module_skipped(lines: &[&str], index: usize) -> bool {
 fn validate_image_serial(
     lines: &[&str],
     modules: &[Module],
-    archive_counts: &str,
+    expected_counts: &fixture::Expected,
 ) -> Result<(), String> {
     let epoch_record = module_epoch_record(modules.len());
     let inspected = modules.iter().filter(|m| **m != Module::Corrupt).count();
@@ -5060,10 +5158,13 @@ fn validate_image_serial(
             }
             continue;
         }
-        let expected = if *module == Module::Empty {
-            EMPTY_MODULE_COUNTS
-        } else {
-            archive_counts
+        let expected = match module {
+            Module::Empty => EMPTY_MODULE_COUNTS,
+            Module::Busybox => expected_counts
+                .busybox_counts
+                .as_deref()
+                .ok_or_else(|| "no expected counts for the busybox module".to_owned())?,
+            _ => expected_counts.archive_counts.as_str(),
         };
         let prefix = format!("CHECK image inspected module={index} physical=");
         let mut records = lines
@@ -5124,7 +5225,7 @@ fn validate_image_serial(
 fn validate_success_serial(
     lines: &[&str],
     modules: &[Module],
-    archive_counts: &str,
+    expected_counts: &fixture::Expected,
 ) -> Result<(), String> {
     if lines.iter().any(|line| line.starts_with("FAIL ")) {
         return Err("positive case emitted a failure diagnostic".to_owned());
@@ -5132,7 +5233,7 @@ fn validate_success_serial(
     if !unique_exact_record(lines, "CHECK memory-runtime", MEMORY_RUNTIME_RECORD) {
         return Err("positive case must report the exact scalar memory-provider proof".to_owned());
     }
-    validate_image_serial(lines, modules, archive_counts)?;
+    validate_image_serial(lines, modules, expected_counts)?;
     if !lines.contains(&"TIMER mask observation periods=2 irq_delta=0") {
         return Err(
             "positive case must observe exactly two tick periods and zero IRQ delta".to_owned(),
@@ -5299,6 +5400,25 @@ fn record_fixtures(
         "sha256_fixture_noinit_archive",
         fixtures.noinit_sha256.clone(),
     );
+    // The `busybox` group's program and module (an unavailable group records why).
+    match &fixtures.busybox {
+        Ok(module) => {
+            manifest_value(
+                values,
+                "sha256_busybox_program",
+                module.program_sha256.clone(),
+            );
+            manifest_value(
+                values,
+                "sha256_fixture_busybox_module",
+                module.module_sha256.clone(),
+            );
+            if let Some(counts) = &fixtures.expected.busybox_counts {
+                manifest_value(values, "expected_busybox_image_record", counts.clone());
+            }
+        }
+        Err(reason) => manifest_value(values, "busybox_unavailable", reason.clone()),
+    }
     manifest_value(
         values,
         "expected_init_summary",
@@ -6841,11 +6961,14 @@ mod tests {
     }
 
     // What the kernel prints for a generated archive; `physical=` varies per module.
+    // The same for the busybox module (a program and a few links).
+    const BUSYBOX_COUNTS: &str = "reserved=1318912 bytes=1311484 records=7 files=6 regular=2 symlinks=3 trailers=1 skipped=0 elf=1 loads=4 interpreters=0 execution=false rootfs=false";
     const COUNTS: &str = "reserved=8192 bytes=4500 records=4 files=3 regular=1 symlinks=1 trailers=1 skipped=0 elf=1 loads=2 interpreters=0 execution=false rootfs=false";
 
     fn expected() -> fixture::Expected {
         fixture::Expected {
             archive_counts: COUNTS.to_owned(),
+            busybox_counts: Some(BUSYBOX_COUNTS.to_owned()),
             init: fixture::ElfFacts {
                 executable_segments: vec![(0x20_47b0, 0x20_c000)],
                 executable_file_extents: vec![(0x20_47b0, 0x20_c000)],
@@ -7015,6 +7138,7 @@ mod tests {
                     Module::Archive => format!("CHECK image inspected module={index} physical={physical:#x} {COUNTS}"),
                     Module::Empty => format!("CHECK image inspected module={index} physical={physical:#x} {EMPTY_MODULE_COUNTS}"),
                     Module::Corrupt => format!("WARN Initramfs unpacking failed: module={index} {CORRUPT_MODULE_WARNING}"),
+                    Module::Busybox => format!("CHECK image inspected module={index} physical={physical:#x} {BUSYBOX_COUNTS}"),
                     Module::NoInit => unreachable!("only negative cases boot without /init"),
                 }
             })
@@ -7026,9 +7150,20 @@ mod tests {
     fn image_serial_requires_exact_counts_order_and_physical_ownership() {
         let serial = success_serial();
         let check = |text: &str, modules: &[Module]| {
-            validate_image_serial(&text.lines().collect::<Vec<_>>(), modules, COUNTS)
+            validate_image_serial(&text.lines().collect::<Vec<_>>(), modules, &expected())
         };
         assert!(check(&serial, &[Module::Archive]).is_ok());
+        // The busybox group: the archive and a second module with its own counts.
+        let two = [Module::Archive, Module::Busybox];
+        assert!(check(&success_serial_for(&two), &two).is_ok());
+        assert!(
+            check(
+                &success_serial_for(&two).replace("elf=1 loads=4", "elf=2 loads=4"),
+                &two
+            )
+            .is_err(),
+            "a second ELF in the busybox module is not the one expected"
+        );
         for (before, after) in [
             ("elf=1 ", "elf=0 "),
             ("loads=2", "loads=0"),
@@ -8287,7 +8422,19 @@ mod tests {
                 row.split('\t').collect::<Vec<_>>().try_into().unwrap();
             match kind {
                 "check" => {
-                    assert_eq!(line, format!("init: test {group}.{name} ok"));
+                    // The `busybox` group's rows are a command's status and output, not `ok`.
+                    if group == "busybox" && !name.starts_with("getrandom-") {
+                        assert!(
+                            line.starts_with(&format!("init: test busybox.{name} ")),
+                            "{line}"
+                        );
+                        assert!(
+                            line.contains(" exit=") || line.contains(" signal="),
+                            "{line}"
+                        );
+                    } else {
+                        assert_eq!(line, format!("init: test {group}.{name} ok"));
+                    }
                     checks.entry(group).or_default().push(name);
                 }
                 "info" => assert!(line.starts_with(&format!("init: info {group}.{name} "))),
@@ -8310,7 +8457,7 @@ mod tests {
         }
         let groups = [
             "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe", "xstate", "tty",
-            "ttyin", "ttykbd",
+            "ttyin", "ttykbd", "names", "busybox",
         ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),

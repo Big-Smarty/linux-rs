@@ -49,6 +49,7 @@ fn user(uid: u32) -> Cred {
         chown: false,
         fsetid: false,
         sys_admin: false,
+        sys_boot: false,
     }
 }
 

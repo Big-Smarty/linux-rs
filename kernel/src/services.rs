@@ -80,6 +80,11 @@
 //! needs process state (an IRQ that wakes a reader, a VFS completion) must queue
 //! the work and let the waking task take the lock.
 //!
+//! `userspace::VFORK_DONE` (the address space a `vfork` child gives back, by the
+//! sleeping parent's slot) is a leaf under `PROCESS`: nothing is acquired while
+//! it is held, and the wake-up of the parent is made after the guard is dropped
+//! (`PROCESS` -> `VFORK_DONE`, then `PROCESS` -> `RQ`).
+//!
 //! The bare-metal suite (`baremetal-suite` only) adds `baremetal::ARCHIVES`
 //! in front of the chain: it is held across `userspace::load_group`, so the
 //! order is `ARCHIVES` -> [`TABLES`] -> `heap` -> [`FRAMES`]; nothing takes it
