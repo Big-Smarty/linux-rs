@@ -173,7 +173,7 @@ impl Tasklist {
         if let Some(t) = self.task_mut(task) {
             t.exit_state = ExitState::Zombie;
         }
-        self.touch_epoch();
+        self.touch_epoch(task);
         let exit_signal = self.task(task).map_or(SIGCHLD, |t| t.exit_signal);
         let autoreap = self.do_notify_parent(task, exit_signal, w);
         if autoreap {

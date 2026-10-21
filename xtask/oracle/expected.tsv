@@ -3,7 +3,7 @@
 # the harness-built /init and generated initramfs (target/linux-reference/init-reference-006 for mm ids time signal fs proc, -009/-010 for fork, -011 for jobctl and pipe, -014 for tty, ttyin and ttykbd (ttyin/ttykbd are driven through the serial port / QMP send-key by `xtask tty-oracle`; ttykbd runs with "console=ttyS0 console=tty0" so that /dev/console is the vt; kinds stage and echo are the driver's transcript rows, see docs/kernel-tooling.md); docs/implementation.md#oracle-syscall-test-suite).
 # The `xstate` group is the exception to the machine: it drives AVX-512 and PKRU state, so it was recorded under KVM with -cpu host (AMD Zen 5) and runs only where KVM does (target/linux-reference/init-reference-012; docs/implementation.md#extended-cpu-state-xsave-pkru). Its `info` rows name the machine (XCR0, sizes, offsets) and are not compared by value.
 # The `names` group (mkdir, rmdir, rename, link, symlink, chmod, chown, utimensat, truncate, fsync, statfs, writev, sendfile, getrandom's argument errors, reboot's checks, mknodat, `#!` scripts, vfork including an expiring ITIMER_REAL a nested vfork killed by its child and a three-deep chain with both middle tasks killed) is CPU independent: recorded under TCG `-cpu qemu64` like the first groups (target/linux-reference/init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017; the `vfork-chain-*` rows and the `names` summary from init-reference-019, fix round 2). The `busybox` group runs the host's BusyBox v1.36.1 (sha256 1097cdef...f0d, static, x86-64-v4) through `user/init` mode `bbrun` and was recorded under KVM `-cpu host` with `initramfs.cpio` followed by the generated `busybox.cpio` as the initrd (init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017: the `getrandom` clamp rows): each row is a command's exit status or signal and its escaped output, and the case is `unavailable` without that exact program, KVM or AVX-512 (docs/implementation.md#busybox-lane).
-# The `procfs` group (mount(2), umount2(2), /proc) was recorded on the same machine as the first groups (target/linux-reference/init-reference-018, fix round 1 target/linux-reference/init-reference-020; docs/implementation.md#procfs-and-mounts); its last check remounts the root read-only and back, so it runs in a boot of its own.
+# The `procfs` group (mount(2), umount2(2), /proc) was recorded on the same machine as the first groups (target/linux-reference/init-reference-018, fix round 1 target/linux-reference/init-reference-020, fix round 2 target/linux-reference/init-reference-021; docs/implementation.md#procfs-and-mounts); its last check remounts the root read-only and back, so it runs in a boot of its own.
 # Columns: group, kind (check|info|summary|stage|echo), name, line (the exact stdout line without the newline).
 # A consumer matches "check" and "summary" rows exactly; "info" rows are recorded observations (tmpfs d_off cookies), not requirements.
 # Kernel printk lines may interleave with console output and must be filtered by the consumer (keep lines that start with
@@ -3200,6 +3200,30 @@ procfs	check	seq-gone-seek-zero	init: test procfs.seq-gone-seek-zero ok
 procfs	check	wchan-self	init: test procfs.wchan-self ok
 procfs	check	wchan-zombie	init: test procfs.wchan-zombie ok
 procfs	check	wchan-reaped	init: test procfs.wchan-reaped ok
+procfs	check	pub-fd-burst-count	init: test procfs.pub-fd-burst-count ok
+procfs	check	pub-fd-burst-ascending	init: test procfs.pub-fd-burst-ascending ok
+procfs	check	pub-fd-burst-closed-count	init: test procfs.pub-fd-burst-closed-count ok
+procfs	check	pub-fd-membership	init: test procfs.pub-fd-membership ok
+procfs	check	pub-fdinfo-cloexec	init: test procfs.pub-fdinfo-cloexec ok
+procfs	check	pub-fd-high	init: test procfs.pub-fd-high ok
+procfs	check	pub-fd-high-listed	init: test procfs.pub-fd-high-listed ok
+procfs	check	pub-fd-high-closed	init: test procfs.pub-fd-high-closed ok
+procfs	check	pub-fd-all-closed	init: test procfs.pub-fd-all-closed ok
+procfs	check	pub-maps-contiguous	init: test procfs.pub-maps-contiguous ok
+procfs	check	pub-maps-alternating	init: test procfs.pub-maps-alternating ok
+procfs	check	pub-maps-holed	init: test procfs.pub-maps-holed ok
+procfs	check	pub-maps-merged	init: test procfs.pub-maps-merged ok
+procfs	check	pub-maps-gone	init: test procfs.pub-maps-gone ok
+procfs	check	pub-rss-untouched	init: test procfs.pub-rss-untouched ok
+procfs	check	pub-rss-touched	init: test procfs.pub-rss-touched ok
+procfs	check	pub-rss-unmapped	init: test procfs.pub-rss-unmapped ok
+procfs	check	pub-pids-spawned	init: test procfs.pub-pids-spawned ok
+procfs	check	pub-pids-listed	init: test procfs.pub-pids-listed ok
+procfs	check	pub-pids-present	init: test procfs.pub-pids-present ok
+procfs	check	pub-pids-zombies	init: test procfs.pub-pids-zombies ok
+procfs	check	pub-pids-zombies-listed	init: test procfs.pub-pids-zombies-listed ok
+procfs	check	pub-pids-reaped	init: test procfs.pub-pids-reaped ok
+procfs	check	pub-pids-gone	init: test procfs.pub-pids-gone ok
 procfs	check	mounts-poll-quiet	init: test procfs.mounts-poll-quiet ok
 procfs	check	mounts-poll-mount	init: test procfs.mounts-poll-mount ok
 procfs	check	mounts-poll-after-mount	init: test procfs.mounts-poll-after-mount ok
@@ -3228,4 +3252,4 @@ procfs	check	root-umount-again	init: test procfs.root-umount-again ok
 procfs	check	root-remount-rw	init: test procfs.root-remount-rw ok
 procfs	check	root-rw-again	init: test procfs.root-rw-again ok
 procfs	check	root-rw-create	init: test procfs.root-rw-create ok
-procfs	summary	-	init: tests procfs passed=769 failed=0
+procfs	summary	-	init: tests procfs passed=793 failed=0

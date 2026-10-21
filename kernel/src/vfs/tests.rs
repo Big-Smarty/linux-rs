@@ -1089,3 +1089,30 @@ fn chown_that_drops_a_set_id_bit_also_needs_the_mode_change_permission() {
     assert_eq!(vfs.chown(&both, su, 7, u32::MAX), Ok(()));
     assert_eq!(vfs.fs.getattr(su).mode, S_IFREG | 0o755);
 }
+
+#[test]
+fn the_descriptor_log_replays_recent_changes_and_reports_a_gap() {
+    let mut fds = FdTable::default();
+    let seen = fds.generation();
+    let a = fds.alloc_fd(0, 1024, false).unwrap();
+    fds.install(a, FileId::from_index(1));
+    fds.set_cloexec(a, true);
+    fds.close(a);
+    assert_eq!(
+        fds.changed_since(seen).unwrap().collect::<Vec<_>>(),
+        [0, 0, 0, 0],
+        "alloc, install, FD_CLOEXEC, close"
+    );
+    // A failed allocation changes nothing.
+    let now = fds.generation();
+    assert!(fds.alloc_fd(0, 0, false).is_err());
+    assert_eq!(fds.generation(), now);
+    for fd in 0..40u32 {
+        fds.expand(u64::from(fd)).unwrap();
+        fds.set_cloexec(fd, true);
+    }
+    assert!(fds.changed_since(seen).is_none(), "wider than the log");
+    let tail = fds.changed_since(fds.generation() - 32).unwrap();
+    assert_eq!(tail.collect::<Vec<_>>(), (8..40).collect::<Vec<u32>>());
+    assert!(fds.changed_since(fds.generation() + 1).is_none());
+}

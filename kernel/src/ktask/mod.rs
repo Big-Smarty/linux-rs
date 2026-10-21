@@ -200,6 +200,21 @@ pub fn cpu_account(id: SchedId) -> &'static CpuAccount {
     &CPU_TIME[id.index()]
 }
 
+/// `kernel_cpustat[CPUTIME_USER]` and `[CPUTIME_SYSTEM]` in nanoseconds: what
+/// `account_process_tick` adds to the CPU's totals next to the task's own
+/// counters, so `/proc/stat` reads two words instead of summing every task
+/// (and keeps the time of tasks that have exited, as Linux does).
+static KCPUSTAT_USER_NS: AtomicU64 = AtomicU64::new(0);
+static KCPUSTAT_SYSTEM_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `(user, system)` nanoseconds of all tick-accounted task time since boot.
+pub fn kcpustat() -> (u64, u64) {
+    (
+        KCPUSTAT_USER_NS.load(Ordering::Relaxed),
+        KCPUSTAT_SYSTEM_NS.load(Ordering::Relaxed),
+    )
+}
+
 /// `account_process_tick`: the tick found the running task in user mode
 /// (`user`) or in the kernel on its behalf, `periods` ticks long; an idle CPU
 /// charges nobody. Interrupt context (RQ is a leaf any context may take).
@@ -209,7 +224,13 @@ pub fn charge_tick(user: bool, periods: u64) {
     }
     let slot = RQ.lock().curr().index();
     if slot != 0 {
-        CPU_TIME[slot].tick(user, periods);
+        let ns = CPU_TIME[slot].tick(user, periods);
+        let total = if user {
+            &KCPUSTAT_USER_NS
+        } else {
+            &KCPUSTAT_SYSTEM_NS
+        };
+        total.fetch_add(ns, Ordering::Relaxed);
     }
 }
 

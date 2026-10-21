@@ -625,68 +625,174 @@ pub struct PidFacts {
     pub zombie: bool,
 }
 
+/// What the address spaces of all live tasks add up to, as the published
+/// views report them (`/proc/meminfo`'s `AnonPages`, `Mapped` and
+/// `PageTables`): kept up to date as views are published and dropped, so the
+/// global files read three words instead of visiting every task.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MmTotals {
+    pub anon_pages: u64,
+    pub mapped_pages: u64,
+    pub pgtables_bytes: u64,
+}
+
+impl MmTotals {
+    fn of(view: &TaskView) -> Self {
+        view.mm.as_ref().map_or_else(Self::default, |mm| Self {
+            anon_pages: mm.rss_anon,
+            mapped_pages: mm.rss_file + mm.rss_shmem,
+            pgtables_bytes: mm.pgtables_bytes,
+        })
+    }
+
+    fn add(&mut self, other: Self) {
+        self.anon_pages += other.anon_pages;
+        self.mapped_pages += other.mapped_pages;
+        self.pgtables_bytes += other.pgtables_bytes;
+    }
+
+    fn sub(&mut self, other: Self) {
+        self.anon_pages -= other.anon_pages;
+        self.mapped_pages -= other.mapped_pages;
+        self.pgtables_bytes -= other.pgtables_bytes;
+    }
+}
+
 /// The procfs state shared by every `proc` superblock: the live thread groups
 /// and the views the tasks published.
 #[derive(Default)]
 pub struct ProcState {
-    /// Sorted by tgid.
+    /// Sorted by tgid; meaningful while `mirror_valid`.
     pub pids: Vec<PidFacts>,
-    /// [`Tasklist::epoch`] the mirror was built for.
-    pub epoch: u64,
+    /// [`Tasklist::epoch`] the mirror was brought up to date at.
+    epoch: u64,
+    /// `pids` was built (and has been followed since); false until the first
+    /// [`ProcState::sync`] and again after a [`ProcState::prune`].
+    mirror_valid: bool,
     /// [`Tasklist::epoch`] the views were last pruned at ([`ProcState::prune`]).
     pruned_epoch: u64,
     /// `(tgid, view)`, sorted by tgid.
     views: Vec<(i32, TaskView)>,
+    /// The sum of the views' address-space figures.
+    totals: MmTotals,
     /// `pde->size` of `/proc/cmdline`: the command line length plus one.
     pub cmdline_size: i64,
 }
 
 impl ProcState {
-    /// Rebuild the pid mirror from the task list when it changed.
+    /// What the mirror records of the task `id`.
+    fn facts_of(tasks: &Tasklist, id: crate::task::TaskId) -> Option<PidFacts> {
+        let task = tasks.task(id)?;
+        let cred = task.cred;
+        Some(PidFacts {
+            tgid: tasks.task_tgid_vnr(id),
+            uid: cred.uid,
+            euid: cred.euid,
+            suid: cred.suid,
+            gid: cred.gid,
+            egid: cred.egid,
+            sgid: cred.sgid,
+            dumpable: tasks.dumpable(id),
+            zombie: task.exit_state != crate::task::tasklist::ExitState::Live,
+        })
+    }
+
+    /// Bring the pid mirror up to date with the task list: replay the changes
+    /// the list logged since the last call (time proportional to them), or
+    /// rebuild from the whole list when the mirror is new or more than the
+    /// log holds happened.
     ///
     /// # Errors
     /// `ENOMEM`; the old mirror stays.
     pub fn sync(&mut self, tasks: &Tasklist) -> KResult<()> {
-        if self.epoch == tasks.epoch() && !self.pids.is_empty() {
+        if self.mirror_valid && self.epoch == tasks.epoch() {
+            return Ok(());
+        }
+        if self.mirror_valid
+            && let Some(changed) = tasks.changed_since(self.epoch)
+        {
+            // One insertion per logged change at most: reserve them all first.
+            let n = changed.count();
+            self.pids.try_reserve(n).map_err(|_| Errno::ENOMEM)?;
+            for nr in tasks.changed_since(self.epoch).into_iter().flatten() {
+                let facts = tasks
+                    .find_task_by_vpid(nr)
+                    .filter(|&id| tasks.task_tgid_vnr(id) == nr)
+                    .and_then(|id| Self::facts_of(tasks, id));
+                match (self.pids.binary_search_by_key(&nr, |f| f.tgid), facts) {
+                    (Ok(at), Some(facts)) => self.pids[at] = facts,
+                    (Err(at), Some(facts)) => {
+                        let _ = self.pids.push_within_capacity(facts);
+                        self.pids[at..].rotate_right(1);
+                    }
+                    (Ok(at), None) => {
+                        self.pids.remove(at);
+                        self.drop_view(nr);
+                    }
+                    (Err(_), None) => self.drop_view(nr),
+                }
+            }
+            self.epoch = tasks.epoch();
             return Ok(());
         }
         let mut pids: Vec<PidFacts> = Vec::new();
         pids.try_reserve_exact(tasks.nr_threads() as usize)
             .map_err(|_| Errno::ENOMEM)?;
         for id in tasks.processes() {
-            let Some(task) = tasks.task(id) else { continue };
-            let cred = task.cred;
-            let _ = pids.push_within_capacity(PidFacts {
-                tgid: tasks.task_tgid_vnr(id),
-                uid: cred.uid,
-                euid: cred.euid,
-                suid: cred.suid,
-                gid: cred.gid,
-                egid: cred.egid,
-                sgid: cred.sgid,
-                dumpable: tasks.dumpable(id),
-                zombie: task.exit_state != crate::task::tasklist::ExitState::Live,
-            });
+            if let Some(facts) = Self::facts_of(tasks, id) {
+                let _ = pids.push_within_capacity(facts);
+            }
         }
         pids.sort_unstable_by_key(|facts| facts.tgid);
         // Views of released groups go with them.
-        self.views
-            .retain(|(tgid, _)| pids.binary_search_by_key(tgid, |f| f.tgid).is_ok());
+        self.retain_views(|tgid| pids.binary_search_by_key(&tgid, |f| f.tgid).is_ok());
         self.pids = pids;
         self.epoch = tasks.epoch();
+        self.mirror_valid = true;
         Ok(())
     }
 
     /// Drop the views of released thread groups without building the mirror
     /// (no procfs exists, so nothing reads it, but the views of exited tasks
-    /// must not pile up). Cheap when the task list did not change.
+    /// must not pile up). Time proportional to the changes since the last
+    /// call, nothing when the task list did not change.
     pub fn prune(&mut self, tasks: &Tasklist) {
+        if self.mirror_valid {
+            // Nothing follows the list from here on: the next sync rebuilds.
+            self.mirror_valid = false;
+            self.pids = Vec::new();
+        }
         if self.pruned_epoch == tasks.epoch() {
             return;
         }
-        self.views
-            .retain(|(tgid, _)| tasks.find_task_by_vpid(*tgid).is_some());
+        if let Some(changed) = tasks.changed_since(self.pruned_epoch) {
+            for nr in changed {
+                if tasks.find_task_by_vpid(nr).is_none() {
+                    self.drop_view(nr);
+                }
+            }
+        } else {
+            self.retain_views(|tgid| tasks.find_task_by_vpid(tgid).is_some());
+        }
         self.pruned_epoch = tasks.epoch();
+    }
+
+    fn retain_views(&mut self, mut keep: impl FnMut(i32) -> bool) {
+        let totals = &mut self.totals;
+        self.views.retain(|(tgid, view)| {
+            let kept = keep(*tgid);
+            if !kept {
+                totals.sub(MmTotals::of(view));
+            }
+            kept
+        });
+    }
+
+    fn drop_view(&mut self, tgid: i32) {
+        if let Ok(at) = self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
+            let (_, view) = self.views.remove(at);
+            self.totals.sub(MmTotals::of(&view));
+        }
     }
 
     /// The facts of a thread group.
@@ -713,10 +819,18 @@ impl ProcState {
             .map(|at| &self.views[at].1)
     }
 
-    /// The view `tgid` last published, to refresh in place.
+    /// The view `tgid` last published, to refresh in place. Only the parts
+    /// that carry no address-space figure may change through it (the totals
+    /// are not adjusted).
     pub fn view_mut(&mut self, tgid: i32) -> Option<&mut TaskView> {
         let at = self.views.binary_search_by_key(&tgid, |(t, _)| *t).ok()?;
         Some(&mut self.views[at].1)
+    }
+
+    /// The sum of the address-space figures of all published views.
+    #[must_use]
+    pub const fn totals(&self) -> MmTotals {
+        self.totals
     }
 
     /// The task `tgid` exited: its view loses the address space, descriptors
@@ -724,9 +838,10 @@ impl ProcState {
     pub fn exit(&mut self, tgid: i32) {
         if let Ok(at) = self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
             let view = &mut self.views[at].1;
+            self.totals.sub(MmTotals::of(view));
             view.mm = None;
             view.exe = None;
-            view.fds = Vec::new();
+            view.fds = view::FdView::default();
             view.has_files = false;
             view.has_fs = false;
             view.args = None;
@@ -738,15 +853,41 @@ impl ProcState {
     /// # Errors
     /// `ENOMEM`.
     pub fn publish(&mut self, tgid: i32, view: TaskView) -> KResult<()> {
+        let added = MmTotals::of(&view);
         match self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
-            Ok(at) => self.views[at].1 = view,
+            Ok(at) => {
+                let old = core::mem::replace(&mut self.views[at].1, view);
+                self.totals.sub(MmTotals::of(&old));
+            }
             Err(at) => {
                 self.views.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
                 let _ = self.views.push_within_capacity((tgid, view));
                 self.views[at..].rotate_right(1);
             }
         }
+        self.totals.add(added);
         Ok(())
+    }
+
+    /// Bring the view of `tgid` up to date with what the task reports (or
+    /// create it): [`TaskView::update`], so the time is proportional to what
+    /// changed since the last publication.
+    ///
+    /// # Errors
+    /// `ENOMEM`; the previous view stays.
+    pub fn publish_update(&mut self, tgid: i32, input: view::Collect<'_>) -> KResult<()> {
+        match self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
+            Ok(at) => {
+                let view = &mut self.views[at].1;
+                let old = MmTotals::of(view);
+                view.update(input)?;
+                let new = MmTotals::of(view);
+                self.totals.sub(old);
+                self.totals.add(new);
+                Ok(())
+            }
+            Err(_) => self.publish(tgid, TaskView::collect(input)?),
+        }
     }
 }
 

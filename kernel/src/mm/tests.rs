@@ -1590,3 +1590,30 @@ fn pkru_denial_refuses_before_a_page_is_populated() {
     w.env.ospke = false;
     assert_eq!(w.fault(b, PF_WRITE), FaultOutcome::Handled);
 }
+
+#[test]
+fn the_vma_stamp_moves_with_every_change_and_names_the_address_space() {
+    let mut w = W::new();
+    let first = w.mm.vma_stamp();
+    // Reading never moves it.
+    let _ = (w.mm.vmas().len(), w.mm.find_vma(0x1000), w.mm.map_count());
+    assert_eq!(w.mm.vma_stamp(), first);
+    let addr = w
+        .map(
+            0,
+            2 * P,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        )
+        .unwrap();
+    let mapped = w.mm.vma_stamp();
+    assert_ne!(mapped, first, "mmap");
+    assert_eq!(mapped.0, first.0, "same address space");
+    let _ = (w.mm.vmas().len(), w.mm.find_vma(addr));
+    assert_eq!(w.mm.vma_stamp(), mapped);
+    w.munmap(addr, P).unwrap();
+    assert_ne!(w.mm.vma_stamp(), mapped, "munmap");
+    // A fork's copy and a new address space are not the same space.
+    assert_ne!(w.mm.dup(&w.env).unwrap().vma_stamp().0, w.mm.vma_stamp().0);
+    assert_ne!(Mm::new(&w.env).vma_stamp().0, w.mm.vma_stamp().0);
+}

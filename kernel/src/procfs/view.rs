@@ -16,8 +16,15 @@
 //! * A view may lag the task by what it did since it last left the kernel; the
 //!   file table's descriptors in it are validated against the file's serial
 //!   before use ([`crate::vfs::FileTable::get_checked`]).
+//! * Cost: a republication (`TaskView::update`) takes time proportional to
+//!   what changed since the last one, not to the size of the task. The
+//!   descriptors are replayed from the table's change log
+//!   ([`FdTable::changed_since`]; a gap wider than the log copies the table),
+//!   the VMA vector is shared while its stamp ([`Mm::vma_stamp`]) is unchanged
+//!   and copied once after it moved, and the resident-page and page-table
+//!   figures are counters the caller reads in constant time.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use syscalls::Errno;
 
@@ -38,9 +45,13 @@ pub struct FdEntry {
 }
 
 /// The address-space facts of a published task (`mm_struct`).
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MmView {
-    pub vmas: Vec<Vma>,
+    /// The VMAs as of `vma_stamp`, shared with the previous publication while
+    /// [`Mm::vma_stamp`] has not moved.
+    pub vmas: Arc<Vec<Vma>>,
+    /// [`Mm::vma_stamp`] when `vmas` was copied.
+    pub vma_stamp: (u64, u64),
     pub start_code: u64,
     pub end_code: u64,
     pub start_data: u64,
@@ -82,10 +93,10 @@ pub struct TaskView {
     pub mm: Option<MmView>,
     /// `mm->exe_file`.
     pub exe: Option<FdEntry>,
-    /// [`crate::vfs::FdTable::generation`] when the table was read.
-    pub fd_gen: u64,
-    /// `files_fdtable(files)->max_fds`; the open descriptors in ascending order.
-    pub fds: Vec<FdEntry>,
+    /// [`crate::vfs::FdTable::stamp`] when the table was read.
+    pub fd_stamp: (u64, u64),
+    /// The open descriptors; `max_fds` is `files_fdtable(files)->max_fds`.
+    pub fds: FdView,
     pub max_fds: u32,
     /// `task->files` still exists (`exit_files` has not run).
     pub has_files: bool,
@@ -139,37 +150,63 @@ impl TaskView {
     /// # Errors
     /// `ENOMEM`.
     pub fn collect(input: Collect<'_>) -> KResult<Self> {
-        let fds = collect_fds(input.fdt, input.files)?;
-        let mm = match input.mm {
-            Some(mm) => Some(MmView::collect(mm, input.rss, input.pgtables_bytes)?),
-            None => None,
-        };
-        let exe = input.exe.map(|file| FdEntry {
-            fd: 0,
-            file,
-            serial: input.files.try_get(file).map_or(0, |f| f.serial),
-            cloexec: false,
-        });
-        Ok(Self {
+        let mut view = Self {
             attrs: *input.attrs,
             has_fs: true,
-            mm,
-            exe,
-            fd_gen: input.fdt.generation(),
-            fds,
-            max_fds: u32::try_from(input.fdt.max_fds()).unwrap_or(u32::MAX),
+            mm: None,
+            exe: None,
+            // No table has this stamp, so the first update copies the table.
+            fd_stamp: (0, u64::MAX),
+            fds: FdView::default(),
+            max_fds: 0,
             has_files: true,
-            min_flt: input.min_flt,
-            maj_flt: input.maj_flt,
-            nvcsw: input.nvcsw,
-            nivcsw: input.nivcsw,
-            start_boottime_ns: input.start_boottime_ns,
-            flags: input.flags,
+            min_flt: 0,
+            maj_flt: 0,
+            nvcsw: 0,
+            nivcsw: 0,
+            start_boottime_ns: 0,
+            flags: 0,
             nice: 0,
             rt_priority: 0,
             policy: 0,
-            args: input.args,
-        })
+            args: None,
+        };
+        view.update(input)?;
+        Ok(view)
+    }
+
+    /// Bring the view up to date with the task: time proportional to what
+    /// changed since the last update (see the module contract).
+    ///
+    /// # Errors
+    /// `ENOMEM`; the view is unchanged.
+    pub fn update(&mut self, input: Collect<'_>) -> KResult<()> {
+        // Everything that can fail comes first; the commit below cannot.
+        let mm = match input.mm {
+            Some(mm) => Some(MmView::collect(
+                self.mm.as_ref(),
+                mm,
+                input.rss,
+                input.pgtables_bytes,
+            )?),
+            None => None,
+        };
+        self.fds.sync(self.fd_stamp, input.fdt, input.files)?;
+        self.attrs = *input.attrs;
+        self.has_fs = true;
+        self.has_files = true;
+        self.mm = mm;
+        self.exe = input.exe.map(|file| exe_entry(file, input.files));
+        self.fd_stamp = input.fdt.stamp();
+        self.max_fds = u32::try_from(input.fdt.max_fds()).unwrap_or(u32::MAX);
+        self.min_flt = input.min_flt;
+        self.maj_flt = input.maj_flt;
+        self.nvcsw = input.nvcsw;
+        self.nivcsw = input.nivcsw;
+        self.start_boottime_ns = input.start_boottime_ns;
+        self.flags = input.flags;
+        self.args = input.args;
+        Ok(())
     }
 
     /// The exec-time argument and environment bytes.
@@ -181,6 +218,7 @@ impl TaskView {
     /// Bring the parts that follow the descriptor table, the filesystem
     /// context and the executable up to date, leaving the address-space part
     /// as published (what a syscall that opened, closed or `chdir`ed changed).
+    /// Time proportional to the descriptors that changed.
     ///
     /// # Errors
     /// `ENOMEM`; the view is unchanged.
@@ -191,34 +229,24 @@ impl TaskView {
         files: &FileTable,
         exe: FileId,
     ) -> KResult<()> {
-        let fds = collect_fds(fdt, files)?;
+        self.fds.sync(self.fd_stamp, fdt, files)?;
         self.attrs = *attrs;
-        self.fds = fds;
-        self.fd_gen = fdt.generation();
+        self.fd_stamp = fdt.stamp();
         self.max_fds = u32::try_from(fdt.max_fds()).unwrap_or(u32::MAX);
-        self.exe = Some(FdEntry {
-            fd: 0,
-            file: exe,
-            serial: files.try_get(exe).map_or(0, |f| f.serial),
-            cloexec: false,
-        });
+        self.exe = Some(exe_entry(exe, files));
         Ok(())
     }
 
     /// The descriptor `fd`, if open.
     #[must_use]
     pub fn fd(&self, fd: u32) -> Option<&FdEntry> {
-        self.fds
-            .binary_search_by_key(&fd, |entry| entry.fd)
-            .ok()
-            .map(|at| &self.fds[at])
+        self.fds.get(fd)
     }
 
     /// `fget_task_next`: the first open descriptor at or after `fd`.
     #[must_use]
     pub fn next_fd(&self, fd: u32) -> Option<u32> {
-        let at = self.fds.partition_point(|entry| entry.fd < fd);
-        self.fds.get(at).map(|entry| entry.fd)
+        self.fds.next(fd)
     }
 
     /// `task->comm` as a byte string.
@@ -246,33 +274,177 @@ impl TaskView {
     }
 }
 
-/// The open descriptors in ascending order.
-fn collect_fds(fdt: &FdTable, files: &FileTable) -> KResult<Vec<FdEntry>> {
-    let mut fds: Vec<FdEntry> = Vec::new();
-    for (fd, file, cloexec) in fdt.iter() {
-        fds.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
-        let serial = files.try_get(file).map_or(0, |f| f.serial);
-        let _ = fds.push_within_capacity(FdEntry {
-            fd,
-            file,
-            serial,
-            cloexec,
-        });
+fn exe_entry(file: FileId, files: &FileTable) -> FdEntry {
+    FdEntry {
+        fd: 0,
+        file,
+        serial: files.try_get(file).map_or(0, |f| f.serial),
+        cloexec: false,
     }
-    Ok(fds)
+}
+
+/// Descriptors per [`FdView`] chunk.
+const CHUNK: usize = 64;
+
+/// The open descriptors of a published table, indexed by descriptor number in
+/// chunks that exist only where a descriptor was ever open: an update touches
+/// the descriptors that changed and nothing else, and a sparse table costs
+/// the chunks it uses.
+#[derive(Debug, Default)]
+pub struct FdView {
+    chunks: Vec<Option<Box<[Option<FdEntry>; CHUNK]>>>,
+    open: usize,
+}
+
+impl FdView {
+    /// The open descriptor `fd`.
+    #[must_use]
+    pub fn get(&self, fd: u32) -> Option<&FdEntry> {
+        let fd = fd as usize;
+        self.chunks
+            .get(fd / CHUNK)?
+            .as_ref()?
+            .get(fd % CHUNK)?
+            .as_ref()
+    }
+
+    /// The first open descriptor at or after `fd`.
+    #[must_use]
+    pub fn next(&self, fd: u32) -> Option<u32> {
+        let fd = fd as usize;
+        let mut index = fd / CHUNK;
+        let mut from = fd % CHUNK;
+        while index < self.chunks.len() {
+            if let Some(chunk) = &self.chunks[index]
+                && let Some(at) = chunk[from..].iter().position(Option::is_some)
+            {
+                return u32::try_from(index * CHUNK + from + at).ok();
+            }
+            index += 1;
+            from = 0;
+        }
+        None
+    }
+
+    /// How many descriptors are open.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.open
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.open == 0
+    }
+
+    /// The chunk of descriptor `fd`, made if there is none (no descriptor
+    /// changes).
+    fn chunk_mut(&mut self, fd: u32) -> KResult<&mut [Option<FdEntry>; CHUNK]> {
+        let index = fd as usize / CHUNK;
+        if self.chunks.len() <= index {
+            self.chunks
+                .try_reserve(index + 1 - self.chunks.len())
+                .map_err(|_| Errno::ENOMEM)?;
+            while self.chunks.len() <= index {
+                let _ = self.chunks.push_within_capacity(None);
+            }
+        }
+        let slot = &mut self.chunks[index];
+        if slot.is_none() {
+            *slot = Some(Box::try_new([None; CHUNK]).map_err(|_| Errno::ENOMEM)?);
+        }
+        slot.as_deref_mut().ok_or(Errno::ENOMEM)
+    }
+
+    /// Record descriptor `fd` as `entry`; [`FdView::chunk_mut`] ran for it if
+    /// `entry` is `Some`.
+    fn put(&mut self, fd: u32, entry: Option<FdEntry>) {
+        let fd = fd as usize;
+        let Some(Some(chunk)) = self.chunks.get_mut(fd / CHUNK) else {
+            return;
+        };
+        let slot = &mut chunk[fd % CHUNK];
+        self.open += usize::from(entry.is_some());
+        self.open -= usize::from(slot.is_some());
+        *slot = entry;
+    }
+
+    /// Make the view equal to `fdt`, whose state `seen` (a
+    /// [`FdTable::stamp`]) the view last read: replay the descriptors the
+    /// table logged since, or copy the whole table when more than its log
+    /// holds changed, when `seen` is another table's or when the view never
+    /// read one. All or nothing.
+    ///
+    /// # Errors
+    /// `ENOMEM`; the view is unchanged.
+    fn sync(&mut self, seen: (u64, u64), fdt: &FdTable, files: &FileTable) -> KResult<()> {
+        let seen = if seen.0 == fdt.stamp().0 {
+            seen.1
+        } else {
+            u64::MAX
+        };
+        let entry_of = |fd: u32| {
+            fdt.get(fd).map(|file| FdEntry {
+                fd,
+                file,
+                serial: files.try_get(file).map_or(0, |f| f.serial),
+                cloexec: fdt.cloexec(fd),
+            })
+        };
+        let Some(changed) = fdt.changed_since(seen) else {
+            let mut fresh = Self::default();
+            for (fd, file, cloexec) in fdt.iter() {
+                let serial = files.try_get(file).map_or(0, |f| f.serial);
+                fresh.chunk_mut(fd)?[fd as usize % CHUNK] = Some(FdEntry {
+                    fd,
+                    file,
+                    serial,
+                    cloexec,
+                });
+                fresh.open += 1;
+            }
+            *self = fresh;
+            return Ok(());
+        };
+        for fd in changed {
+            if fdt.get(fd).is_some() {
+                self.chunk_mut(fd)?;
+            }
+        }
+        // Chunks exist for every descriptor that is open now: nothing fails.
+        for fd in fdt.changed_since(seen).into_iter().flatten() {
+            self.put(fd, entry_of(fd));
+        }
+        Ok(())
+    }
 }
 
 impl MmView {
-    fn collect(mm: &Mm, rss: (u64, u64, u64), pgtables_bytes: u64) -> KResult<Self> {
-        let mut vmas: Vec<Vma> = Vec::new();
-        vmas.try_reserve_exact(mm.vmas().len())
-            .map_err(|_| Errno::ENOMEM)?;
-        for vma in mm.vmas() {
-            let _ = vmas.push_within_capacity(*vma);
-        }
+    /// The address-space facts of `mm`; the VMA vector is shared with `prev`
+    /// while `mm` reports the same stamp, copied once otherwise.
+    fn collect(
+        prev: Option<&Self>,
+        mm: &Mm,
+        rss: (u64, u64, u64),
+        pgtables_bytes: u64,
+    ) -> KResult<Self> {
+        let stamp = mm.vma_stamp();
+        let vmas = match prev {
+            Some(prev) if prev.vma_stamp == stamp => Arc::clone(&prev.vmas),
+            _ => {
+                let mut vmas: Vec<Vma> = Vec::new();
+                vmas.try_reserve_exact(mm.vmas().len())
+                    .map_err(|_| Errno::ENOMEM)?;
+                for vma in mm.vmas() {
+                    let _ = vmas.push_within_capacity(*vma);
+                }
+                Arc::try_new(vmas).map_err(|_| Errno::ENOMEM)?
+            }
+        };
         let total_rss = rss.0 + rss.1 + rss.2;
         Ok(Self {
             vmas,
+            vma_stamp: stamp,
             start_code: mm.start_code,
             end_code: mm.end_code,
             start_data: mm.start_data,

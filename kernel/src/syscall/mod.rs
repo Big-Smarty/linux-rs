@@ -43,6 +43,8 @@ mod process;
 mod procio;
 #[cfg(test)]
 mod procperm_tests;
+#[cfg(test)]
+mod procview_tests;
 mod random;
 mod reboot;
 mod signal;

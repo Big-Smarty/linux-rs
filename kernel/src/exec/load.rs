@@ -50,6 +50,8 @@ pub trait Pager: UserPages {
     /// Install a fresh private frame holding `bytes` at `page` (page-aligned,
     /// below `TASK_SIZE_MAX`, inside a just-created VMA, no PTE yet) with
     /// `prot` (`accessible == false` keeps the frame behind a `PROT_NONE` PTE).
+    /// `file` says the page belongs to a file mapping (a `vm_file` VMA), which
+    /// decides how `/proc` counts it (`RssAnon` once written, else `RssShmem`).
     ///
     /// # Errors
     /// [`OutOfMemory`] if a frame or table cannot be allocated; nothing changed.
@@ -57,6 +59,7 @@ pub trait Pager: UserPages {
         &mut self,
         page: u64,
         prot: PageProt,
+        file: bool,
         bytes: &[u8; PAGE_BYTES],
     ) -> Result<(), OutOfMemory>;
 }
@@ -265,7 +268,7 @@ fn install_file_pages(
     for page in 0..segment.file_pages {
         let address = segment.start + page * crate::memory::PAGE;
         segment.fill_page(file, page, &mut bytes);
-        pt.install(address, prot, &bytes)
+        pt.install(address, prot, true, &bytes)
             .map_err(|_| failed(Errno::ENOMEM))?;
     }
     Ok(())

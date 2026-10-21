@@ -18,6 +18,7 @@
 //! allocated lowest-free-first from a `next_fd` hint exactly like `alloc_fd`.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use syscalls::Errno;
 
 use super::{FileId, InodeId, KResult, NR_OPEN, PipeId, try_push};
@@ -242,16 +243,41 @@ impl FileTable {
 }
 
 /// `struct files_struct` (single-threaded sharing: one owner).
-#[derive(Default)]
 pub struct FdTable {
     fds: Vec<Option<FileId>>,
     open: Vec<usize>,
     cloexec: Vec<usize>,
     next_fd: u32,
-    /// Bumped by every change of a descriptor, so `/proc/<pid>/fd` readers can tell their copy of
-    /// the table is stale.
+    /// Counts the changes of descriptors, so `/proc/<pid>/fd` readers can tell their copy of the
+    /// table is stale; `recent` remembers the descriptor numbers of the last [`FD_LOG`] of them,
+    /// so such a reader can apply just those ([`FdTable::changed_since`]) instead of copying
+    /// the whole table.
     generation: u64,
+    recent: [Fd; FD_LOG],
+    /// Names this table, so a reader that copied another table never mistakes
+    /// its `generation` for this one's ([`FdTable::stamp`]).
+    id: u64,
 }
+
+/// Numbers the tables.
+static NEXT_FD_TABLE_ID: AtomicU64 = AtomicU64::new(1);
+
+impl Default for FdTable {
+    fn default() -> Self {
+        Self {
+            fds: Vec::new(),
+            open: Vec::new(),
+            cloexec: Vec::new(),
+            next_fd: 0,
+            generation: 0,
+            recent: [0; FD_LOG],
+            id: NEXT_FD_TABLE_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+/// How many recent descriptor changes an [`FdTable`] remembers.
+const FD_LOG: usize = 32;
 
 /// A descriptor number as syscalls carry it (`unsigned int`).
 pub type Fd = u32;
@@ -275,6 +301,40 @@ impl FdTable {
         self.generation
     }
 
+    /// `(id, generation)`: which table and which state of it. A copy made at an
+    /// equal stamp is exact; one made of the same table at an earlier stamp can
+    /// be brought up to date with [`FdTable::changed_since`].
+    #[must_use]
+    pub const fn stamp(&self) -> (u64, u64) {
+        (self.id, self.generation)
+    }
+
+    /// The descriptors changed after the `seen` value of
+    /// [`FdTable::generation`], oldest first (a number can repeat), or `None`
+    /// if more than [`FD_LOG`] changes happened since (copy the table instead).
+    #[must_use]
+    pub fn changed_since(&self, seen: u64) -> Option<impl Iterator<Item = Fd> + '_> {
+        let behind = self.generation.checked_sub(seen)?;
+        (behind <= FD_LOG as u64)
+            .then(|| (seen..self.generation).map(|at| self.recent[Self::log_slot(at)]))
+    }
+
+    /// The slot of change number `at` in `recent`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the remainder is below FD_LOG"
+    )]
+    const fn log_slot(at: u64) -> usize {
+        (at % FD_LOG as u64) as usize
+    }
+
+    /// Record that descriptor `fd` changed (its file, its close-on-exec flag
+    /// or its reservation).
+    fn touch(&mut self, fd: Fd) {
+        self.recent[Self::log_slot(self.generation)] = fd;
+        self.generation += 1;
+    }
+
     /// `get_close_on_exec`.
     #[must_use]
     pub fn cloexec(&self, fd: Fd) -> bool {
@@ -292,7 +352,7 @@ impl FdTable {
 
     /// `set_close_on_exec` / `__clear_close_on_exec` on an open descriptor.
     pub fn set_cloexec(&mut self, fd: Fd, on: bool) {
-        self.generation += 1;
+        self.touch(fd);
         let bits = self.fds.len();
         if let Some(mut map) = Bitmap::new(&mut self.cloexec, bits) {
             map.replace(fd as usize, on);
@@ -348,7 +408,6 @@ impl FdTable {
     /// # Errors
     /// `EMFILE` when it would reach `end` (`RLIMIT_NOFILE`) or `NR_OPEN`.
     pub fn alloc_fd(&mut self, start: u32, end: u64, cloexec: bool) -> KResult<Fd> {
-        self.generation += 1;
         let mut fd = start.max(self.next_fd);
         let bits = self.fds.len();
         if (fd as usize) < bits
@@ -360,6 +419,7 @@ impl FdTable {
             return Err(Errno::EMFILE);
         }
         self.expand(u64::from(fd))?;
+        self.touch(fd);
         let bits = self.fds.len();
         if let Some(mut map) = Bitmap::new(&mut self.open, bits) {
             map.replace(fd as usize, true);
@@ -375,13 +435,13 @@ impl FdTable {
 
     /// `fd_install`: populate a descriptor [`FdTable::alloc_fd`] reserved.
     pub fn install(&mut self, fd: Fd, file: FileId) {
-        self.generation += 1;
+        self.touch(fd);
         self.fds[fd as usize] = Some(file);
     }
 
     /// `put_unused_fd` / the bit clearing of `file_close_fd_locked`.
     fn release(&mut self, fd: Fd) {
-        self.generation += 1;
+        self.touch(fd);
         let bits = self.fds.len();
         if let Some(mut map) = Bitmap::new(&mut self.open, bits) {
             map.replace(fd as usize, false);
@@ -412,7 +472,7 @@ impl FdTable {
     /// # Errors
     /// `EBUSY`.
     pub fn replace(&mut self, fd: Fd, file: FileId, cloexec: bool) -> KResult<Option<FileId>> {
-        self.generation += 1;
+        self.touch(fd);
         let bits = self.fds.len();
         let reserved = Bitmap::new(&mut self.open, bits)
             .and_then(|map| map.get(fd as usize))

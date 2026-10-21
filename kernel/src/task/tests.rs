@@ -1475,3 +1475,36 @@ fn a_stopped_member_of_a_newly_orphaned_group_is_hung_up_then_continued() {
         0
     );
 }
+
+#[test]
+fn the_change_log_replays_recent_pids_and_reports_a_gap() {
+    // `/proc` keeps the count it last saw and replays what came after; more
+    // than the ring holds means "rebuild from the list".
+    let (mut l, init) = list();
+    let seen = l.epoch();
+    assert_eq!(l.changed_since(seen).unwrap().count(), 0);
+    let a = l.fork(init, FORK).unwrap();
+    let b = l.fork(init, FORK).unwrap();
+    l.set_dumpable(a, false);
+    assert_eq!(
+        l.changed_since(seen).unwrap().collect::<Vec<_>>(),
+        [2, 3, 2]
+    );
+    // A change that changes nothing records nothing.
+    let now = l.epoch();
+    l.set_dumpable(a, false);
+    assert_eq!(l.epoch(), now);
+    // A release is recorded under the number the task had.
+    exit(&mut l, b, 0, &mut Rec::default());
+    l.release_task(b);
+    assert_eq!(l.changed_since(now).unwrap().collect::<Vec<_>>(), [3, 3]);
+    // A reader from the future or from before the ring gets `None`.
+    assert!(l.changed_since(l.epoch() + 1).is_none());
+    for _ in 0..70 {
+        l.set_dumpable(a, true);
+        l.set_dumpable(a, false);
+    }
+    assert!(l.changed_since(seen).is_none());
+    assert_eq!(l.changed_since(l.epoch() - 64).unwrap().count(), 64);
+    assert!(l.changed_since(l.epoch() - 65).is_none());
+}

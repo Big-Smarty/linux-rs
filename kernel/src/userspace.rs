@@ -78,9 +78,9 @@ use kernel::{
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     procfs::{
-        Caller,
+        Caller, MmTotals,
         show::{HostInfo, Show, ShowScope},
-        view::{Collect, TaskView},
+        view::Collect,
     },
     ratelimit::RateLimit,
     sched::{CLASS_VFORK, PIPE_KEY, SchedId, TaskState, WaitKey, WakeMode},
@@ -990,7 +990,11 @@ const MAX_PUBLISHED_ARGS: u64 = 2 << 20;
 /// for a new child.
 ///
 /// Context: task, `PROCESS` held by the caller (`vfs` lock class); allocates
-/// fallibly (`ENOMEM` leaves the previous view in place).
+/// fallibly (`ENOMEM` leaves the previous view in place). The time is
+/// proportional to what changed since the task's last publication: the
+/// descriptors replay the table's change log, the VMA vector is shared until
+/// its stamp moves, and the resident-page and page-table figures are counters
+/// (`procfs::view`).
 fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Result<(), Errno> {
     let tgid = own.tgid.cast_signed();
     // The argument and environment bytes are copied when the layout changes
@@ -1022,24 +1026,29 @@ fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Res
             Some(Arc::try_new(bytes).map_err(|_| Errno::ENOMEM)?)
         }
     };
-    let rss = space.rss(own.space.vmas());
-    let view = TaskView::collect(Collect {
-        attrs: &own.attrs,
-        fdt: &own.fdt,
-        files: &process.vfs.files,
-        mm: Some(&own.space),
-        exe: Some(own.exe_file),
-        rss,
-        pgtables_bytes: space.table_bytes(),
-        min_flt: own.stats.min_flt,
-        maj_flt: own.stats.maj_flt,
-        nvcsw: own.stats.nvcsw,
-        nivcsw: own.stats.nivcsw,
-        start_boottime_ns: own.stats.start_ns,
-        flags: 0,
-        args,
-    })?;
-    process.vfs.fs.ns.proc.publish(tgid, view)
+    // The self-test builds prove the counters against the walks they replaced.
+    #[cfg(feature = "qemu-self-test")]
+    space.check_counters(own.space.vmas());
+    let vfs = &mut process.vfs;
+    vfs.fs.ns.proc.publish_update(
+        tgid,
+        Collect {
+            attrs: &own.attrs,
+            fdt: &own.fdt,
+            files: &vfs.files,
+            mm: Some(&own.space),
+            exe: Some(own.exe_file),
+            rss: space.rss(),
+            pgtables_bytes: space.table_bytes(),
+            min_flt: own.stats.min_flt,
+            maj_flt: own.stats.maj_flt,
+            nvcsw: own.stats.nvcsw,
+            nivcsw: own.stats.nivcsw,
+            start_boottime_ns: own.stats.start_ns,
+            flags: 0,
+            args,
+        },
+    )
 }
 
 /// [`publish`] for the running task, taking its state and `PROCESS`.
@@ -1054,9 +1063,8 @@ fn publish_current() {
 ///
 /// Context: task; takes `FRAMES` and `LOAD` (leaf locks) while `process` is held.
 #[allow(clippy::too_many_lines)] // one straight list of the counters /proc shows
-fn host_info(process: &Process, own: &Owned, machine: bool) -> Result<HostInfo, Errno> {
+fn host_info(process: &Process, own: &Owned) -> Result<HostInfo, Errno> {
     let up = timer::ktime_get_boottime_ns();
-    let now = timer::ktime_get_ns();
     let (total_pages, free_pages) = {
         let frames = services::FRAMES.lock();
         (frames.total() as u64, frames.available() as u64)
@@ -1076,40 +1084,16 @@ fn host_info(process: &Process, own: &Owned, machine: bool) -> Result<HostInfo, 
     for &byte in line {
         let _ = cmdline.push_within_capacity(byte);
     }
-    // The CPU time of all tasks; the idle time is what is left of the uptime.
-    let (mut user, mut system) = (0u64, 0u64);
-    let (mut anon, mut mapped, mut tables_bytes) = (0u64, 0u64, 0u64);
-    // Summed only for the global files (`ShowScope::Machine`).
-    for id in process
-        .tasks
-        .processes()
-        .take(if machine { usize::MAX } else { 0 })
-    {
-        let Some(task) = process.tasks.task(id) else {
-            continue;
-        };
-        let (u, s) = match task.sched {
-            Some(sched) if task.exit_state == task::tasklist::ExitState::Live => {
-                ktask::cpu_account(sched).adjusted(now)
-            }
-            _ => (task.utime_ns, task.stime_ns),
-        };
-        user += u;
-        system += s;
-        if let Some(mm) = process
-            .vfs
-            .fs
-            .ns
-            .proc
-            .view(process.tasks.task_tgid_vnr(id))
-            .and_then(|view| view.mm.as_ref())
-        {
-            anon += mm.rss_anon;
-            mapped += mm.rss_file + mm.rss_shmem;
-            tables_bytes += mm.pgtables_bytes;
-        }
-    }
+    // `kernel_cpustat`: the tick-accounted time of all tasks (the exited ones
+    // included); the idle time is what is left of the uptime. The address-space
+    // figures are the sums the published views keep.
+    let (user, system) = ktask::kcpustat();
     let idle = up.saturating_sub(user + system);
+    let MmTotals {
+        anon_pages: anon,
+        mapped_pages: mapped,
+        pgtables_bytes: tables_bytes,
+    } = process.vfs.fs.ns.proc.totals();
     let mut irqs = Vec::new();
     irqs.try_reserve_exact(16).map_err(|_| Errno::ENOMEM)?;
     for irq in 0..16 {
@@ -1247,7 +1231,7 @@ fn user_fault(
     let pgoff = vma.pgoff + ((page - vma.start) >> 12);
     match vfs.fault_page(owner, file, pgoff, &mut bytes) {
         Err(FileFault::Bus) => FaultOutcome::Bus { address },
-        Ok(()) => match space.install(page, mm::page_prot(vma.flags), &bytes) {
+        Ok(()) => match space.install(page, mm::page_prot(vma.flags), true, &bytes) {
             Ok(()) => FaultOutcome::Handled,
             Err(mm::OutOfMemory) => FaultOutcome::Oom,
         },
@@ -1860,13 +1844,9 @@ impl Context for Syscall<'_> {
         // executable changed since it was taken. Only those parts are rebuilt: the address space
         // is published when a file of `/proc` is read, and when the task leaves the CPU.
         let tgid = self.own.tgid.cast_signed();
-        let (fs, exe, fd_gen) = (
-            self.own.attrs.fs,
-            self.own.exe_file,
-            self.own.fdt.generation(),
-        );
+        let (fs, exe, fd_stamp) = (self.own.attrs.fs, self.own.exe_file, self.own.fdt.stamp());
         let stale = process.vfs.fs.ns.proc.view(tgid).is_none_or(|v| {
-            v.fd_gen != fd_gen
+            v.fd_stamp != fd_stamp
                 || v.attrs.fs.root != fs.root
                 || v.attrs.fs.pwd != fs.pwd
                 || v.exe.map(|e| e.file) != Some(exe)
@@ -1896,7 +1876,7 @@ impl Context for Syscall<'_> {
             publish(self.shared.get(), self.own, &mut self.space)?;
         }
         let process = self.shared.get();
-        let host = host_info(process, self.own, scope == ShowScope::Machine)?;
+        let host = host_info(process, self.own)?;
         let caller = Caller {
             tgid: self.own.tgid.cast_signed(),
             cred: vfs::Cred::of_task(&self.own.attrs.cred),

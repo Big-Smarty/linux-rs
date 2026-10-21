@@ -379,6 +379,7 @@ fn install_arguments(
                     write: true,
                     exec: p.plan.exec_stack,
                 },
+                false,
                 bytes,
             )
             .map_err(|_| LoadError::Errno(Errno::ENOMEM))?;

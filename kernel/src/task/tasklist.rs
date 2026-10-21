@@ -210,9 +210,47 @@ pub struct Tasklist {
     max_threads: u32,
     /// `total_forks`: tasks created since boot.
     forks: u64,
-    /// Bumped by everything `/proc` mirrors: a task published or released, a
-    /// credential snapshot published ([`Tasklist::epoch`]).
-    epoch: u64,
+    /// What `/proc` mirrors changed ([`Tasklist::epoch`]).
+    changes: ChangeLog,
+}
+
+/// How many recent changes [`ChangeLog`] remembers.
+const CHANGE_LOG: usize = 64;
+
+/// The pid numbers of the thread groups whose mirrored facts changed (a task
+/// published or released, a credential snapshot published, the zombie
+/// transition, a change of dumpability), newest last, in a ring of the last
+/// [`CHANGE_LOG`]. A reader keeps the count it last saw and replays what came
+/// after ([`Tasklist::changed_since`]); a reader that fell more than the ring
+/// behind rebuilds from the task list instead. No allocation: nothing here can
+/// fail, and nothing needs a consumer to keep it bounded.
+#[derive(Clone, Copy)]
+struct ChangeLog {
+    ring: [i32; CHANGE_LOG],
+    /// Changes recorded since boot.
+    count: u64,
+}
+
+impl ChangeLog {
+    /// The ring slot of change number `at`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the remainder is below CHANGE_LOG"
+    )]
+    const fn slot(at: u64) -> usize {
+        (at % CHANGE_LOG as u64) as usize
+    }
+
+    fn note(&mut self, nr: i32) {
+        self.ring[Self::slot(self.count)] = nr;
+        self.count += 1;
+    }
+
+    fn since(&self, seen: u64) -> Option<impl Iterator<Item = i32> + '_> {
+        let behind = self.count.checked_sub(seen)?;
+        (behind <= CHANGE_LOG as u64)
+            .then(|| (seen..self.count).map(|at| self.ring[Self::slot(at)]))
+    }
 }
 
 impl Tasklist {
@@ -238,7 +276,10 @@ impl Tasklist {
             nr_threads: 0,
             max_threads,
             forks: 0,
-            epoch: 1,
+            changes: ChangeLog {
+                ring: [0; CHANGE_LOG],
+                count: 1,
+            },
         };
         let signals =
             Box::try_new(TaskSignals::new_init(rlimit_sigpending)).map_err(|_| Errno::ENOMEM)?;
@@ -326,7 +367,7 @@ impl Tasklist {
         assert!(self.order.push_within_capacity(id).is_ok());
         self.nr_threads += 1;
         self.forks += 1;
-        self.epoch += 1;
+        self.note_changed(id);
         Ok(id)
     }
 
@@ -444,6 +485,7 @@ impl Tasklist {
     /// If the task is the child reaper (init is never released).
     pub fn release_task(&mut self, id: TaskId) {
         assert!(id != self.child_reaper, "init released");
+        let nr = self.task_tgid_vnr(id);
         let Some(task) = self.tasks.remove(id) else {
             return;
         };
@@ -461,7 +503,7 @@ impl Tasklist {
         }
         self.order.retain(|&t| t != id);
         self.nr_threads -= 1;
-        self.epoch += 1;
+        self.changes.note(nr);
     }
 
     /// `free_pid` once the last link of every type is gone. `init_struct_pid`
@@ -512,17 +554,32 @@ impl Tasklist {
         i32::try_from(self.table.cursor().saturating_sub(1)).unwrap_or(i32::MAX)
     }
 
-    /// A counter that changes whenever a thread group appears or disappears or
-    /// its credentials change: the pid mirror of `/proc` is rebuilt when it
-    /// moves ([`crate::procfs::ProcState::sync`]).
+    /// A counter that moves whenever a thread group appears or disappears or
+    /// the facts `/proc` mirrors of it change (credentials, the zombie
+    /// transition, dumpability): [`crate::procfs::ProcState::sync`] follows it
+    /// with [`Tasklist::changed_since`].
     #[must_use]
     pub const fn epoch(&self) -> u64 {
-        self.epoch
+        self.changes.count
     }
 
-    /// Mark the task list changed for `/proc` readers: a task became a zombie.
-    pub(super) fn touch_epoch(&mut self) {
-        self.epoch += 1;
+    /// The pid numbers whose mirrored facts changed after the `seen` value of
+    /// [`Tasklist::epoch`], oldest first (a number can repeat), or `None` when
+    /// more than the ring remembers happened since (rebuild from the list).
+    #[must_use]
+    pub fn changed_since(&self, seen: u64) -> Option<impl Iterator<Item = i32> + '_> {
+        self.changes.since(seen)
+    }
+
+    /// Record that the facts `/proc` mirrors of `task` changed.
+    fn note_changed(&mut self, task: TaskId) {
+        let nr = self.task_tgid_vnr(task);
+        self.changes.note(nr);
+    }
+
+    /// Mark the task changed for `/proc` readers: it became a zombie.
+    pub(super) fn touch_epoch(&mut self, task: TaskId) {
+        self.note_changed(task);
     }
 
     /// `get_dumpable(mm) == SUID_DUMP_USER` for the task (a task that is gone
@@ -540,7 +597,7 @@ impl Tasklist {
             && t.dumpable != dumpable
         {
             t.dumpable = dumpable;
-            self.epoch += 1; // the /proc mirror copies it
+            self.note_changed(task); // the /proc mirror copies it
         }
     }
 
@@ -773,14 +830,22 @@ impl Tasklist {
     pub fn publish_cred(&mut self, task: TaskId, cred: &Cred) {
         if let Some(t) = self.tasks.get_mut(task) {
             let new = CredSnapshot::of(cred);
-            // commit_creds: "dumpability changes" when the effective ids move
-            // (fsuid/fsgid follow them; the capabilities are tied to euid 0),
-            // to `suid_dumpable` (0).
+            // commit_creds (kernel/cred.c:406-410): "dumpability changes" to
+            // `suid_dumpable` (0) when the effective uid or gid, the fsuid or
+            // fsgid, or the capabilities (`!cred_cap_issubset(old, new)`)
+            // change. shortcut: only the first two are compared. This model
+            // has no separate fsuid/fsgid (`setfsuid`/`setfsgid` stop the
+            // kernel loudly, so they always equal the effective ids and move
+            // with them) and no capability sets (`capset` stops loudly; the
+            // capabilities are `euid == 0`, so they move only with the
+            // effective uid). The first of `setfsuid`, `setfsgid` or `capset`
+            // to be ported MUST add its comparison here (and a `CredSnapshot`
+            // field), or a privilege change will leave the task dumpable.
             if t.cred.euid != new.euid || t.cred.egid != new.egid {
                 t.dumpable = false;
             }
             t.cred = new;
-            self.epoch += 1;
+            self.note_changed(task);
         }
     }
 

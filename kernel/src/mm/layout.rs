@@ -72,7 +72,7 @@ impl Mm {
     /// (`mas_empty_area`).
     fn lowest_gap(&self, low: u64, high: u64, len: u64) -> Option<u64> {
         let mut cand = low;
-        for v in &self.vmas {
+        for v in self.vmas.iter() {
             if v.end <= cand {
                 continue;
             }

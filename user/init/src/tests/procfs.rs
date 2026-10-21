@@ -415,6 +415,7 @@ pub fn run() -> bool {
     seq_files(&mut t);
     seq_records(&mut t);
     wchan(&mut t);
+    publication(&mut t);
     mounts_poll(&mut t);
     root_umount(&mut t);
     t.finish()
@@ -4835,6 +4836,234 @@ fn wchan(t: &mut T) {
         pid_text(child, "wchan", &mut page).map(<[u8]>::len),
         Err(Errno::ENOENT),
     );
+}
+
+// ---- views that follow a changing task ----------------------------------------------------------
+
+/// The descriptors, mappings, resident pages and pid list of a task as `/proc` shows them while
+/// the task keeps changing: a few changes at a time, bursts wider than anything a kernel could
+/// replay one by one, a sparse table, and seventy children that all exit while the reader sleeps.
+/// Every check compares what `/proc` says with what the test itself did, so it holds on any
+/// kernel; the recording on the pinned Linux fixes which of them must.
+fn publication(t: &mut T) {
+    use super::proc::{nap, spawn, wait4};
+    let me = getpid();
+    let mut page: Page = [0; 16384];
+    let base = open("/fixture/hello.txt", O_RDONLY).unwrap_or(99);
+    let listed = || Dir::list("/proc/self/fd").map_or(usize::MAX, |d| d.count);
+    let before = listed();
+
+    // Ninety duplicates in a row, then every other one closed again.
+    let mut fds = [0usize; 90];
+    for fd in &mut fds {
+        *fd = fcntl(base, 0 /* F_DUPFD */, 10).unwrap_or(0);
+    }
+    t.eq("pub-fd-burst-count", listed(), before.wrapping_add(90));
+    let ascending = fds.is_sorted() && fds[0] >= 10;
+    t.holds(
+        "pub-fd-burst-ascending",
+        ascending,
+        fds[0],
+        "lowest free first",
+    );
+    for fd in fds.iter().skip(1).step_by(2) {
+        let _ = close(*fd);
+    }
+    t.eq(
+        "pub-fd-burst-closed-count",
+        listed(),
+        before.wrapping_add(45),
+    );
+    let mut wrong = 0;
+    for (i, fd) in fds.iter().enumerate() {
+        let link = text!(32, "/proc/self/fd/{fd}");
+        let open = stat(link.str()).0.is_ok();
+        wrong += usize::from(open != (i % 2 == 0));
+    }
+    t.eq("pub-fd-membership", wrong, 0);
+
+    // The close-on-exec bit of a descriptor is part of its fdinfo; flip every third.
+    let flags = fcntl(base, 3 /* F_GETFL */, 0).unwrap_or(0);
+    let mut wrong = 0;
+    for (i, fd) in fds.iter().enumerate().step_by(2) {
+        if i % 3 == 0 {
+            let _ = fcntl(*fd, 2 /* F_SETFD */, 1);
+        }
+    }
+    for (i, fd) in fds.iter().enumerate().step_by(2) {
+        let want = text!(
+            96,
+            "pos:\t0\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n",
+            flags | if i % 3 == 0 { O_CLOEXEC } else { 0 },
+            mnt_id("/fixture/hello.txt").unwrap_or(0),
+            stat("/fixture/hello.txt").1.ino
+        );
+        let got = pid_text(me, text!(32, "fdinfo/{fd}").str(), &mut page).unwrap_or_default();
+        wrong += usize::from(got != want.bytes());
+    }
+    t.eq("pub-fdinfo-cloexec", wrong, 0);
+
+    // A sparse table: a descriptor far above the others, listed in its place.
+    let high = fcntl(base, 0, 900).unwrap_or(0);
+    t.eq("pub-fd-high", high, 900);
+    let listing = Dir::list("/proc/self/fd").unwrap_or(Dir {
+        names: [0; 4096],
+        len: 0,
+        count: 0,
+    });
+    t.holds(
+        "pub-fd-high-listed",
+        listing.entries().last() == Some(b"900:l".as_slice())
+            && listing
+                .entries()
+                .filter_map(|e| num(&e[..e.len() - 2]))
+                .is_sorted(),
+        Txt(listing.text()),
+        "last and ascending",
+    );
+    let _ = close(high);
+    t.eq(
+        "pub-fd-high-closed",
+        stat("/proc/self/fd/900").0,
+        Err(Errno::ENOENT),
+    );
+    for fd in fds.iter().step_by(2) {
+        let _ = close(*fd);
+    }
+    t.eq("pub-fd-all-closed", listed(), before);
+    let _ = close(base);
+
+    // Mappings: forty regions that cannot merge (readable, inaccessible, ...), then the
+    // inaccessible ones removed, then the holes filled so that everything merges.
+    const PRIVATE_ANON: usize = 0x22;
+    let overlapping = |lo: usize, hi: usize| -> usize {
+        let mut p: Page = [0; 16384];
+        let text = pid_text(me, "maps", &mut p).unwrap_or_default();
+        lines(text)
+            .filter_map(hex_range)
+            .filter(|&(a, b)| a < hi as u64 && b > lo as u64)
+            .count()
+    };
+    let mut regions = [0usize; 40];
+    for (i, region) in regions.iter_mut().enumerate() {
+        *region = sys(
+            Sysno::mmap,
+            &[
+                0,
+                4096,
+                usize::from(i % 2 == 0),
+                PRIVATE_ANON,
+                usize::MAX,
+                0,
+            ],
+        )
+        .unwrap_or(0);
+    }
+    let lo = regions.iter().copied().min().unwrap_or(0);
+    let hi = regions.iter().copied().max().unwrap_or(0) + 4096;
+    t.holds(
+        "pub-maps-contiguous",
+        regions.iter().all(|&r| r != 0) && hi - lo == 40 * 4096,
+        (lo, hi),
+        "forty neighbouring pages",
+    );
+    t.eq("pub-maps-alternating", overlapping(lo, hi), 40);
+    for region in regions.iter().skip(1).step_by(2) {
+        let _ = sys(Sysno::munmap, &[*region, 4096]);
+    }
+    t.eq("pub-maps-holed", overlapping(lo, hi), 20);
+    for region in regions.iter().skip(1).step_by(2) {
+        let _ = sys(
+            Sysno::mmap,
+            &[
+                *region,
+                4096,
+                1,
+                PRIVATE_ANON | 0x10, /* MAP_FIXED */
+                usize::MAX,
+                0,
+            ],
+        );
+    }
+    t.eq("pub-maps-merged", overlapping(lo, hi), 1);
+    let _ = sys(Sysno::munmap, &[lo, hi - lo]);
+    t.eq("pub-maps-gone", overlapping(lo, hi), 0);
+
+    // Resident pages: touched pages show in RssAnon at once, and leave with the mapping.
+    let rss_anon =
+        |p: &mut Page| status_kb(pid_text(me, "status", p).unwrap_or_default(), "RssAnon");
+    let r0 = rss_anon(&mut page);
+    let map = sys(Sysno::mmap, &[0, 64 * 4096, 3, PRIVATE_ANON, usize::MAX, 0]).unwrap_or(0);
+    t.eq("pub-rss-untouched", rss_anon(&mut page) <= r0 + 64, true);
+    for i in 0..64 {
+        super::poke(map + i * 4096, 1);
+    }
+    let r1 = rss_anon(&mut page);
+    t.holds(
+        "pub-rss-touched",
+        (r0 + 256..=r0 + 256 + 64).contains(&r1),
+        (r0, r1),
+        "64 pages of 4 kB, give or take a few of the test's own",
+    );
+    let _ = sys(Sysno::munmap, &[map, 64 * 4096]);
+    let r2 = rss_anon(&mut page);
+    t.holds(
+        "pub-rss-unmapped",
+        (r0..=r0 + 64).contains(&r2),
+        (r0, r2),
+        "back to where it was",
+    );
+
+    // Seventy children in one process group, all killed while the reader sleeps, then reaped.
+    let numeric = || -> usize {
+        Dir::list("/proc").map_or(usize::MAX, |d| {
+            d.entries().filter(|e| e[0].is_ascii_digit()).count()
+        })
+    };
+    let alive = numeric();
+    let mut kids = [0usize; 70];
+    for kid in &mut kids {
+        *kid = spawn(|| {
+            nap(60_000);
+            0
+        });
+    }
+    let group = kids[0];
+    let mut grouped = 0;
+    for kid in kids {
+        grouped += usize::from(sys(Sysno::setpgid, &[kid, group]).is_ok());
+    }
+    t.eq(
+        "pub-pids-spawned",
+        (kids.iter().all(|&k| k != usize::MAX), grouped),
+        (true, 70),
+    );
+    t.eq("pub-pids-listed", numeric(), alive + 70);
+    let mut missing = 0;
+    for kid in kids {
+        missing += usize::from(stat(text!(32, "/proc/{kid}").str()).0.is_err());
+    }
+    t.eq("pub-pids-present", missing, 0);
+    let _ = sys(Sysno::kill, &[(-(group as isize)) as usize, 9]);
+    nap(300);
+    let mut zombies = 0;
+    for kid in kids {
+        let state = parse_stat(pid_text(kid, "stat", &mut page).unwrap_or_default())
+            .map_or(b'?', |s| s.state()[0]);
+        zombies += usize::from(state == b'Z');
+    }
+    t.eq("pub-pids-zombies", zombies, 70);
+    t.eq("pub-pids-zombies-listed", numeric(), alive + 70);
+    let mut reaped = 0;
+    while let (Ok(_), _) = wait4(-1, 0) {
+        reaped += 1;
+    }
+    t.eq("pub-pids-reaped", reaped, 70);
+    let mut left = 0;
+    for kid in kids {
+        left += usize::from(stat(text!(32, "/proc/{kid}").str()).0.is_ok());
+    }
+    t.eq("pub-pids-gone", (left, numeric()), (0, alive));
 }
 
 // ---- the permission matrix of /proc (reference-only mode `procperm`) ---------------------------

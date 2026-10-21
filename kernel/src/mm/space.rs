@@ -31,6 +31,10 @@
 //!   VMAs leaves the finished prefix) and are documented where they do.
 
 use alloc::vec::Vec;
+use core::{
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use syscalls::Errno;
 
@@ -78,10 +82,40 @@ impl Vma {
     }
 }
 
+/// The sorted VMA vector, with a version that moves whenever it is borrowed
+/// mutably (so a change can never be missed, and a borrow that changes nothing
+/// costs only a spurious difference). `/proc` copies the vector when the
+/// version moved and shares its last copy otherwise ([`Mm::vma_stamp`]).
+#[derive(Debug, Default)]
+pub(super) struct VmaList {
+    list: Vec<Vma>,
+    version: u64,
+}
+
+impl Deref for VmaList {
+    type Target = Vec<Vma>;
+    fn deref(&self) -> &Vec<Vma> {
+        &self.list
+    }
+}
+
+impl DerefMut for VmaList {
+    fn deref_mut(&mut self) -> &mut Vec<Vma> {
+        self.version += 1;
+        &mut self.list
+    }
+}
+
+/// Numbers the address spaces, so two different ones never share a
+/// [`Mm::vma_stamp`] (an `execve` builds a new one).
+static NEXT_MM_ID: AtomicU64 = AtomicU64::new(1);
+
 /// The address space of the one task.
 #[derive(Debug)]
 pub struct Mm {
-    pub(super) vmas: Vec<Vma>,
+    pub(super) vmas: VmaList,
+    /// Identifies this address space for [`Mm::vma_stamp`].
+    id: u64,
     /// `mm->mmap_base`: top of the top-down area.
     pub mmap_base: u64,
     /// `mm->mmap_legacy_base`: bottom of the legacy area.
@@ -127,7 +161,8 @@ impl Mm {
     pub fn new(env: &Env) -> Self {
         let (mmap_base, mmap_legacy_base) = super::layout::pick_mmap_base(env);
         Self {
-            vmas: Vec::new(),
+            vmas: VmaList::default(),
+            id: NEXT_MM_ID.fetch_add(1, Ordering::Relaxed),
             mmap_base,
             mmap_legacy_base,
             topdown: true,
@@ -174,7 +209,7 @@ impl Mm {
         vmas.try_reserve_exact(self.vmas.len())
             .map_err(|_| Errno::ENOMEM)?;
         let mut next_anon = self.next_anon;
-        for vma in &self.vmas {
+        for vma in self.vmas.iter() {
             if vma.flags.contains(VmFlags::ACCOUNT) && !env.enough_memory(vma.pages()) {
                 return enomem();
             }
@@ -187,7 +222,11 @@ impl Mm {
             vmas.push_within_capacity(copy).map_err(|_| Errno::ENOMEM)?;
         }
         Ok(Self {
-            vmas,
+            vmas: VmaList {
+                list: vmas,
+                version: 0,
+            },
+            id: NEXT_MM_ID.fetch_add(1, Ordering::Relaxed),
             mmap_base: self.mmap_base,
             mmap_legacy_base: self.mmap_legacy_base,
             topdown: self.topdown,
@@ -237,6 +276,13 @@ impl Mm {
     #[must_use]
     pub fn vmas(&self) -> &[Vma] {
         &self.vmas
+    }
+
+    /// Names this address space and the state of its VMA vector: equal stamps
+    /// mean [`Mm::vmas`] is unchanged (a copy taken earlier is still exact).
+    #[must_use]
+    pub fn vma_stamp(&self) -> (u64, u64) {
+        (self.id, self.vmas.version)
     }
     /// `mm->map_count`.
     #[must_use]

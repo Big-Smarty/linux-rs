@@ -119,14 +119,14 @@ pub struct HostInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShowScope {
     /// The files of one thread group: the caller's own view is brought up to
-    /// date first when it is the one shown. The machine-wide sums of
-    /// [`HostInfo`] (`cpustat`, `anon_pages`, `mapped_pages`, `pagetable_kb`)
-    /// are zero.
+    /// date first when it is the one shown.
     Pid(i32),
-    /// The global files: every task's counters are summed.
+    /// The global files: the caller's own view is brought up to date first,
+    /// so the machine-wide sums of [`HostInfo`] (`cpustat`, `anon_pages`,
+    /// `mapped_pages`, `pagetable_kb`, which the procfs state keeps as running
+    /// totals of the published views) include its current figures.
     Machine,
-    /// Nothing about any task (the sysctls, a task-existence check): the
-    /// machine-wide sums are zero.
+    /// Nothing about any task (the sysctls, a task-existence check).
     Plain,
 }
 
@@ -629,7 +629,7 @@ fn maps(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     let Some(mm) = &view.mm else {
         return Ok(());
     };
-    for vma in &mm.vmas {
+    for vma in mm.vmas.iter() {
         show_map_vma(show, mm, vma, seq)?;
         seq.end_record()?;
     }
