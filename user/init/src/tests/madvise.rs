@@ -1216,7 +1216,11 @@ fn guard(t: &mut T, probe: &Probe) {
     );
     // Locked mappings take no new guard but may lose theirs.
     let l = map_at(win(2), 2, PROT_RW, MAP_LOCKED);
-    t.eq("guard-install-locked", madv(l, 2 * P, GUARD_INSTALL), E_INVAL);
+    t.eq(
+        "guard-install-locked",
+        madv(l, 2 * P, GUARD_INSTALL),
+        E_INVAL,
+    );
     t.eq("guard-remove-locked", madv(l, 2 * P, GUARD_REMOVE), Ok(0));
     unmap(l, 2);
     // A guard disappears with the mapping.

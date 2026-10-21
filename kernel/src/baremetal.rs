@@ -94,7 +94,8 @@ const MAX_PROOFS: usize = 40;
 /// Inventory facts the summary repeats: cpu, memory, platform, time, display, pci, adapters.
 const KEYS: usize = 7;
 const NONE: usize = usize::MAX;
-const MAX_GROUPS: usize = 24;
+const MAX_GROUPS: usize = 16;
+const _: () = assert!(GROUPS.len() <= MAX_GROUPS);
 /// Extra `suite_groups=` words of the QEMU harness: `/init` modes that end a
 /// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not; a
 /// loop that never ends; the same loop in a child while init waits for it, so the time bound
