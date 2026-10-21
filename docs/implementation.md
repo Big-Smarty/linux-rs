@@ -2,7 +2,7 @@
 
 ## Current status
 
-Observed 2026-10-21 at `main` **9804570** (the merge of PR #35; v0.2.0 is the annotated tag at `59b09a9`, the merge of PR #28, whose executable sources equal `0eb3b1d`). **This section is the single authoritative status of what is implemented, tested and open.** Everything below it is a chronological record: each section describes the commit, pull request or artifact it names, was true when written and is **not** updated when later work changes the facts. Where a history section and this section disagree, this section and [next steps](next-steps.md) win. Nothing here is whole-kernel completion, physical qualification or a performance result.
+Observed 2026-10-21 at `main` **9804570** (the merge of PR #35; v0.2.0 is the annotated tag at `59b09a9`, the merge of PR #28, whose executable sources equal `0eb3b1d`). **This section is the single authoritative status of what is implemented, tested and open.** Everything below it, except the maintained [routing table](#routed-implementation-status), is a chronological record: each section describes the commit, pull request or artifact it names, was true when written and is **not** updated when later work changes the facts. Where a history section and this section disagree, this section, the [support matrix](compatibility.md#current-support-matrix) and [next steps](next-steps.md) win. Nothing here is whole-kernel completion, physical qualification or a performance result.
 
 What runs: the [support matrix](compatibility.md#current-support-matrix); how it is built: [implemented architecture](architecture.md#implemented-architecture).
 
