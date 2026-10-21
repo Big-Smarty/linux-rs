@@ -54,7 +54,7 @@ use crate::{
     services::{self, Service, ServiceGuard},
     timer,
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdseed64_step, _rdtsc},
     cell::UnsafeCell,
@@ -77,6 +77,11 @@ use kernel::{
     image::elf::Elf,
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
+    procfs::{
+        Caller, MmTotals,
+        show::{HostInfo, Show, ShowScope},
+        view::Collect,
+    },
     ratelimit::RateLimit,
     sched::{CLASS_VFORK, PIPE_KEY, SchedId, TaskState, WaitKey, WakeMode},
     signal::{
@@ -509,6 +514,13 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
         ENVP.iter().copied(),
         &aux,
     )?;
+    mm.record_stack(
+        built.sp,
+        built.arg_start,
+        built.arg_end,
+        built.env_start,
+        built.env_end,
+    );
     let top = top.into_reserved();
     // SAFETY: `top` is the live order-two reservation just made; no token,
     // reference or mapping of it exists yet. Afterwards each page is its own
@@ -768,14 +780,38 @@ struct Owned {
     /// This task's address space is in use by its `vfork` child (the tree and VMA set in
     /// `TaskLocal` are placeholders): its pins must outlive this task's exit.
     lent_out: bool,
+    /// The counters `/proc/<pid>/{stat,status}` show.
+    stats: Stats,
 }
 
 /// The parent of a `vfork` child.
 #[derive(Clone, Copy)]
 struct Lender {
     sched: SchedId,
+    /// The parent's thread group: its `/proc` view follows its address space.
+    tgid: i32,
     /// The child works in the parent's address space (`CLONE_VM`).
     lent: bool,
+}
+
+/// `task_struct`'s `start_boottime`, `min_flt`, `maj_flt`, `nvcsw` and `nivcsw`.
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    start_ns: u64,
+    min_flt: u64,
+    maj_flt: u64,
+    nvcsw: u64,
+    nivcsw: u64,
+}
+
+impl Stats {
+    /// A task created now.
+    fn started() -> Self {
+        Self {
+            start_ns: timer::ktime_get_boottime_ns(),
+            ..Self::default()
+        }
+    }
 }
 
 impl Owned {
@@ -828,7 +864,10 @@ fn vfork_done_key(parent: SchedId) -> WaitKey {
 /// `complete_vfork_done`, called by the child when it execs or exits: the parent wakes (and
 /// takes back its address space). A parent that no longer exists (it was killed while it
 /// waited) cannot take it: the address space is freed here, with the mappings' pins it left.
-fn complete_vfork(lender: Lender, key: u32, lent: Option<Lent>, vfs: &mut Vfs) {
+///
+/// `from` is the thread group that lets go of the address space: a lender that is still alive
+/// shows what that task's view showed.
+fn complete_vfork(lender: Lender, key: u32, lent: Option<Lent>, from: i32, vfs: &mut Vfs) {
     let alive = matches!(ktask::state(lender.sched), Some(state) if state != TaskState::Dead);
     // Taken as its own statement: an `if let` scrutinee guard lives through the whole branch
     // (edition 2024), and the recursion below must run with `VFORK_FORWARD` released.
@@ -838,11 +877,14 @@ fn complete_vfork(lender: Lender, key: u32, lent: Option<Lent>, vfs: &mut Vfs) {
         VFORK_FORWARD.lock()[lender.sched.index()].take()
     };
     if alive {
+        if lent.is_some() {
+            vfs.fs.ns.proc.return_mm(lender.tgid, from);
+        }
         VFORK_DONE.lock()[lender.sched.index()] = Some(Done { lent });
         ktask::wake_up_key(vfork_done_key(lender.sched), WakeMode::Normal, 0);
     } else if let Some(next) = next {
         // The lender died borrowing: the address space goes to whom it borrowed it from.
-        complete_vfork(next, key, lent, vfs);
+        complete_vfork(next, key, lent, from, vfs);
     } else if let Some(lent) = lent {
         vfs.unpin_all(key);
         destroy_tables(lent.tables);
@@ -946,6 +988,210 @@ fn take_local(slot: usize) -> Option<Box<TaskLocal>> {
     unsafe { (*entry.cell.get()).take() }
 }
 
+/// The most `cmdline`/`environ` bytes copied for other readers at `execve`
+/// (`ARG_MAX`'s order of magnitude: the exec path caps the block far below).
+const MAX_PUBLISHED_ARGS: u64 = 2 << 20;
+
+/// Publish what `/proc/<pid>/*` shows of `own` for the readers of other tasks
+/// (see `procfs::view`): called by the task itself when it is about to leave
+/// the CPU (a sleep, a preemption, a stop), when it reads its own entries, and
+/// for a new child.
+///
+/// Context: task, `PROCESS` held by the caller (`vfs` lock class); allocates
+/// fallibly (`ENOMEM` leaves the previous view in place). The time is
+/// proportional to what changed since the task's last publication: the
+/// descriptors replay the table's change log, the VMA vector is shared until
+/// its stamp moves, and the resident-page and page-table figures are counters
+/// (`procfs::view`).
+fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Result<(), Errno> {
+    let tgid = own.tgid.cast_signed();
+    // The argument and environment bytes are copied when the layout changes
+    // (an `execve`) and kept otherwise.
+    let layout = (own.space.arg_start, own.space.env_end);
+    // A parent whose address space is lent to its `vfork` child publishes no address space (the
+    // slot holds a placeholder): the child works in the same `mm_struct` and its view stands for
+    // both (`ProcState::mm_of`). The exec-time bytes stay what they were.
+    let lent = own.lent_out;
+    let kept = process.vfs.fs.ns.proc.view(tgid).and_then(|view| {
+        let same_image = lent
+            || view
+                .mm
+                .as_ref()
+                .is_some_and(|mm| (mm.arg_start, mm.env_end) == layout);
+        (same_image && !view.args().is_empty())
+            .then(|| view.args.clone())
+            .flatten()
+    });
+    let args = if kept.is_some() {
+        kept
+    } else {
+        let len = layout.1.saturating_sub(layout.0).min(MAX_PUBLISHED_ARGS);
+        let mut bytes = Vec::new();
+        if len > 0 && layout.0 != 0 {
+            let len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+            bytes.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
+            for _ in 0..len {
+                let _ = bytes.push_within_capacity(0);
+            }
+            let missing = usercopy::copy_from_user(space, &mut bytes, layout.0);
+            bytes.truncate(len - missing);
+        }
+        if bytes.is_empty() {
+            None
+        } else {
+            Some(Arc::try_new(bytes).map_err(|_| Errno::ENOMEM)?)
+        }
+    };
+    // The self-test builds prove the counters against the walks they replaced.
+    #[cfg(feature = "qemu-self-test")]
+    space.check_counters(own.space.vmas());
+    let vfs = &mut process.vfs;
+    vfs.fs.ns.proc.publish_update(
+        tgid,
+        Collect {
+            attrs: &own.attrs,
+            fdt: &own.fdt,
+            files: &vfs.files,
+            mm: (!lent).then_some(&own.space),
+            exe: Some(own.exe_file),
+            rss: space.rss(),
+            pgtables_bytes: space.table_bytes(),
+            min_flt: own.stats.min_flt,
+            maj_flt: own.stats.maj_flt,
+            nvcsw: own.stats.nvcsw,
+            nivcsw: own.stats.nivcsw,
+            start_boottime_ns: own.stats.start_ns,
+            flags: 0,
+            args,
+        },
+    )
+}
+
+/// The address space `own` works in, published to its own view: the part of [`publish`] that a
+/// `vfork` hand-back needs, since the lender's view takes over what this task's last showed.
+fn publish_mm(vfs: &mut Vfs, own: &Owned, space: &mut UserSpace<'_>) {
+    let _ = vfs.fs.ns.proc.publish_mm(
+        own.tgid.cast_signed(),
+        &own.space,
+        space.rss(),
+        space.table_bytes(),
+    );
+}
+
+/// [`publish`] for the running task, taking its state and `PROCESS`.
+fn publish_current() {
+    let mut local = current_local();
+    let TaskLocal { tables, own } = &mut *local;
+    let mut process = PROCESS.lock();
+    let _ = publish(&mut process, own, &mut tables.user_space());
+}
+
+/// The machine's counters for the global files of /proc.
+///
+/// Context: task; takes `FRAMES` and `LOAD` (leaf locks) while `process` is held.
+#[allow(clippy::too_many_lines)] // one straight list of the counters /proc shows
+fn host_info(process: &Process, own: &Owned) -> Result<HostInfo, Errno> {
+    let up = timer::ktime_get_boottime_ns();
+    let (total_pages, free_pages) = {
+        let frames = services::FRAMES.lock();
+        (frames.total() as u64, frames.available() as u64)
+    };
+    // `get_avenrun(loads, FIXED_1/200, 0)`-style: the sysinfo scale is
+    // `<< (SI_LOAD_SHIFT - FSHIFT)` = `<< 5` of the FSHIFT fixed point.
+    let loads = LOAD.lock().loads_at(
+        jiffies_of(up),
+        i64::try_from(ktask::nr_active()).unwrap_or(i64::MAX),
+    );
+    let avenrun = loads.map(|v| v >> 5);
+    let mut cmdline = Vec::new();
+    let line = services::boot().command_line();
+    cmdline
+        .try_reserve_exact(line.len())
+        .map_err(|_| Errno::ENOMEM)?;
+    for &byte in line {
+        let _ = cmdline.push_within_capacity(byte);
+    }
+    // `kernel_cpustat`: the tick-accounted time of all tasks (the exited ones
+    // included); the idle time is what is left of the uptime. The address-space
+    // figures are the sums the published views keep.
+    let (user, system) = ktask::kcpustat();
+    let idle = up.saturating_sub(user + system);
+    let MmTotals {
+        anon_pages: anon,
+        mapped_pages: mapped,
+        pgtables_bytes: tables_bytes,
+    } = process.vfs.fs.ns.proc.totals();
+    let mut irqs = Vec::new();
+    irqs.try_reserve_exact(16).map_err(|_| Errno::ENOMEM)?;
+    for irq in 0..16 {
+        let _ = irqs.push_within_capacity(cpu::isa_irq_count(irq));
+    }
+    let mut chrdevs = Vec::new();
+    chrdevs
+        .try_reserve_exact(CHRDEVS.len())
+        .map_err(|_| Errno::ENOMEM)?;
+    for entry in CHRDEVS {
+        let _ = chrdevs.push_within_capacity(entry);
+    }
+    let real = timer::ktime_get_real();
+    Ok(HostInfo {
+        uptime_ns: up,
+        idle_ns: idle,
+        total_pages,
+        free_pages,
+        avenrun,
+        cmdline,
+        nr_running: u64::try_from(ktask::nr_active()).unwrap_or(0),
+        last_pid: process.tasks.last_pid(),
+        forks: process.tasks.forks(),
+        ctxt: ktask::context_switches(),
+        boot_real_s: real.sec - i64::try_from(up / 1_000_000_000).unwrap_or(0),
+        cpustat: [user, 0, system, idle, 0, 0, 0, 0, 0, 0],
+        irqs,
+        arch_irqs: cpu::arch_irq_stat(),
+        softirqs: [0; 10],
+        tty_pgrp: process.tty.ctrl.pgrp.map_or(0, |pgrp| pgrp.nr),
+        shmem_pages: process.vfs.fs.tmpfs_pages(),
+        kernel_stack_kb: u64::try_from(ktask::tasks_in_use()).unwrap_or(0) * 64,
+        slab_kb: (crate::kalloc::requested_bytes() as u64) >> 10,
+        anon_pages: anon,
+        mapped_pages: mapped,
+        pagetable_kb: tables_bytes >> 10,
+        sched_state: ktask::state,
+        cpu_time: |sched| ktask::cpu_account(sched).adjusted(timer::ktime_get_ns()),
+        uts: [
+            b"Linux",
+            syscall::UTS_RELEASE,
+            syscall::UTS_VERSION,
+            b"(none)",
+            b"(none)",
+        ],
+        cpu: cpu_facts(),
+        chrdevs,
+        threads_max: task::max_threads(total_pages),
+        pid_max: 32768,
+        max_map_count: u64::from(own.env.max_map_count),
+        mmap_min_addr: 4096,
+        overcommit_memory: 0,
+        compile_by: b"linux-rs@build",
+        compiler: COMPILER,
+    })
+}
+
+/// The `LINUX_COMPILER` of /proc/version: the pinned toolchain.
+const COMPILER: &[u8] =
+    b"rustc 1.101.0-nightly (5c543b0b8c73c7b72bc8284ced4fb22ead15734d) LLVM 23.1.1";
+
+/// The character devices this kernel serves, `(major, name)` as
+/// /proc/devices lists them (`register_chrdev` names).
+const CHRDEVS: [(u32, &str); 5] = [
+    (1, "mem"),
+    (4, "/dev/vc/0"),
+    (4, "tty"),
+    (4, "ttyS"),
+    (5, "/dev/tty"),
+];
+
 /// The system-wide state a system call touches, taken on first use and
 /// dropped before the task sleeps (see [`Process`]). Taking it again after a
 /// sleep re-reads everything, as Linux's `wait_event` does.
@@ -975,10 +1221,13 @@ struct Syscall<'a> {
 }
 
 /// `handle_mm_fault` for one user address: the model's decision, and for a
-/// page of a private file mapping (`NeedsFile`) `shmem_fault` + `do_cow_fault`:
-/// a private frame holding the file page ([`Vfs::fault_page`]; `SIGBUS` past
-/// `i_size`), mapped with the VMA's protection. `owner` is the faulting
-/// task's mapping-pin key.
+/// page of a private file mapping (`NeedsFile`) `shmem_fault` + `do_read_fault`
+/// / `do_cow_fault`: a private frame holding the file page ([`Vfs::fault_page`];
+/// `SIGBUS` past `i_size`). A read fault maps it read-only (`do_read_fault`
+/// maps the page-cache page without `FAULT_FLAG_WRITE`, so `RssShmem`; the
+/// first write takes the write-protect fault that copies it), a write fault
+/// with the VMA's protection (`do_cow_fault`, `RssAnon`). `owner` is the
+/// faulting task's mapping-pin key.
 fn user_fault(
     mm: &mut Mm,
     env: &Env,
@@ -989,7 +1238,7 @@ fn user_fault(
     error: u64,
 ) -> FaultOutcome {
     let outcome = mm.handle_user_fault(env, space, address, error);
-    let FaultOutcome::NeedsFile { address, .. } = outcome else {
+    let FaultOutcome::NeedsFile { address, write } = outcome else {
         return outcome;
     };
     let page = address & !(PAGE - 1);
@@ -1012,10 +1261,14 @@ fn user_fault(
     let pgoff = vma.pgoff + ((page - vma.start) >> 12);
     match vfs.fault_page(owner, file, pgoff, &mut bytes) {
         Err(FileFault::Bus) => FaultOutcome::Bus { address },
-        Ok(()) => match space.install(page, mm::page_prot(vma.flags), &bytes) {
-            Ok(()) => FaultOutcome::Handled,
-            Err(mm::OutOfMemory) => FaultOutcome::Oom,
-        },
+        Ok(()) => {
+            let mut prot = mm::page_prot(vma.flags);
+            prot.write &= write;
+            match space.install(page, prot, true, &bytes) {
+                Ok(()) => FaultOutcome::Handled,
+                Err(mm::OutOfMemory) => FaultOutcome::Oom,
+            }
+        }
     }
 }
 
@@ -1039,6 +1292,9 @@ struct FaultPages<'a, 'b> {
     vfs: &'a mut Vfs,
     owner: u32,
     space: &'a mut UserSpace<'b>,
+    /// `current->min_flt`: a fault the kernel itself took on the task's behalf counts too
+    /// (`mm_account_fault`).
+    faults: &'a mut u64,
 }
 
 /// The `State` view of a task's signal objects (`me` is in the task list for as
@@ -1067,6 +1323,7 @@ impl<'a, 'b> FaultPages<'a, 'b> {
                 vfs: &mut process.vfs,
                 owner,
                 space,
+                faults: &mut own.stats.min_flt,
             },
         )
     }
@@ -1088,7 +1345,7 @@ impl<'a, 'b> FaultPages<'a, 'b> {
             match user_fault(
                 self.mm, self.env, self.vfs, self.owner, self.space, page, error,
             ) {
-                FaultOutcome::Handled => {}
+                FaultOutcome::Handled => *self.faults += 1,
                 _ => return None,
             }
         }
@@ -1104,6 +1361,7 @@ impl UserPages for FaultPages<'_, '_> {
             vfs: &mut *self.vfs,
             owner: self.owner,
             space: &mut *self.space,
+            faults: &mut *self.faults,
         }
         .into_page(page, write)
     }
@@ -1118,6 +1376,7 @@ impl UserPages for Syscall<'_> {
             vfs: &mut self.shared.get().vfs,
             owner,
             space: &mut self.space,
+            faults: &mut self.own.stats.min_flt,
         }
         .into_page(page, write)
     }
@@ -1327,9 +1586,19 @@ impl Syscall<'_> {
         attrs.clear_child_tid = request.clear_child_tid;
         attrs.robust_list = 0;
         let tid = pid.cast_unsigned();
-        let (tables, space) = match memory {
+        let (mut tables, space) = match memory {
             ChildMemory::Copy { space, tables } => (tables, space),
             ChildMemory::Lend { placeholder } => {
+                // The parent's view is brought up to date with the address space it lends
+                // (what it mapped or exec'd since it last published), then it follows the
+                // child, who works in the same `mm_struct`.
+                let _ = publish(process, self.own, &mut self.space);
+                process
+                    .vfs
+                    .fs
+                    .ns
+                    .proc
+                    .lend_mm(self.own.tgid.cast_signed(), tid.cast_signed());
                 // The child takes the real tree and VMA set, the parent the placeholders.
                 let tables = self.space.replace_tables(placeholder);
                 let space = core::mem::replace(&mut self.own.space, Mm::new(&self.own.env));
@@ -1337,32 +1606,34 @@ impl Syscall<'_> {
                 (tables, space)
             }
         };
-        let local = Box::write(
-            block,
-            TaskLocal {
-                tables,
-                own: Owned {
-                    me: child,
-                    sched,
-                    tgid: tid,
-                    tid,
-                    attrs,
-                    restart: RestartBlock::NONE,
-                    space,
-                    env: self.own.env,
-                    exe_file: self.own.exe_file,
-                    exec: self.own.exec,
-                    fdt,
-                    pin_owner: child_owner,
-                    vfork_parent: request.vfork.then_some(Lender {
-                        sched: self.own.sched,
-                        lent: request.share_vm,
-                    }),
-                    pending_mm: None,
-                    lent_out: false,
-                },
-            },
-        );
+        let own = Owned {
+            me: child,
+            sched,
+            tgid: tid,
+            tid,
+            attrs,
+            restart: RestartBlock::NONE,
+            space,
+            env: self.own.env,
+            exe_file: self.own.exe_file,
+            exec: self.own.exec,
+            fdt,
+            pin_owner: child_owner,
+            vfork_parent: request.vfork.then_some(Lender {
+                sched: self.own.sched,
+                tgid: self.own.tgid.cast_signed(),
+                lent: request.share_vm,
+            }),
+            pending_mm: None,
+            lent_out: false,
+            stats: Stats::started(),
+        };
+        // The child is visible to /proc from now on: its first view, taken
+        // from the state it was just given (the parent may read it before the
+        // child ever runs). A refusal leaves the child without a view until
+        // it first leaves the CPU; the files of /proc then answer `ESRCH`.
+        let _ = publish(process, &own, &mut tables.user_space());
+        let local = Box::write(block, TaskLocal { tables, own });
         install_local(sched.index(), local);
         // wake_up_new_task: the child is on the run queue; it first runs when
         // the parent next gives up the CPU.
@@ -1403,6 +1674,10 @@ impl Syscall<'_> {
 }
 
 /// The address space a forked child starts with.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a local of one fork, moved once; boxing would add a fallible allocation to the common path"
+)]
 enum ChildMemory {
     /// `dup_mmap`: its own copy.
     Copy { space: Mm, tables: Tables },
@@ -1578,6 +1853,9 @@ impl Context for Syscall<'_> {
             return;
         };
         let lent = if lender.lent {
+            // The address space goes back to the lender: its view shows what this task's did,
+            // brought up to date first.
+            publish_mm(&mut self.shared.get().vfs, self.own, &mut self.space);
             let Some((tables, space)) = self.own.pending_mm.take() else {
                 crate::log!("FAIL vfork child's exec without its new address space\n");
                 crate::fail();
@@ -1601,7 +1879,78 @@ impl Context for Syscall<'_> {
         if lender.lent {
             self.own.pin_owner = next_pin_owner();
         }
-        complete_vfork(lender, key, lent, &mut self.shared.get().vfs);
+        let from = self.own.tgid.cast_signed();
+        complete_vfork(lender, key, lent, from, &mut self.shared.get().vfs);
+    }
+    fn sync_proc(&mut self) {
+        let process = self.shared.get();
+        // Nothing reads the mirror or a view before a procfs is mounted.
+        if !process.vfs.fs.ns.has_proc() {
+            process.vfs.fs.ns.proc.prune(&process.tasks);
+            return;
+        }
+        // A refusal keeps the previous mirror: lookups of the newest pids may
+        // miss until memory is available.
+        let _ = process.vfs.sync_proc(&process.tasks);
+        // A walk or a directory read through the caller's own `/proc/<pid>` sees its published
+        // view: bring that up to date when a descriptor, the root, the working directory or the
+        // executable changed since it was taken. Only those parts are rebuilt: the address space
+        // is published when a file of `/proc` is read, and when the task leaves the CPU.
+        let tgid = self.own.tgid.cast_signed();
+        let (fs, exe, fd_stamp) = (self.own.attrs.fs, self.own.exe_file, self.own.fdt.stamp());
+        let stale = process.vfs.fs.ns.proc.view(tgid).is_none_or(|v| {
+            v.fd_stamp != fd_stamp
+                || v.attrs.fs.root != fs.root
+                || v.attrs.fs.pwd != fs.pwd
+                || v.exe.map(|e| e.file) != Some(exe)
+        });
+        if !stale {
+            return;
+        }
+        if process.vfs.fs.ns.proc.view(tgid).is_none() {
+            let _ = publish(process, self.own, &mut self.space);
+            return;
+        }
+        let vfs = &mut process.vfs;
+        let files = &vfs.files;
+        if let Some(view) = vfs.fs.ns.proc.view_mut(tgid) {
+            let _ = view.refresh_files(&self.own.attrs, &self.own.fdt, files, exe);
+        }
+    }
+    fn with_show<R>(
+        &mut self,
+        scope: ShowScope,
+        f: impl FnOnce(&Show<'_>) -> R,
+    ) -> Result<R, Errno> {
+        // The caller's own view is current before anyone reads it: when its
+        // own files are shown, or every task's counters are summed.
+        // A `vfork` child works in its lender's address space, which the lender's files show:
+        // its own is current before it reads anyone's.
+        let mine = self.own.tgid.cast_signed();
+        if matches!(scope, ShowScope::Machine)
+            || scope == ShowScope::Pid(mine)
+            || self.own.vfork_parent.is_some_and(|lender| lender.lent)
+        {
+            publish(self.shared.get(), self.own, &mut self.space)?;
+        }
+        let process = self.shared.get();
+        let host = host_info(process, self.own)?;
+        let caller = Caller {
+            tgid: self.own.tgid.cast_signed(),
+            cred: vfs::Cred::of_task(&self.own.attrs.cred),
+        };
+        let show = Show {
+            vfs: &process.vfs,
+            tasks: &process.tasks,
+            host: &host,
+            caller,
+            root: self.own.attrs.fs.root,
+        };
+        Ok(f(&show))
+    }
+    fn mm_args(&mut self) -> Option<(u64, u64, u64, u64)> {
+        let mm = &self.own.space;
+        Some((mm.arg_start, mm.arg_end, mm.env_start, mm.env_end))
     }
 }
 
@@ -1668,6 +2017,10 @@ impl<'a> signal::Task for Syscall<'a> {
         if let Some(process) = self.shared.guard.as_mut() {
             wake_sleepers(process);
         }
+        // Other tasks run while this one sleeps: what /proc shows of it is
+        // published now, since only the task itself can see its state.
+        self.own.stats.nvcsw += 1;
+        let _ = publish(self.shared.get(), self.own, &mut self.space);
         // No lock is held while the task is off the CPU: another task runs
         // system calls meanwhile. The time until it is chosen again is not
         // the task's (the switch marks it off the CPU).
@@ -1757,12 +2110,24 @@ fn exit_mm(mut tables: Tables, own: &mut Owned, vfs: &mut Vfs) {
         // left here are placeholders. The borrowed space cannot go back yet; the child's
         // completion forwards it to the lender, who keeps sleeping until then.
         Some(lender) if lender.lent && own.lent_out => {
+            // The lender's view follows the child that holds the address space now.
+            vfs.fs
+                .ns
+                .proc
+                .skip_lent(lender.tgid, own.tgid.cast_signed());
             destroy_tables(tables);
             VFORK_FORWARD.lock()[own.sched.index()] = Some(lender);
         }
         Some(lender) if lender.lent => {
+            publish_mm(vfs, own, &mut tables.user_space());
             let space = core::mem::replace(&mut own.space, Mm::new(&own.env));
-            complete_vfork(lender, owner, Some(Lent { tables, space }), vfs);
+            complete_vfork(
+                lender,
+                owner,
+                Some(Lent { tables, space }),
+                own.tgid.cast_signed(),
+                vfs,
+            );
         }
         other => {
             destroy_tables(tables);
@@ -1771,7 +2136,7 @@ fn exit_mm(mut tables: Tables, own: &mut Owned, vfs: &mut Vfs) {
                 vfs.unpin_all(owner);
             }
             if let Some(lender) = other {
-                complete_vfork(lender, owner, None, vfs);
+                complete_vfork(lender, owner, None, own.tgid.cast_signed(), vfs);
             }
         }
     }
@@ -1825,6 +2190,8 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
     shared.vfs.fput(own.exe_file);
     shared.vfs.close_files(&mut own.fdt);
     shared.vfs.put_fs(&own.attrs.fs);
+    // The address space, descriptors and filesystem context are gone for /proc.
+    shared.vfs.fs.ns.proc.exit(own.tgid.cast_signed());
     // `disassociate_ctty(1)` of a session leader (after `exit_files`, before
     // `exit_notify`), and the tty's last close if this exit was it.
     {
@@ -1978,8 +2345,16 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
     let mut after_stop = false;
     loop {
         // `exit_to_user_mode_loop`: `TIF_NEED_RESCHED` first; this task continues,
-        // with everything re-examined below, when it is chosen again.
+        // with everything re-examined below, when it is chosen again. What
+        // /proc shows of it is published before it leaves the CPU.
+        if ktask::resched_wanted() {
+            publish_current();
+        }
+        let switches = ktask::context_switches();
         ktask::preempt_user(regs.orig_ax == u64::MAX);
+        if ktask::context_switches() != switches {
+            current_local().own.stats.nivcsw += 1;
+        }
         let mut local = current_local();
         let TaskLocal { tables, own } = &mut *local;
         let mut process = PROCESS.lock();
@@ -2034,6 +2409,7 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
                     let me = own.me;
                     let Process { tasks, wake, .. } = &mut *process;
                     if let StopPlan::Stop { fatal } = tasks.signal_stop(me, sig, wake) {
+                        let _ = publish(&mut process, own, &mut tables.user_space());
                         // `set_special_state(TASK_STOPPED)` and `schedule()`: no
                         // guard is held while the task is off the CPU, and a
                         // fatal signal already pending keeps it running (it
@@ -2312,6 +2688,7 @@ fn page_fault(
     );
     let kind = match outcome {
         FaultOutcome::Handled => {
+            own.stats.min_flt += 1;
             #[cfg(all(feature = "qemu-self-test", not(feature = "baremetal-suite")))]
             USER_FAULTS_HANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return true;
@@ -2975,6 +3352,9 @@ fn start(mut init: Loaded) {
         kernel::tty::Tty::new().map_err(|_| "out of memory"),
         "console-tty",
     );
+    init.vfs.set_ram_pages(managed_pages);
+    init.vfs.fs.ns.proc.cmdline_size =
+        i64::try_from(services::boot().command_line().len()).unwrap_or(0) + 1;
     PROCESS.install(Process {
         tasks,
         wake: SchedWaker,
@@ -3012,6 +3392,7 @@ fn start(mut init: Loaded) {
                 vfork_parent: None,
                 pending_mm: None,
                 lent_out: false,
+                stats: Stats::started(),
             },
         })
         .map_err(|_| "init task state"),
@@ -3048,8 +3429,28 @@ fn start(mut init: Loaded) {
             process
                 .vfs
                 .pin(local.own.owner(), u64::from(init.exec.index()));
+            // init's first view for /proc.
+            let tables = &mut local.tables;
+            let own = &local.own;
+            let _ = publish(&mut process, own, &mut tables.user_space());
             drop(process);
             install_local(sched.index(), local);
         });
     }
+}
+
+/// The CPU facts of `/proc/cpuinfo`: `cpuid` is read once (it can cost a VM
+/// exit per leaf); the TSC frequency is refreshed on every call.
+fn cpu_facts() -> kernel::procfs::cpuinfo::CpuFacts {
+    static FACTS: crate::services::IrqMutex<Option<kernel::procfs::cpuinfo::CpuFacts>> =
+        crate::services::IrqMutex::new(None);
+    let mut slot = FACTS.lock();
+    let mut facts = *slot.get_or_insert_with(|| {
+        kernel::procfs::cpuinfo::CpuFacts::read(|leaf, sub| {
+            let r = raw_cpuid::native_cpuid::cpuid_count(leaf, sub);
+            [r.eax, r.ebx, r.ecx, r.edx]
+        })
+    });
+    facts.tsc_khz = timer::tsc_khz();
+    facts
 }

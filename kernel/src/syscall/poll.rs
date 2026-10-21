@@ -39,6 +39,7 @@ use syscalls::{Errno, Sysno};
 
 const POLLIN: u16 = 0x0001;
 const POLLOUT: u16 = 0x0004;
+const POLLPRI: u16 = 0x0002;
 const POLLERR: u16 = 0x0008;
 const POLLHUP: u16 = 0x0010;
 const POLLNVAL: u16 = 0x0020;
@@ -297,7 +298,31 @@ fn vfs_poll<C: Context>(ctx: &mut C, view: &super::fd::View) -> Result<u16, Stop
             super::tty::poll_mask(ctx, view)
         }
         // No `->poll`: `DEFAULT_POLLMASK`.
-        FileKind::Regular | FileKind::Directory | FileKind::Char(_) => DEFAULT_POLLMASK,
+        FileKind::Proc
+            if view
+                .inode
+                .and_then(crate::procfs::ProcNode::of)
+                .is_some_and(|node| {
+                    matches!(
+                        node.kind,
+                        crate::procfs::Kind::Mounts | crate::procfs::Kind::Mountinfo
+                    )
+                }) =>
+        {
+            // mounts_poll: readable, and EPOLLERR | EPOLLPRI once per mount table change.
+            let vfs = &mut *ctx.files().vfs;
+            let event = vfs.fs.ns.event;
+            let file = vfs.files.get_mut(view.id);
+            let mut mask = POLLIN | POLLRDNORM;
+            if file.poll_event != event {
+                file.poll_event = event;
+                mask |= POLLERR | POLLPRI;
+            }
+            mask
+        }
+        FileKind::Regular | FileKind::Directory | FileKind::Proc | FileKind::Char(_) => {
+            DEFAULT_POLLMASK
+        }
         // `fdget` refused `O_PATH` already.
         FileKind::Path => POLLNVAL,
         FileKind::Unsupported => return Err(Stop::Unimplemented),

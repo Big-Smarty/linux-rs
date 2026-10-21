@@ -362,7 +362,7 @@ pub trait Cpu {
 }
 
 pub use crate::sched::WaitKey;
-pub use state::{Ids, State, TaskSignals};
+pub use state::{Ids, SigSets, State, TaskSignals};
 
 /// The task the signal syscalls and the blocking waits run for: the binary's
 /// process (and the host tests' fake). `parts` hands out the two disjoint

@@ -6,7 +6,9 @@
 // is at or past `i_size` is `-EINVAL`, hence `SIGBUS`), drivers/char/mem.c
 // (`mmap_zero`, `zero_fops`; the other `*_fops` have no `->mmap`), fs/pipe.c
 // (`pipefifo_fops`: no `->mmap`), fs/libfs.c (directory operations: no
-// `->mmap`). GPL-2.0-only / GPL-2.0.
+// `->mmap`), fs/proc/inode.c (`proc_reg_mmap`, `proc_reg_file_ops`), mm/vma.c
+// (`__mmap_setup`, `__mmap_new_file_vma`, `vms_abort_munmap_vmas`).
+// GPL-2.0-only / GPL-2.0.
 // Transformation: a mapping holds a reference on the open file description
 // (`vma->vm_file`, kept in [`Vfs`]'s pin list and reconciled with the VMA set
 // by the syscall layer); a file page is a private copy made at the first
@@ -22,9 +24,10 @@
 //!
 //! * shortcut: no page cache, so a `MAP_PRIVATE` file page is a private copy of
 //!   the tmpfs page taken when it is first touched (what `do_cow_fault` would
-//!   leave, also for a read fault, where Linux maps the shared page read-only
-//!   and a later write to the file shows through until the first private
-//!   write). A write or truncate of a file with a touched mapping therefore
+//!   leave; a read fault maps the copy read-only as `do_read_fault` maps the
+//!   page-cache page, so it counts as `RssShmem` and the first write copies it
+//!   again, but where Linux maps the shared page and a later write to the file
+//!   shows through until the first private write). A write or truncate of a file with a touched mapping therefore
 //!   sets [`Vfs::take_coherence_loss`], which the dispatcher turns into a loud
 //!   stop instead of letting the two diverge silently. A `MAP_SHARED` mapping
 //!   is created only through a description that cannot write (`VM_SHARED` is
@@ -44,6 +47,7 @@ use super::{
 };
 use crate::{
     mm::FileInfo,
+    procfs::{Kind, ProcNode},
     vfs::{FMODE_PATH, FMODE_READ, FMODE_WRITE},
 };
 use syscalls::Errno;
@@ -94,10 +98,12 @@ impl Vfs {
             id: u64::from(id.index()),
             readable: file.mode & FMODE_READ != 0,
             writable: file.mode & FMODE_WRITE != 0,
-            noexec: false, // the rootfs is mounted without MNT_NOEXEC
+            // path_noexec: a `noexec` mount, or a procfs superblock (`SB_I_NOEXEC`).
+            noexec: file.inode.is_some_and(|inode| self.fs.path_noexec(inode)),
             swapfile: false,
             append_only: false, // no chattr +a: `IS_APPEND` is never true
             can_mmap,
+            mmap_error: None,
             mmap_size_max,
             mmap_sync: false,
             hugepages: false,
@@ -119,6 +125,21 @@ impl Vfs {
                 | CharDev::Full,
             ) => Mappable::File(info(false, u64::MAX)),
             FileKind::Char(CharDev::Zero) => Mappable::Zero(info(true, u64::MAX)),
+            // A procfs regular file is `S_ISREG`: `MAX_LFS_FILESIZE`. The entries of the global
+            // table run on `proc_reg_file_ops`/`proc_iter_file_ops`, whose `->mmap` is
+            // `proc_reg_mmap`: `-EIO` for an entry without `proc_mmap` (all of them here). The
+            // process files, `fdinfo` and the sysctls have no `->mmap`.
+            FileKind::Proc => {
+                let global = file
+                    .inode
+                    .and_then(ProcNode::of)
+                    .is_some_and(|node| node.kind == Kind::Global);
+                let mut mapping = info(global, MAX_LFS_FILESIZE as u64);
+                if global {
+                    mapping.mmap_error = Some(Errno::EIO);
+                }
+                Mappable::File(mapping)
+            }
             FileKind::Path => return None,
             FileKind::Unsupported => Mappable::Unported,
         })

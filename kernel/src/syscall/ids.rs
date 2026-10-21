@@ -22,7 +22,7 @@
 //! Context: task context, no sleeping, no allocation; user memory only through
 //! `usercopy`. State lives in [`crate::task::Attributes`] (`ctx.attrs()`).
 
-use super::{Context, Outcome};
+use super::{Context, Outcome, Tasks};
 use crate::task::pid::PidType;
 use crate::task::{Attributes, COMM_LEN, LimitError, RLIM_INFINITY, RLIMIT_CPU, Rlimit};
 use crate::usercopy::{TASK_SIZE_MAX, copy_from_user, copy_to_user, put_user, strncpy_from_user};
@@ -353,7 +353,7 @@ pub const UTS_RELEASE: &[u8] = b"6.18.57";
 const UNAME26_PATCH: &[u8] = b"78";
 /// `UTS_VERSION`: Linux prints `#<build number> <config flags> <build date>`;
 /// this kernel has no build counter or date source, so it names itself.
-const UTS_VERSION: &[u8] = b"#1 linux-rs";
+pub const UTS_VERSION: &[u8] = b"#1 linux-rs";
 const NEW_UTS_LEN: usize = 65;
 const UTS_FIELDS: [&[u8]; 6] = [
     b"Linux",    // UTS_SYSNAME
@@ -530,15 +530,17 @@ fn arch_prctl<C: Context>(ctx: &mut C, option: i32, arg2: u64) -> Res {
 }
 
 const PR_GET_DUMPABLE: i32 = 3;
+const PR_SET_DUMPABLE: i32 = 4;
 const PR_GET_TIMING: i32 = 13;
 const PR_SET_TIMING: i32 = 14;
 const PR_SET_NAME: i32 = 15;
 const PR_GET_NAME: i32 = 16;
 const PR_GET_TIMERSLACK: i32 = 30;
 const PR_GET_NO_NEW_PRIVS: i32 = 39;
-/// `SUID_DUMP_USER`: an `mm` is dumpable unless `PR_SET_DUMPABLE` or a
-/// set-id exec says otherwise (neither exists here).
-const SUID_DUMP_USER: i64 = 1;
+/// `SUID_DUMP_DISABLE` and `SUID_DUMP_USER`: `PR_GET_DUMPABLE` reports the
+/// task's `mm`; `PR_SET_DUMPABLE` takes only these two.
+const SUID_DUMP_DISABLE: u64 = 0;
+const SUID_DUMP_USER: u64 = 1;
 /// `init_task.timer_slack_ns` (`init/init_task.c:146`); `PR_SET_TIMERSLACK` is
 /// not implemented, so it stays the default.
 const TIMER_SLACK_NS: i64 = 50_000;
@@ -583,7 +585,18 @@ fn known_prctl_option(option: i32) -> bool {
 /// `-EINVAL`.
 fn prctl<C: Context>(ctx: &mut C, option: i32, args: [u64; 4]) -> Res {
     match option {
-        PR_GET_DUMPABLE => Ok(SUID_DUMP_USER),
+        PR_GET_DUMPABLE => {
+            let Tasks { list, current, .. } = ctx.tasks();
+            Ok(i64::from(list.dumpable(current)))
+        }
+        PR_SET_DUMPABLE => {
+            if args[0] != SUID_DUMP_DISABLE && args[0] != SUID_DUMP_USER {
+                return Err(Errno::EINVAL.into());
+            }
+            let Tasks { list, current, .. } = ctx.tasks();
+            list.set_dumpable(current, args[0] == SUID_DUMP_USER);
+            Ok(0)
+        }
         PR_GET_TIMERSLACK => Ok(TIMER_SLACK_NS),
         PR_GET_NO_NEW_PRIVS => {
             if args.iter().any(|&arg| arg != 0) {
@@ -1416,6 +1429,18 @@ mod tests {
                 "{option:#x}"
             );
         }
+        // Dumpability is state: PR_SET_DUMPABLE takes 0 and 1 only.
+        assert_eq!(call(&mut t, Sysno::prctl, &[3]), ok(1));
+        assert_eq!(call(&mut t, Sysno::prctl, &[4, 0]), ok(0));
+        assert_eq!(call(&mut t, Sysno::prctl, &[3]), ok(0));
+        assert_eq!(call(&mut t, Sysno::prctl, &[4, 2]), err(Errno::EINVAL));
+        assert_eq!(
+            call(&mut t, Sysno::prctl, &[4, u64::MAX]),
+            err(Errno::EINVAL)
+        );
+        assert_eq!(call(&mut t, Sysno::prctl, &[3]), ok(0));
+        assert_eq!(call(&mut t, Sysno::prctl, &[4, 1]), ok(0));
+        assert_eq!(call(&mut t, Sysno::prctl, &[3]), ok(1));
         // Timing: a constant method.
         assert_eq!(call(&mut t, Sysno::prctl, &[13]), ok(0));
         assert_eq!(call(&mut t, Sysno::prctl, &[14, 0]), ok(0));
@@ -1439,7 +1464,6 @@ mod tests {
         // Options with real behaviour that this slice does not have.
         for option in [
             1u64,
-            4,
             22,
             25,
             52,

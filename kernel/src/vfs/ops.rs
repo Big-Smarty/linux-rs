@@ -25,16 +25,21 @@ use syscalls::Errno;
 use super::{
     __O_TMPFILE, AT_SYMLINK_NOFOLLOW, Cred, FMODE_CAN_READ, FMODE_CAN_WRITE, FMODE_LSEEK,
     FMODE_PATH, FMODE_PREAD, FMODE_PWRITE, FMODE_READ, FMODE_WRITE, FileId, FsStruct, InodeId,
-    KResult, Kstat, MAY_APPEND, MAY_EXEC, MAY_READ, MAY_WRITE, NAME_MAX, O_ACCMODE, O_APPEND,
-    O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_DSYNC, O_EXCL, O_NOATIME, O_NOCTTY, O_NOFOLLOW,
-    O_PATH, O_TRUNC, S_IALLUGO, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
-    S_IFSOCK, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, S_IXGRP, Timespec, VALID_OPEN_FLAGS, Vfs,
-    file::{CharDev, File, FileKind},
+    KResult, Kstat, MAX_LFS_FILESIZE, MAX_NON_LFS, MAY_APPEND, MAY_EXEC, MAY_READ, MAY_WRITE,
+    NAME_MAX, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_DSYNC, O_EXCL,
+    O_NOATIME, O_NOCTTY, O_NOFOLLOW, O_PATH, O_TRUNC, S_IALLUGO, S_IFBLK, S_IFCHR, S_IFDIR,
+    S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_IRWXUGO, S_ISGID, S_ISUID, S_ISVTX, S_IXGRP,
+    Timespec, VALID_OPEN_FLAGS, Vfs,
+    file::{CharDev, Dentry, File, FileKind},
     mkdev, new_decode_dev,
-    path::{self, LOOKUP_DIRECTORY, LOOKUP_FOLLOW, LastKind, WALK_TRAILING, Walk, permission},
+    path::{self, LOOKUP_DIRECTORY, LOOKUP_FOLLOW, LastKind, WALK_TRAILING, Walk},
     pipe::Pipe,
-    try_copy, try_push,
+    try_copy,
 };
+
+/// The mount id of the kernel-internal pipefs mount in the reference
+/// configuration (`/proc/<pid>/fdinfo` of a pipe, `init-reference-016`).
+pub const PIPEFS_MNT_ID: u32 = 13;
 
 /// What a path operation needs to know about the caller (`current`).
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +51,38 @@ pub struct Env {
     pub cred: Cred,
     /// `fs->umask`.
     pub umask: u32,
+    /// `task_tgid_vnr(current)`: what `/proc/self` names (0 for the kernel).
+    pub tgid: i32,
+}
+
+/// A truncation `inode_newsize_ok` refuses: `EFBIG`, and `SIGXFSZ` when the reason was the
+/// caller's `RLIMIT_FSIZE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewSizeRefused {
+    pub signal: bool,
+}
+
+/// `inode_newsize_ok` for a non-negative `length`: growing past `rlimit` (`RLIM_INFINITY` is
+/// `u64::MAX`) is `EFBIG` with `SIGXFSZ`, then growing past `s_maxbytes` is `EFBIG`; a size at or
+/// below `i_size` is no growth (the swap file case does not exist here).
+///
+/// # Errors
+/// [`NewSizeRefused`].
+pub const fn inode_newsize_ok(
+    i_size: u64,
+    length: u64,
+    s_maxbytes: u64,
+    rlimit: u64,
+) -> Result<(), NewSizeRefused> {
+    if i_size < length {
+        if rlimit != u64::MAX && length > rlimit {
+            return Err(NewSizeRefused { signal: true });
+        }
+        if length > s_maxbytes {
+            return Err(NewSizeRefused { signal: false });
+        }
+    }
+    Ok(())
 }
 
 /// `UTIME_NOW` / `UTIME_OMIT` (include/linux/stat.h): the special `tv_nsec` values of `utimensat`.
@@ -209,12 +246,14 @@ impl Vfs {
         if matches!(file.kind, FileKind::Char(dev) if dev.is_tty()) {
             self.tty_touched = true;
         }
-        match file.kind {
-            FileKind::Pipe { pipe, writer } => self.pipe_release(pipe, writer),
-            _ => {
-                if let Some(inode) = file.inode {
-                    self.fs.iput(inode);
-                }
+        if let FileKind::Pipe { pipe, writer } = file.kind {
+            self.pipe_release(pipe, writer);
+        } else {
+            if let Some(inode) = file.inode {
+                self.fs.iput(inode);
+            }
+            if let Some(entry) = file.dentry {
+                self.fs.iput(entry.parent);
             }
         }
     }
@@ -294,6 +333,7 @@ impl Vfs {
             start: root,
             cred: Cred::root(),
             umask: 0o022,
+            tgid: 0,
         }
     }
 
@@ -304,7 +344,15 @@ impl Vfs {
     /// # Errors
     /// See [`path::lookup`].
     pub fn lookup(&self, env: &Env, path: &[u8], flags: u32) -> KResult<InodeId> {
-        path::lookup(&self.fs, env, path, flags)
+        path::lookup(&self.fs, &self.files, env, path, flags)
+    }
+
+    /// `vfs_getattr` of an inode or node, with the mount it belongs to.
+    #[must_use]
+    pub fn getattr(&self, inode: InodeId) -> Kstat {
+        let mut stat = self.fs.getattr(inode);
+        stat.mnt_id = self.mnt_id_of(inode);
+        stat
     }
 
     /// `vfs_getattr` of a file (`vfs_fstat`): pipes are described by their
@@ -332,9 +380,10 @@ impl Vfs {
                     btime: p.time,
                     attributes: 0,
                     attributes_mask: 0,
+                    mnt_id: self.pipe_mnt_id(),
                 }
             }
-            (_, Some(inode)) => self.fs.getattr(inode),
+            (_, Some(inode)) => self.getattr(inode),
             _ => unreachable!("a file without an inode is a pipe"),
         }
     }
@@ -345,12 +394,22 @@ impl Vfs {
         if self.fs.is_dead(dir) {
             return Err(Errno::ENOENT); // IS_DEADDIR
         }
-        permission(self.fs.inode(dir), &env.cred, MAY_WRITE | MAY_EXEC)
+        self.fs.permission(env, dir, MAY_WRITE | MAY_EXEC)
+    }
+
+    /// The `i_op->unlink`/`rmdir` a procfs directory lacks: `EPERM` after the
+    /// permission and `may_delete` checks.
+    fn no_proc_create(dir: InodeId) -> KResult<()> {
+        if dir.is_proc() {
+            Err(Errno::EPERM)
+        } else {
+            Ok(())
+        }
     }
 
     /// `check_sticky`: whether the sticky bit lets the caller touch `victim`.
     fn sticky_ok(&self, env: &Env, dir: InodeId, victim: InodeId) -> bool {
-        let (d, v) = (self.fs.inode(dir), self.fs.inode(victim));
+        let (d, v) = (self.fs.node_attr(dir), self.fs.node_attr(victim));
         d.mode & S_ISVTX == 0
             || v.uid == env.cred.fsuid
             || d.uid == env.cred.fsuid
@@ -359,11 +418,13 @@ impl Vfs {
 
     /// `may_delete`.
     fn may_delete(&self, env: &Env, dir: InodeId, victim: InodeId, isdir: bool) -> KResult<()> {
-        permission(self.fs.inode(dir), &env.cred, MAY_WRITE | MAY_EXEC)?;
-        if !self.sticky_ok(env, dir, victim) {
+        self.fs.permission(env, dir, MAY_WRITE | MAY_EXEC)?;
+        if !self.sticky_ok(env, dir, victim)
+            || crate::procfs::ProcNode::of(victim).is_some_and(crate::procfs::is_immutable)
+        {
             return Err(Errno::EPERM);
         }
-        let victim_is_dir = self.fs.inode(victim).is_dir();
+        let victim_is_dir = self.fs.is_dir(victim);
         if isdir {
             if !victim_is_dir {
                 return Err(Errno::ENOTDIR);
@@ -387,14 +448,18 @@ impl Vfs {
         path: &[u8],
         want_dir: bool,
     ) -> KResult<(InodeId, Vec<u8>)> {
-        let parent = path::parent_of(&self.fs, env, path)?;
+        let parent = path::parent_of(&self.fs, &self.files, env, path)?;
         if parent.kind != LastKind::Norm {
             return Err(Errno::EEXIST);
         }
         if self.fs.is_dead(parent.dir) {
             return Err(Errno::ENOENT); // lookup_one_qstr_excl: no dentry in a dead dir
         }
-        if self.fs.lookup(parent.dir, &parent.name).is_some() {
+        if self
+            .fs
+            .lookup_child(env, parent.dir, &parent.name)?
+            .is_some()
+        {
             return Err(Errno::EEXIST); // LOOKUP_EXCL
         }
         if parent.name.len() > NAME_MAX {
@@ -403,6 +468,12 @@ impl Vfs {
         if parent.trailing_slash && !want_dir {
             return Err(Errno::ENOENT); // LOOKUP_CREATE dropped
         }
+        // procfs has no negative dentry: the lookup of a missing name fails.
+        if parent.dir.is_proc() {
+            return Err(Errno::ENOENT);
+        }
+        // `err2 = mnt_want_write()` is reported last, after the lookup errors.
+        self.fs.want_write(parent.dir)?;
         Ok((parent.dir, parent.name))
     }
 
@@ -493,14 +564,17 @@ impl Vfs {
     ) -> KResult<()> {
         let source = self.lookup(old_env, old, old_flags)?;
         let (dir, name) = self.prepare_create(new_env, new, false)?;
-        // vfs_link: may_create; (same superblock); IS_APPEND/IMMUTABLE;
-        // a directory (`!dir->i_op->link` is false, `S_ISDIR` is EPERM).
+        // do_linkat: `old_path.mnt != new_path.mnt` is `EXDEV`, before `vfs_link`.
+        if self.fs.sb_of(source) != self.fs.sb_of(dir) {
+            return Err(Errno::EXDEV);
+        }
+        // vfs_link: may_create; IS_APPEND/IMMUTABLE; a directory (`!dir->i_op->link` is
+        // false, `S_ISDIR` is EPERM).
         self.may_create(new_env, dir)?;
-        let inode = self.fs.inode(source);
-        if inode.is_dir() {
+        if self.fs.is_dir(source) {
             return Err(Errno::EPERM);
         }
-        if inode.nlink == 0 {
+        if self.fs.inode(source).nlink == 0 {
             return Err(Errno::ENOENT);
         }
         self.fs.link(source, dir, &name)
@@ -534,10 +608,14 @@ impl Vfs {
         // of resolving the second (a bad directory descriptor, a name that
         // could not be read) is only seen after the first walk succeeded.
         let (old_env, old) = old?;
-        let from = path::parent_of(&self.fs, &old_env, &old)?;
+        let from = path::parent_of(&self.fs, &self.files, &old_env, &old)?;
         let (new_env, new) = new?;
-        let to = path::parent_of(&self.fs, &new_env, &new)?;
+        let to = path::parent_of(&self.fs, &self.files, &new_env, &new)?;
         let (old_env, new_env) = (&old_env, &new_env);
+        // do_renameat2: `old_path.mnt != new_path.mnt` is `EXDEV`, before the type checks.
+        if self.fs.sb_of(from.dir) != self.fs.sb_of(to.dir) {
+            return Err(Errno::EXDEV);
+        }
         if from.kind != LastKind::Norm {
             return Err(Errno::EBUSY);
         }
@@ -548,6 +626,8 @@ impl Vfs {
                 Errno::EBUSY
             });
         }
+        // `mnt_want_write(old_path.mnt)` follows the type checks, before any lookup.
+        self.fs.want_write(from.dir)?;
         // lock_rename: the child of one parent that is an ancestor of the other.
         let trap = if from.dir == to.dir {
             None
@@ -557,15 +637,20 @@ impl Vfs {
         };
         // lookup_one_qstr_excl for the source (must exist) ...
         let source = self
-            .rename_lookup(from.dir, &from.name, false, false)?
+            .rename_lookup(old_env, from.dir, &from.name, false, false)?
             .ok_or(Errno::ENOENT)?;
         // ... and for the target (LOOKUP_CREATE unless exchanging; LOOKUP_EXCL for NOREPLACE).
-        let target =
-            self.rename_lookup(to.dir, &to.name, !exchange, flags & RENAME_NOREPLACE != 0)?;
-        if exchange && !target.is_some_and(|t| self.fs.inode(t).is_dir()) && to.trailing_slash {
+        let target = self.rename_lookup(
+            new_env,
+            to.dir,
+            &to.name,
+            !exchange,
+            flags & RENAME_NOREPLACE != 0,
+        )?;
+        if exchange && !target.is_some_and(|t| self.fs.is_dir(t)) && to.trailing_slash {
             return Err(Errno::ENOTDIR);
         }
-        let is_dir = self.fs.inode(source).is_dir();
+        let is_dir = self.fs.is_dir(source);
         if !is_dir && (from.trailing_slash || (!exchange && to.trailing_slash)) {
             return Err(Errno::ENOTDIR);
         }
@@ -587,20 +672,25 @@ impl Vfs {
         match target {
             None => self.may_create(new_env, to.dir)?,
             Some(t) => {
-                let t_is_dir = self.fs.inode(t).is_dir();
+                let t_is_dir = self.fs.is_dir(t);
                 self.may_delete(new_env, to.dir, t, if exchange { t_is_dir } else { is_dir })?;
             }
         }
+        Self::no_proc_create(from.dir)?; // no `i_op->rename`
         if to.dir != from.dir {
             if is_dir {
-                permission(self.fs.inode(source), &old_env.cred, MAY_WRITE)?;
+                self.fs.permission(old_env, source, MAY_WRITE)?;
             }
             if let Some(t) = target
                 && exchange
-                && self.fs.inode(t).is_dir()
+                && self.fs.is_dir(t)
             {
-                permission(self.fs.inode(t), &old_env.cred, MAY_WRITE)?;
+                self.fs.permission(old_env, t, MAY_WRITE)?;
             }
+        }
+        // vfs_rename: `is_local_mountpoint` of either dentry is `EBUSY`.
+        if self.fs.ns.is_mountpoint(source) || target.is_some_and(|t| self.fs.ns.is_mountpoint(t)) {
+            return Err(Errno::EBUSY);
         }
         if flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
             return Ok(Renamed::Unsupported);
@@ -612,15 +702,18 @@ impl Vfs {
     /// `d_ancestor(p1, p2)`: the child of `p1` on the way from `p2` to the
     /// root (`p2` itself when it is a child of `p1`), or `None`.
     fn d_ancestor(&self, p1: InodeId, p2: InodeId) -> Option<InodeId> {
+        // Both are in one superblock (`EXDEV` otherwise), whose root is its own parent.
         let mut p = p2;
-        while p != self.fs.root() {
-            let parent = self.fs.parent(p);
+        loop {
+            let parent = self.fs.parent_dir(p);
             if parent == p1 {
                 return Some(p);
             }
+            if parent == p {
+                return None;
+            }
             p = parent;
         }
-        None
     }
 
     /// `lookup_one_qstr_excl` for `rename`: the entry, or `None` for a missing
@@ -628,14 +721,17 @@ impl Vfs {
     /// a name beyond `NAME_MAX` fails in `simple_lookup`.
     fn rename_lookup(
         &self,
+        env: &Env,
         dir: InodeId,
         name: &[u8],
         create: bool,
         excl: bool,
     ) -> KResult<Option<InodeId>> {
-        match self.fs.lookup(dir, name) {
+        match self.fs.lookup_child(env, dir, name)? {
             Some(_) if excl => Err(Errno::EEXIST),
             Some(found) => Ok(Some(found)),
+            // procfs has no negative dentry: the lookup of a missing name fails.
+            None if dir.is_proc() => Err(Errno::ENOENT),
             None if self.fs.is_dead(dir) => Err(Errno::ENOENT),
             None if name.len() > NAME_MAX => Err(Errno::ENAMETOOLONG),
             None if create => Ok(None),
@@ -651,11 +747,13 @@ impl Vfs {
     /// `EISDIR`, `ENOTDIR` (trailing slash on a file), `ENOENT`, `EACCES`,
     /// `EPERM` (sticky) and path errors.
     pub fn unlink(&mut self, env: &Env, path: &[u8]) -> KResult<()> {
-        let parent = path::parent_of(&self.fs, env, path)?;
+        let parent = path::parent_of(&self.fs, &self.files, env, path)?;
         if parent.kind != LastKind::Norm {
             return Err(Errno::EISDIR);
         }
-        let Some(victim) = self.fs.lookup(parent.dir, &parent.name) else {
+        // do_unlinkat: `mnt_want_write` precedes the lookup of the name.
+        self.fs.want_write(parent.dir)?;
+        let Some(victim) = self.fs.lookup_child(env, parent.dir, &parent.name)? else {
             return Err(if parent.name.len() > NAME_MAX {
                 Errno::ENAMETOOLONG
             } else {
@@ -663,13 +761,14 @@ impl Vfs {
             });
         };
         if parent.trailing_slash {
-            return Err(if self.fs.inode(victim).is_dir() {
+            return Err(if self.fs.is_dir(victim) {
                 Errno::EISDIR
             } else {
                 Errno::ENOTDIR
             });
         }
         self.may_delete(env, parent.dir, victim, false)?;
+        Self::no_proc_create(parent.dir)?; // no `i_op->unlink`
         self.fs.unlink(parent.dir, &parent.name, false)
     }
 
@@ -679,14 +778,15 @@ impl Vfs {
     /// `EINVAL` (`.`), `ENOTEMPTY` (`..` or a non-empty directory), `EBUSY`
     /// (the root), `ENOTDIR`, `ENOENT`, `EACCES`, `EPERM` and path errors.
     pub fn rmdir(&mut self, env: &Env, path: &[u8]) -> KResult<()> {
-        let parent = path::parent_of(&self.fs, env, path)?;
+        let parent = path::parent_of(&self.fs, &self.files, env, path)?;
         match parent.kind {
             LastKind::DotDot => return Err(Errno::ENOTEMPTY),
             LastKind::Dot => return Err(Errno::EINVAL),
             LastKind::Root => return Err(Errno::EBUSY),
             LastKind::Norm => {}
         }
-        let Some(victim) = self.fs.lookup(parent.dir, &parent.name) else {
+        self.fs.want_write(parent.dir)?;
+        let Some(victim) = self.fs.lookup_child(env, parent.dir, &parent.name)? else {
             return Err(if parent.name.len() > NAME_MAX {
                 Errno::ENAMETOOLONG
             } else {
@@ -694,6 +794,11 @@ impl Vfs {
             });
         };
         self.may_delete(env, parent.dir, victim, true)?;
+        Self::no_proc_create(parent.dir)?; // no `i_op->rmdir`
+        // vfs_rmdir: `is_local_mountpoint(dentry)` is `EBUSY`.
+        if self.fs.ns.is_mountpoint(victim) {
+            return Err(Errno::EBUSY);
+        }
         self.fs.unlink(parent.dir, &parent.name, true)
     }
 
@@ -705,6 +810,8 @@ impl Vfs {
     /// `EOPNOTSUPP` for a symbolic link (`notify_change`), `EPERM` unless the
     /// caller owns the file or has `CAP_FOWNER` (`setattr_prepare`).
     pub fn chmod(&mut self, env: &Env, inode: InodeId, mode: u32) -> KResult<()> {
+        // do_fchmodat / fchmod: `mnt_want_write` precedes `chmod_common`.
+        self.fs.want_write(inode)?;
         if self.fs.inode(inode).is_symlink() {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -726,6 +833,8 @@ impl Vfs {
     /// `EPERM` when a set-id bit would be dropped and the caller neither owns the file nor
     /// has `CAP_FOWNER` (the `ATTR_MODE` branch of `setattr_prepare`).
     pub fn chown(&mut self, env: &Env, inode: InodeId, uid: u32, gid: u32) -> KResult<()> {
+        // do_fchownat / fchown: `mnt_want_write` precedes `chown_common`.
+        self.fs.want_write(inode)?;
         let cur = self.fs.inode(inode);
         let owner = cur.uid == env.cred.fsuid;
         if uid != u32::MAX && !(owner && uid == cur.uid || env.cred.chown) {
@@ -784,6 +893,8 @@ impl Vfs {
                 times = None;
             }
         }
+        // vfs_utimes: `mnt_want_write` follows the validity checks.
+        self.fs.want_write(inode)?;
         let owner_or_capable = {
             let node = self.fs.inode(inode);
             node.uid == env.cred.fsuid || env.cred.fowner
@@ -792,7 +903,7 @@ impl Vfs {
             // ATTR_TOUCH (`may_setattr`): the owner, else write permission.
             None => {
                 if !owner_or_capable {
-                    permission(self.fs.inode(inode), &env.cred, MAY_WRITE)?;
+                    self.fs.permission(env, inode, MAY_WRITE)?;
                 }
                 let now = self.fs.now();
                 self.fs.set_times(inode, now, now);
@@ -820,30 +931,73 @@ impl Vfs {
         Ok(())
     }
 
-    /// `vfs_truncate`.
+    /// `vfs_truncate` of a tmpfs inode without the `RLIMIT_FSIZE` check (the callers are the
+    /// initramfs unpacker and the tests; the system calls run [`Vfs::truncate_check`],
+    /// [`Vfs::newsize_ok`] and the setattr of the node themselves).
     ///
     /// # Errors
-    /// `EISDIR`, `EINVAL`, `EACCES`.
+    /// `EISDIR`, `EINVAL`, `EACCES`, `EROFS`.
     pub fn truncate(&mut self, env: &Env, inode: InodeId, length: u64) -> KResult<()> {
+        debug_assert!(!inode.is_proc(), "a procfs node has its own setattr");
         self.truncate_check(env, inode)?;
         self.do_truncate(&env.cred, inode, length);
         Ok(())
     }
 
-    /// The checks of `vfs_truncate` before `do_truncate`: the type and the
-    /// write permission.
+    /// The checks of `vfs_truncate` before `do_truncate`: the type, the write permission, and
+    /// then `mnt_want_write` (a caller without the permission gets `EACCES` on a read-only mount,
+    /// not `EROFS`).
     ///
     /// # Errors
-    /// `EISDIR`, `EINVAL`, `EACCES`.
+    /// `EISDIR`, `EINVAL`, `EACCES`, `EROFS`.
     pub fn truncate_check(&self, env: &Env, inode: InodeId) -> KResult<()> {
-        let node = self.fs.inode(inode);
-        if node.is_dir() {
+        if self.fs.is_dir(inode) {
             return Err(Errno::EISDIR);
         }
-        if !node.is_reg() {
+        if self.fs.file_type(inode) != S_IFREG {
             return Err(Errno::EINVAL);
         }
-        permission(node, &env.cred, MAY_WRITE)
+        // vfs_truncate: `inode_permission`, then `mnt_want_write`.
+        self.fs.permission(env, inode, MAY_WRITE)?;
+        self.fs.want_write(inode)
+    }
+
+    /// `setattr_prepare`'s `inode_newsize_ok` for a truncation of `inode` to `length` by a caller
+    /// whose `RLIMIT_FSIZE` is `rlimit` (`RLIM_INFINITY` is `u64::MAX`): the size cannot grow
+    /// past the limit (`SIGXFSZ`), nor past the superblock's `s_maxbytes` (`MAX_LFS_FILESIZE`,
+    /// except procfs, which keeps the `MAX_NON_LFS` default).
+    ///
+    /// # Errors
+    /// `EFBIG`; [`NewSizeRefused::signal`] when the caller must also get `SIGXFSZ`.
+    pub fn newsize_ok(
+        &self,
+        inode: InodeId,
+        length: u64,
+        rlimit: u64,
+    ) -> Result<(), NewSizeRefused> {
+        let s_maxbytes = if inode.is_proc() {
+            MAX_NON_LFS
+        } else {
+            MAX_LFS_FILESIZE
+        };
+        inode_newsize_ok(
+            self.fs.i_size(inode),
+            length,
+            u64::try_from(s_maxbytes).unwrap_or(0),
+            rlimit,
+        )
+    }
+
+    /// `setattr_copy` of `ATTR_MTIME | ATTR_CTIME` on a procfs node (`ftruncate`, `O_TRUNC`):
+    /// both times become the current time. `ATTR_SIZE` changes nothing there: no procfs
+    /// `setattr` resizes anything, so the size stays what the entry reports.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn proc_touch(&mut self, inode: InodeId) -> KResult<()> {
+        debug_assert!(inode.is_proc());
+        let now = self.fs.clock_now();
+        self.fs.ns.proc.set_stamp(inode, now)
     }
 
     /// `do_truncate` after `inode_newsize_ok`: `dentry_needs_remove_privs`
@@ -881,7 +1035,7 @@ impl Vfs {
     /// # Errors
     /// `EACCES`.
     pub fn access_check(&self, env: &Env, inode: InodeId, mode: u32) -> KResult<()> {
-        permission(self.fs.inode(inode), &env.cred, mode)
+        self.fs.permission(env, inode, mode)
     }
 
     // ---- getcwd --------------------------------------------------------------
@@ -891,32 +1045,77 @@ impl Vfs {
     /// # Errors
     /// `ENOENT` for a removed directory, `ENOMEM`.
     pub fn dir_path(&self, root: InodeId, dir: InodeId) -> KResult<Vec<u8>> {
-        let mut parts: Vec<InodeId> = Vec::new();
+        // d_unlinked: a removed directory (or one below one) has no path.
         let mut cur = dir;
-        while cur != root && cur != self.fs.root() {
-            let parent = self.fs.parent(cur);
+        while !cur.is_proc() && cur != self.fs.root() && !self.fs.is_mount_root(cur) {
+            let parent = self.fs.parent_dir(cur);
             if self.fs.name_of(parent, cur).is_none() {
-                return Err(Errno::ENOENT); // d_unlinked
+                return Err(Errno::ENOENT);
             }
-            try_push(&mut parts, cur)?;
             cur = parent;
         }
-        let mut out = Vec::new();
-        out.try_reserve(2).map_err(|_| Errno::ENOMEM)?;
-        if parts.is_empty() {
-            out.push_within_capacity(b'/').map_err(|_| Errno::ENOMEM)?;
+        let (mut path, reachable) = self.fs.d_path(root, dir)?;
+        if !reachable {
+            // `prepend_unreachable`: the path is not below the root.
+            let mut out = try_copy(b"(unreachable)")?;
+            out.try_reserve(path.len()).map_err(|_| Errno::ENOMEM)?;
+            for byte in path.drain(..) {
+                let _ = out.push_within_capacity(byte);
+            }
             return Ok(out);
         }
-        for &part in parts.iter().rev() {
-            let parent = self.fs.parent(part);
-            let name = self.fs.name_of(parent, part).unwrap_or(b"?");
-            out.try_reserve(name.len() + 1).map_err(|_| Errno::ENOMEM)?;
-            out.push_within_capacity(b'/').map_err(|_| Errno::ENOMEM)?;
-            for &byte in name {
-                out.push_within_capacity(byte).map_err(|_| Errno::ENOMEM)?;
+        Ok(path)
+    }
+
+    /// `d_path` of an open file below `root`: the name it was opened by when
+    /// it has one, else the path of its inode.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn file_path(&self, root: InodeId, file: &File) -> KResult<(Vec<u8>, bool)> {
+        let Some(inode) = file.inode else {
+            return Ok((Vec::new(), false));
+        };
+        match &file.dentry {
+            Some(entry) if !self.fs.is_dir(inode) => {
+                let (mut path, reachable) = self.fs.d_path(root, entry.parent)?;
+                if path.last() != Some(&b'/') {
+                    path.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+                    let _ = path.push_within_capacity(b'/');
+                }
+                path.try_reserve(entry.name.len())
+                    .map_err(|_| Errno::ENOMEM)?;
+                for &byte in &entry.name {
+                    let _ = path.push_within_capacity(byte);
+                }
+                Ok((path, reachable))
             }
+            _ => self.fs.d_path(root, inode),
         }
-        Ok(out)
+    }
+
+    /// `d_unlinked` of an open file's dentry.
+    #[must_use]
+    pub fn file_deleted(&self, file: &File) -> bool {
+        let Some(inode) = file.inode else {
+            return false;
+        };
+        if inode.is_proc() {
+            return false;
+        }
+        match &file.dentry {
+            Some(entry) if !self.fs.is_dir(inode) => {
+                self.fs.is_dead(entry.parent)
+                    || self.fs.tmp().lookup(entry.parent, &entry.name) != Some(inode)
+            }
+            _ => self.fs.is_dead(inode),
+        }
+    }
+
+    /// The mount id of the internal pipefs mount (`pipe_mnt`).
+    #[must_use]
+    pub const fn pipe_mnt_id(&self) -> u32 {
+        PIPEFS_MNT_ID
     }
 
     // ---- open ----------------------------------------------------------------
@@ -932,11 +1131,17 @@ impl Vfs {
         if op.flags & O_PATH != 0 {
             let flags = if op.follow { LOOKUP_FOLLOW } else { 0 }
                 | if op.directory { LOOKUP_DIRECTORY } else { 0 };
-            let inode = self.lookup(env, path, flags)?;
-            return self.make_file(inode, op.flags, FileKind::Path, FMODE_PATH);
+            let found = path::lookup_dentry(&self.fs, &self.files, env, path, flags)?;
+            return self.make_file(
+                found.inode,
+                op.flags,
+                FileKind::Path,
+                FMODE_PATH,
+                found.dentry,
+            );
         }
-        let (inode, created) = self.open_last_lookups(env, path, op)?;
-        self.do_open(env, inode, created, op)
+        let (inode, created, dentry) = self.open_last_lookups(env, path, op)?;
+        self.do_open(env, inode, created, op, dentry)
     }
 
     /// `path_openat`'s walk and `open_last_lookups`/`lookup_open`: the inode
@@ -947,21 +1152,21 @@ impl Vfs {
         env: &Env,
         path: &[u8],
         op: &OpenFlags,
-    ) -> KResult<(InodeId, bool)> {
+    ) -> KResult<(InodeId, bool, Option<Dentry>)> {
         enum Resolved {
-            Found(InodeId),
+            Found(InodeId, Option<Dentry>),
             Missing(InodeId, Vec<u8>),
         }
         let create = op.flags & O_CREAT != 0;
         let mut directory = op.directory;
         let resolved = {
-            let mut walk = Walk::new(&self.fs, env, path, op.follow)?;
+            let mut walk = Walk::new(&self.fs, &self.files, env, path, op.follow)?;
             let mut remaining = path;
             loop {
                 let last = walk.link_path_walk(remaining)?;
                 if last.kind != LastKind::Norm {
                     walk.walk_component(&last, WALK_TRAILING)?; // handle_dots
-                    break Resolved::Found(walk.cur);
+                    break Resolved::Found(walk.cur, None);
                 }
                 if create && last.trailing_slash {
                     return Err(Errno::EISDIR);
@@ -970,7 +1175,7 @@ impl Vfs {
                     walk.follow = true;
                     directory = true;
                 }
-                if create && walk.fs.lookup(walk.cur, last.name).is_none() {
+                if create && walk.child(&last)?.is_none() {
                     if walk.fs.is_dead(walk.cur) {
                         return Err(Errno::ENOENT); // lookup_open: IS_DEADDIR
                     }
@@ -979,39 +1184,54 @@ impl Vfs {
                     }
                     break Resolved::Missing(walk.cur, try_copy(last.name)?);
                 }
-                match walk.walk_component(&last, WALK_TRAILING)? {
-                    Some(body) => remaining = body,
-                    None => break Resolved::Found(walk.cur),
+                let dir = walk.cur;
+                if let Some(body) = walk.walk_component(&last, WALK_TRAILING)? {
+                    remaining = body;
+                } else {
+                    let dentry = if walk.cur.is_proc() && dir.is_proc() || !walk.cur.is_proc() {
+                        Some(Dentry {
+                            parent: dir,
+                            name: try_copy(last.name)?,
+                        })
+                    } else {
+                        None
+                    };
+                    break Resolved::Found(walk.cur, dentry);
                 }
             }
         };
         let (dir, name) = match resolved {
-            Resolved::Found(found) => {
+            Resolved::Found(found, dentry) => {
                 return self
                     .check_found(found, directory, op)
-                    .map(|inode| (inode, false));
+                    .map(|inode| (inode, false, dentry));
             }
             Resolved::Missing(dir, name) => (dir, name),
         };
-        // lookup_open: create_error = may_o_create() for the missing name.
+        // lookup_open: procfs's lookup of a missing name is `-ENOENT`; else
+        // `got_write` false is `create_error = -EROFS`, or `may_o_create`.
+        if dir.is_proc() {
+            return Err(Errno::ENOENT);
+        }
+        self.fs.want_write(dir)?;
         self.may_create(env, dir)?;
         let mode = Self::prepare_mode(env, op.mode, S_IALLUGO, S_IFREG) | S_IFREG;
         let inode = self.fs.mknod(dir, &name, mode, 0, &env.cred)?;
-        Ok((inode, true))
+        Ok((inode, true, Some(Dentry { parent: dir, name })))
     }
 
     /// The `do_open` checks that precede `may_open` for an existing inode.
     fn check_found(&self, inode: InodeId, directory: bool, op: &OpenFlags) -> KResult<InodeId> {
-        let node = self.fs.inode(inode);
+        let is_dir = self.fs.is_dir(inode);
         if op.flags & O_CREAT != 0 {
             if op.flags & O_EXCL != 0 {
                 return Err(Errno::EEXIST);
             }
-            if node.is_dir() {
+            if is_dir {
                 return Err(Errno::EISDIR);
             }
         }
-        if directory && !node.is_dir() {
+        if directory && !is_dir {
             return Err(Errno::ENOTDIR);
         }
         Ok(inode)
@@ -1024,6 +1244,7 @@ impl Vfs {
         inode: InodeId,
         created: bool,
         op: &OpenFlags,
+        dentry: Option<Dentry>,
     ) -> KResult<FileId> {
         let mut open_flag = op.flags;
         let mut acc_mode = op.acc_mode;
@@ -1031,20 +1252,30 @@ impl Vfs {
         if created {
             open_flag &= !O_TRUNC;
             acc_mode = 0;
-        } else if self.fs.inode(inode).is_reg() && open_flag & O_TRUNC != 0 {
+        } else if self.fs.file_type(inode) == S_IFREG && open_flag & O_TRUNC != 0 {
+            // `mnt_want_write` before `may_open`.
+            self.fs.want_write(inode)?;
             do_truncate = true;
         }
         self.may_open(env, inode, acc_mode, open_flag)?;
-        let file = self.vfs_open(inode, open_flag)?;
+        let file = self.vfs_open(env, inode, open_flag, dentry)?;
         if do_truncate {
-            self.do_truncate(&env.cred, inode, 0); // handle_truncate (0 is always within RLIMIT_FSIZE)
+            // handle_truncate: `inode_newsize_ok` of 0 always passes.
+            if inode.is_proc() {
+                if let Err(errno) = self.proc_touch(inode) {
+                    self.fput(file);
+                    return Err(errno);
+                }
+            } else {
+                self.do_truncate(&env.cred, inode, 0);
+            }
         }
         Ok(file)
     }
 
     /// `may_open`.
     fn may_open(&self, env: &Env, inode: InodeId, acc_mode: u32, flag: u32) -> KResult<()> {
-        let node = self.fs.inode(inode);
+        let node = self.fs.node_attr(inode);
         match node.mode & S_IFMT {
             S_IFLNK => return Err(Errno::ELOOP),
             S_IFDIR => {
@@ -1058,9 +1289,18 @@ impl Vfs {
             S_IFBLK | S_IFCHR | S_IFIFO | S_IFSOCK if acc_mode & MAY_EXEC != 0 => {
                 return Err(Errno::EACCES);
             }
+            // may_open_dev: a nodev mount does not open device nodes.
+            S_IFBLK | S_IFCHR
+                if self
+                    .fs
+                    .mount_of(inode)
+                    .is_some_and(|m| m.flags & super::mount::MNT_NODEV != 0) =>
+            {
+                return Err(Errno::EACCES);
+            }
             _ => {}
         }
-        permission(node, &env.cred, acc_mode)?;
+        self.fs.permission(env, inode, acc_mode)?;
         // O_NOATIME can only be set by the owner or superuser.
         if flag & O_NOATIME != 0 && node.uid != env.cred.fsuid && !env.cred.fowner {
             return Err(Errno::EPERM);
@@ -1069,12 +1309,27 @@ impl Vfs {
     }
 
     /// `vfs_open`/`do_dentry_open` for a resolved inode.
-    fn vfs_open(&mut self, inode: InodeId, open_flag: u32) -> KResult<FileId> {
-        let mode = self.fs.inode(inode).mode;
-        let rdev = self.fs.inode(inode).rdev;
+    fn vfs_open(
+        &mut self,
+        env: &Env,
+        inode: InodeId,
+        open_flag: u32,
+        dentry: Option<Dentry>,
+    ) -> KResult<FileId> {
+        let mode = self.fs.node_attr(inode).mode;
+        let rdev = if inode.is_proc() {
+            0
+        } else {
+            self.fs.inode(inode).rdev
+        };
         let mut fmode = (open_flag & O_ACCMODE).wrapping_add(1) & O_ACCMODE;
         let mut unported_stream = false;
+        if let Some(node) = crate::procfs::ProcNode::of(inode) {
+            // proc_reg_open / the `open` of the entry.
+            crate::procfs::open_check(&self.fs.ns.proc, env, node)?;
+        }
         let kind = match mode & S_IFMT {
+            S_IFREG if inode.is_proc() => FileKind::Proc,
             S_IFREG => FileKind::Regular,
             S_IFDIR => FileKind::Directory,
             S_IFCHR => match chrdev(rdev) {
@@ -1112,8 +1367,18 @@ impl Vfs {
         if fmode & FMODE_READ != 0 {
             fmode |= FMODE_CAN_READ;
         }
-        if fmode & FMODE_WRITE != 0 && kind != FileKind::Directory {
+        // `f_op->write`: tmpfs files, and the procfs files with a writer.
+        let writable = match crate::procfs::ProcNode::of(inode) {
+            Some(node) => crate::procfs::has_write_op(node),
+            None => kind != FileKind::Directory,
+        };
+        if fmode & FMODE_WRITE != 0 && writable {
             fmode |= FMODE_CAN_WRITE;
+        }
+        // do_dentry_open: `get_write_access` + `mnt_get_write_access` for a
+        // regular file opened for writing on a read-only mount.
+        if fmode & FMODE_WRITE != 0 && matches!(kind, FileKind::Regular | FileKind::Proc) {
+            self.fs.want_write(inode)?;
         }
         // No inode here has `a_ops->direct_IO` (tmpfs has none, nor do the
         // device nodes): do_dentry_open rejects O_DIRECT.
@@ -1121,7 +1386,7 @@ impl Vfs {
             return Err(Errno::EINVAL);
         }
         let flags = open_flag & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
-        self.make_file(inode, flags, kind, fmode)
+        self.make_file(inode, flags, kind, fmode, dentry)
     }
 
     fn make_file(
@@ -1130,9 +1395,18 @@ impl Vfs {
         flags: u32,
         kind: FileKind,
         mode: u32,
+        dentry: Option<Dentry>,
     ) -> KResult<FileId> {
         self.fs.iget(inode);
-        match self.files.alloc(File::new(Some(inode), kind, flags, mode)) {
+        // A dentry pins its parent.
+        let parent = dentry.as_ref().map(|entry| entry.parent);
+        if let Some(parent) = parent {
+            self.fs.iget(parent);
+        }
+        let mut file = File::new(Some(inode), kind, flags, mode);
+        file.dentry = dentry;
+        file.poll_event = self.fs.ns.event;
+        match self.files.alloc(file) {
             Ok(id) => {
                 if matches!(kind, FileKind::Char(dev) if dev.is_tty()) {
                     self.tty_touched = true;
@@ -1140,6 +1414,9 @@ impl Vfs {
                 Ok(id)
             }
             Err(error) => {
+                if let Some(parent) = parent {
+                    self.fs.iput(parent);
+                }
                 self.fs.iput(inode);
                 Err(error)
             }
@@ -1149,11 +1426,16 @@ impl Vfs {
     /// `do_tmpfile`: an unnamed regular file in directory `path`.
     fn open_tmpfile(&mut self, env: &Env, path: &[u8], op: &OpenFlags) -> KResult<FileId> {
         let dir = self.lookup(env, path, LOOKUP_FOLLOW | LOOKUP_DIRECTORY)?;
+        self.fs.want_write(dir)?;
         self.may_create(env, dir)?;
+        if dir.is_proc() {
+            return Err(Errno::EOPNOTSUPP); // no `i_op->tmpfile`
+        }
         let mode = Self::prepare_mode(env, op.mode, S_IALLUGO, S_IFREG) | S_IFREG;
-        let inode = self.fs.mknod_unlinked(mode, &env.cred)?;
+        let sb = self.fs.inode(dir).sb;
+        let inode = self.fs.mknod_unlinked(sb, mode, &env.cred)?;
         let flags = op.flags & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
-        let file = self.vfs_open(inode, flags);
+        let file = self.vfs_open(env, inode, flags, None);
         // The file holds the only pin; an open failure frees the inode.
         if file.is_err() {
             self.fs.drop_unlinked(inode);
@@ -1166,11 +1448,10 @@ impl Vfs {
     /// # Errors
     /// `ENOTDIR`, `EACCES`.
     pub fn chdir_check(&self, env: &Env, dir: InodeId) -> KResult<()> {
-        let node = self.fs.inode(dir);
-        if !node.is_dir() {
+        if !self.fs.is_dir(dir) {
             return Err(Errno::ENOTDIR);
         }
-        permission(node, &env.cred, MAY_EXEC)
+        self.fs.permission(env, dir, MAY_EXEC)
     }
 
     /// Open `/dev/console` three times for init (`console_on_rootfs`): one
@@ -1256,7 +1537,9 @@ impl Vfs {
     pub fn take_pipe_events(&mut self) -> bool {
         let changed = self.pipe_events != self.pipe_events_seen;
         self.pipe_events_seen = self.pipe_events;
-        changed
+        // A change of the mount table wakes the `poll` sleepers on `mounts`/`mountinfo`
+        // (`touch_mnt_namespace`'s `wake_up_interruptible(&ns->poll)`), who share the key.
+        self.fs.ns.take_event() || changed
     }
 
     /// Shared access for the syscall layer.

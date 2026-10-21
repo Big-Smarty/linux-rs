@@ -112,10 +112,23 @@ static READY: AtomicBool = AtomicBool::new(false);
 const NO_PREV: u64 = u64::MAX;
 static SWITCH_PREV: AtomicU64 = AtomicU64::new(NO_PREV);
 
-/// Context switches performed (the self-test asserts the ping-pong reached the
-/// switch).
-#[cfg(feature = "qemu-self-test")]
+/// Context switches performed (`nr_context_switches`; the self-test asserts the
+/// ping-pong reached the switch).
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// `nr_context_switches()`.
+#[must_use]
+pub fn context_switches() -> u64 {
+    SWITCHES.load(Ordering::Relaxed)
+}
+
+/// Whether the tick asked for a reschedule that the next return to ring 3
+/// will perform (`need_resched`): the caller publishes what other tasks may
+/// read before the task leaves the CPU.
+#[must_use]
+pub fn resched_wanted() -> bool {
+    resched_pending()
+}
 
 /// The register context of one task: what is saved while it is off the CPU.
 struct Thread {
@@ -187,6 +200,21 @@ pub fn cpu_account(id: SchedId) -> &'static CpuAccount {
     &CPU_TIME[id.index()]
 }
 
+/// `kernel_cpustat[CPUTIME_USER]` and `[CPUTIME_SYSTEM]` in nanoseconds: what
+/// `account_process_tick` adds to the CPU's totals next to the task's own
+/// counters, so `/proc/stat` reads two words instead of summing every task
+/// (and keeps the time of tasks that have exited, as Linux does).
+static KCPUSTAT_USER_NS: AtomicU64 = AtomicU64::new(0);
+static KCPUSTAT_SYSTEM_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `(user, system)` nanoseconds of all tick-accounted task time since boot.
+pub fn kcpustat() -> (u64, u64) {
+    (
+        KCPUSTAT_USER_NS.load(Ordering::Relaxed),
+        KCPUSTAT_SYSTEM_NS.load(Ordering::Relaxed),
+    )
+}
+
 /// `account_process_tick`: the tick found the running task in user mode
 /// (`user`) or in the kernel on its behalf, `periods` ticks long; an idle CPU
 /// charges nobody. Interrupt context (RQ is a leaf any context may take).
@@ -196,12 +224,17 @@ pub fn charge_tick(user: bool, periods: u64) {
     }
     let slot = RQ.lock().curr().index();
     if slot != 0 {
-        CPU_TIME[slot].tick(user, periods);
+        let ns = CPU_TIME[slot].tick(user, periods);
+        let total = if user {
+            &KCPUSTAT_USER_NS
+        } else {
+            &KCPUSTAT_SYSTEM_NS
+        };
+        total.fetch_add(ns, Ordering::Relaxed);
     }
 }
 
-/// Scheduler slots in use, the idle task excluded (leak checks).
-#[cfg(feature = "qemu-self-test")]
+/// Scheduler slots in use, the idle task excluded (leak checks, `/proc/meminfo`).
 pub fn tasks_in_use() -> usize {
     RQ.lock().tasks_in_use()
 }
@@ -685,7 +718,6 @@ fn check_stack_end(id: SchedId) {
 /// whose `Thread`s are in the states [`spawn`] or an earlier switch left.
 fn context_switch(switch: Switch) {
     let (prev, next) = (switch.prev.index(), switch.next.index());
-    #[cfg(feature = "qemu-self-test")]
     SWITCHES.fetch_add(1, Ordering::Relaxed);
     let (prev_thread, next_thread) = (thread(prev), thread(next));
     // SAFETY: module `Threads` argument (b): IF=0 and the single CPU make this

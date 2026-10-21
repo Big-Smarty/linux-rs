@@ -332,6 +332,62 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
             owner: 0,
         }
     }
+    fn sync_proc(&mut self) {
+        self.vfs.sync_proc(&self.tasks).expect("proc mirror");
+    }
+    fn with_show<R>(
+        &mut self,
+        _scope: crate::procfs::show::ShowScope,
+        f: impl FnOnce(&crate::procfs::show::Show<'_>) -> R,
+    ) -> Result<R, syscalls::Errno> {
+        use crate::procfs::{
+            Caller,
+            show::{HostInfo, Show},
+            view::{Collect, TaskView},
+        };
+        // The caller publishes its view first (the binary does it when it
+        // reads its own /proc entries and when it leaves the CPU).
+        self.vfs.sync_proc(&self.tasks)?;
+        let exe = self.exe;
+        let view = TaskView::collect(Collect {
+            attrs: &self.attrs,
+            fdt: &self.fdt,
+            files: &self.vfs.files,
+            mm: Some(&self.mm),
+            exe,
+            rss: (0, 0, 0),
+            pgtables_bytes: 0,
+            min_flt: 0,
+            maj_flt: 0,
+            nvcsw: 0,
+            nivcsw: 0,
+            start_boottime_ns: 0,
+            flags: 0,
+            args: None,
+        })?;
+        let tgid = i32::try_from(self.tgid).unwrap_or(0);
+        self.vfs.fs.ns.proc.publish(tgid, view)?;
+        let host = HostInfo::blank();
+        let show = Show {
+            vfs: &self.vfs,
+            tasks: &self.tasks,
+            host: &host,
+            caller: Caller {
+                tgid,
+                cred: crate::vfs::Cred::of_task(&self.attrs.cred),
+            },
+            root: self.attrs.fs.root,
+        };
+        Ok(f(&show))
+    }
+    fn mm_args(&mut self) -> Option<(u64, u64, u64, u64)> {
+        Some((
+            self.mm.arg_start,
+            self.mm.arg_end,
+            self.mm.env_start,
+            self.mm.env_end,
+        ))
+    }
     fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, syscalls::Errno> {
         let params = ForkParams::of(&self.attrs, request);
         let child = self.tasks.fork(self.current, params)?;

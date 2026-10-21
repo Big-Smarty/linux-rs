@@ -316,12 +316,13 @@ fn initramfs_files(t: &mut T) {
     t.eq("lseek-end-minus", lseek(fd, -4, 2), Ok(size as usize - 4));
     t.eq("read-at-end-part", read(fd, &mut buf), Ok(4));
     t.eq("read-at-eof", read(fd, &mut buf), Ok(0));
-    t.eq("lseek-past-end", lseek(fd, 1 << 20, 0), Ok(1 << 20));
+    // Far beyond the file: the init binary of a larger build (the bare-metal suite's) passes 1 MiB.
+    t.eq("lseek-past-end", lseek(fd, 1 << 26, 0), Ok(1 << 26));
     t.eq("read-past-end", read(fd, &mut buf), Ok(0));
     t.eq("lseek-negative", lseek(fd, -1, 0), Err(Errno::EINVAL));
     t.eq(
         "lseek-negative-from-cur",
-        lseek(fd, -(1 << 21), 1),
+        lseek(fd, -(1 << 27), 1),
         Err(Errno::EINVAL),
     );
     t.eq("lseek-bad-whence", lseek(fd, 0, 7), Err(Errno::EINVAL));
@@ -480,7 +481,8 @@ fn stat_family(t: &mut T) {
     t.eq(
         "stat-root",
         (root.mode, root.nlink, root.uid, root.gid),
-        (S_IFDIR | 0o1777, 5, 0, 0),
+        // /dev, /root, /fixture, /proc and /mnt
+        (S_IFDIR | 0o1777, 7, 0, 0),
     );
     t.eq("stat-root-same-dev", root.dev, init.dev);
     let (_, fixture) = stat_path(b"/fixture\0");
@@ -751,7 +753,7 @@ fn directories(t: &mut T) {
     t.eq(
         "getdents-root-order",
         &names[..n],
-        b"fixture,linuxrc,init,root,dev".as_slice(),
+        b"mnt,proc,fixture,linuxrc,init,root,dev".as_slice(),
     );
     let n = list(b"/fixture\0", &mut names).unwrap_or(0);
     t.eq(

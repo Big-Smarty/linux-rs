@@ -7,9 +7,18 @@
 // `acl_permission_check`, `may_lookup`, `complete_walk`'s `LOOKUP_DIRECTORY`
 // check), fs/libfs.c (`simple_lookup`: `-ENAMETOOLONG` beyond `NAME_MAX`).
 // Copyright of the original: Linus Torvalds and the VFS authors (Al Viro).
-// Transformation: ref-walk only; one filesystem, no mounts, no automount, no
-// LSM and no RCU-walk; symlink bodies are borrowed from the tmpfs arena so the
-// walk allocates nothing. `protected_symlinks` is off (the sysctl default).
+// `follow_dotdot`, `follow_up`, `traverse_mounts`, `nd_jump_link`,
+// `step_into`'s mount handling), fs/proc/base.c (`proc_pid_get_link`,
+// `proc_fd_access_allowed`), fs/proc/self.c (`proc_self_get_link`),
+// fs/proc/thread_self.c. Copyright of the originals: Linus Torvalds and the
+// VFS authors.
+// Transformation: ref-walk only; mounts are crossed through the namespace's
+// mount table (`Fs::follow_mounts`/`follow_up`), no automount, no LSM and no
+// RCU-walk; symlink bodies are borrowed from the tmpfs arena so the walk
+// allocates nothing. The links of procfs (`self`, `thread-self`, `fd/N`,
+// `cwd`, `root`, `exe`) are jumps (`nd_jump_link`): their target is found
+// from the caller or the task view the target task published, so no body is
+// walked. `protected_symlinks` is off (the sysctl default).
 #![forbid(unsafe_code)]
 //! Pathname resolution with Linux's component rules and error precedence.
 //!
@@ -24,11 +33,10 @@ use alloc::vec::Vec;
 use syscalls::Errno;
 
 use super::{
-    Cred, InodeId, KResult, MAXSYMLINKS, MAY_EXEC, MAY_READ, MAY_WRITE, NAME_MAX, S_IFDIR, S_IFMT,
-    S_IXUGO,
-    ops::Env,
-    tmpfs::{Body, Inode, Tmpfs},
+    Cred, FileTable, Fs, InodeId, KResult, MAXSYMLINKS, MAY_EXEC, MAY_READ, MAY_WRITE, NAME_MAX,
+    S_IFDIR, S_IFMT, S_IXUGO, fs::NodeAttr, ops::Env, tmpfs::Body,
 };
+use crate::procfs::{Kind, ProcNode};
 
 /// `LOOKUP_FOLLOW`: resolve a symlink in the final component.
 pub const LOOKUP_FOLLOW: u32 = 1;
@@ -54,22 +62,23 @@ pub struct Last<'p> {
     pub trailing_slash: bool,
 }
 
-/// `inode_permission` + `generic_permission` for the VFS-internal checks.
+/// `generic_permission` (with `acl_permission_check`) for the attributes of an
+/// inode or node.
 ///
 /// # Errors
 /// `EACCES`.
-pub fn permission(inode: &Inode, cred: &Cred, mask: u32) -> KResult<()> {
-    let mode = inode.mode;
+pub fn permission(attr: &NodeAttr, cred: &Cred, mask: u32) -> KResult<()> {
+    let mode = attr.mode;
     // acl_permission_check
     let bits = mask & 7;
     if (bits * 0o111) & !mode == 0 {
         return Ok(());
     }
-    let denied = if inode.uid == cred.fsuid {
+    let denied = if attr.uid == cred.fsuid {
         bits & !(mode >> 6) != 0
     } else {
         let mut shifted = mode;
-        if bits & (mode ^ (mode >> 3)) != 0 && inode.gid == cred.fsgid {
+        if bits & (mode ^ (mode >> 3)) != 0 && attr.gid == cred.fsgid {
             shifted >>= 3;
         }
         bits & !shifted != 0
@@ -78,7 +87,7 @@ pub fn permission(inode: &Inode, cred: &Cred, mask: u32) -> KResult<()> {
         return Ok(());
     }
     // generic_permission: capability overrides.
-    if inode.mode & S_IFMT == S_IFDIR {
+    if attr.mode & S_IFMT == S_IFDIR {
         if mask & MAY_WRITE == 0 && cred.dac_read_search {
             return Ok(());
         }
@@ -92,7 +101,7 @@ pub fn permission(inode: &Inode, cred: &Cred, mask: u32) -> KResult<()> {
     if rwx == MAY_READ && cred.dac_read_search {
         return Ok(());
     }
-    if (rwx & MAY_EXEC == 0 || inode.mode & S_IXUGO != 0) && cred.dac_override {
+    if (rwx & MAY_EXEC == 0 || attr.mode & S_IXUGO != 0) && cred.dac_override {
         return Ok(());
     }
     Err(Errno::EACCES)
@@ -101,7 +110,9 @@ pub fn permission(inode: &Inode, cred: &Cred, mask: u32) -> KResult<()> {
 /// One pathname walk (`struct nameidata`): the directory reached so far, the
 /// symlinks followed and whether a final symlink is followed.
 pub(crate) struct Walk<'a> {
-    pub(crate) fs: &'a Tmpfs,
+    pub(crate) fs: &'a Fs,
+    /// The open files, for the jumps through `/proc/<pid>/fd/<n>` and `exe`.
+    files: &'a FileTable,
     env: &'a Env,
     pub(crate) cur: InodeId,
     /// `nd->total_link_count`.
@@ -122,9 +133,16 @@ fn skip_slashes(mut name: &[u8]) -> &[u8] {
 
 impl<'a> Walk<'a> {
     /// `path_init`.
-    pub(crate) fn new(fs: &'a Tmpfs, env: &'a Env, path: &[u8], follow: bool) -> KResult<Self> {
+    pub(crate) fn new(
+        fs: &'a Fs,
+        files: &'a FileTable,
+        env: &'a Env,
+        path: &[u8],
+        follow: bool,
+    ) -> KResult<Self> {
         Ok(Self {
             fs,
+            files,
             env,
             cur: init(fs, env, path)?,
             links: 0,
@@ -133,18 +151,29 @@ impl<'a> Walk<'a> {
     }
 
     pub(crate) fn is_dir(&self, id: InodeId) -> bool {
-        self.fs.inode(id).is_dir()
+        self.fs.is_dir(id)
     }
 
     /// `may_lookup`: search permission on the directory being walked.
     fn may_lookup(&self) -> KResult<()> {
-        permission(self.fs.inode(self.cur), &self.env.cred, MAY_EXEC)
+        self.fs.permission(self.env, self.cur, MAY_EXEC)
     }
 
-    /// `handle_dots`: `..` stays at the process root (`follow_dotdot`).
+    /// `follow_dotdot`: `..` stays at the process root and climbs out of a
+    /// mount at its root (`follow_up`).
     fn dotdot(&mut self) {
-        if self.cur != self.env.root {
-            self.cur = self.fs.parent(self.cur);
+        loop {
+            if self.cur == self.env.root {
+                break;
+            }
+            if !self.fs.is_mount_root(self.cur) {
+                self.cur = self.fs.parent_dir(self.cur);
+                break;
+            }
+            match self.fs.mount_of(self.cur) {
+                Some(mount) if mount.parent != mount.id => self.cur = mount.point,
+                _ => break,
+            }
         }
     }
 
@@ -156,6 +185,10 @@ impl<'a> Walk<'a> {
         if count >= MAXSYMLINKS {
             return Err(Errno::ELOOP);
         }
+        if let Some(node) = ProcNode::of(link) {
+            self.cur = self.jump_target(node)?;
+            return Ok(None);
+        }
         let Body::Link(body) = &self.fs.inode(link).body else {
             return Err(Errno::EINVAL);
         };
@@ -165,6 +198,57 @@ impl<'a> Walk<'a> {
             body = skip_slashes(body);
         }
         Ok((!body.is_empty()).then_some(body))
+    }
+
+    /// `nd_jump_link` of a procfs link: where `self`, `thread-self`, `mounts`,
+    /// `fd/<n>`, `cwd`, `root` and `exe` lead.
+    fn jump_target(&self, node: ProcNode) -> KResult<InodeId> {
+        let caller = self.env.tgid;
+        match node.kind {
+            // proc_self_get_link / proc_thread_self_get_link: `-ENOENT` when
+            // the caller has no pid (the kernel itself).
+            Kind::SelfLink | Kind::MountsLink | Kind::ThreadSelf => {
+                if caller == 0 {
+                    return Err(Errno::ENOENT);
+                }
+                let pid = ProcNode::new(node.sb, Kind::Pid).with_tgid(caller);
+                Ok(match node.kind {
+                    Kind::SelfLink => pid.id(),
+                    Kind::ThreadSelf => pid.in_task().id(),
+                    _ => ProcNode::new(node.sb, Kind::Mounts).with_tgid(caller).id(),
+                })
+            }
+            Kind::FdLink | Kind::Cwd | Kind::RootLink | Kind::Exe => {
+                // proc_pid_get_link: `proc_fd_access_allowed`, then the
+                // `proc_get_link` of the entry.
+                let target =
+                    crate::procfs::magic_target(&self.fs.ns.proc, self.files, self.env, node)?;
+                match target {
+                    crate::procfs::Magic::Inode(id) => Ok(id),
+                    // A pipe or socket: Linux reopens an anonymous inode; not ported.
+                    crate::procfs::Magic::Anonymous => {
+                        self.fs.ns.note_unimplemented();
+                        Err(Errno::ENOENT)
+                    }
+                }
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// The child `name` of the current directory, mounts followed
+    /// (`lookup_fast` + `traverse_mounts`).
+    pub(crate) fn child(&self, last: &Last<'_>) -> KResult<Option<InodeId>> {
+        Ok(self
+            .fs
+            .lookup_child(self.env, self.cur, last.name)?
+            .map(|child| {
+                if self.fs.is_symlink(child) {
+                    child
+                } else {
+                    self.fs.follow_mounts(child)
+                }
+            }))
     }
 
     /// `walk_component` (+ `step_into`).
@@ -181,7 +265,7 @@ impl<'a> Walk<'a> {
             }
             LastKind::Norm => {}
         }
-        let Some(child) = self.fs.lookup(self.cur, last.name) else {
+        let Some(child) = self.child(last)? else {
             // __lookup_slow: no dentry is created in a removed directory.
             if self.fs.is_dead(self.cur) {
                 return Err(Errno::ENOENT);
@@ -194,7 +278,7 @@ impl<'a> Walk<'a> {
                 Errno::ENOENT
             });
         };
-        let symlink = self.fs.inode(child).is_symlink();
+        let symlink = self.fs.is_symlink(child);
         let stop = (flags & WALK_TRAILING != 0 && !self.follow) && symlink;
         if !symlink || stop {
             self.cur = child;
@@ -266,16 +350,24 @@ impl<'a> Walk<'a> {
 }
 
 /// `path_init`: where a walk of `path` begins.
-fn init(fs: &Tmpfs, env: &Env, path: &[u8]) -> KResult<InodeId> {
+fn init(fs: &Fs, env: &Env, path: &[u8]) -> KResult<InodeId> {
     let start = if path.first() == Some(&b'/') {
         env.root
     } else {
         env.start
     };
-    if !path.is_empty() && path.first() != Some(&b'/') && !fs.inode(start).is_dir() {
+    if !path.is_empty() && path.first() != Some(&b'/') && !fs.is_dir(start) {
         return Err(Errno::ENOTDIR);
     }
     Ok(start)
+}
+
+/// What a lookup found and the name it found it by.
+pub struct Found {
+    pub inode: InodeId,
+    /// The directory and name of the final component (`None` for `.`, `..`,
+    /// the root, and a procfs jump).
+    pub dentry: Option<super::file::Dentry>,
 }
 
 /// `path_lookupat`: the inode `path` names. `flags` are [`LOOKUP_FOLLOW`] and
@@ -283,28 +375,73 @@ fn init(fs: &Tmpfs, env: &Env, path: &[u8]) -> KResult<InodeId> {
 ///
 /// # Errors
 /// `ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`, `EACCES`.
-pub fn lookup<'x>(fs: &'x Tmpfs, env: &'x Env, path: &'x [u8], flags: u32) -> KResult<InodeId> {
-    let mut walk = Walk::new(fs, env, path, flags & LOOKUP_FOLLOW != 0)?;
+pub fn lookup<'x>(
+    fs: &'x Fs,
+    files: &'x FileTable,
+    env: &'x Env,
+    path: &'x [u8],
+    flags: u32,
+) -> KResult<InodeId> {
+    lookup_inner(fs, files, env, path, flags, false).map(|found| found.inode)
+}
+
+/// [`lookup`] that also returns the dentry (directory and name) for `d_path`.
+///
+/// # Errors
+/// As [`lookup`]; `ENOMEM`.
+pub fn lookup_dentry<'x>(
+    fs: &'x Fs,
+    files: &'x FileTable,
+    env: &'x Env,
+    path: &'x [u8],
+    flags: u32,
+) -> KResult<Found> {
+    lookup_inner(fs, files, env, path, flags, true)
+}
+
+fn lookup_inner<'x>(
+    fs: &'x Fs,
+    files: &'x FileTable,
+    env: &'x Env,
+    path: &'x [u8],
+    flags: u32,
+    want_dentry: bool,
+) -> KResult<Found> {
+    let mut walk = Walk::new(fs, files, env, path, flags & LOOKUP_FOLLOW != 0)?;
     let mut want_dir = flags & LOOKUP_DIRECTORY != 0;
     let mut remaining = path;
+    let dentry;
     loop {
         let last = walk.link_path_walk(remaining)?;
         if last.kind == LastKind::Norm && last.trailing_slash {
             walk.follow = true;
             want_dir = true;
         }
+        let dir = walk.cur;
         // lookup_last -> walk_component(WALK_TRAILING)
-        match walk.walk_component(&last, WALK_TRAILING)? {
-            // The body is walked by a fresh link_path_walk; what follows it in
-            // the original path is nothing (this was the final component).
-            Some(body) => remaining = body,
-            None => break,
+        // The body is walked by a fresh link_path_walk; what follows it in the original path is
+        // nothing (this was the final component).
+        if let Some(body) = walk.walk_component(&last, WALK_TRAILING)? {
+            remaining = body;
+        } else {
+            dentry = (want_dentry && last.kind == LastKind::Norm && !walk.cur.is_proc())
+                .then(|| -> KResult<_> {
+                    Ok(super::file::Dentry {
+                        parent: dir,
+                        name: super::try_copy(last.name)?,
+                    })
+                })
+                .transpose()?;
+            break;
         }
     }
     if want_dir && !walk.is_dir(walk.cur) {
         return Err(Errno::ENOTDIR);
     }
-    Ok(walk.cur)
+    Ok(Found {
+        inode: walk.cur,
+        dentry,
+    })
 }
 
 /// The parent directory of the final component and that component
@@ -319,8 +456,13 @@ pub struct Parent {
 
 /// # Errors
 /// As [`lookup`] for the directories on the way; `ENOMEM`.
-pub fn parent_of<'x>(fs: &'x Tmpfs, env: &'x Env, path: &'x [u8]) -> KResult<Parent> {
-    let mut walk = Walk::new(fs, env, path, false)?;
+pub fn parent_of<'x>(
+    fs: &'x Fs,
+    files: &'x FileTable,
+    env: &'x Env,
+    path: &'x [u8],
+) -> KResult<Parent> {
+    let mut walk = Walk::new(fs, files, env, path, false)?;
     let last = walk.link_path_walk(path)?;
     Ok(Parent {
         dir: walk.cur,

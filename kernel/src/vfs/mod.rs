@@ -59,8 +59,11 @@
 //! granularity).
 
 pub mod file;
+pub mod fs;
 pub mod initramfs;
 pub mod mapping;
+pub mod mount;
+pub mod mountops;
 pub mod ops;
 pub mod path;
 pub mod pipe;
@@ -70,19 +73,41 @@ use alloc::vec::Vec;
 use syscalls::Errno;
 
 pub use file::{Fd, FdTable, FileTable, FsStruct};
+pub use fs::Fs;
 pub use ops::Env;
 pub use tmpfs::Tmpfs;
 
 pub type KResult<T> = Result<T, Errno>;
 
-/// A tmpfs inode (arena index; `Tmpfs::iget` pins it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InodeId(pub(crate) u32);
+/// A superblock (mount instance) of the namespace: the index into the
+/// namespace's table and, for a tmpfs, into the arena's superblock table.
+pub type SbId = u16;
+
+/// An inode of any filesystem of the namespace: a tmpfs inode (arena index;
+/// `Tmpfs::iget` pins it) or a procfs node (a value, [`PROC_NODE_BIT`] set;
+/// see [`crate::procfs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InodeId(pub(crate) u64);
+
+/// Set in an [`InodeId`] that names a procfs node.
+pub const PROC_NODE_BIT: u64 = 1 << 63;
+
 impl InodeId {
-    /// The arena index: a stable identity while the inode is pinned.
+    /// The tmpfs inode in arena slot `slot`.
+    #[must_use]
+    pub(crate) const fn tmp(slot: u32) -> Self {
+        Self(slot as u64)
+    }
+    /// The arena index of a tmpfs inode: a stable identity while the inode is
+    /// pinned.
     #[must_use]
     pub const fn index(self) -> u32 {
-        self.0
+        self.0 as u32
+    }
+    /// Whether the handle names a procfs node.
+    #[must_use]
+    pub const fn is_proc(self) -> bool {
+        self.0 & PROC_NODE_BIT != 0
     }
 }
 /// An open file description (`struct file`; arena index in [`FileTable`]).
@@ -93,6 +118,12 @@ impl FileId {
     #[must_use]
     pub const fn index(self) -> u32 {
         self.0
+    }
+    /// The handle of arena slot `index` (the inverse of [`FileId::index`]; the
+    /// slot may be empty, which [`FileTable::try_get`] answers).
+    #[must_use]
+    pub(crate) const fn from_index(index: u32) -> Self {
+        Self(index)
     }
 }
 /// A pipe (`pipe_inode_info`; arena index in [`Vfs`]).
@@ -215,6 +246,9 @@ pub const MAXSYMLINKS: u32 = 40;
 pub const PAGE_SIZE: usize = 4096;
 /// `MAX_LFS_FILESIZE` on 64-bit (`LLONG_MAX`).
 pub const MAX_LFS_FILESIZE: i64 = i64::MAX;
+/// `MAX_NON_LFS`: the offset limit of a file opened without `O_LARGEFILE`, and the `s_maxbytes` of
+/// a superblock that never sets one (procfs: `alloc_super` leaves the default).
+pub const MAX_NON_LFS: i64 = (1 << 31) - 1;
 /// `sysctl_nr_open`: the hard ceiling of a descriptor number.
 pub const NR_OPEN: u64 = 1 << 20;
 /// `INR_OPEN_CUR` / `INR_OPEN_MAX`: init's `RLIMIT_NOFILE`.
@@ -357,11 +391,14 @@ pub struct Kstat {
     pub btime: Timespec,
     pub attributes: u64,
     pub attributes_mask: u64,
+    /// `stat->mnt_id`: the mount the file was reached through (0 until
+    /// [`Vfs::getattr`] fills it).
+    pub mnt_id: u32,
 }
 
 /// The mounted instance and every table hanging off it.
 pub struct Vfs {
-    pub fs: Tmpfs,
+    pub fs: Fs,
     pub files: FileTable,
     pipes: Vec<Option<pipe::Pipe>>,
     next_pipe_ino: u64,
@@ -389,8 +426,10 @@ impl Vfs {
     /// # Errors
     /// `ENOMEM` when the root inode cannot be allocated.
     pub fn new(max_blocks: u64, max_inodes: u64, clock: fn() -> Timespec) -> KResult<Self> {
+        // `totalram_pages()` is what the default limits halve.
+        let ram_pages = max_blocks.saturating_mul(2);
         Ok(Self {
-            fs: Tmpfs::new(max_blocks, max_inodes, clock)?,
+            fs: Fs::new(Tmpfs::new(max_blocks, max_inodes, clock)?, ram_pages)?,
             files: FileTable::default(),
             pipes: Vec::new(),
             next_pipe_ino: 1,

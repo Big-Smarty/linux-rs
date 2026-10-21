@@ -143,7 +143,8 @@ fn file_mapping<C: Context>(ctx: &mut C, m: &FileMapping, zero: bool) -> Outcome
             Err(errno) => Outcome::Return(error(errno)),
         };
     }
-    if m.populate != 0 {
+    // (mm_populate never runs when `->mmap` fails.)
+    if m.populate != 0 && m.file.mmap_error.is_none() {
         return unimplemented;
     }
     // The pin that keeps the file alive for the VMA needs its slot before the
@@ -152,7 +153,7 @@ fn file_mapping<C: Context>(ctx: &mut C, m: &FileMapping, zero: bool) -> Outcome
         return Outcome::Return(error(errno));
     }
     let AddressSpace { mm, env, pages } = ctx.address_space();
-    match mm.mmap_region(
+    match mm.mmap_region_with(
         env,
         pages,
         Some(m.file.id),
@@ -160,6 +161,7 @@ fn file_mapping<C: Context>(ctx: &mut C, m: &FileMapping, zero: bool) -> Outcome
         m.len,
         m.vm_flags,
         m.pgoff,
+        m.file.mmap_error,
     ) {
         Ok(addr) => {
             let Files { vfs, owner, .. } = ctx.files();

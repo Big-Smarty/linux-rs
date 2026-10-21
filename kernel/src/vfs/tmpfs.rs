@@ -35,8 +35,8 @@ use syscalls::Errno;
 use super::{
     Cred, InodeId, KResult, Kstat, MAX_LFS_FILESIZE, PAGE_SIZE, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
     S_ISGID, S_ISUID, S_ISVTX, S_IXGRP, STATX_ATTR_APPEND, STATX_ATTR_AUTOMOUNT, STATX_ATTR_DAX,
-    STATX_ATTR_IMMUTABLE, STATX_ATTR_MOUNT_ROOT, STATX_ATTR_NODUMP, Timespec, dtype, try_copy,
-    try_push,
+    STATX_ATTR_IMMUTABLE, STATX_ATTR_MOUNT_ROOT, STATX_ATTR_NODUMP, SbId, Timespec, dtype,
+    try_copy, try_push,
 };
 
 /// The timestamp of an inode created before timekeeping runs; replaced by
@@ -125,6 +125,8 @@ pub enum Body {
 }
 
 pub struct Inode {
+    /// The superblock (mount instance) the inode belongs to (`i_sb`).
+    pub sb: SbId,
     pub ino: u64,
     pub mode: u32,
     pub uid: u32,
@@ -174,19 +176,54 @@ impl Inode {
     }
 }
 
-/// The superblock, its inode arena and the space accounting of one tmpfs.
-pub struct Tmpfs {
-    inodes: Vec<Option<Inode>>,
-    free: Vec<u32>,
-    next_ino: u64,
+/// One tmpfs superblock (`struct shmem_sb_info`): the space and inode
+/// accounting and the defaults of new inodes. All superblocks share the inode
+/// arena of [`Tmpfs`]; an inode names its superblock ([`Inode::sb`]).
+pub struct TmpSb {
+    /// `sb->s_dev`: an anonymous device (major 0), `st_dev` of its files.
+    pub dev: u32,
     used_blocks: u64,
     max_blocks: u64,
     nr_inodes: u64,
     max_inodes: u64,
+    /// `sbinfo->next_ino`.
+    next_ino: u64,
     root: InodeId,
+    /// `sbinfo->mode`, `uid`, `gid`: the root inode's mode and owner.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// `SB_RDONLY`.
+    pub rdonly: bool,
+    /// Pins on the superblock's inodes other than internal links (open files,
+    /// working directories, mappings): the superblock outlives its mount while
+    /// any exists (`sb->s_active`).
+    pins: u64,
+    /// The mount is gone (`MNT_DETACH` or unmounted): the arena entries are
+    /// freed with the last pin.
+    detached: bool,
+}
+
+/// What `shmem_fill_super` needs of the mount options.
+#[derive(Clone, Copy, Debug)]
+pub struct SbParams {
+    pub max_blocks: u64,
+    pub max_inodes: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdonly: bool,
+    /// The number of the first inode (the root's).
+    pub first_ino: u64,
+}
+
+/// The inode arena of every tmpfs instance: the superblock table, the inodes
+/// and the clock.
+pub struct Tmpfs {
+    inodes: Vec<Option<Inode>>,
+    free: Vec<u32>,
+    sbs: Vec<Option<TmpSb>>,
     clock: fn() -> Timespec,
-    /// `sb->s_dev`: an anonymous device (major 0).
-    pub dev: u32,
 }
 
 /// What `shmem_statfs` reports besides the constants.
@@ -202,36 +239,166 @@ pub struct Statfs {
 pub type Actor<'a> = dyn FnMut(&[u8], i64, u64, u8) -> bool + 'a;
 
 impl Tmpfs {
+    /// The arena with the rootfs superblock (id 0, device `0:2`).
+    ///
     /// # Errors
     /// `ENOMEM` for the root inode.
     pub fn new(max_blocks: u64, max_inodes: u64, clock: fn() -> Timespec) -> KResult<Self> {
         let mut fs = Self {
             inodes: Vec::new(),
             free: Vec::new(),
-            next_ino: 2,
-            used_blocks: 0,
-            max_blocks,
-            nr_inodes: 0,
-            max_inodes,
-            root: InodeId(0),
+            sbs: Vec::new(),
             clock,
-            dev: 2,
         };
         // `shmem_fill_super`: the root is `S_IFDIR | sbinfo->mode` with the
-        // default mode 01777 and root ownership.
-        let root = fs.alloc(None, S_IFDIR | S_ISVTX | 0o777, 0, &Cred::root())?;
-        fs.root = root;
-        if let Some(inode) = fs.inodes[root.0 as usize].as_mut()
+        // default mode 01777 and root ownership. Inode numbers start at 1
+        // (`sbinfo->next_ino`): the reference's `/` is inode 1.
+        fs.new_sb(
+            0,
+            2,
+            SbParams {
+                max_blocks,
+                max_inodes,
+                mode: S_ISVTX | 0o777,
+                uid: 0,
+                gid: 0,
+                rdonly: false,
+                first_ino: 1,
+            },
+        )?;
+        Ok(fs)
+    }
+
+    /// `shmem_fill_super` for a new superblock `sb` (a free id of the
+    /// namespace) with anonymous device minor `dev`: the table entry and the
+    /// root directory. Returns the root.
+    ///
+    /// # Errors
+    /// `ENOMEM`, `ENOSPC`; nothing changed.
+    pub fn new_sb(&mut self, sb: SbId, dev: u32, params: SbParams) -> KResult<InodeId> {
+        let slot = usize::from(sb);
+        if self.sbs.len() <= slot {
+            self.sbs
+                .try_reserve(slot + 1 - self.sbs.len())
+                .map_err(|_| Errno::ENOMEM)?;
+            while self.sbs.len() <= slot {
+                self.sbs
+                    .push_within_capacity(None)
+                    .map_err(|_| Errno::ENOMEM)?;
+            }
+        }
+        debug_assert!(self.sbs[slot].is_none(), "superblock id in use");
+        self.sbs[slot] = Some(TmpSb {
+            dev,
+            used_blocks: 0,
+            max_blocks: params.max_blocks,
+            nr_inodes: 0,
+            max_inodes: params.max_inodes,
+            next_ino: params.first_ino,
+            root: InodeId::tmp(0),
+            mode: params.mode,
+            uid: params.uid,
+            gid: params.gid,
+            rdonly: params.rdonly,
+            pins: 0,
+            detached: false,
+        });
+        let owner = Cred {
+            fsuid: params.uid,
+            fsgid: params.gid,
+            ..Cred::root()
+        };
+        let root = match self.alloc(sb, None, S_IFDIR | params.mode, 0, &owner) {
+            Ok(root) => root,
+            Err(error) => {
+                self.sbs[slot] = None;
+                return Err(error);
+            }
+        };
+        if let Some(entry) = self.sbs[slot].as_mut() {
+            entry.root = root;
+        }
+        if let Some(inode) = self.inodes[root.0 as usize].as_mut()
             && let Body::Dir(dir) = &mut inode.body
         {
             dir.parent = root;
         }
-        Ok(fs)
+        Ok(root)
     }
 
+    /// The superblock table entry (`SHMEM_SB`).
+    ///
+    /// # Panics
+    /// On an id that names no tmpfs superblock (a kernel bug).
+    #[must_use]
+    pub fn sb(&self, sb: SbId) -> &TmpSb {
+        self.sbs
+            .get(usize::from(sb))
+            .and_then(Option::as_ref)
+            .expect("stale tmpfs superblock")
+    }
+
+    /// Mutable superblock access.
+    ///
+    /// # Panics
+    /// As [`Tmpfs::sb`].
+    pub fn sb_mut(&mut self, sb: SbId) -> &mut TmpSb {
+        self.sbs
+            .get_mut(usize::from(sb))
+            .and_then(Option::as_mut)
+            .expect("stale tmpfs superblock")
+    }
+
+    /// Whether `sb` names a live tmpfs superblock.
+    #[must_use]
+    pub fn has_sb(&self, sb: SbId) -> bool {
+        self.sbs.get(usize::from(sb)).is_some_and(Option::is_some)
+    }
+
+    /// The root of the rootfs.
     #[must_use]
     pub fn root(&self) -> InodeId {
-        self.root
+        self.sb(0).root
+    }
+
+    /// The root of superblock `sb`.
+    #[must_use]
+    pub fn sb_root(&self, sb: SbId) -> InodeId {
+        self.sb(sb).root
+    }
+
+    /// `kill_litter_super`/`generic_shutdown_super` at the last `sb->s_active`
+    /// reference: every inode of the superblock is freed. The caller has
+    /// checked that nothing pins it (or defers to [`Tmpfs::detach_sb`]).
+    fn kill_sb(&mut self, sb: SbId) {
+        for (slot, entry) in self.inodes.iter_mut().enumerate() {
+            if entry.as_ref().is_some_and(|inode| inode.sb == sb) {
+                *entry = None;
+                if let Ok(slot) = u32::try_from(slot) {
+                    let _ = try_push(&mut self.free, slot);
+                }
+            }
+        }
+        if let Some(entry) = self.sbs.get_mut(usize::from(sb)) {
+            *entry = None;
+        }
+    }
+
+    /// The mount of `sb` is gone (`umount`): free it now when nothing pins an
+    /// inode, else with the last pin (`MNT_DETACH`).
+    pub fn detach_sb(&mut self, sb: SbId) {
+        let pinned = self.sb(sb).pins != 0;
+        self.sb_mut(sb).detached = true;
+        if !pinned {
+            self.kill_sb(sb);
+        }
+    }
+
+    /// Pins held on the superblock's inodes (`sb->s_active` minus the mount):
+    /// zero means no open file, working directory, root or mapping is inside.
+    #[must_use]
+    pub fn sb_pins(&self, sb: SbId) -> u64 {
+        self.sb(sb).pins
     }
 
     #[must_use]
@@ -274,15 +441,39 @@ impl Tmpfs {
     pub fn iget(&mut self, id: InodeId) {
         let inode = self.inode_mut(id);
         inode.refs += 1;
+        let sb = inode.sb;
+        self.sb_mut(sb).pins += 1;
     }
 
     /// Drop a pin; the last pin of an unlinked inode frees it (`iput` ->
-    /// `shmem_evict_inode`: pages and the inode charge are returned).
+    /// `shmem_evict_inode`: pages and the inode charge are returned), and the
+    /// last pin of a detached superblock frees the superblock.
     pub fn iput(&mut self, id: InodeId) {
         let inode = self.inode_mut(id);
         inode.refs -= 1;
-        if inode.refs == 0 && inode.nlink == 0 {
+        let (sb, free) = (inode.sb, inode.refs == 0 && inode.nlink == 0);
+        let entry = self.sb_mut(sb);
+        entry.pins -= 1;
+        if entry.detached && entry.pins == 0 {
+            self.kill_sb(sb);
+            return;
+        }
+        if free {
             self.evict(id);
+        }
+    }
+
+    /// A child directory's `d_parent` reference (not a pin of the superblock).
+    fn hold_parent(&mut self, dir: InodeId) {
+        self.inode_mut(dir).refs += 1;
+    }
+
+    /// Drop a `d_parent` reference.
+    fn drop_parent(&mut self, dir: InodeId) {
+        let inode = self.inode_mut(dir);
+        inode.refs -= 1;
+        if inode.refs == 0 && inode.nlink == 0 {
+            self.evict(dir);
         }
     }
 
@@ -290,34 +481,37 @@ impl Tmpfs {
         let Some(inode) = self.inodes[id.0 as usize].take() else {
             return;
         };
+        let sb = self.sb_mut(inode.sb);
         if let Body::Reg(pages) = &inode.body {
-            self.used_blocks -= pages.0.len() as u64;
+            sb.used_blocks -= pages.0.len() as u64;
         } else if let Body::Link(target) = &inode.body
             && target.len() >= SHORT_SYMLINK_LEN
         {
-            self.used_blocks -= 1;
+            sb.used_blocks -= 1;
         }
-        self.nr_inodes -= 1;
+        sb.nr_inodes -= 1;
         // The slot was just emptied and `free` only ever grows by evictions,
         // so reserving can fail only under memory pressure; losing the slot
         // then wastes one arena entry, never correctness.
-        let _ = try_push(&mut self.free, id.0);
+        let _ = try_push(&mut self.free, id.index());
         if let Body::Dir(dir) = inode.body
             && dir.parent != id
         {
-            self.iput(dir.parent);
+            self.drop_parent(dir.parent);
         }
     }
 
     fn alloc(
         &mut self,
+        sb: SbId,
         dir: Option<InodeId>,
         mode: u32,
         rdev: u32,
         cred: &Cred,
     ) -> KResult<InodeId> {
         // shmem_reserve_inode
-        if self.max_inodes != 0 && self.nr_inodes >= self.max_inodes {
+        let entry = self.sb(sb);
+        if entry.max_inodes != 0 && entry.nr_inodes >= entry.max_inodes {
             return Err(Errno::ENOSPC);
         }
         let now = self.now();
@@ -344,7 +538,7 @@ impl Tmpfs {
             S_IFDIR => (
                 Body::Dir(Dir {
                     children: Vec::new(),
-                    parent: dir.unwrap_or(InodeId(0)),
+                    parent: dir.unwrap_or(InodeId::tmp(0)),
                     next_offset: DIR_OFFSET_MIN,
                     dead: false,
                 }),
@@ -355,7 +549,8 @@ impl Tmpfs {
             _ => (Body::Special, 1, 0),
         };
         let inode = Inode {
-            ino: self.next_ino,
+            sb,
+            ino: self.sb(sb).next_ino,
             mode,
             uid: cred.fsuid,
             gid,
@@ -384,14 +579,15 @@ impl Tmpfs {
             }
             slot
         };
-        self.next_ino += 1;
-        self.nr_inodes += 1;
-        let id = InodeId(slot);
+        let entry = self.sb_mut(sb);
+        entry.next_ino += 1;
+        entry.nr_inodes += 1;
+        let id = InodeId::tmp(slot);
         if let Some(dir) = dir
             && mode & S_IFMT == S_IFDIR
         {
             // A directory's dentry references its parent for as long as it exists.
-            self.iget(dir);
+            self.hold_parent(dir);
         }
         Ok(id)
     }
@@ -472,7 +668,8 @@ impl Tmpfs {
         rdev: u32,
         cred: &Cred,
     ) -> KResult<InodeId> {
-        let id = self.alloc(Some(dir), mode, rdev, cred)?;
+        let sb = self.inode(dir).sb;
+        let id = self.alloc(sb, Some(dir), mode, rdev, cred)?;
         if let Err(error) = self.add_entry(dir, name, id) {
             self.discard(id);
             return Err(error);
@@ -488,8 +685,8 @@ impl Tmpfs {
     ///
     /// # Errors
     /// `ENOSPC`, `ENOMEM`.
-    pub fn mknod_unlinked(&mut self, mode: u32, cred: &Cred) -> KResult<InodeId> {
-        let id = self.alloc(None, mode, 0, cred)?;
+    pub fn mknod_unlinked(&mut self, sb: SbId, mode: u32, cred: &Cred) -> KResult<InodeId> {
+        let id = self.alloc(sb, None, mode, 0, cred)?;
         self.inode_mut(id).nlink = 0;
         Ok(id)
     }
@@ -526,16 +723,18 @@ impl Tmpfs {
         }
         let copy = try_copy(target)?;
         let long = target.len() + 1 > SHORT_SYMLINK_LEN;
-        if long && self.used_blocks >= self.max_blocks && self.max_blocks != 0 {
+        let sb = self.inode(dir).sb;
+        let entry = self.sb(sb);
+        if long && entry.used_blocks >= entry.max_blocks && entry.max_blocks != 0 {
             return Err(Errno::ENOSPC);
         }
-        let id = self.alloc(Some(dir), S_IFLNK | 0o777, 0, cred)?;
+        let id = self.alloc(sb, Some(dir), S_IFLNK | 0o777, 0, cred)?;
         if let Err(error) = self.add_entry(dir, name, id) {
             self.discard(id);
             return Err(error);
         }
         if long {
-            self.used_blocks += 1;
+            self.sb_mut(sb).used_blocks += 1;
         }
         let inode = self.inode_mut(id);
         inode.size = target.len() as u64;
@@ -551,15 +750,17 @@ impl Tmpfs {
         // Each extra name pins a dentry: it is charged as an inode, except the
         // first name of an `O_TMPFILE` file (`inode->i_nlink` is zero).
         let charged = self.inode(old).nlink != 0;
+        let sb = self.inode(old).sb;
         if charged {
-            if self.max_inodes != 0 && self.nr_inodes >= self.max_inodes {
+            let entry = self.sb_mut(sb);
+            if entry.max_inodes != 0 && entry.nr_inodes >= entry.max_inodes {
                 return Err(Errno::ENOSPC);
             }
-            self.nr_inodes += 1;
+            entry.nr_inodes += 1;
         }
         if let Err(error) = self.add_entry(dir, name, old) {
             if charged {
-                self.nr_inodes -= 1;
+                self.sb_mut(sb).nr_inodes -= 1;
             }
             return Err(error);
         }
@@ -600,7 +801,8 @@ impl Tmpfs {
         let now = self.now();
         // shmem_unlink: the extra names of a file were charged as inodes.
         if !rmdir && self.inode(victim).nlink > 1 && !self.inode(victim).is_dir() {
-            self.nr_inodes -= 1;
+            let sb = self.inode(victim).sb;
+            self.sb_mut(sb).nr_inodes -= 1;
         }
         let parent = self.inode_mut(dir);
         if let Body::Dir(d) = &mut parent.body {
@@ -686,7 +888,8 @@ impl Tmpfs {
             // shmem_unlink(new_dir, new_dentry)
             let victim_is_dir = self.inode(victim).is_dir();
             if self.inode(victim).nlink > 1 && !victim_is_dir {
-                self.nr_inodes -= 1;
+                let sb = self.inode(victim).sb;
+                self.sb_mut(sb).nr_inodes -= 1;
             }
             let at = find(self, new_dir, new_name).unwrap_or(0);
             let nd = self.inode_mut(new_dir);
@@ -809,8 +1012,9 @@ impl Tmpfs {
     #[must_use]
     pub fn getattr(&self, id: InodeId) -> Kstat {
         let inode = self.inode(id);
+        let sb = self.sb(inode.sb);
         Kstat {
-            dev: super::mkdev(0, self.dev),
+            dev: super::mkdev(0, sb.dev),
             ino: inode.ino,
             mode: inode.mode,
             nlink: inode.nlink,
@@ -824,7 +1028,7 @@ impl Tmpfs {
             mtime: inode.mtime,
             ctime: inode.ctime,
             btime: inode.btime,
-            attributes: if id == self.root {
+            attributes: if id == sb.root {
                 STATX_ATTR_MOUNT_ROOT
             } else {
                 0
@@ -837,6 +1041,7 @@ impl Tmpfs {
                 | STATX_ATTR_IMMUTABLE
                 | STATX_ATTR_NODUMP
                 | STATX_ATTR_MOUNT_ROOT,
+            mnt_id: 0,
         }
     }
 
@@ -918,7 +1123,8 @@ impl Tmpfs {
         let at = match existing {
             Ok(at) => at,
             Err(at) => {
-                if self.max_blocks != 0 && self.used_blocks >= self.max_blocks {
+                let entry = self.sb(self.inode(id).sb);
+                if entry.max_blocks != 0 && entry.used_blocks >= entry.max_blocks {
                     return Err(Errno::ENOSPC);
                 }
                 let mut page = Vec::new();
@@ -939,7 +1145,8 @@ impl Tmpfs {
                     return Err(Errno::ENOMEM);
                 }
                 pages.0[at..].rotate_right(1);
-                self.used_blocks += 1;
+                let sb = self.inode(id).sb;
+                self.sb_mut(sb).used_blocks += 1;
                 at
             }
         };
@@ -987,7 +1194,8 @@ impl Tmpfs {
                 last.data[tail..].fill(0);
             }
             let freed = (before - pages.0.len()) as u64;
-            self.used_blocks -= freed;
+            let sb = self.inode(id).sb;
+            self.sb_mut(sb).used_blocks -= freed;
         }
         let inode = self.inode_mut(id);
         inode.size = size;
@@ -995,20 +1203,18 @@ impl Tmpfs {
         inode.ctime = now;
     }
 
-    /// `shmem_statfs`: the block and inode counts (`f_blocks`, `f_bfree` = `f_bavail`,
-    /// `f_files`, `f_ffree`; all zero for an unlimited size or inode count).
+    /// `shmem_statfs`: the block and inode counts of one superblock (`f_blocks`, `f_bfree` =
+    /// `f_bavail`, `f_files`, `f_ffree`; all zero for an unlimited size or inode count).
     #[must_use]
-    pub fn statfs(&self) -> Statfs {
-        let (blocks, bfree) = if self.max_blocks != 0 {
-            (self.max_blocks, self.max_blocks - self.used_blocks)
+    pub fn statfs(&self, sb: SbId) -> Statfs {
+        let (max_blocks, used_blocks, max_inodes, nr_inodes) = self.sb_usage(sb);
+        let (blocks, bfree) = if max_blocks != 0 {
+            (max_blocks, max_blocks - used_blocks)
         } else {
             (0, 0)
         };
-        let (files, ffree) = if self.max_inodes != 0 {
-            (
-                self.max_inodes,
-                self.max_inodes.saturating_sub(self.nr_inodes),
-            )
+        let (files, ffree) = if max_inodes != 0 {
+            (max_inodes, max_inodes.saturating_sub(nr_inodes))
         } else {
             (0, 0)
         };
@@ -1084,16 +1290,76 @@ impl Tmpfs {
         Ok(out)
     }
 
-    /// Space charged against the superblock, in pages (tests, `statfs`).
+    /// Space charged against the rootfs superblock, in pages (tests).
     #[must_use]
     pub fn used_blocks(&self) -> u64 {
-        self.used_blocks
+        self.sb(0).used_blocks
     }
 
-    /// Live inodes (tests).
+    /// Live inodes of the rootfs superblock (tests).
     #[must_use]
     pub fn inode_count(&self) -> u64 {
-        self.nr_inodes
+        self.sb(0).nr_inodes
+    }
+
+    /// The limits and use of a superblock as `shmem_show_options` and
+    /// `shmem_statfs` read them: `(max_blocks, used_blocks, max_inodes,
+    /// nr_inodes)`.
+    #[must_use]
+    pub fn sb_usage(&self, sb: SbId) -> (u64, u64, u64, u64) {
+        let entry = self.sb(sb);
+        (
+            entry.max_blocks,
+            entry.used_blocks,
+            entry.max_inodes,
+            entry.nr_inodes,
+        )
+    }
+
+    /// Whether the superblock is read-only (`sb_rdonly`).
+    #[must_use]
+    pub fn sb_rdonly(&self, sb: SbId) -> bool {
+        self.sb(sb).rdonly
+    }
+
+    /// `shmem_reconfigure` and the `SB_RDONLY` change of `reconfigure_super`:
+    /// new limits (0 keeps "unlimited" semantics as `0` means no limit) and
+    /// read-only state.
+    ///
+    /// # Errors
+    /// `EINVAL`: a limit cannot be introduced retroactively or is below the
+    /// current use (`Cannot retroactively limit size`, `Too small a size for
+    /// current use`, `Cannot retroactively limit inodes`, `Too few inodes for
+    /// current use`).
+    pub fn reconfigure(
+        &mut self,
+        sb: SbId,
+        blocks: Option<u64>,
+        inodes: Option<u64>,
+    ) -> KResult<()> {
+        let entry = self.sb_mut(sb);
+        if let Some(blocks) = blocks.filter(|&b| b != 0)
+            && (entry.max_blocks == 0 || entry.used_blocks > blocks)
+        {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(inodes) = inodes.filter(|&i| i != 0)
+            && (entry.max_inodes == 0 || inodes < entry.nr_inodes)
+        {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(blocks) = blocks {
+            entry.max_blocks = blocks;
+        }
+        if let Some(inodes) = inodes {
+            entry.max_inodes = inodes;
+        }
+        Ok(())
+    }
+
+    /// Set the read-only state of a superblock.
+    pub fn set_rdonly(&mut self, sb: SbId, rdonly: bool) {
+        self.sb_mut(sb).rdonly = rdonly;
     }
 
     // ---- directories -------------------------------------------------------

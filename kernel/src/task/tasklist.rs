@@ -76,6 +76,10 @@ pub struct CredSnapshot {
     pub uid: u32,
     pub euid: u32,
     pub suid: u32,
+    /// The group ids (`/proc/<pid>` ownership and `ptrace_may_access`).
+    pub gid: u32,
+    pub egid: u32,
+    pub sgid: u32,
     /// `ns_capable(CAP_KILL)`.
     pub cap_kill: bool,
     /// `capable(CAP_SYS_RESOURCE)` (the `RLIMIT_NPROC` bypass).
@@ -95,6 +99,9 @@ impl CredSnapshot {
             uid: cred.uid,
             euid: cred.euid,
             suid: cred.suid,
+            gid: cred.gid,
+            egid: cred.egid,
+            sgid: cred.sgid,
             cap_kill: root,
             cap_sys_resource: root,
         }
@@ -130,6 +137,10 @@ pub struct TaskStruct {
     /// `PF_*`.
     pub flags: u32,
     pub cred: CredSnapshot,
+    /// `get_dumpable(mm) == SUID_DUMP_USER` (`MMF_DUMPABLE`): copied by `fork`,
+    /// set again by `execve`, cleared by `PR_SET_DUMPABLE` and by a change of
+    /// the effective ids (`commit_creds`).
+    pub dumpable: bool,
     /// `signal->leader`: a session leader.
     pub session_leader: bool,
     /// `signal->tty != NULL`: the console tty is the controlling terminal
@@ -197,6 +208,49 @@ pub struct Tasklist {
     order: Vec<TaskId>,
     nr_threads: u32,
     max_threads: u32,
+    /// `total_forks`: tasks created since boot.
+    forks: u64,
+    /// What `/proc` mirrors changed ([`Tasklist::epoch`]).
+    changes: ChangeLog,
+}
+
+/// How many recent changes [`ChangeLog`] remembers.
+const CHANGE_LOG: usize = 64;
+
+/// The pid numbers of the thread groups whose mirrored facts changed (a task
+/// published or released, a credential snapshot published, the zombie
+/// transition, a change of dumpability), newest last, in a ring of the last
+/// [`CHANGE_LOG`]. A reader keeps the count it last saw and replays what came
+/// after ([`Tasklist::changed_since`]); a reader that fell more than the ring
+/// behind rebuilds from the task list instead. No allocation: nothing here can
+/// fail, and nothing needs a consumer to keep it bounded.
+#[derive(Clone, Copy)]
+struct ChangeLog {
+    ring: [i32; CHANGE_LOG],
+    /// Changes recorded since boot.
+    count: u64,
+}
+
+impl ChangeLog {
+    /// The ring slot of change number `at`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the remainder is below CHANGE_LOG"
+    )]
+    const fn slot(at: u64) -> usize {
+        (at % CHANGE_LOG as u64) as usize
+    }
+
+    fn note(&mut self, nr: i32) {
+        self.ring[Self::slot(self.count)] = nr;
+        self.count += 1;
+    }
+
+    fn since(&self, seen: u64) -> Option<impl Iterator<Item = i32> + '_> {
+        let behind = self.count.checked_sub(seen)?;
+        (behind <= CHANGE_LOG as u64)
+            .then(|| (seen..self.count).map(|at| self.ring[Self::slot(at)]))
+    }
 }
 
 impl Tasklist {
@@ -221,6 +275,11 @@ impl Tasklist {
             order: Vec::new(),
             nr_threads: 0,
             max_threads,
+            forks: 0,
+            changes: ChangeLog {
+                ring: [0; CHANGE_LOG],
+                count: 1,
+            },
         };
         let signals =
             Box::try_new(TaskSignals::new_init(rlimit_sigpending)).map_err(|_| Errno::ENOMEM)?;
@@ -240,6 +299,7 @@ impl Tasklist {
                 parent_exec_id: 0,
                 flags: 0,
                 cred: CredSnapshot::of(cred),
+                dumpable: true,
                 session_leader: false,
                 ctty: false,
                 tty_old_pgrp: None,
@@ -306,6 +366,8 @@ impl Tasklist {
         }
         assert!(self.order.push_within_capacity(id).is_ok());
         self.nr_threads += 1;
+        self.forks += 1;
+        self.note_changed(id);
         Ok(id)
     }
 
@@ -324,8 +386,14 @@ impl Tasklist {
     pub fn fork(&mut self, parent: TaskId, params: ForkParams) -> Result<TaskId, Errno> {
         self.fork_allowed(parent, params)?;
         let p = self.tasks.get(parent).ok_or(Errno::ESRCH)?;
-        let (pgid, sid, cred, exec_id, ctty) =
-            (p.pids[2], p.pids[3], p.cred, p.self_exec_id, p.ctty);
+        let (pgid, sid, cred, exec_id, ctty, dumpable) = (
+            p.pids[2],
+            p.pids[3],
+            p.cred,
+            p.self_exec_id,
+            p.ctty,
+            p.dumpable,
+        );
         // copy_sighand / copy_signal / dup_task_struct: the parent's
         // dispositions, blocked mask and altstack; nothing pending.
         let signals = Box::try_new(
@@ -350,6 +418,8 @@ impl Tasklist {
             parent_exec_id: exec_id,
             flags: PF_FORKNOEXEC,
             cred,
+            // mm_init: the child's mm takes the parent's dumpability.
+            dumpable,
             session_leader: false,
             // copy_signal: `p->signal->tty = tty_kref_get(current->signal->tty)`.
             ctty,
@@ -415,6 +485,7 @@ impl Tasklist {
     /// If the task is the child reaper (init is never released).
     pub fn release_task(&mut self, id: TaskId) {
         assert!(id != self.child_reaper, "init released");
+        let nr = self.task_tgid_vnr(id);
         let Some(task) = self.tasks.remove(id) else {
             return;
         };
@@ -432,6 +503,7 @@ impl Tasklist {
         }
         self.order.retain(|&t| t != id);
         self.nr_threads -= 1;
+        self.changes.note(nr);
     }
 
     /// `free_pid` once the last link of every type is gone. `init_struct_pid`
@@ -468,6 +540,65 @@ impl Tasklist {
     #[must_use]
     pub const fn init_struct_pid(&self) -> PidId {
         self.init_pid
+    }
+
+    /// `total_forks`.
+    #[must_use]
+    pub const fn forks(&self) -> u64 {
+        self.forks
+    }
+
+    /// `idr_get_cursor(&pid_ns->idr) - 1`: the last pid handed out.
+    #[must_use]
+    pub fn last_pid(&self) -> i32 {
+        i32::try_from(self.table.cursor().saturating_sub(1)).unwrap_or(i32::MAX)
+    }
+
+    /// A counter that moves whenever a thread group appears or disappears or
+    /// the facts `/proc` mirrors of it change (credentials, the zombie
+    /// transition, dumpability): [`crate::procfs::ProcState::sync`] follows it
+    /// with [`Tasklist::changed_since`].
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.changes.count
+    }
+
+    /// The pid numbers whose mirrored facts changed after the `seen` value of
+    /// [`Tasklist::epoch`], oldest first (a number can repeat), or `None` when
+    /// more than the ring remembers happened since (rebuild from the list).
+    #[must_use]
+    pub fn changed_since(&self, seen: u64) -> Option<impl Iterator<Item = i32> + '_> {
+        self.changes.since(seen)
+    }
+
+    /// Record that the facts `/proc` mirrors of `task` changed.
+    fn note_changed(&mut self, task: TaskId) {
+        let nr = self.task_tgid_vnr(task);
+        self.changes.note(nr);
+    }
+
+    /// Mark the task changed for `/proc` readers: it became a zombie.
+    pub(super) fn touch_epoch(&mut self, task: TaskId) {
+        self.note_changed(task);
+    }
+
+    /// `get_dumpable(mm) == SUID_DUMP_USER` for the task (a task that is gone
+    /// counts as dumpable: nothing reads it). shortcut: `fs.suid_dumpable`
+    /// stays 0 and `SUID_DUMP_ROOT` does not exist, so a task is dumpable or
+    /// not; no set-id `execve` exists to make the new image undumpable.
+    #[must_use]
+    pub fn dumpable(&self, task: TaskId) -> bool {
+        self.tasks.get(task).is_none_or(|t| t.dumpable)
+    }
+
+    /// `set_dumpable(mm, value)` (`PR_SET_DUMPABLE`, `commit_creds`, `execve`).
+    pub fn set_dumpable(&mut self, task: TaskId, dumpable: bool) {
+        if let Some(t) = self.tasks.get_mut(task)
+            && t.dumpable != dumpable
+        {
+            t.dumpable = dumpable;
+            self.note_changed(task); // the /proc mirror copies it
+        }
     }
 
     /// Live and zombie tasks, `nr_threads`.
@@ -686,13 +817,35 @@ impl Tasklist {
         Some(self.tasks.get_mut(task)?.signals.view(ids))
     }
 
+    /// The `/proc` summary of a task's signal sets.
+    #[must_use]
+    pub fn signal_sets(&self, task: TaskId) -> Option<crate::signal::SigSets> {
+        Some(self.tasks.get(task)?.signals.sets())
+    }
+
     // ---- credentials ------------------------------------------------------------
 
     /// Publish `cred` as the snapshot cross-task readers see: at exec
     /// (`commit_creds`) and after every credential-changing syscall.
     pub fn publish_cred(&mut self, task: TaskId, cred: &Cred) {
         if let Some(t) = self.tasks.get_mut(task) {
-            t.cred = CredSnapshot::of(cred);
+            let new = CredSnapshot::of(cred);
+            // commit_creds (kernel/cred.c:406-410): "dumpability changes" to
+            // `suid_dumpable` (0) when the effective uid or gid, the fsuid or
+            // fsgid, or the capabilities (`!cred_cap_issubset(old, new)`)
+            // change. shortcut: only the first two are compared. This model
+            // has no separate fsuid/fsgid (`setfsuid`/`setfsgid` stop the
+            // kernel loudly, so they always equal the effective ids and move
+            // with them) and no capability sets (`capset` stops loudly; the
+            // capabilities are `euid == 0`, so they move only with the
+            // effective uid). The first of `setfsuid`, `setfsgid` or `capset`
+            // to be ported MUST add its comparison here (and a `CredSnapshot`
+            // field), or a privilege change will leave the task dumpable.
+            if t.cred.euid != new.euid || t.cred.egid != new.egid {
+                t.dumpable = false;
+            }
+            t.cred = new;
+            self.note_changed(task);
         }
     }
 

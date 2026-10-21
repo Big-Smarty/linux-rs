@@ -18,6 +18,7 @@
 //! allocated lowest-free-first from a `next_fd` hint exactly like `alloc_fd`.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use syscalls::Errno;
 
 use super::{FileId, InodeId, KResult, NR_OPEN, PipeId, try_push};
@@ -60,6 +61,9 @@ impl CharDev {
 pub enum FileKind {
     Regular,
     Directory,
+    /// A regular file of procfs (`seq_file` and the `proc_ops` of the entry):
+    /// `File::inode` is the node.
+    Proc,
     Char(CharDev),
     /// One end of a pipe; `writer` selects the write end.
     Pipe {
@@ -83,7 +87,27 @@ pub struct File {
     pub mode: u32,
     /// `f_pos`; the directory cookie for a directory.
     pub pos: i64,
+    /// A number unique to this open description for the life of the system
+    /// (never reused, unlike the arena slot): lets a handle that outlived its
+    /// file be recognised.
+    pub serial: u64,
+    /// The name the file was opened by (`f_path.dentry`): the directory it was
+    /// found in and the name there, for `d_path`.
+    pub dentry: Option<Dentry>,
+    /// The `seq_file` state of a procfs file: the text as last generated, the
+    /// buffer and `read_pos`. Taken out while a read or seek uses it.
+    pub seq: Option<crate::seq::SeqFile>,
+    /// `seq_file.poll_event`: the mount namespace event `/proc/<pid>/mounts` and
+    /// `mountinfo` last reported to `poll` (taken when the file is opened).
+    pub poll_event: u64,
     refs: u32,
+}
+
+/// Where an open file was found (`struct dentry`: `d_parent` and `d_name`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Dentry {
+    pub parent: InodeId,
+    pub name: alloc::vec::Vec<u8>,
 }
 
 impl File {
@@ -95,6 +119,10 @@ impl File {
             flags,
             mode,
             pos: 0,
+            serial: 0,
+            dentry: None,
+            seq: None,
+            poll_event: 0,
             refs: 1,
         }
     }
@@ -105,6 +133,7 @@ impl File {
 pub struct FileTable {
     files: Vec<Option<File>>,
     free: Vec<u32>,
+    next_serial: u64,
 }
 
 impl FileTable {
@@ -112,7 +141,9 @@ impl FileTable {
     ///
     /// # Errors
     /// `ENOMEM`.
-    pub fn alloc(&mut self, file: File) -> KResult<FileId> {
+    pub fn alloc(&mut self, mut file: File) -> KResult<FileId> {
+        self.next_serial += 1;
+        file.serial = self.next_serial;
         if let Some(slot) = self.free.pop() {
             self.files[slot as usize] = Some(file);
             return Ok(FileId(slot));
@@ -135,6 +166,22 @@ impl FileTable {
             .get(id.0 as usize)
             .and_then(Option::as_ref)
             .expect("stale file handle")
+    }
+
+    /// The file in slot `id`, if the slot is occupied.
+    #[must_use]
+    pub fn try_get(&self, id: FileId) -> Option<&File> {
+        self.files.get(id.0 as usize).and_then(Option::as_ref)
+    }
+
+    /// The file behind a handle that may have outlived it: `None` when the
+    /// slot is empty or holds another description than the one with `serial`.
+    #[must_use]
+    pub fn get_checked(&self, id: FileId, serial: u64) -> Option<&File> {
+        self.files
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
+            .filter(|file| file.serial == serial)
     }
 
     /// Mutable access to the file behind a handle.
@@ -166,6 +213,11 @@ impl FileTable {
         file
     }
 
+    /// Whether some open description satisfies `pred`.
+    pub fn has_writer(&self, pred: impl Fn(&File) -> bool) -> bool {
+        self.files.iter().flatten().any(pred)
+    }
+
     /// Every open description (the tty hangup walks them).
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut File> {
         self.files.iter_mut().flatten()
@@ -191,13 +243,41 @@ impl FileTable {
 }
 
 /// `struct files_struct` (single-threaded sharing: one owner).
-#[derive(Default)]
 pub struct FdTable {
     fds: Vec<Option<FileId>>,
     open: Vec<usize>,
     cloexec: Vec<usize>,
     next_fd: u32,
+    /// Counts the changes of descriptors, so `/proc/<pid>/fd` readers can tell their copy of the
+    /// table is stale; `recent` remembers the descriptor numbers of the last [`FD_LOG`] of them,
+    /// so such a reader can apply just those ([`FdTable::changed_since`]) instead of copying
+    /// the whole table.
+    generation: u64,
+    recent: [Fd; FD_LOG],
+    /// Names this table, so a reader that copied another table never mistakes
+    /// its `generation` for this one's ([`FdTable::stamp`]).
+    id: u64,
 }
+
+/// Numbers the tables.
+static NEXT_FD_TABLE_ID: AtomicU64 = AtomicU64::new(1);
+
+impl Default for FdTable {
+    fn default() -> Self {
+        Self {
+            fds: Vec::new(),
+            open: Vec::new(),
+            cloexec: Vec::new(),
+            next_fd: 0,
+            generation: 0,
+            recent: [0; FD_LOG],
+            id: NEXT_FD_TABLE_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+/// How many recent descriptor changes an [`FdTable`] remembers.
+const FD_LOG: usize = 32;
 
 /// A descriptor number as syscalls carry it (`unsigned int`).
 pub type Fd = u32;
@@ -213,6 +293,46 @@ impl FdTable {
     #[must_use]
     pub fn get(&self, fd: Fd) -> Option<FileId> {
         self.fds.get(fd as usize).copied().flatten()
+    }
+
+    /// The change counter (see the field).
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// `(id, generation)`: which table and which state of it. A copy made at an
+    /// equal stamp is exact; one made of the same table at an earlier stamp can
+    /// be brought up to date with [`FdTable::changed_since`].
+    #[must_use]
+    pub const fn stamp(&self) -> (u64, u64) {
+        (self.id, self.generation)
+    }
+
+    /// The descriptors changed after the `seen` value of
+    /// [`FdTable::generation`], oldest first (a number can repeat), or `None`
+    /// if more than [`FD_LOG`] changes happened since (copy the table instead).
+    #[must_use]
+    pub fn changed_since(&self, seen: u64) -> Option<impl Iterator<Item = Fd> + '_> {
+        let behind = self.generation.checked_sub(seen)?;
+        (behind <= FD_LOG as u64)
+            .then(|| (seen..self.generation).map(|at| self.recent[Self::log_slot(at)]))
+    }
+
+    /// The slot of change number `at` in `recent`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the remainder is below FD_LOG"
+    )]
+    const fn log_slot(at: u64) -> usize {
+        (at % FD_LOG as u64) as usize
+    }
+
+    /// Record that descriptor `fd` changed (its file, its close-on-exec flag
+    /// or its reservation).
+    fn touch(&mut self, fd: Fd) {
+        self.recent[Self::log_slot(self.generation)] = fd;
+        self.generation += 1;
     }
 
     /// `get_close_on_exec`.
@@ -232,6 +352,7 @@ impl FdTable {
 
     /// `set_close_on_exec` / `__clear_close_on_exec` on an open descriptor.
     pub fn set_cloexec(&mut self, fd: Fd, on: bool) {
+        self.touch(fd);
         let bits = self.fds.len();
         if let Some(mut map) = Bitmap::new(&mut self.cloexec, bits) {
             map.replace(fd as usize, on);
@@ -298,6 +419,7 @@ impl FdTable {
             return Err(Errno::EMFILE);
         }
         self.expand(u64::from(fd))?;
+        self.touch(fd);
         let bits = self.fds.len();
         if let Some(mut map) = Bitmap::new(&mut self.open, bits) {
             map.replace(fd as usize, true);
@@ -313,11 +435,13 @@ impl FdTable {
 
     /// `fd_install`: populate a descriptor [`FdTable::alloc_fd`] reserved.
     pub fn install(&mut self, fd: Fd, file: FileId) {
+        self.touch(fd);
         self.fds[fd as usize] = Some(file);
     }
 
     /// `put_unused_fd` / the bit clearing of `file_close_fd_locked`.
     fn release(&mut self, fd: Fd) {
+        self.touch(fd);
         let bits = self.fds.len();
         if let Some(mut map) = Bitmap::new(&mut self.open, bits) {
             map.replace(fd as usize, false);
@@ -348,6 +472,7 @@ impl FdTable {
     /// # Errors
     /// `EBUSY`.
     pub fn replace(&mut self, fd: Fd, file: FileId, cloexec: bool) -> KResult<Option<FileId>> {
+        self.touch(fd);
         let bits = self.fds.len();
         let reserved = Bitmap::new(&mut self.open, bits)
             .and_then(|map| map.get(fd as usize))
@@ -393,12 +518,20 @@ impl FdTable {
         Ok(new)
     }
 
-    /// Every populated descriptor with its close-on-exec flag.
+    /// Every populated descriptor with its close-on-exec flag; words of the
+    /// open bitmap without a set bit are skipped, so a sparse table costs
+    /// its words, not its slots.
     pub fn iter(&self) -> impl Iterator<Item = (Fd, FileId, bool)> + '_ {
-        (0..self.fds.len()).filter_map(move |fd| {
-            let fd = u32::try_from(fd).ok()?;
-            Some((fd, self.get(fd)?, self.cloexec(fd)))
-        })
+        self.open
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| **word != 0)
+            .flat_map(move |(index, _)| {
+                (index * BITS_PER_WORD..(index + 1) * BITS_PER_WORD).filter_map(move |fd| {
+                    let fd = u32::try_from(fd).ok()?;
+                    Some((fd, self.get(fd)?, self.cloexec(fd)))
+                })
+            })
     }
 }
 
@@ -430,8 +563,8 @@ impl FsStruct {
     /// are taken by [`super::Vfs::new_fs_struct`], which the owner of the task
     /// calls once the rootfs exists and assigns over this value.
     pub const INIT: Self = Self {
-        root: InodeId(0),
-        pwd: InodeId(0),
+        root: InodeId::tmp(0),
+        pwd: InodeId::tmp(0),
         umask: 0o022,
     };
 }

@@ -366,8 +366,34 @@ impl Mm {
         file: Option<u64>,
         addr: u64,
         len: u64,
+        vm_flags: VmFlags,
+        pgoff: u64,
+    ) -> Result<u64, Errno> {
+        self.mmap_region_with(env, pt, file, addr, len, vm_flags, pgoff, None)
+    }
+
+    /// [`Mm::mmap_region`] for a file whose `->mmap` fails with `mmap_error`: everything up to
+    /// the call happens (the limits, the accounting, the gathering of what the range replaces),
+    /// and then the call's error ends it. `__mmap_setup` has cleared the PTEs of the replaced
+    /// mappings by then, so `vms_abort_munmap_vmas` cannot reattach them and leaves the gap: the
+    /// range is unmapped although the call failed.
+    ///
+    /// # Errors
+    /// As [`Mm::mmap_region`], then `mmap_error`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mmap_region's own parameter list"
+    )]
+    pub fn mmap_region_with(
+        &mut self,
+        env: &Env,
+        pt: &mut (impl UserPages + ?Sized),
+        file: Option<u64>,
+        addr: u64,
+        len: u64,
         mut vm_flags: VmFlags,
         pgoff: u64,
+        mmap_error: Option<Errno>,
     ) -> Result<u64, Errno> {
         // (MDWE off; arch_validate_flags is true on x86.)
         let end = addr + len;
@@ -394,6 +420,13 @@ impl Mm {
         }
         // vma_iter_prealloc for a new VMA; nothing is modified until it exists.
         self.reserve(1)?;
+
+        // __mmap_new_file_vma: `->mmap` failed; abort and complete the unmap (the gap).
+        if let Some(errno) = mmap_error {
+            pt.unmap(addr, pglen);
+            self.complete_munmap(&g);
+            return Err(errno);
+        }
 
         // __mmap_complete's vms_complete_munmap_vmas, then the new range.
         pt.unmap(addr, pglen);

@@ -31,6 +31,10 @@
 //!   VMAs leaves the finished prefix) and are documented where they do.
 
 use alloc::vec::Vec;
+use core::{
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use syscalls::Errno;
 
@@ -78,10 +82,40 @@ impl Vma {
     }
 }
 
+/// The sorted VMA vector, with a version that moves whenever it is borrowed
+/// mutably (so a change can never be missed, and a borrow that changes nothing
+/// costs only a spurious difference). `/proc` copies the vector when the
+/// version moved and shares its last copy otherwise ([`Mm::vma_stamp`]).
+#[derive(Debug, Default)]
+pub(super) struct VmaList {
+    list: Vec<Vma>,
+    version: u64,
+}
+
+impl Deref for VmaList {
+    type Target = Vec<Vma>;
+    fn deref(&self) -> &Vec<Vma> {
+        &self.list
+    }
+}
+
+impl DerefMut for VmaList {
+    fn deref_mut(&mut self) -> &mut Vec<Vma> {
+        self.version += 1;
+        &mut self.list
+    }
+}
+
+/// Numbers the address spaces, so two different ones never share a
+/// [`Mm::vma_stamp`] (an `execve` builds a new one).
+static NEXT_MM_ID: AtomicU64 = AtomicU64::new(1);
+
 /// The address space of the one task.
 #[derive(Debug)]
 pub struct Mm {
-    pub(super) vmas: Vec<Vma>,
+    pub(super) vmas: VmaList,
+    /// Identifies this address space for [`Mm::vma_stamp`].
+    id: u64,
     /// `mm->mmap_base`: top of the top-down area.
     pub mmap_base: u64,
     /// `mm->mmap_legacy_base`: bottom of the legacy area.
@@ -92,6 +126,19 @@ pub struct Mm {
     pub brk: u64,
     pub start_data: u64,
     pub end_data: u64,
+    /// `mm->start_code`, `end_code`: the executable `PT_LOAD`s' extent.
+    pub start_code: u64,
+    pub end_code: u64,
+    /// `mm->start_stack`: the user stack pointer at the entry of the program.
+    pub start_stack: u64,
+    /// `mm->arg_start`, `arg_end`, `env_start`, `env_end`: the argument and
+    /// environment strings (`/proc/<pid>/cmdline`, `environ`).
+    pub arg_start: u64,
+    pub arg_end: u64,
+    pub env_start: u64,
+    pub env_end: u64,
+    /// `mm->hiwater_vm` (pages): the highest `total_vm` seen.
+    pub hiwater_vm: u64,
     /// `mm->total_vm`, `data_vm`, `exec_vm`, `stack_vm`, `locked_vm` (pages).
     pub total_vm: u64,
     pub data_vm: u64,
@@ -114,7 +161,8 @@ impl Mm {
     pub fn new(env: &Env) -> Self {
         let (mmap_base, mmap_legacy_base) = super::layout::pick_mmap_base(env);
         Self {
-            vmas: Vec::new(),
+            vmas: VmaList::default(),
+            id: NEXT_MM_ID.fetch_add(1, Ordering::Relaxed),
             mmap_base,
             mmap_legacy_base,
             topdown: true,
@@ -122,6 +170,14 @@ impl Mm {
             brk: 0,
             start_data: 0,
             end_data: 0,
+            start_code: 0,
+            end_code: 0,
+            start_stack: 0,
+            arg_start: 0,
+            arg_end: 0,
+            env_start: 0,
+            env_end: 0,
+            hiwater_vm: 0,
             total_vm: 0,
             data_vm: 0,
             exec_vm: 0,
@@ -153,7 +209,7 @@ impl Mm {
         vmas.try_reserve_exact(self.vmas.len())
             .map_err(|_| Errno::ENOMEM)?;
         let mut next_anon = self.next_anon;
-        for vma in &self.vmas {
+        for vma in self.vmas.iter() {
             if vma.flags.contains(VmFlags::ACCOUNT) && !env.enough_memory(vma.pages()) {
                 return enomem();
             }
@@ -166,7 +222,11 @@ impl Mm {
             vmas.push_within_capacity(copy).map_err(|_| Errno::ENOMEM)?;
         }
         Ok(Self {
-            vmas,
+            vmas: VmaList {
+                list: vmas,
+                version: 0,
+            },
+            id: NEXT_MM_ID.fetch_add(1, Ordering::Relaxed),
             mmap_base: self.mmap_base,
             mmap_legacy_base: self.mmap_legacy_base,
             topdown: self.topdown,
@@ -174,6 +234,14 @@ impl Mm {
             brk: self.brk,
             start_data: self.start_data,
             end_data: self.end_data,
+            start_code: self.start_code,
+            end_code: self.end_code,
+            start_stack: self.start_stack,
+            arg_start: self.arg_start,
+            arg_end: self.arg_end,
+            env_start: self.env_start,
+            env_end: self.env_end,
+            hiwater_vm: self.hiwater_vm,
             total_vm: self.total_vm,
             data_vm: self.data_vm,
             exec_vm: self.exec_vm,
@@ -187,10 +255,34 @@ impl Mm {
         })
     }
 
+    /// `create_elf_tables` / `load_elf_binary`: where the program's stack
+    /// pointer and its argument and environment strings are.
+    pub fn record_stack(
+        &mut self,
+        start_stack: u64,
+        arg_start: u64,
+        arg_end: u64,
+        env_start: u64,
+        env_end: u64,
+    ) {
+        self.start_stack = start_stack;
+        self.arg_start = arg_start;
+        self.arg_end = arg_end;
+        self.env_start = env_start;
+        self.env_end = env_end;
+    }
+
     /// The VMAs in address order (`/proc/self/maps` order).
     #[must_use]
     pub fn vmas(&self) -> &[Vma] {
         &self.vmas
+    }
+
+    /// Names this address space and the state of its VMA vector: equal stamps
+    /// mean [`Mm::vmas`] is unchanged (a copy taken earlier is still exact).
+    #[must_use]
+    pub fn vma_stamp(&self) -> (u64, u64) {
+        (self.id, self.vmas.version)
     }
     /// `mm->map_count`.
     #[must_use]
@@ -329,6 +421,7 @@ impl Mm {
     /// `vm_stat_account` (`npages` may be negative through `sub`).
     pub(super) fn stat_add(&mut self, flags: VmFlags, npages: u64) {
         self.total_vm += npages;
+        self.hiwater_vm = self.hiwater_vm.max(self.total_vm);
         if is_exec_mapping(flags) {
             self.exec_vm += npages;
         } else if is_stack_mapping(flags) {

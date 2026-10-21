@@ -462,6 +462,7 @@ fn mmap_file_branch_checks_and_typed_outcome() {
         swapfile: false,
         append_only: false,
         can_mmap: true,
+        mmap_error: None,
         mmap_size_max: u64::MAX >> 1,
         mmap_sync: false,
         hugepages: false,
@@ -597,6 +598,83 @@ fn mmap_file_branch_checks_and_typed_outcome() {
     w.pt.pages.get_mut(&m.addr).unwrap().kind = Pte::Anon { writable: false };
     assert_eq!(w.fault(m.addr, PF_WRITE | PF_PROT), FaultOutcome::Handled);
     assert_eq!(w.pt.lookup(m.addr), Pte::Anon { writable: true });
+}
+
+/// src: mm/vma.c `__mmap_setup` (limits, then the PTEs of what the range replaces are cleared),
+/// `__mmap_new_file_vma` (`->mmap` fails) and `vms_abort_munmap_vmas` (the PTEs are gone, so the
+/// replaced VMAs cannot come back: "leaving a gap"). oracle: `procfs.mmap-fixed-eio-leaves-gap`.
+#[test]
+fn a_failing_file_mmap_leaves_a_gap_after_the_limits() {
+    let mut w = W::new();
+    let at = 0x2000_0000;
+    w.map(at, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    w.pt.map_anon_page(at, page_prot(VmFlags::READ | VmFlags::WRITE))
+        .unwrap();
+    let file = FileInfo {
+        id: 7,
+        readable: true,
+        writable: false,
+        noexec: false,
+        swapfile: false,
+        append_only: false,
+        can_mmap: true,
+        mmap_error: Some(Errno::EIO),
+        mmap_size_max: u64::MAX >> 1,
+        mmap_sync: false,
+        hugepages: false,
+    };
+    let prepare = |w: &mut W| {
+        let r = w.mm.mmap(
+            &w.env,
+            &mut w.pt,
+            at,
+            P,
+            PROT_READ,
+            MAP_PRIVATE | MAP_FIXED,
+            0,
+            Some(&file),
+        );
+        let Ok(Mmap::NeedsFile(m)) = r else {
+            panic!("{r:?}")
+        };
+        m
+    };
+    let m = prepare(&mut w);
+    // The address-space limit comes before ->mmap.
+    let total = w.mm.total_vm;
+    w.env.rlimit_as = 0;
+    let r = w.mm.mmap_region_with(
+        &w.env,
+        &mut w.pt,
+        Some(7),
+        m.addr,
+        m.len,
+        m.vm_flags,
+        m.pgoff,
+        m.file.mmap_error,
+    );
+    assert_eq!(r, Err(Errno::ENOMEM));
+    assert_eq!(w.mm.total_vm, total);
+    let covers = |w: &W, page: u64| w.mm.vmas().iter().any(|v| v.start <= page && page < v.end);
+    assert!(covers(&w, at));
+    w.env.rlimit_as = RLIM_INFINITY;
+    let r = w.mm.mmap_region_with(
+        &w.env,
+        &mut w.pt,
+        Some(7),
+        m.addr,
+        m.len,
+        m.vm_flags,
+        m.pgoff,
+        m.file.mmap_error,
+    );
+    assert_eq!(r, Err(Errno::EIO));
+    assert!(!covers(&w, at), "the replaced page is gone");
+    assert!(covers(&w, at + P), "its neighbour stays");
+    assert_eq!(w.mm.total_vm, total - 1);
+    assert_eq!(w.pt.lookup(at), Pte::Absent);
+    assert!(w.mm.vmas().iter().all(|vma| vma.file != Some(7)));
+    w.check_invariants();
 }
 
 /// src: mm/mmap.c do_mmap: MAP_FIXED_NOREPLACE -> EEXIST is after
@@ -1589,4 +1667,31 @@ fn pkru_denial_refuses_before_a_page_is_populated() {
     // Keys off: the PKRU value is not looked at.
     w.env.ospke = false;
     assert_eq!(w.fault(b, PF_WRITE), FaultOutcome::Handled);
+}
+
+#[test]
+fn the_vma_stamp_moves_with_every_change_and_names_the_address_space() {
+    let mut w = W::new();
+    let first = w.mm.vma_stamp();
+    // Reading never moves it.
+    let _ = (w.mm.vmas().len(), w.mm.find_vma(0x1000), w.mm.map_count());
+    assert_eq!(w.mm.vma_stamp(), first);
+    let addr = w
+        .map(
+            0,
+            2 * P,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+        )
+        .unwrap();
+    let mapped = w.mm.vma_stamp();
+    assert_ne!(mapped, first, "mmap");
+    assert_eq!(mapped.0, first.0, "same address space");
+    let _ = (w.mm.vmas().len(), w.mm.find_vma(addr));
+    assert_eq!(w.mm.vma_stamp(), mapped);
+    w.munmap(addr, P).unwrap();
+    assert_ne!(w.mm.vma_stamp(), mapped, "munmap");
+    // A fork's copy and a new address space are not the same space.
+    assert_ne!(w.mm.dup(&w.env).unwrap().vma_stamp().0, w.mm.vma_stamp().0);
+    assert_ne!(Mm::new(&w.env).vma_stamp().0, w.mm.vma_stamp().0);
 }

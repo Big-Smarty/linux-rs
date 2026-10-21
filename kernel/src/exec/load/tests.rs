@@ -30,6 +30,7 @@ impl Pager for Fake {
         &mut self,
         page: u64,
         prot: PageProt,
+        _file: bool,
         _bytes: &[u8; PAGE_BYTES],
     ) -> Result<(), OutOfMemory> {
         let kind = Pte::Anon {

@@ -92,18 +92,23 @@ impl CpuAccount {
     /// `account_process_tick` for `periods` elapsed ticks: a tick that finds the
     /// task in user mode is user time, one that finds it running in the kernel is
     /// system time, and one that finds it asleep (or no task yet) is idle time.
-    pub fn tick(&self, user_mode: bool, periods: u64) {
+    ///
+    /// Returns the nanoseconds charged (0 for an ignored tick), which the caller
+    /// adds to the machine-wide `kernel_cpustat` (`ktask::charge_tick`).
+    pub fn tick(&self, user_mode: bool, periods: u64) -> u64 {
         if self.start_ns.load(Ordering::Relaxed) == NEVER
             || self.sleep_since_ns.load(Ordering::Relaxed) != NEVER
         {
-            return;
+            return 0;
         }
         let field = if user_mode {
             &self.user_ns
         } else {
             &self.system_ns
         };
-        field.fetch_add(periods.saturating_mul(TICK_NSEC), Ordering::Relaxed);
+        let ns = periods.saturating_mul(TICK_NSEC);
+        field.fetch_add(ns, Ordering::Relaxed);
+        ns
     }
 
     /// The task leaves the CPU (it blocks) at `now_ns`.
@@ -243,13 +248,13 @@ mod tests {
     #[test]
     fn runtime_excludes_sleep_and_ticks_need_a_running_task() {
         let account = CpuAccount::new();
-        account.tick(true, 1);
+        assert_eq!(account.tick(true, 1), 0);
         assert_eq!(account.sample(1_000), sample(0, 0, 0));
         account.start(1_000);
-        account.tick(true, 2);
-        account.tick(false, 1);
+        assert_eq!(account.tick(true, 2), 2 * TICK_NSEC);
+        assert_eq!(account.tick(false, 1), TICK_NSEC);
         account.sleep_begin(5_000);
-        account.tick(true, 10); // asleep: idle time, not accounted
+        assert_eq!(account.tick(true, 10), 0); // asleep: idle time, not accounted
         assert_eq!(account.runtime_ns(9_000), 4_000);
         account.sleep_end(9_000);
         assert_eq!(account.runtime_ns(10_000), 5_000);

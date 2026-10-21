@@ -144,15 +144,13 @@ pub fn lock_free() -> bool {
     HEAP.0.try_lock().is_some()
 }
 
-#[cfg(any(feature = "boot-proofs", feature = "qemu-self-test"))]
 fn stats() -> kernel::heap::HeapStats {
     HEAP.0.lock().stats()
 }
 
 /// Bytes the callers of the heap currently hold (`HeapStats::requested`): the
 /// self-test builds compare it before and after a workload to find a leak of
-/// kernel objects that the frame count would hide.
-#[cfg(feature = "qemu-self-test")]
+/// kernel objects that the frame count would hide, and `/proc/meminfo` shows it.
 pub fn requested_bytes() -> usize {
     stats().requested
 }

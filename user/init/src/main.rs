@@ -331,6 +331,10 @@ fn run(stack: &Stack) {
     if stack.argv.iter().nth(1) == Some(b"xstateexec".as_slice()) {
         tests::xstate::execd();
     }
+    // The image of the `procfs` group's `vfork` check: silent, reports through a pipe.
+    if stack.argv.iter().nth(1) == Some(b"procvfork".as_slice()) {
+        tests::procfs::vfork::image();
+    }
     tests::xstate::set_minsigstksz(stack.find(AT_MINSIGSTKSZ).unwrap_or(0));
     out!("init: {stack:?}");
 

@@ -78,6 +78,13 @@ const HUGE: u64 = 1 << 7;
 const PROTNONE: u64 = 1 << 8;
 /// A leaf that holds a page: reachable (`PRESENT`) or `PROT_NONE`.
 const MAPPED: u64 = PRESENT | PROTNONE;
+/// Software bit (an `AVL` bit the hardware ignores): the page belongs to a file
+/// mapping that is still the page-cache page ([`Tables::mm_install_page`] with
+/// `file` and no write access): it counts as `RssShmem`, and the private copy
+/// the first write makes ([`Tables::mm_make_writable`], `wp_page_copy`) clears it,
+/// after which the page is `RssAnon` whatever a later `mprotect` does to the
+/// write bit; see [`rss_class`].
+const FILE: u64 = 1 << 9;
 const NX: u64 = 1 << 63;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 const LARGE: u64 = 2 * 1024 * 1024;
@@ -175,17 +182,48 @@ pub struct Tables {
     pub pages: usize,
     /// The shared read-only zero page, once [`Tables::init_zero_page`] ran.
     zero: Option<Physical>,
+    /// The resident user pages that count as `RssAnon` and `RssShmem` (the
+    /// zero page counts as neither) and the PUD, PMD and PTE pages of the user
+    /// half (`mm_pgtables_bytes`), kept up to date by every edit of a user
+    /// entry so `/proc` reads them in constant time. The walks that computed
+    /// them ([`Tables::recount`]) remain the boot proofs' cross-check.
+    rss_anon: u64,
+    rss_shmem: u64,
+    user_pt_pages: u64,
+}
+
+/// What a leaf entry adds to `(RssAnon, RssShmem)` of an address space whose
+/// shared zero page is `zero`: nothing unless it is a present, non-zero page;
+/// a page that is still the file's ([`FILE`]) is the page-cache page
+/// (`MM_SHMEMPAGES`: every file here is on tmpfs), anything else a private
+/// anonymous frame.
+fn rss_class(zero: Option<Physical>, entry: u64) -> (u64, u64) {
+    if entry & PRESENT == 0 || Some(Physical(entry & ADDRESS)) == zero {
+        (0, 0)
+    } else if entry & FILE != 0 {
+        (0, 1)
+    } else {
+        (1, 0)
+    }
 }
 
 impl Tables {
+    /// A tree that is only its zeroed root: no user page, no user table.
+    const fn empty(root: Physical, direct_map: u64, zero: Option<Physical>) -> Self {
+        Self {
+            root,
+            direct_map,
+            pages: 1,
+            zero,
+            rss_anon: 0,
+            rss_shmem: 0,
+            user_pt_pages: 0,
+        }
+    }
+
     pub fn build(boot: &BootInfo, allocator: &mut Allocator<'_>) -> Result<Self, Error> {
         let root = allocator.allocate()?.into_reserved();
-        let mut tables = Self {
-            root,
-            direct_map: boot.direct_map,
-            pages: 1,
-            zero: None,
-        };
+        let mut tables = Self::empty(root, boot.direct_map, None);
         let result = (|| {
             let guards = cpu::guards();
             let image_end = ptr::addr_of!(__kernel_end) as u64;
@@ -339,6 +377,12 @@ impl Tables {
     fn pointer(&self, physical: Physical, index: usize) -> Result<*mut u64, Error> {
         entry_pointer(self.direct_map, physical, index)
     }
+    /// Record that a user leaf went from `old` to `new` in the counters.
+    fn account(&mut self, old: u64, new: u64) {
+        let (old, new) = (rss_class(self.zero, old), rss_class(self.zero, new));
+        self.rss_anon = self.rss_anon + new.0 - old.0;
+        self.rss_shmem = self.rss_shmem + new.1 - old.1;
+    }
     fn read(&self, physical: Physical, index: usize) -> Result<u64, Error> {
         read_entry(self.direct_map, physical, index)
     }
@@ -378,11 +422,15 @@ impl Tables {
                 unsafe {
                     self.pointer(table, index)?.write_volatile(entry);
                 }
+                if flags & USER != 0 && !large {
+                    self.account(0, entry);
+                }
                 return Ok(());
             }
             if old & PRESENT == 0 {
                 let child = allocator.allocate()?.into_reserved();
                 self.pages += 1;
+                self.user_pt_pages += u64::from(flags & USER != 0);
                 // SAFETY: same non-present parent entry and exclusive ownership
                 // as above; the child frame was fully zeroed by the allocator
                 // before its physical address is published in the PTE.
@@ -656,6 +704,10 @@ impl Tables {
         {
             return Err(fail());
         }
+        // Every edit above went through the counters: they equal the walks.
+        if !self.counters_match() {
+            return Err(fail());
+        }
         Ok(())
     }
 
@@ -676,12 +728,7 @@ impl Tables {
     /// Frame exhaustion; nothing was kept.
     pub fn fork_template(&self, allocator: &mut Allocator<'_>) -> Result<Self, Error> {
         let root = allocator.allocate()?.into_reserved();
-        let child = Self {
-            root,
-            direct_map: self.direct_map,
-            pages: 1,
-            zero: self.zero,
-        };
+        let child = Self::empty(root, self.direct_map, self.zero);
         for top in 256..512 {
             let entry = self.read(self.root, top)?;
             if entry != 0 {
@@ -927,6 +974,80 @@ impl Tables {
         }
     }
 
+    /// The resident pages of `[start, start + pages * 4096)` that are not the
+    /// shared zero page: `(pages, pages still the file's)`. A walk over the
+    /// present tables only (`for_each_user_slot`): what `/proc/<pid>/status`'s
+    /// `RssAnon` and `RssShmem` were computed from before the counters, now the
+    /// self-test's cross-check ([`UserSpace::check_counters`]).
+    #[cfg(feature = "qemu-self-test")]
+    #[must_use]
+    pub fn mm_resident(&self, start: u64, pages: u64) -> (u64, u64) {
+        let (mut present, mut filed) = (0, 0);
+        self.for_each_user_slot(start, pages, |_, slot| {
+            // SAFETY: `for_each_user_slot` hands out a valid, aligned PTE slot
+            // of this tree inside the direct map; a volatile read creates no
+            // reference and observes hardware accessed/dirty updates.
+            let entry = unsafe { ptr::read_volatile(slot) };
+            if entry & PRESENT != 0 && Some(Physical(frame_bits(entry))) != self.zero {
+                present += 1;
+                filed += u64::from(entry & FILE != 0);
+            }
+        });
+        (present, filed)
+    }
+
+    /// `mm_pgtables_bytes`: the PUD, PMD and PTE pages of the user half, by
+    /// walking them (the counters' cross-check, [`Tables::counters_match`]).
+    #[cfg(feature = "boot-proofs")]
+    #[must_use]
+    fn mm_table_pages(&self) -> u64 {
+        let mut count = 0u64;
+        for pgd in 0..256 {
+            let Ok(entry) = self.read(self.root, pgd) else {
+                continue;
+            };
+            if entry & PRESENT == 0 || entry & USER == 0 {
+                continue;
+            }
+            count += 1;
+            let pud = Physical(entry & ADDRESS);
+            for upper in 0..512 {
+                let Ok(entry) = self.read(pud, upper) else {
+                    continue;
+                };
+                if entry & PRESENT == 0 || entry & HUGE != 0 {
+                    continue;
+                }
+                count += 1;
+                let pmd = Physical(entry & ADDRESS);
+                for middle in 0..512 {
+                    let Ok(entry) = self.read(pmd, middle) else {
+                        continue;
+                    };
+                    if entry & PRESENT != 0 && entry & HUGE == 0 {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Whether the counters equal what a walk of the whole user half finds:
+    /// resident pages by [`rss_class`] and the table pages.
+    #[cfg(feature = "boot-proofs")]
+    fn counters_match(&self) -> bool {
+        let zero = self.zero;
+        let (mut anon, mut shmem) = (0, 0);
+        self.for_each_user_slot(0, TASK_SIZE_MAX / PAGE, |_, slot| {
+            // SAFETY: `slot` is a PTE of this tree (see `for_each_user_slot`);
+            // a volatile read creates no reference.
+            let class = rss_class(zero, unsafe { ptr::read_volatile(slot) });
+            (anon, shmem) = (anon + class.0, shmem + class.1);
+        });
+        (anon, shmem, self.mm_table_pages()) == (self.rss_anon, self.rss_shmem, self.user_pt_pages)
+    }
+
     /// What the model sees at `page`.
     #[must_use]
     pub fn mm_lookup(&self, page: u64) -> kernel::mm::Pte {
@@ -1005,7 +1126,9 @@ impl Tables {
                 if Some(Physical(frame_bits(old))) != self.zero || old & USER == 0 {
                     return Err(Error::Conflict);
                 }
-                entry.store(leaf_entry(frame.0, flags), Ordering::Release);
+                let new = leaf_entry(frame.0, flags);
+                entry.store(new, Ordering::Release);
+                self.account(old, new);
                 // A not-present -> present change needs no invalidation, but
                 // this replaces a live read-only translation of the zero page.
                 tlb::flush(VirtAddr::new(page));
@@ -1017,6 +1140,11 @@ impl Tables {
 
     /// Install a private frame holding `bytes` (the loader's page-cache
     /// stand-in); `accessible == false` keeps it behind a `PROT_NONE` PTE.
+    /// `file` says the page is the file's page-cache page ([`FILE`], `RssShmem`):
+    /// it is ignored when `prot.write` is set, because a page installed
+    /// writable is the private copy a write fault made (`do_cow_fault`, `RssAnon`);
+    /// a read fault installs it read-only (`do_read_fault`) and the first write
+    /// copies it ([`Tables::mm_make_writable`]).
     ///
     /// # Errors
     /// As [`Tables::mm_map_anon`].
@@ -1025,6 +1153,7 @@ impl Tables {
         allocator: &mut Allocator<'_>,
         page: u64,
         prot: kernel::mm::PageProt,
+        file: bool,
         bytes: &[u8; PAGE_BYTES],
     ) -> Result<(), Error> {
         let mut frame = allocator.allocate()?;
@@ -1034,7 +1163,7 @@ impl Tables {
             PRESENT | USER | if prot.write { WRITE } else { 0 } | if prot.exec { 0 } else { NX }
         } else {
             PROTNONE | USER | NX
-        };
+        } | if file && !prot.write { FILE } else { 0 };
         let result = self.map(allocator, Virtual(page), frame, flags, false);
         if result.is_err() {
             // SAFETY: as in `mm_map_anon`.
@@ -1043,7 +1172,9 @@ impl Tables {
         result
     }
 
-    /// `wp_page_reuse`: set the hardware write bit of the present private page.
+    /// `wp_page_reuse` / `wp_page_copy`: set the hardware write bit of the
+    /// present private page. A page that was still the file's becomes the
+    /// task's own copy ([`FILE`] cleared: `RssShmem` -> `RssAnon`).
     pub fn mm_make_writable(&mut self, page: u64) {
         let Ok(Some(slot)) = self.user_slot(page) else {
             return;
@@ -1054,9 +1185,12 @@ impl Tables {
         // Never on a not-present (PROT_NONE) entry, the zero page or a
         // supervisor entry: the model only asks for exclusive anonymous pages.
         while old & PRESENT != 0 && old & USER != 0 && Some(Physical(old & ADDRESS)) != self.zero {
-            match entry.compare_exchange_weak(old, old | WRITE, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break,
+            let new = (old | WRITE) & !FILE;
+            match entry.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    self.account(old, new);
+                    break;
+                }
                 Err(current) => old = current,
             }
         }
@@ -1070,6 +1204,7 @@ impl Tables {
     pub fn mm_unmap(&mut self, allocator: &mut Allocator<'_>, start: u64, pages: u64) -> u64 {
         let zero = self.zero;
         let mut freed = 0;
+        let (mut anon, mut shmem) = (0, 0);
         self.for_each_user_slot(start, pages, |address, slot| {
             // SAFETY: `slot` is a PTE of this tree (see `for_each_user_slot`);
             // `&mut self` excludes software writers and `AtomicU64` makes the
@@ -1081,6 +1216,8 @@ impl Tables {
                 return;
             }
             let old = entry.swap(0, Ordering::AcqRel);
+            let class = rss_class(zero, old);
+            (anon, shmem) = (anon + class.0, shmem + class.1);
             if old & PRESENT != 0 {
                 // Single CPU: `invlpg` retires the cached translation. SMP needs
                 // a shootdown acknowledged before the frame is freed.
@@ -1103,6 +1240,8 @@ impl Tables {
                 freed += 1;
             }
         });
+        self.rss_anon -= anon;
+        self.rss_shmem -= shmem;
         freed
     }
 
@@ -1111,6 +1250,9 @@ impl Tables {
     /// through the write fault), `!exec` sets NX, and `!accessible` turns the
     /// PTE into the `PROT_NONE` form (frame kept).
     pub fn mm_protect(&mut self, start: u64, pages: u64, prot: kernel::mm::PageProt) {
+        let zero = self.zero;
+        // Signed change of the two counters, summed over the range.
+        let (mut anon, mut shmem) = (0i64, 0i64);
         self.for_each_user_slot(start, pages, |address, slot| {
             // SAFETY: as in `mm_unmap`.
             let entry = unsafe { AtomicU64::from_ptr(slot) };
@@ -1136,7 +1278,12 @@ impl Tables {
                     leaf_entry(frame, keep | PROTNONE | NX)
                 };
                 match entry.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        let (before, after) = (rss_class(zero, old), rss_class(zero, new));
+                        anon += after.0.cast_signed() - before.0.cast_signed();
+                        shmem += after.1.cast_signed() - before.1.cast_signed();
+                        break;
+                    }
                     Err(current) => old = current,
                 }
             }
@@ -1147,6 +1294,8 @@ impl Tables {
                 tlb::flush(VirtAddr::new(address));
             }
         });
+        self.rss_anon = self.rss_anon.wrapping_add_signed(anon);
+        self.rss_shmem = self.rss_shmem.wrapping_add_signed(shmem);
     }
 }
 
@@ -1220,9 +1369,10 @@ impl kernel::exec::load::Pager for UserSpace<'_> {
         &mut self,
         page: u64,
         prot: kernel::mm::PageProt,
+        file: bool,
         bytes: &[u8; PAGE_BYTES],
     ) -> Result<(), kernel::mm::OutOfMemory> {
-        self.parts(|tables, frames| tables.mm_install_page(frames, page, prot, bytes))
+        self.parts(|tables, frames| tables.mm_install_page(frames, page, prot, file, bytes))
             .map_err(out_of_memory)
     }
 }
@@ -1267,6 +1417,52 @@ impl UserSpace<'_> {
     /// Frame exhaustion.
     pub fn fork_tables(&mut self) -> Result<Tables, Error> {
         self.parts(|tables, frames| tables.fork_user(frames))
+    }
+}
+
+impl UserSpace<'_> {
+    /// `(anon, file, shmem)` resident pages of the address space: a page of a
+    /// file mapping that the task has not written is the page-cache page
+    /// (`MM_SHMEMPAGES`: every file here is on tmpfs); a written one is a
+    /// private copy (`MM_ANONPAGES`). Constant time: the counters
+    /// [`Tables::account`] keeps.
+    #[must_use]
+    pub fn rss(&self) -> (u64, u64, u64) {
+        (self.tables.rss_anon, 0, self.tables.rss_shmem)
+    }
+
+    /// `mm_pgtables_bytes`, from the counter of user table pages.
+    #[must_use]
+    pub fn table_bytes(&self) -> u64 {
+        self.tables.user_pt_pages * PAGE
+    }
+
+    /// Cross-check of the counters against walks (self-test builds only): the
+    /// per-entry walk of the whole user half, the per-VMA walk the counters
+    /// replaced (`vmas` are the task's own), and the table walk. A mismatch
+    /// is a bug in the counter maintenance and stops the kernel.
+    ///
+    /// # Panics
+    /// If a counter disagrees with its walk.
+    #[cfg(feature = "qemu-self-test")]
+    pub fn check_counters(&self, vmas: &[kernel::mm::Vma]) {
+        assert!(
+            self.tables.counters_match(),
+            "rss/page-table counters disagree with the page tables"
+        );
+        let (mut anon, mut shmem) = (0, 0);
+        for vma in vmas {
+            // Only a file VMA may hold a page that is still the file's.
+            let (present, filed) = self.tables.mm_resident(vma.start, vma.pages());
+            let filed = if vma.file.is_some() { filed } else { 0 };
+            anon += present - filed;
+            shmem += filed;
+        }
+        assert_eq!(
+            (anon, shmem),
+            (self.tables.rss_anon, self.tables.rss_shmem),
+            "rss counters disagree with the per-VMA walk"
+        );
     }
 }
 
