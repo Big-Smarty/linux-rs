@@ -27,14 +27,14 @@
 //!   loader also uses; Linux accepts up to
 //!   `max(min(3/4 * _STK_LIM, RLIMIT_STACK / 4), ARG_MAX)` = 2 MiB. A larger
 //!   block is `E2BIG` here and succeeds there. Upgrade with a window sized by
-//!   the block (and a variable `STACK_START`).
+//!   the block (the stack VMA itself is sized like Linux's: [`super::stack::stack_vma_start`]).
 //! * shortcut: setuid/setgid bits, `ETXTBSY` (`exe_file_deny_write_access`) and
 //!   the reading of the file through a page cache are not modelled (the whole
 //!   file is read into a vector, like the boot loader).
 
 use super::{
     args::Word,
-    plan::{LoadError, LoadPlan, Unsupported},
+    plan::{InterpPlan, LoadError, LoadPlan},
     stack::{ARG_PAGES, Aux, Built, StackError, WINDOW_BYTES},
 };
 use crate::{
@@ -104,54 +104,29 @@ pub fn open_exec_file(
     }
 }
 
-/// [`open_exec_file`] of a kernel path for a caller that only needs the bytes.
-fn open_exec(vfs: &mut Vfs, path: &[u8]) -> Result<Vec<u8>, Errno> {
-    let env = vfs.kernel_env();
-    let (bytes, file) = open_exec_file(vfs, &env, path, true)?;
-    vfs.fput(file);
-    Ok(bytes)
-}
-
-/// The tail of `load_elf_binary`'s `PT_INTERP` scan:
-/// `open_exec(interpreter)` fails with its errno exactly as Linux does; an
-/// interpreter that opens is `unsupported` (running it is outside this slice).
+/// The interpreter of an image that names one: `open_exec(elf_interpreter)`, then the header
+/// read and checks of `load_elf_binary` (`EIO` for a short file, `ELIBBAD`). The path is a C
+/// string: Linux hands it to `open_exec` as is, so an empty one names the working directory
+/// (`path_init` on `""` for a kernel string) and fails as a directory.
+///
+/// `path` is relative to the caller's root and working directory (`env`).
 ///
 /// # Errors
-/// The `open_exec` errno, or [`LoadError::Unsupported`].
-pub fn interpreter_failure(
+/// The `open_exec` errors in `open(2)`'s order, `EACCES` for a non-regular file, then the
+/// interpreter checks; the open file is released on every error.
+pub fn open_interpreter(
     vfs: &mut Vfs,
-    interpreter: &[u8],
-    unsupported: Unsupported,
-) -> LoadError {
-    if interpreter.is_empty() {
-        return LoadError::Errno(Errno::ENOENT);
-    }
-    match open_exec(vfs, interpreter) {
-        Err(errno) => LoadError::Errno(errno),
-        Ok(_) => LoadError::Unsupported(unsupported),
-    }
-}
-
-/// Header and `PT_INTERP` acceptance of an ELF image: the load plan or the
-/// `execve` error. Scripts are the caller's (`load_script` rewrites the argument
-/// vector and restarts with the interpreter); everything up to here precedes
-/// `begin_new_exec`.
-///
-/// # Errors
-/// `ENOEXEC` and the format errors of the plan, a failed interpreter lookup,
-/// or an unsupported-but-valid image.
-pub fn plan_image(vfs: &mut Vfs, file: &[u8]) -> Result<LoadPlan, LoadError> {
-    match LoadPlan::new(file) {
-        Err(LoadError::Unsupported(Unsupported::Interpreter)) => {
-            // The plan checked the header and the `PT_INTERP` bytes (Linux
-            // order); the interpreter is now looked up in the rootfs.
-            let path = crate::image::elf::Elf::linux_x86_64(file)
-                .ok()
-                .and_then(|elf| elf.interpreter().ok().flatten())
-                .unwrap_or_default();
-            Err(interpreter_failure(vfs, path, Unsupported::Interpreter))
+    env: &Env,
+    path: &[u8],
+) -> Result<(Vec<u8>, FileId, InterpPlan), LoadError> {
+    let path = if path.is_empty() { b"." } else { path };
+    let (bytes, file) = open_exec_file(vfs, env, path, true).map_err(LoadError::Errno)?;
+    match InterpPlan::new(&bytes) {
+        Ok(plan) => Ok((bytes, file, plan)),
+        Err(error) => {
+            vfs.fput(file);
+            Err(error)
         }
-        other => other,
     }
 }
 
@@ -348,6 +323,14 @@ fn user_string<P: UserPages>(pages: &mut P, pointer: u64) -> Result<Vec<u8>, Err
     }
 }
 
+/// The interpreter of a [`Prepared`] image (`bprm->interpreter`): the open file, its bytes and
+/// the plan made from them.
+pub struct PreparedInterp {
+    pub file: FileId,
+    pub bytes: Vec<u8>,
+    pub plan: InterpPlan,
+}
+
 /// The new image, fully validated, with its stack block built: what
 /// `begin_new_exec` and `load_elf_binary` install after the point of no
 /// return.
@@ -355,9 +338,12 @@ pub struct Prepared {
     pub file: FileId,
     pub bytes: Vec<u8>,
     pub plan: LoadPlan,
+    pub interp: Option<PreparedInterp>,
     /// The top [`ARG_PAGES`] pages of the stack, ready to be installed.
     pub window: Vec<u8>,
     pub built: Built,
+    /// `bprm->rlim_stack.rlim_cur`, which sizes the stack VMA (`setup_arg_pages`).
+    pub rlim_stack: u64,
     /// `task_struct::comm` for the new image.
     pub comm: [u8; crate::task::COMM_LEN],
 }

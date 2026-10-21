@@ -7,7 +7,8 @@
 // `SYSCALL_DEFINE4(utimensat)`, `do_futimesat`, `SYSCALL_DEFINE2(utime)`),
 // fs/attr.c (`notify_change`, `may_setattr`, `setattr_prepare`, `chown_ok`,
 // `chgrp_ok`), fs/sync.c (`SYSCALL_DEFINE0(sync)`, `SYSCALL_DEFINE1(syncfs)`,
-// `do_fsync`, `vfs_fsync_range`), drivers/char/mem.c (the character devices
+// `do_fsync`, `vfs_fsync_range`), mm/fadvise.c (`SYSCALL_DEFINE4(fadvise64)`,
+// `ksys_fadvise64_64`, `vfs_fadvise`, `generic_fadvise`), drivers/char/mem.c (the character devices
 // have no `->fsync`), arch/x86/entry/syscalls/syscall_64.tbl. All GPL-2.0 /
 // GPL-2.0-only.
 // Transformation: the attribute changes are `vfs::ops` (`chmod`, `chown`,
@@ -21,7 +22,7 @@
     clippy::cast_sign_loss
 )]
 //! Attribute syscalls: `chmod`, `chown`, `utimensat` and its relatives,
-//! `truncate`, `fsync`, `fdatasync`, `sync` and `syncfs`.
+//! `truncate`, `fsync`, `fdatasync`, `sync`, `syncfs` and `fadvise64`.
 //!
 //! Context: task context, never sleeps. Nothing here reaches a device: the only
 //! file system is tmpfs, whose `->fsync` is `noop_fsync` and whose writeback
@@ -68,6 +69,7 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         Sysno::truncate => truncate(ctx, a[0], a[1]),
         Sysno::fsync | Sysno::fdatasync => fsync(ctx, a[0]),
         Sysno::syncfs => syncfs(ctx, a[0]),
+        Sysno::fadvise64 => fadvise64(ctx, a[0], a[2], a[3]),
         // `ksys_sync`: no block device, no dirty page cache beyond tmpfs's own.
         Sysno::sync => Ok(0),
         _ => return None,
@@ -82,7 +84,7 @@ fn dfd(raw: u64) -> i32 {
 
 /// `user_path_at`: the inode a path names, `LOOKUP_FOLLOW` unless `nofollow`,
 /// an empty name only with `AT_EMPTY_PATH`.
-fn user_path_at<C: Context>(
+pub(super) fn user_path_at<C: Context>(
     ctx: &mut C,
     dfd: i32,
     path: u64,
@@ -100,6 +102,14 @@ fn user_path_at<C: Context>(
 /// on an open file (`f_path`).
 fn fd_inode<C: Context>(ctx: &mut C, fd: u64) -> Result<(crate::vfs::ops::Env, InodeId), Stop> {
     let view = fdget(ctx, fd, false)?;
+    fd_inode_of(ctx, &view)
+}
+
+/// [`fd_inode`] for a descriptor already looked up.
+pub(super) fn fd_inode_of<C: Context>(
+    ctx: &mut C,
+    view: &super::fd::View,
+) -> Result<(crate::vfs::ops::Env, InodeId), Stop> {
     // A pipe's inode is not part of the file system model.
     if matches!(view.kind, FileKind::Pipe { .. }) {
         return Err(Stop::Unimplemented);
@@ -330,4 +340,28 @@ fn syncfs<C: Context>(ctx: &mut C, fd: u64) -> Sys {
         return Err(Stop::Unimplemented);
     }
     Ok(0)
+}
+
+/// `SYSCALL_DEFINE4(fadvise64)` -> `vfs_fadvise` -> `generic_fadvise` (no file system here has
+/// `->fadvise`): a FIFO is `-ESPIPE`, a negative length (`size_t` as `loff_t`) `-EINVAL`, and
+/// every file of this kernel lives on a super block whose backing device is
+/// `noop_backing_dev_info` (tmpfs, procfs, the device nodes of the rootfs), where the six
+/// POSIX advice values are accepted and ignored and any other is `-EINVAL`. `offset` has no
+/// effect there and is not read.
+fn fadvise64<C: Context>(ctx: &mut C, fd: u64, len: u64, advice: u64) -> Sys {
+    let view = fdget(ctx, fd, false)?;
+    match view.kind {
+        FileKind::Path => return Err(Errno::EBADF.into()),
+        FileKind::Pipe { .. } => return Err(Errno::ESPIPE.into()),
+        FileKind::Unsupported => return Err(Stop::Unimplemented),
+        _ => {}
+    }
+    if len.cast_signed() < 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    // POSIX_FADV_NORMAL .. POSIX_FADV_NOREUSE (0..=5 on x86).
+    match advice as i32 {
+        0..=5 => Ok(0),
+        _ => Err(Errno::EINVAL.into()),
+    }
 }

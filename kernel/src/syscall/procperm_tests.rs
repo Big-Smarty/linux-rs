@@ -121,6 +121,7 @@ fn victim(
         child_sp: 0,
         clear_sighand: false,
         clear_child_tid: 0,
+        set_child_tid: 0,
         share_vm: false,
         vfork: false,
     };

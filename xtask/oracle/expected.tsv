@@ -1,9 +1,10 @@
-# Expected output lines of the oracle syscall suite (user/init modes mm ids time signal fs proc fork jobctl pipe xstate tty ttyin ttykbd names busybox procfs) on the pinned
+# Expected output lines of the oracle syscall suite (user/init modes mm ids time signal fs proc fork jobctl pipe xstate tty ttyin ttykbd names busybox procfs dynelf) on the pinned
 # Linux 6.18.57 reference kernel: QEMU q35, -cpu qemu64 (TCG), -smp 1 -m 512M, "console=ttyS0 panic=-1 vdso=0 norandmaps -- <mode>",
 # the harness-built /init and generated initramfs (target/linux-reference/init-reference-006 for mm ids time signal fs proc, -009/-010 for fork, -011 for jobctl and pipe, -014 for tty, ttyin and ttykbd (ttyin/ttykbd are driven through the serial port / QMP send-key by `xtask tty-oracle`; ttykbd runs with "console=ttyS0 console=tty0" so that /dev/console is the vt; kinds stage and echo are the driver's transcript rows, see docs/kernel-tooling.md); docs/implementation.md#oracle-syscall-test-suite).
 # The `xstate` group is the exception to the machine: it drives AVX-512 and PKRU state, so it was recorded under KVM with -cpu host (AMD Zen 5) and runs only where KVM does (target/linux-reference/init-reference-012; docs/implementation.md#extended-cpu-state-xsave-pkru). Its `info` rows name the machine (XCR0, sizes, offsets) and are not compared by value.
 # The `names` group (mkdir, rmdir, rename, link, symlink, chmod, chown, utimensat, truncate, fsync, statfs, writev, sendfile, getrandom's argument errors, reboot's checks, mknodat, `#!` scripts, vfork including an expiring ITIMER_REAL a nested vfork killed by its child and a three-deep chain with both middle tasks killed) is CPU independent: recorded under TCG `-cpu qemu64` like the first groups (target/linux-reference/init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017; the `vfork-chain-*` rows and the `names` summary from init-reference-019, fix round 2). The `busybox` group runs the host's BusyBox v1.36.1 (sha256 1097cdef...f0d, static, x86-64-v4) through `user/init` mode `bbrun` and was recorded under KVM `-cpu host` with `initramfs.cpio` followed by the generated `busybox.cpio` as the initrd (init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017: the `getrandom` clamp rows): each row is a command's exit status or signal and its escaped output, and the case is `unavailable` without that exact program, KVM or AVX-512 (docs/implementation.md#busybox-lane).
 # The `procfs` group (mount(2), umount2(2), /proc) was recorded on the same machine as the first groups (target/linux-reference/init-reference-018, fix round 1 target/linux-reference/init-reference-020, fix round 2 target/linux-reference/init-reference-021, fix round 3 target/linux-reference/init-reference-022; docs/implementation.md#procfs-and-mounts); its last check remounts the root read-only and back, so it runs in a boot of its own.
+# The `dynelf` group (dynamically linked host programs through ET_DYN images and PT_INTERP interpreters, synthetic ELF layout and error probes, mremap(2), CLONE_CHILD_SETTID and the `sys-*` system call probes of user/init `tests/dynsys.rs`; user/init mode `dynrun`) was recorded under KVM `-cpu host` with `nofsgsbase` (AT_HWCAP2 0) from `initramfs.cpio` followed by the generated `dynamic.cpio` (target/linux-reference/init-reference-025, fix round 1; init-reference-024 was the first recording; docs/implementation.md#dynamic-elf-lane). The values of AT_HWCAP and AT_MINSIGSTKSZ (CPUID of the recording machine) are masked to `*` in the auxv rows. The host binaries and libraries are pinned by sha256 in xtask/src/fixture.rs; the case is `unavailable` without them, KVM or AVX-512.
 # Columns: group, kind (check|info|summary|stage|echo), name, line (the exact stdout line without the newline).
 # A consumer matches "check" and "summary" rows exactly; "info" rows are recorded observations (tmpfs d_off cookies), not requirements.
 # Kernel printk lines may interleave with console output and must be filtered by the consumer (keep lines that start with
@@ -2459,6 +2460,419 @@ busybox	check	getrandom-nothing-copied	init: test busybox.getrandom-nothing-copi
 busybox	check	getrandom-clamp-before-access-ok	init: test busybox.getrandom-clamp-before-access-ok ok
 busybox	check	getrandom-clamp-just-over	init: test busybox.getrandom-clamp-just-over ok
 busybox	summary	-	init: tests busybox passed=307 failed=0
+dynelf	check	true	init: test dynelf.true exit=0 out=""
+dynelf	check	false	init: test dynelf.false exit=1 out=""
+dynelf	check	echo	init: test dynelf.echo exit=0 out="hello world\n"
+dynelf	check	echo-n	init: test dynelf.echo-n exit=0 out="no newline"
+dynelf	check	echo-e	init: test dynelf.echo-e exit=0 out="a\tb\\cA\n"
+dynelf	check	printf	init: test dynelf.printf exit=0 out="abc-42-ff-10| 3.14|ab  |\n"
+dynelf	check	seq	init: test dynelf.seq exit=0 out="1\n2\n3\n4\n5\n"
+dynelf	check	seq-step	init: test dynelf.seq-step exit=0 out="10\n7\n4\n1\n"
+dynelf	check	expr	init: test dynelf.expr exit=0 out="14\n"
+dynelf	check	factor	init: test dynelf.factor exit=0 out="360: 2 2 2 3 3 5\n97: 97\n"
+dynelf	check	basename	init: test dynelf.basename exit=0 out="c\n"
+dynelf	check	dirname	init: test dynelf.dirname exit=0 out="/a/b\n"
+dynelf	check	uname	init: test dynelf.uname exit=0 out="Linux (none) x86_64 GNU/Linux\n"
+dynelf	check	id	init: test dynelf.id exit=0 out="uid=0 gid=0 groups=0\n"
+dynelf	check	id-un	init: test dynelf.id-un exit=1 out="id: cannot find name for user ID 0\n0\n"
+dynelf	check	whoami	init: test dynelf.whoami exit=1 out="whoami: cannot find name for user ID 0: No such file or directory\n"
+dynelf	check	pwd	init: test dynelf.pwd exit=0 out="/\n"
+dynelf	check	env	init: test dynelf.env exit=0 out="PATH=/usr/bin\nHOME=/\nLC_ALL=C\n"
+dynelf	check	env-set	init: test dynelf.env-set exit=0 out="1\n"
+dynelf	check	printenv	init: test dynelf.printenv exit=0 out="/\n/usr/bin\n"
+dynelf	check	tty	init: test dynelf.tty exit=1 out="not a tty\n"
+dynelf	check	nproc	init: test dynelf.nproc exit=0 out="1\n"
+dynelf	check	sleep-0	init: test dynelf.sleep-0 exit=0 out=""
+dynelf	check	date	init: test dynelf.date exit=0 out="2001-09-09 01:46:40\n"
+dynelf	check	cat	init: test dynelf.cat exit=0 out="hello world\na,b,c\n1,2,3\n4,5,6\n"
+dynelf	check	cat-missing	init: test dynelf.cat-missing exit=1 out="cat: /bb/nothing: No such file or directory\n"
+dynelf	check	cat-dir	init: test dynelf.cat-dir exit=1 out="cat: /bb: Is a directory\n"
+dynelf	check	wc	init: test dynelf.wc exit=0 out=" 2  9 44 /bb/words.txt\n 6  6 39 /bb/lines.txt\n 8 15 83 total\n"
+dynelf	check	wc-l	init: test dynelf.wc-l exit=0 out="6 /bb/lines.txt\n"
+dynelf	check	head	init: test dynelf.head exit=0 out="banana\napple\n"
+dynelf	check	head-c	init: test dynelf.head-c exit=0 out="the qui"
+dynelf	check	tail	init: test dynelf.tail exit=0 out="banana\napple\n"
+dynelf	check	tail-c	init: test dynelf.tail-c exit=0 out="y dog\n"
+dynelf	check	sort	init: test dynelf.sort exit=0 out="apple\napple\napple\nbanana\nbanana\ncherry\n"
+dynelf	check	sort-n	init: test dynelf.sort-n exit=0 out="1\n9\n10\n55\n100\n"
+dynelf	check	sort-rn	init: test dynelf.sort-rn exit=0 out="100\n55\n10\n9\n1\n"
+dynelf	check	sort-u	init: test dynelf.sort-u exit=0 out="apple\nbanana\ncherry\n"
+dynelf	check	tac	init: test dynelf.tac exit=0 out="55\n1\n100\n9\n10\n"
+dynelf	check	rev	init: test dynelf.rev exit=0 out="xof nworb kciuq eht\ngod yzal eht revo spmuj\n"
+dynelf	check	nl	init: test dynelf.nl exit=0 out="     1\ta,b,c\n     2\t1,2,3\n     3\t4,5,6\n"
+dynelf	check	cut	init: test dynelf.cut exit=0 out="b,c\n2,3\n5,6\n"
+dynelf	check	paste	init: test dynelf.paste exit=0 out="10\t10\n9\t9\n100\t100\n1\t1\n55\t55\n"
+dynelf	check	fold	init: test dynelf.fold exit=0 out="the quick \nbrown fox\njumps over\n the lazy \ndog\n"
+dynelf	check	od	init: test dynelf.od exit=0 out="000000 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n000010 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f\n000020 20 21 22 23 24 25 26 27 28 29 2a 2b 2c 2d 2e 2f\n000030\n"
+dynelf	check	base64	init: test dynelf.base64 exit=0 out="aGVsbG8gd29ybGQK\n"
+dynelf	check	cmp	init: test dynelf.cmp exit=1 out="/bb/hello.txt /bb/words.txt differ: char 1, line 1\n"
+dynelf	check	diff	init: test dynelf.diff exit=1 out="1,5c1,6\n< 10\n< 9\n< 100\n< 1\n< 55\n---\n> banana\n> apple\n> cherry\n> apple\n> banana\n> apple\n"
+dynelf	check	comm	init: test dynelf.comm exit=0 out="\t\tbanana\n\t\tapple\n\t\tcherry\n\t\tapple\n\t\tbanana\n\t\tapple\n"
+dynelf	check	ls	init: test dynelf.ls exit=0 out="a\ndangling\ne.txt\nexec.sh\nlink\n"
+dynelf	check	ls-a	init: test dynelf.ls-a exit=0 out=".\n..\na\ndangling\ne.txt\nexec.sh\nlink\n"
+dynelf	check	ls-l	init: test dynelf.ls-l exit=0 out="total 32\n-rw-r--r-- 1 0 0 256 Sep  9  2001 bin.dat\n-rw-r--r-- 1 0 0  18 Sep  9  2001 csv.txt\n-rw-r--r-- 1 0 0   0 Sep  9  2001 empty\n-rw-r--r-- 1 0 0  12 Sep  9  2001 hello.txt\n-rw-r--r-- 1 0 0  39 Sep  9  2001 lines.txt\n---------- 1 0 0   7 Sep  9  2001 noperm\n-rw-r--r-- 1 0 0  14 Sep  9  2001 nums.txt\n-rwxr-xr-x 1 0 0  35 Sep  9  2001 script.sh\ndrwxr-xr-x 3 0 0 140 Sep  9  2001 tree\n-rw-r--r-- 1 0 0  44 Sep  9  2001 words.txt\n"
+dynelf	check	ls-ln	init: test dynelf.ls-ln exit=0 out="total 8\ndrwxr-xr-x 3 0 0 80 Sep  9  2001 a\nlrwxrwxrwx 1 0 0  7 Sep  9  2001 dangling -> nowhere\n-rw-r--r-- 1 0 0  2 Sep  9  2001 e.txt\n-rwxr-xr-x 1 0 0 20 Sep  9  2001 exec.sh\nlrwxrwxrwx 1 0 0  5 Sep  9  2001 link -> e.txt\n"
+dynelf	check	ls-ld	init: test dynelf.ls-ld exit=0 out="drwxr-xr-x 3 0 0 240 Sep  9  2001 /bb\n-rw-r--r-- 1 0 0  12 Sep  9  2001 /bb/hello.txt\nlrwxrwxrwx 1 0 0   5 Sep  9  2001 /bb/tree/link -> e.txt\n"
+dynelf	check	ls-R	init: test dynelf.ls-R exit=0 out="/bb/tree:\na\ndangling\ne.txt\nexec.sh\nlink\n\n/bb/tree/a:\nb\nd.txt\n\n/bb/tree/a/b:\nc.txt\n"
+dynelf	check	ls-missing	init: test dynelf.ls-missing exit=2 out="ls: cannot access '/bb/nothing': No such file or directory\n"
+dynelf	check	stat	init: test dynelf.stat exit=0 out="644 12 regular file 1 0 0 /bb/hello.txt\n755 240 directory 3 0 0 /bb\n777 5 symbolic link 1 0 0 /bb/tree/link\n644 0 character special file 1 0 0 /dev/null\n"
+dynelf	check	stat-missing	init: test dynelf.stat-missing exit=1 out="stat: cannot statx '/bb/nothing': No such file or directory\n"
+dynelf	check	readlink	init: test dynelf.readlink exit=0 out="e.txt\n"
+dynelf	check	realpath	init: test dynelf.realpath exit=0 out="/bb/tree/e.txt\n"
+dynelf	check	test-file	init: test dynelf.test-file exit=0 out=""
+dynelf	check	test-dir-missing	init: test dynelf.test-dir-missing exit=1 out=""
+dynelf	check	find	init: test dynelf.find exit=0 out="/bb/tree/e.txt\n/bb/tree/a/d.txt\n/bb/tree/a/b/c.txt\n"
+dynelf	check	find-type	init: test dynelf.find-type exit=0 out="/bb/tree\n/bb/tree/a\n/bb/tree/a/b\n"
+dynelf	check	du	init: test dynelf.du exit=0 out="0\t/bb/tree/dangling\n0\t/bb/tree/link\n4\t/bb/tree/exec.sh\n4\t/bb/tree/e.txt\n4\t/bb/tree/a/d.txt\n4\t/bb/tree/a/b/c.txt\n4\t/bb/tree/a/b\n8\t/bb/tree/a\n16\t/bb/tree\n"
+dynelf	check	grep	init: test dynelf.grep exit=0 out="apple\napple\napple\n"
+dynelf	check	grep-c	init: test dynelf.grep-c exit=0 out="2\n"
+dynelf	check	grep-r	init: test dynelf.grep-r exit=0 out="/bb/tree/a/d.txt:dd\n"
+dynelf	check	grep-E	init: test dynelf.grep-E exit=0 out="cherry\n"
+dynelf	check	sed-s	init: test dynelf.sed-s exit=0 out="banana\nPEAR\ncherry\nPEAR\nbanana\nPEAR\n"
+dynelf	check	sed-n	init: test dynelf.sed-n exit=0 out="apple\ncherry\n"
+dynelf	check	awk-sum	init: test dynelf.awk-sum exit=0 out="7\n"
+dynelf	check	awk-printf	init: test dynelf.awk-printf exit=0 out="7 x 2.5\n"
+dynelf	check	xargs	init: test dynelf.xargs exit=0 out="x /bb/hello.txt\n"
+dynelf	check	bash-echo	init: test dynelf.bash-echo exit=0 out="hello from bash\n"
+dynelf	check	bash-pipeline	init: test dynelf.bash-pipeline exit=0 out="      3 apple\n      2 banana\n"
+dynelf	check	bash-loop	init: test dynelf.bash-loop exit=0 out="n1\nn2\nn3\n3\n"
+dynelf	check	bash-function	init: test dynelf.bash-function exit=0 out="f:a:2\nrc=3\n"
+dynelf	check	bash-heredoc	init: test dynelf.bash-heredoc exit=0 out="line 42\n/\n"
+dynelf	check	bash-subshell	init: test dynelf.bash-subshell exit=0 out="in2\nout1\nsub\n"
+dynelf	check	bash-trap	init: test dynelf.bash-trap exit=0 out="usr1\ndone\nbye\n"
+dynelf	check	bash-bg	init: test dynelf.bash-bg exit=0 out="rc=5\nall\n"
+dynelf	check	bash-redirect	init: test dynelf.bash-redirect exit=0 out="to3\nerr\n"
+dynelf	check	bash-array	init: test dynelf.bash-array exit=0 out="3 y v\nb\n"
+dynelf	check	bash-glob	init: test dynelf.bash-glob exit=0 out="csv.txt hello.txt lines.txt nums.txt words.txt\ntree/a tree/dangling tree/e.txt tree/exec.sh tree/link\n"
+dynelf	check	bash-read	init: test dynelf.bash-read exit=0 out="[a][b][c]\n[1][2][3]\n[4][5][6]\n"
+dynelf	check	bash-set-e	init: test dynelf.bash-set-e exit=1 out="before\n"
+dynelf	check	bash-missing	init: test dynelf.bash-missing exit=0 out="bash: line 1: /usr/bin/nothing-here: No such file or directory\nrc=127\nbash: line 1: nothing-either: command not found\nrc=127\n"
+dynelf	check	bash-umask	init: test dynelf.bash-umask exit=0 out="0022\n0027\nbuiltin\nfile\nbuiltin\n"
+dynelf	check	sh-echo	init: test dynelf.sh-echo exit=0 out="posix\nsh\n"
+dynelf	check	bash-script	init: test dynelf.bash-script exit=7 out="script 1 arg1\n"
+dynelf	check	bash-files	init: test dynelf.bash-files exit=0 out="1\nf\n600\nd/e/f\n"
+dynelf	check	bash-gzip	init: test dynelf.bash-gzip exit=0 out="gz-same\ntree/\ntree/a/\ntree/a/b/\ntree/a/b/c.txt\ntree/a/d.txt\ntree/dangling\ntree/e.txt\ntree/exec.sh\ntree/link\n"
+dynelf	check	bash-dd	init: test dynelf.bash-dd exit=0 out=" 20 21 22 23 24 25 26 27 28 29 2a 2b 2c 2d 2e 2f\ny\ny\ny\n"
+dynelf	check	ls-color	init: test dynelf.ls-color exit=0 out="total 32\n-rw-r--r-- 1 0 0 256 Sep  9  2001 bin.dat\n-rw-r--r-- 1 0 0  18 Sep  9  2001 csv.txt\n-rw-r--r-- 1 0 0   0 Sep  9  2001 empty\n-rw-r--r-- 1 0 0  12 Sep  9  2001 hello.txt\n-rw-r--r-- 1 0 0  39 Sep  9  2001 lines.txt\n---------- 1 0 0   7 Sep  9  2001 noperm\n-rw-r--r-- 1 0 0  14 Sep  9  2001 nums.txt\n-rwxr-xr-x 1 0 0  35 Sep  9  2001 script.sh\ndrwxr-xr-x 3 0 0 140 Sep  9  2001 tree\n-rw-r--r-- 1 0 0  44 Sep  9  2001 words.txt\n"
+dynelf	check	stat-f	init: test dynelf.stat-f exit=0 out="tmpfs\n"
+dynelf	check	bash-ulimit	init: test dynelf.bash-ulimit exit=0 out="n 1024\ns 8192\nc 0\nl 8192\nt unlimited\nd unlimited\nf unlimited\nm unlimited\nv unlimited\nq 819200\ne 0\nr 0\nR unlimited\n"
+dynelf	check	stdbuf	init: test dynelf.stdbuf exit=0 out="unbuffered\n"
+dynelf	check	setsid	init: test dynelf.setsid exit=0 out="session\n"
+dynelf	check	sleep-short	init: test dynelf.sleep-short exit=0 out=""
+dynelf	check	sort-many	init: test dynelf.sort-many exit=0 out="3000\n2999\n2998\n998\n999\n3000\n"
+dynelf	check	bash-forks	init: test dynelf.bash-forks exit=0 out="done\n111\n"
+dynelf	check	tar-roundtrip	init: test dynelf.tar-roundtrip exit=0 out="t2:\ntotal 0\ndrwxr-xr-x 3 0 0 140 Sep  9  2001 tree\n\nt2/tree:\ntotal 8\ndrwxr-xr-x 3 0 0 80 Sep  9  2001 a\nlrwxrwxrwx 1 0 0  7 Sep  9  2001 dangling -> nowhere\n-rw-r--r-- 1 0 0  2 Sep  9  2001 e.txt\n-rwxr-xr-x 1 0 0 20 Sep  9  2001 exec.sh\nlrwxrwxrwx 1 0 0  5 Sep  9  2001 link -> e.txt\n\n755 1000000000 t2/tree/exec.sh\n"
+dynelf	check	sed-i	init: test dynelf.sed-i exit=0 out="a\nB\nc\n"
+dynelf	check	grep-P	init: test dynelf.grep-P exit=0 out="banana\nbanana\n"
+dynelf	check	awk-array	init: test dynelf.awk-array exit=0 out="332833500\n1000\nbcd X\n"
+dynelf	check	find-exec	init: test dynelf.find-exec exit=0 out="e\ndd\nccc\n"
+dynelf	check	ls-many	init: test dynelf.ls-many exit=0 out="300\nf1\nf10\nf100\n300\n"
+dynelf	check	dd-big	init: test dynelf.dd-big exit=0 out="4+0 records in\n4+0 records out\n4194304\n"
+dynelf	check	cat-big	init: test dynelf.cat-big exit=0 out="2370976\nsame\n3454784\n"
+dynelf	check	gzip-big	init: test dynelf.gzip-big exit=0 out="same\n"
+dynelf	check	python-print	init: test dynelf.python-print exit=0 out="2\n"
+dynelf	check	python-sys	init: test dynelf.python-sys exit=0 out="linux little 9223372036854775807 ['-c', 'a1', 'a2'] 1\n"
+dynelf	check	python-math	init: test dynelf.python-math exit=0 out="1.4142135623730951 2432902008176640000 12 3.141592653589793\n"
+dynelf	check	python-re	init: test dynelf.python-re exit=0 out="a<1>b<22>c<333> ['hi', 'there', 'you']\n"
+dynelf	check	python-json	init: test dynelf.python-json exit=0 out="{\"a\": true, \"b\": [1, 2, {\"c\": null}]} [1, 2.5, 'x']\n"
+dynelf	check	python-collections	init: test dynelf.python-collections exit=0 out="[('a', 5), ('b', 2), ('c', 1), ('d', 1), ('r', 2)] OrderedDict({'a': 1})\n"
+dynelf	check	python-os	init: test dynelf.python-os exit=0 out="['a', 'dangling', 'e.txt', 'exec.sh', 'link'] 12 / 0 / Linux\n"
+dynelf	check	python-files	init: test dynelf.python-files exit=0 out="'hello world\\n'\n5000\n"
+dynelf	check	python-fork	init: test dynelf.python-fork exit=0 out="b'child' 7\n"
+dynelf	check	python-signal	init: test dynelf.python-signal exit=0 out="[10]\n"
+dynelf	check	python-exit	init: test dynelf.python-exit exit=3 out=""
+dynelf	check	python-traceback	init: test dynelf.python-traceback exit=1 out="Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nZeroDivisionError: division by zero\n"
+dynelf	check	python-sum	init: test dynelf.python-sum exit=0 out="8999955000050000 1506\n"
+dynelf	check	ld-list	init: test dynelf.ld-list exit=0 out="\tlibc.so.6 => /usr/lib/libc.so.6 (0x00007ffff7d5e000)\n\t/lib64/ld-linux-x86-64.so.2 => ld.so (0x00007ffff7fb8000)\n"
+dynelf	check	ld-list-ls	init: test dynelf.ld-list-ls exit=0 out="\tlibcap.so.2 => /usr/lib/libcap.so.2 (0x00007ffff7f76000)\n\tlibc.so.6 => /usr/lib/libc.so.6 (0x00007ffff7d2e000)\n\t/lib64/ld-linux-x86-64.so.2 => ld.so (0x00007ffff7fb8000)\n"
+dynelf	check	ld-verify	init: test dynelf.ld-verify exit=0 out=""
+dynelf	check	ld-run	init: test dynelf.ld-run exit=0 out="via ld.so\n"
+dynelf	check	ld-library-path	init: test dynelf.ld-library-path exit=0 out=""
+dynelf	check	ld-no-file	init: test dynelf.ld-no-file exit=127 out="/nonexistent: error while loading shared libraries: /nonexistent: cannot open shared object file: No such file or directory\n"
+dynelf	check	ld-not-elf	init: test dynelf.ld-not-elf exit=127 out="/bb/hello.txt: error while loading shared libraries: /bb/hello.txt: file too short\n"
+dynelf	check	ld-trace	init: test dynelf.ld-trace exit=0 out="\tlibcap.so.2 => /usr/lib/libcap.so.2 (0x00007ffff7faa000)\n\tlibc.so.6 => /usr/lib/libc.so.6 (0x00007ffff7d60000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007ffff7fb8000)\n"
+dynelf	check	ld-preload-missing	init: test dynelf.ld-preload-missing exit=0 out="ERROR: ld.so: object '/nonexistent.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.\n"
+dynelf	check	ld-show-auxv	init: test dynelf.ld-show-auxv exit=0 out="AT_MINSIGSTKSZ:       *\nAT_HWCAP:             *\nAT_PAGESZ:            4096\nAT_CLKTCK:            100\nAT_PHDR:              0x555555554040\nAT_PHENT:             56\nAT_PHNUM:             15\nAT_BASE:              0x7ffff7fb8000\nAT_FLAGS:             0x0\nAT_ENTRY:             0x5555555565b0\nAT_UID:               0\nAT_EUID:              0\nAT_GID:               0\nAT_EGID:              0\nAT_SECURE:            0\nAT_RANDOM:            0x7fffffffef99\nAT_HWCAP2:            0x0\nAT_EXECFN:            /usr/bin/true\nAT_PLATFORM:          x86_64\n"
+dynelf	check	ld-bind-now	init: test dynelf.ld-bind-now exit=0 out="/bb/hello.txt\n"
+dynelf	check	ld-library-path-env	init: test dynelf.ld-library-path-env exit=0 out="/bb/hello.txt\n"
+dynelf	check	maps-cat	init: test dynelf.maps-cat exit=0 out="555555554000-555555556000 r--p 00000000 00:02 I                         /usr/bin/cat\n555555556000-555555560000 r-xp 00002000 00:02 I                         /usr/bin/cat\n555555560000-555555563000 r--p 0000c000 00:02 I                         /usr/bin/cat\n555555563000-555555564000 r--p 0000f000 00:02 I                         /usr/bin/cat\n555555564000-555555565000 rw-p 00010000 00:02 I                         /usr/bin/cat\n555555565000-555555586000 rw-p 00000000 00:00 0                          [heap]\n7ffff7d2c000-7ffff7d70000 rw-p 00000000 00:00 0 \n7ffff7d70000-7ffff7d94000 r--p 00000000 00:02 I                        /usr/lib/libc.so.6\n7ffff7d94000-7ffff7f31000 r-xp 00024000 00:02 I                        /usr/lib/libc.so.6\n7ffff7f31000-7ffff7faa000 r--p 001c1000 00:02 I                        /usr/lib/libc.so.6\n7ffff7faa000-7ffff7fae000 r--p 0023a000 00:02 I                        /usr/lib/libc.so.6\n7ffff7fae000-7ffff7fb0000 rw-p 0023e000 00:02 I                        /usr/lib/libc.so.6\n7ffff7fb0000-7ffff7fb8000 rw-p 00000000 00:00 0 \n7ffff7fb8000-7ffff7fb9000 r--p 00000000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7fb9000-7ffff7feb000 r-xp 00001000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7feb000-7ffff7ffb000 r--p 00033000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7ffb000-7ffff7ffd000 r--p 00043000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7ffd000-7ffff7ffe000 rw-p 00045000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7ffe000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	maps-ld	init: test dynelf.maps-ld exit=0 out="555555555000-555555576000 rw-p 00000000 00:00 0                          [heap]\n7ffff7d1b000-7ffff7d5d000 rw-p 00000000 00:00 0 \n7ffff7d5d000-7ffff7d81000 r--p 00000000 00:02 I                        /usr/lib/libc.so.6\n7ffff7d81000-7ffff7f1e000 r-xp 00024000 00:02 I                        /usr/lib/libc.so.6\n7ffff7f1e000-7ffff7f97000 r--p 001c1000 00:02 I                        /usr/lib/libc.so.6\n7ffff7f97000-7ffff7f9b000 r--p 0023a000 00:02 I                        /usr/lib/libc.so.6\n7ffff7f9b000-7ffff7f9d000 rw-p 0023e000 00:02 I                        /usr/lib/libc.so.6\n7ffff7f9d000-7ffff7fa7000 rw-p 00000000 00:00 0 \n7ffff7fa7000-7ffff7fa9000 r--p 00000000 00:02 I                         /usr/bin/cat\n7ffff7fa9000-7ffff7fb3000 r-xp 00002000 00:02 I                         /usr/bin/cat\n7ffff7fb3000-7ffff7fb6000 r--p 0000c000 00:02 I                         /usr/bin/cat\n7ffff7fb6000-7ffff7fb7000 r--p 0000f000 00:02 I                         /usr/bin/cat\n7ffff7fb7000-7ffff7fb8000 rw-p 00010000 00:02 I                         /usr/bin/cat\n7ffff7fb8000-7ffff7fb9000 r--p 00000000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7fb9000-7ffff7feb000 r-xp 00001000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7feb000-7ffff7ffb000 r--p 00033000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7ffb000-7ffff7ffd000 r--p 00043000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7ffd000-7ffff7ffe000 rw-p 00045000 00:02 I                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7ffe000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	maps-bash	init: test dynelf.maps-bash exit=0 out="555555554000-555555556000 r--p                         /usr/bin/cat\n555555556000-555555560000 r-xp                         /usr/bin/cat\n555555560000-555555563000 r--p                         /usr/bin/cat\n555555563000-555555564000 r--p                         /usr/bin/cat\n555555564000-555555565000 rw-p                         /usr/bin/cat\n555555565000-555555586000 rw-p                          [heap]\n7ffff7d2c000-7ffff7d70000 rw-p \n7ffff7d70000-7ffff7d94000 r--p                        /usr/lib/libc.so.6\n7ffff7d94000-7ffff7f31000 r-xp                        /usr/lib/libc.so.6\n7ffff7f31000-7ffff7faa000 r--p                        /usr/lib/libc.so.6\n7ffff7faa000-7ffff7fae000 r--p                        /usr/lib/libc.so.6\n7ffff7fae000-7ffff7fb0000 rw-p                        /usr/lib/libc.so.6\n7ffff7fb0000-7ffff7fb8000 rw-p \n7ffff7fb8000-7ffff7fb9000 r--p                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7fb9000-7ffff7feb000 r-xp                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7feb000-7ffff7ffb000 r--p                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7ffb000-7ffff7ffd000 r--p                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7ffd000-7ffff7ffe000 rw-p                        /usr/lib/ld-linux-x86-64.so.2\n7ffff7ffe000-7ffff7fff000 rw-p \n7ffffffde000-7ffffffff000 rw-p                          [stack]\nffffffffff600000-ffffffffff601000 --xp                  [vsyscall]\n"
+dynelf	check	pie-interp	init: test dynelf.pie-interp signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x555555554040 4=0x38 5=0x4 7=0x7ffff7ff9000 8=0x0 9=0x555555554200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x55555555a000\n555555554000-555555555000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n555555556000-555555557000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n555555557000-55555555a000 rw-p 00000000 00:00 0 \n7ffff7ff9000-7ffff7ffa000 r-xp 00000000 00:02 I                        /tmp/dyn-interp\n7ffff7ffb000-7ffff7ffc000 rw-p 00001000 00:02 I                        /tmp/dyn-interp\n7ffff7ffc000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	pie-hole	init: test dynelf.pie-hole signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x555555554040 4=0x38 5=0x5 7=0x7ffff7ff9000 8=0x0 9=0x555555554200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x555555575000\n555555554000-555555555000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n555555564000-555555565000 r--p 00001000 00:02 I                        /tmp/dyn-main\n555555574000-555555575000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n7ffff7ff9000-7ffff7ffa000 r-xp 00000000 00:02 I                        /tmp/dyn-interp\n7ffff7ffb000-7ffff7ffc000 rw-p 00001000 00:02 I                        /tmp/dyn-interp\n7ffff7ffc000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	etexec-interp	init: test dynelf.etexec-interp signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x400040 4=0x38 5=0x4 7=0x7ffff7ff9000 8=0x0 9=0x400200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x405000\n00400000-00401000 r-xp 00000000 00:02 I                                /tmp/dyn-main\n00402000-00403000 rw-p 00001000 00:02 I                                /tmp/dyn-main\n00403000-00405000 rw-p 00000000 00:00 0 \n7ffff7ff9000-7ffff7ffa000 r-xp 00000000 00:02 I                        /tmp/dyn-interp\n7ffff7ffb000-7ffff7ffc000 rw-p 00001000 00:02 I                        /tmp/dyn-interp\n7ffff7ffc000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	dyn-nointerp	init: test dynelf.dyn-nointerp signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x7ffff7ff9040 4=0x38 5=0x3 7=0x0 8=0x0 9=0x7ffff7ff9200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x555555555000\n7ffff7ff9000-7ffff7ffa000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n7ffff7ffb000-7ffff7ffc000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n7ffff7ffc000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	dyn-first-offset	init: test dynelf.dyn-first-offset signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x7ffff7ff9000 4=0x38 5=0x3 7=0x0 8=0x0 9=0x7ffff7ff9200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x555555555000\n7ffff7ff9000-7ffff7ffa000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n7ffff7ffb000-7ffff7ffc000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n7ffff7ffc000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	dyn-nointerp-align	init: test dynelf.dyn-nointerp-align signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x7ffff7c00040 4=0x38 5=0x3 7=0x0 8=0x0 9=0x7ffff7c00200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x555555555000\n7ffff7c00000-7ffff7c01000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n7ffff7e02000-7ffff7e03000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n7ffff7e03000-7ffff7e04000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	pie-interp-align	init: test dynelf.pie-interp-align signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x555555400040 4=0x38 5=0x4 7=0x7ffff7ff9000 8=0x0 9=0x555555400200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x555555604000\n555555400000-555555401000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n555555602000-555555603000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n555555603000-555555604000 rw-p 00000000 00:00 0 \n7ffff7ff9000-7ffff7ffa000 r-xp 00000000 00:02 I                        /tmp/dyn-interp\n7ffff7ffb000-7ffff7ffc000 rw-p 00001000 00:02 I                        /tmp/dyn-interp\n7ffff7ffc000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	interp-exec	init: test dynelf.interp-exec signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x555555554040 4=0x38 5=0x4 7=0x0 8=0x0 9=0x555555554200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x55555555a000\n70000000-70001000 r-xp 00000000 00:02 I                                /tmp/dyn-interp\n70002000-70003000 rw-p 00001000 00:02 I                                /tmp/dyn-interp\n70003000-70004000 rw-p 00000000 00:00 0 \n555555554000-555555555000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n555555556000-555555557000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n555555557000-55555555a000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	interp-hole-bss	init: test dynelf.interp-hole-bss signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x555555554040 4=0x38 5=0x4 7=0x7ffff7fcc000 8=0x0 9=0x555555554200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x55555555a000\n555555554000-555555555000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n555555556000-555555557000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n555555557000-55555555a000 rw-p 00000000 00:00 0 \n7ffff7fcc000-7ffff7fcd000 r-xp 00000000 00:02 I                        /tmp/dyn-interp\n7ffff7fd4000-7ffff7fd5000 rw-p 00001000 00:02 I                        /tmp/dyn-interp\n7ffff7ffc000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	interp-align	init: test dynelf.interp-align signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x555555554040 4=0x38 5=0x4 7=0x7ffff7dfb000 8=0x0 9=0x555555554200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x55555555a000\n555555554000-555555555000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n555555556000-555555557000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n555555557000-55555555a000 rw-p 00000000 00:00 0 \n7ffff7dfb000-7ffff7dfc000 r-xp 00000000 00:02 I                        /tmp/dyn-interp\n7ffff7ffd000-7ffff7ffe000 rw-p 00001000 00:02 I                        /tmp/dyn-interp\n7ffff7ffe000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	dyn-exec-stack	init: test dynelf.dyn-exec-stack signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x7ffff7ff9040 4=0x38 5=0x3 7=0x0 8=0x0 9=0x7ffff7ff9200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x555555555000\n7ffff7ff9000-7ffff7ffa000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n7ffff7ffb000-7ffff7ffc000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n7ffff7ffc000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rwxp 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	dyn-no-gnu-stack	init: test dynelf.dyn-no-gnu-stack signal=9 out="auxv 51=* 16=* 6=0x1000 17=0x64 3=0x7ffff7ff9040 4=0x38 5=0x2 7=0x0 8=0x0 9=0x7ffff7ff9200 11=0x0 12=0x0 13=0x0 14=0x0 23=0x0 25=0x7fffffffefa9 26=0x0 31=0x7fffffffefea 15=0x7fffffffefb9\nbrk=0x555555555000\n7ffff7ff9000-7ffff7ffa000 r-xp 00000000 00:02 I                        /tmp/dyn-main\n7ffff7ffb000-7ffff7ffc000 rw-p 00001000 00:02 I                        /tmp/dyn-main\n7ffff7ffc000-7ffff7fff000 rw-p 00000000 00:00 0 \n7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]\nffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n"
+dynelf	check	exec-interp-runs	init: test dynelf.exec-interp-runs ok
+dynelf	check	exec-interp-missing	init: test dynelf.exec-interp-missing ok
+dynelf	check	exec-interp-directory	init: test dynelf.exec-interp-directory ok
+dynelf	check	exec-interp-not-executable	init: test dynelf.exec-interp-not-executable ok
+dynelf	check	exec-interp-enoent-dir	init: test dynelf.exec-interp-enoent-dir ok
+dynelf	check	exec-interp-enotdir	init: test dynelf.exec-interp-enotdir ok
+dynelf	check	exec-interp-size-one	init: test dynelf.exec-interp-size-one ok
+dynelf	check	exec-interp-too-long	init: test dynelf.exec-interp-too-long ok
+dynelf	check	exec-interp-unterminated	init: test dynelf.exec-interp-unterminated ok
+dynelf	check	exec-interp-relative	init: test dynelf.exec-interp-relative ok
+dynelf	check	exec-interp-empty-path	init: test dynelf.exec-interp-empty-path ok
+dynelf	check	exec-interp-not-elf	init: test dynelf.exec-interp-not-elf ok
+dynelf	check	exec-interp-short	init: test dynelf.exec-interp-short ok
+dynelf	check	exec-interp-empty-file	init: test dynelf.exec-interp-empty-file ok
+dynelf	check	exec-interp-machine	init: test dynelf.exec-interp-machine ok
+dynelf	check	exec-interp-phentsize	init: test dynelf.exec-interp-phentsize ok
+dynelf	check	exec-interp-phdrs-outside	init: test dynelf.exec-interp-phdrs-outside ok
+dynelf	check	exec-interp-no-phdrs	init: test dynelf.exec-interp-no-phdrs ok
+dynelf	check	exec-interp-type-rel	init: test dynelf.exec-interp-type-rel ok
+dynelf	check	exec-interp-no-loads	init: test dynelf.exec-interp-no-loads ok
+dynelf	check	exec-interp-too-big	init: test dynelf.exec-interp-too-big ok
+dynelf	check	exec-interp-filesz-over-memsz	init: test dynelf.exec-interp-filesz-over-memsz ok
+dynelf	check	exec-main-no-loads-runs	init: test dynelf.exec-main-no-loads-runs ok
+dynelf	check	exec-static-pie-runs	init: test dynelf.exec-static-pie-runs ok
+dynelf	check	exec-interp-is-self	init: test dynelf.exec-interp-is-self ok
+dynelf	check	exec-interp-script	init: test dynelf.exec-interp-script ok
+dynelf	check	sys-mremap-flag	init: test dynelf.sys-mremap-flag ok
+dynelf	check	sys-mremap-fixed-needs-maymove	init: test dynelf.sys-mremap-fixed-needs-maymove ok
+dynelf	check	sys-mremap-dontunmap-needs-maymove	init: test dynelf.sys-mremap-dontunmap-needs-maymove ok
+dynelf	check	sys-mremap-dontunmap-resize	init: test dynelf.sys-mremap-dontunmap-resize ok
+dynelf	check	sys-mremap-unaligned	init: test dynelf.sys-mremap-unaligned ok
+dynelf	check	sys-mremap-zero-new	init: test dynelf.sys-mremap-zero-new ok
+dynelf	check	sys-mremap-zero-old	init: test dynelf.sys-mremap-zero-old ok
+dynelf	check	sys-mremap-overlap	init: test dynelf.sys-mremap-overlap ok
+dynelf	check	sys-mremap-unaligned-target	init: test dynelf.sys-mremap-unaligned-target ok
+dynelf	check	sys-mremap-unmapped	init: test dynelf.sys-mremap-unmapped ok
+dynelf	check	sys-mremap-past-the-vma	init: test dynelf.sys-mremap-past-the-vma ok
+dynelf	check	sys-mremap-same-size	init: test dynelf.sys-mremap-same-size ok
+dynelf	check	sys-mremap-same-size-unchecked	init: test dynelf.sys-mremap-same-size-unchecked ok
+dynelf	check	sys-mremap-shrink	init: test dynelf.sys-mremap-shrink ok
+dynelf	check	sys-mremap-shrink-head	init: test dynelf.sys-mremap-shrink-head ok
+dynelf	check	sys-mremap-shrink-tail	init: test dynelf.sys-mremap-shrink-tail ok
+dynelf	check	sys-mremap-shrink-data	init: test dynelf.sys-mremap-shrink-data ok
+dynelf	check	sys-mremap-grow	init: test dynelf.sys-mremap-grow ok
+dynelf	check	sys-mremap-grow-data	init: test dynelf.sys-mremap-grow-data ok
+dynelf	check	sys-mremap-grow-middle	init: test dynelf.sys-mremap-grow-middle ok
+dynelf	check	sys-mremap-blocked	init: test dynelf.sys-mremap-blocked ok
+dynelf	check	sys-mremap-moved	init: test dynelf.sys-mremap-moved ok
+dynelf	check	sys-mremap-moved-data	init: test dynelf.sys-mremap-moved-data ok
+dynelf	check	sys-mremap-moved-old	init: test dynelf.sys-mremap-moved-old ok
+dynelf	check	sys-mremap-moved-address	init: test dynelf.sys-mremap-moved-address ok
+dynelf	check	sys-mremap-fixed	init: test dynelf.sys-mremap-fixed ok
+dynelf	check	sys-mremap-fixed-data	init: test dynelf.sys-mremap-fixed-data ok
+dynelf	check	sys-mremap-fixed-old	init: test dynelf.sys-mremap-fixed-old ok
+dynelf	check	sys-mremap-fixed-grow	init: test dynelf.sys-mremap-fixed-grow ok
+dynelf	check	sys-mremap-fixed-grow-data	init: test dynelf.sys-mremap-fixed-grow-data ok
+dynelf	check	sys-mremap-dontunmap	init: test dynelf.sys-mremap-dontunmap ok
+dynelf	check	sys-mremap-dontunmap-data	init: test dynelf.sys-mremap-dontunmap-data ok
+dynelf	check	sys-mremap-dontunmap-old	init: test dynelf.sys-mremap-dontunmap-old ok
+dynelf	check	sys-mremap-multi	init: test dynelf.sys-mremap-multi ok
+dynelf	check	sys-mremap-multi-layout	init: test dynelf.sys-mremap-multi-layout ok
+dynelf	check	sys-mremap-multi-protection	init: test dynelf.sys-mremap-multi-protection ok
+dynelf	check	sys-mremap-multi-gap	init: test dynelf.sys-mremap-multi-gap ok
+dynelf	check	sys-mremap-file	init: test dynelf.sys-mremap-file ok
+dynelf	check	sys-mremap-file-data	init: test dynelf.sys-mremap-file-data ok
+dynelf	check	sys-clone-child-settid	init: test dynelf.sys-clone-child-settid ok
+dynelf	check	sys-clone-child-settid-parent	init: test dynelf.sys-clone-child-settid-parent ok
+dynelf	check	sys-clone-no-settid	init: test dynelf.sys-clone-no-settid ok
+dynelf	check	sys-creat-write-only	init: test dynelf.sys-creat-write-only ok
+dynelf	check	sys-creat-truncates	init: test dynelf.sys-creat-truncates ok
+dynelf	check	sys-creat-efault	init: test dynelf.sys-creat-efault ok
+dynelf	check	sys-creat-directory	init: test dynelf.sys-creat-directory ok
+dynelf	check	sys-fadvise-advice-0	init: test dynelf.sys-fadvise-advice-0 ok
+dynelf	check	sys-fadvise-advice-1	init: test dynelf.sys-fadvise-advice-1 ok
+dynelf	check	sys-fadvise-advice-2	init: test dynelf.sys-fadvise-advice-2 ok
+dynelf	check	sys-fadvise-advice-3	init: test dynelf.sys-fadvise-advice-3 ok
+dynelf	check	sys-fadvise-advice-4	init: test dynelf.sys-fadvise-advice-4 ok
+dynelf	check	sys-fadvise-advice-5	init: test dynelf.sys-fadvise-advice-5 ok
+dynelf	check	sys-fadvise-advice-6	init: test dynelf.sys-fadvise-advice-6 ok
+dynelf	check	sys-fadvise-advice-huge	init: test dynelf.sys-fadvise-advice-huge ok
+dynelf	check	sys-fadvise-negative-length	init: test dynelf.sys-fadvise-negative-length ok
+dynelf	check	sys-fadvise-negative-offset	init: test dynelf.sys-fadvise-negative-offset ok
+dynelf	check	sys-fadvise-ebadf	init: test dynelf.sys-fadvise-ebadf ok
+dynelf	check	sys-fadvise-directory	init: test dynelf.sys-fadvise-directory ok
+dynelf	check	sys-fadvise-pipe	init: test dynelf.sys-fadvise-pipe ok
+dynelf	check	sys-fadvise-null	init: test dynelf.sys-fadvise-null ok
+dynelf	check	sys-fadvise-dontneed-bad-advice-before-fd	init: test dynelf.sys-fadvise-dontneed-bad-advice-before-fd ok
+dynelf	check	sys-splice-zero-length	init: test dynelf.sys-splice-zero-length ok
+dynelf	check	sys-splice-flags	init: test dynelf.sys-splice-flags ok
+dynelf	check	sys-splice-flags-high-bits	init: test dynelf.sys-splice-flags-high-bits ok
+dynelf	check	sys-splice-ebadf-in	init: test dynelf.sys-splice-ebadf-in ok
+dynelf	check	sys-splice-ebadf-out	init: test dynelf.sys-splice-ebadf-out ok
+dynelf	check	sys-splice-espipe-in	init: test dynelf.sys-splice-espipe-in ok
+dynelf	check	sys-splice-espipe-out	init: test dynelf.sys-splice-espipe-out ok
+dynelf	check	sys-splice-espipe-before-efault	init: test dynelf.sys-splice-espipe-before-efault ok
+dynelf	check	sys-splice-efault-out-offset	init: test dynelf.sys-splice-efault-out-offset ok
+dynelf	check	sys-splice-efault-in-offset	init: test dynelf.sys-splice-efault-in-offset ok
+dynelf	check	sys-splice-read-mode-before-offsets	init: test dynelf.sys-splice-read-mode-before-offsets ok
+dynelf	check	sys-splice-input-not-readable	init: test dynelf.sys-splice-input-not-readable ok
+dynelf	check	sys-splice-output-not-writable	init: test dynelf.sys-splice-output-not-writable ok
+dynelf	check	sys-splice-two-files	init: test dynelf.sys-splice-two-files ok
+dynelf	check	sys-splice-same-pipe	init: test dynelf.sys-splice-same-pipe ok
+dynelf	check	sys-splice-file-to-pipe	init: test dynelf.sys-splice-file-to-pipe ok
+dynelf	check	sys-splice-file-to-pipe-position	init: test dynelf.sys-splice-file-to-pipe-position ok
+dynelf	check	sys-splice-file-to-pipe-offset	init: test dynelf.sys-splice-file-to-pipe-offset ok
+dynelf	check	sys-splice-offset-written-back	init: test dynelf.sys-splice-offset-written-back ok
+dynelf	check	sys-splice-offset-keeps-position	init: test dynelf.sys-splice-offset-keeps-position ok
+dynelf	check	sys-splice-pipe-holds	init: test dynelf.sys-splice-pipe-holds ok
+dynelf	check	sys-splice-at-eof	init: test dynelf.sys-splice-at-eof ok
+dynelf	check	sys-splice-negative-offset-in	init: test dynelf.sys-splice-negative-offset-in ok
+dynelf	check	sys-splice-directory-in	init: test dynelf.sys-splice-directory-in ok
+dynelf	check	sys-splice-pipe-to-file	init: test dynelf.sys-splice-pipe-to-file ok
+dynelf	check	sys-splice-pipe-to-file-position	init: test dynelf.sys-splice-pipe-to-file-position ok
+dynelf	check	sys-splice-pipe-to-file-offset	init: test dynelf.sys-splice-pipe-to-file-offset ok
+dynelf	check	sys-splice-pipe-to-file-offset-back	init: test dynelf.sys-splice-pipe-to-file-offset-back ok
+dynelf	check	sys-splice-negative-offset-out	init: test dynelf.sys-splice-negative-offset-out ok
+dynelf	check	sys-splice-append	init: test dynelf.sys-splice-append ok
+dynelf	check	sys-splice-append-with-offset	init: test dynelf.sys-splice-append-with-offset ok
+dynelf	check	sys-splice-directory-out	init: test dynelf.sys-splice-directory-out ok
+dynelf	check	sys-splice-full-empty-pipe	init: test dynelf.sys-splice-full-empty-pipe ok
+dynelf	check	sys-splice-full-with-data	init: test dynelf.sys-splice-full-with-data ok
+dynelf	check	sys-splice-full-keeps-data	init: test dynelf.sys-splice-full-keeps-data ok
+dynelf	check	sys-splice-null	init: test dynelf.sys-splice-null ok
+dynelf	check	sys-splice-null-drained	init: test dynelf.sys-splice-null-drained ok
+dynelf	check	sys-splice-pipe-to-pipe	init: test dynelf.sys-splice-pipe-to-pipe ok
+dynelf	check	sys-splice-pipe-to-pipe-left	init: test dynelf.sys-splice-pipe-to-pipe-left ok
+dynelf	check	sys-splice-pipe-to-pipe-rest	init: test dynelf.sys-splice-pipe-to-pipe-rest ok
+dynelf	check	sys-splice-pipe-to-pipe-nonblock	init: test dynelf.sys-splice-pipe-to-pipe-nonblock ok
+dynelf	check	sys-splice-pipe-to-pipe-data	init: test dynelf.sys-splice-pipe-to-pipe-data ok
+dynelf	check	sys-splice-pipe-to-pipe-bytes	init: test dynelf.sys-splice-pipe-to-pipe-bytes ok
+dynelf	check	sys-splice-pipe-to-pipe-eof	init: test dynelf.sys-splice-pipe-to-pipe-eof ok
+dynelf	check	sys-splice-pipe-to-file-eof	init: test dynelf.sys-splice-pipe-to-file-eof ok
+dynelf	check	sys-splice-epipe	init: test dynelf.sys-splice-epipe ok
+dynelf	check	sys-splice-nonblocking-descriptor	init: test dynelf.sys-splice-nonblocking-descriptor ok
+dynelf	check	sys-vmsplice-to-pipe	init: test dynelf.sys-vmsplice-to-pipe ok
+dynelf	check	sys-vmsplice-queued	init: test dynelf.sys-vmsplice-queued ok
+dynelf	check	sys-vmsplice-to-user	init: test dynelf.sys-vmsplice-to-user ok
+dynelf	check	sys-vmsplice-bytes	init: test dynelf.sys-vmsplice-bytes ok
+dynelf	check	sys-vmsplice-flags	init: test dynelf.sys-vmsplice-flags ok
+dynelf	check	sys-vmsplice-ebadf	init: test dynelf.sys-vmsplice-ebadf ok
+dynelf	check	sys-vmsplice-flags-before-descriptor	init: test dynelf.sys-vmsplice-flags-before-descriptor ok
+dynelf	check	sys-vmsplice-file	init: test dynelf.sys-vmsplice-file ok
+dynelf	check	sys-vmsplice-file-no-segments	init: test dynelf.sys-vmsplice-file-no-segments ok
+dynelf	check	sys-vmsplice-file-empty-vector	init: test dynelf.sys-vmsplice-file-empty-vector ok
+dynelf	check	sys-vmsplice-file-bad-vector	init: test dynelf.sys-vmsplice-file-bad-vector ok
+dynelf	check	sys-vmsplice-file-too-many-segments	init: test dynelf.sys-vmsplice-file-too-many-segments ok
+dynelf	check	sys-vmsplice-pipe-too-many-segments	init: test dynelf.sys-vmsplice-pipe-too-many-segments ok
+dynelf	check	sys-vmsplice-pipe-bad-vector	init: test dynelf.sys-vmsplice-pipe-bad-vector ok
+dynelf	check	sys-vmsplice-pipe-empty-vector	init: test dynelf.sys-vmsplice-pipe-empty-vector ok
+dynelf	check	sys-vmsplice-kernel-half-segment	init: test dynelf.sys-vmsplice-kernel-half-segment ok
+dynelf	check	sys-vmsplice-partial	init: test dynelf.sys-vmsplice-partial ok
+dynelf	check	sys-vmsplice-unmapped-segment	init: test dynelf.sys-vmsplice-unmapped-segment ok
+dynelf	check	sys-vmsplice-efault-segment	init: test dynelf.sys-vmsplice-efault-segment ok
+dynelf	check	sys-vmsplice-to-user-nonblock	init: test dynelf.sys-vmsplice-to-user-nonblock ok
+dynelf	check	sys-vmsplice-to-user-eof	init: test dynelf.sys-vmsplice-to-user-eof ok
+dynelf	check	sys-vmsplice-epipe	init: test dynelf.sys-vmsplice-epipe ok
+dynelf	check	sys-cfr-ebadf-in	init: test dynelf.sys-cfr-ebadf-in ok
+dynelf	check	sys-cfr-ebadf-out	init: test dynelf.sys-cfr-ebadf-out ok
+dynelf	check	sys-cfr-ebadf-before-efault	init: test dynelf.sys-cfr-ebadf-before-efault ok
+dynelf	check	sys-cfr-efault-in	init: test dynelf.sys-cfr-efault-in ok
+dynelf	check	sys-cfr-efault-out	init: test dynelf.sys-cfr-efault-out ok
+dynelf	check	sys-cfr-efault-before-flags	init: test dynelf.sys-cfr-efault-before-flags ok
+dynelf	check	sys-cfr-flags	init: test dynelf.sys-cfr-flags ok
+dynelf	check	sys-cfr-flags-before-descriptors-mode	init: test dynelf.sys-cfr-flags-before-descriptors-mode ok
+dynelf	check	sys-cfr-directory-in	init: test dynelf.sys-cfr-directory-in ok
+dynelf	check	sys-cfr-directory-out	init: test dynelf.sys-cfr-directory-out ok
+dynelf	check	sys-cfr-pipe-out	init: test dynelf.sys-cfr-pipe-out ok
+dynelf	check	sys-cfr-pipe-in	init: test dynelf.sys-cfr-pipe-in ok
+dynelf	check	sys-cfr-read-only-output	init: test dynelf.sys-cfr-read-only-output ok
+dynelf	check	sys-cfr-append-output	init: test dynelf.sys-cfr-append-output ok
+dynelf	check	sys-cfr-other-file-system	init: test dynelf.sys-cfr-other-file-system ok
+dynelf	check	sys-cfr-zero-length	init: test dynelf.sys-cfr-zero-length ok
+dynelf	check	sys-cfr-copy	init: test dynelf.sys-cfr-copy ok
+dynelf	check	sys-cfr-positions	init: test dynelf.sys-cfr-positions ok
+dynelf	check	sys-cfr-short-at-eof	init: test dynelf.sys-cfr-short-at-eof ok
+dynelf	check	sys-cfr-offsets-written-back	init: test dynelf.sys-cfr-offsets-written-back ok
+dynelf	check	sys-cfr-offsets-keep-positions	init: test dynelf.sys-cfr-offsets-keep-positions ok
+dynelf	check	sys-cfr-at-eof	init: test dynelf.sys-cfr-at-eof ok
+dynelf	check	sys-cfr-eof-offsets-unchanged	init: test dynelf.sys-cfr-eof-offsets-unchanged ok
+dynelf	check	sys-cfr-overlap	init: test dynelf.sys-cfr-overlap ok
+dynelf	check	sys-cfr-negative-out-wraps	init: test dynelf.sys-cfr-negative-out-wraps ok
+dynelf	check	sys-cfr-negative-out-zero-length	init: test dynelf.sys-cfr-negative-out-zero-length ok
+dynelf	check	sys-cfr-min-in-zero-length	init: test dynelf.sys-cfr-min-in-zero-length ok
+dynelf	check	sys-cfr-min-in	init: test dynelf.sys-cfr-min-in ok
+dynelf	check	sys-cfr-max-out	init: test dynelf.sys-cfr-max-out ok
+dynelf	check	sys-cfr-min-out	init: test dynelf.sys-cfr-min-out ok
+dynelf	check	sys-cfr-huge-length-wraps	init: test dynelf.sys-cfr-huge-length-wraps ok
+dynelf	check	sys-cfr-store-fault-in-offset	init: test dynelf.sys-cfr-store-fault-in-offset ok
+dynelf	check	sys-cfr-store-fault-updates-out-offset	init: test dynelf.sys-cfr-store-fault-updates-out-offset ok
+dynelf	check	sys-ficlone-ebadf	init: test dynelf.sys-ficlone-ebadf ok
+dynelf	check	sys-ficlone-tmpfs	init: test dynelf.sys-ficlone-tmpfs ok
+dynelf	check	sys-ficlone-directory-source	init: test dynelf.sys-ficlone-directory-source ok
+dynelf	check	sys-ficlone-pipe-source	init: test dynelf.sys-ficlone-pipe-source ok
+dynelf	check	sys-ficlone-other-file-system	init: test dynelf.sys-ficlone-other-file-system ok
+dynelf	check	sys-ficlone-read-only-destination	init: test dynelf.sys-ficlone-read-only-destination ok
+dynelf	check	sys-ficlone-directory-destination	init: test dynelf.sys-ficlone-directory-destination ok
+dynelf	check	sys-ficlone-same-file	init: test dynelf.sys-ficlone-same-file ok
+dynelf	check	sys-ficlonerange-efault	init: test dynelf.sys-ficlonerange-efault ok
+dynelf	check	sys-ficlonerange-tmpfs	init: test dynelf.sys-ficlonerange-tmpfs ok
+dynelf	check	sys-ficlonerange-ebadf	init: test dynelf.sys-ficlonerange-ebadf ok
+dynelf	check	sys-xattr-list	init: test dynelf.sys-xattr-list ok
+dynelf	check	sys-xattr-list-ebadf	init: test dynelf.sys-xattr-list-ebadf ok
+dynelf	check	sys-xattr-list-efault	init: test dynelf.sys-xattr-list-efault ok
+dynelf	check	sys-xattr-list-enoent	init: test dynelf.sys-xattr-list-enoent ok
+dynelf	check	sys-xattr-get-name-efault	init: test dynelf.sys-xattr-get-name-efault ok
+dynelf	check	sys-xattr-get-empty-name	init: test dynelf.sys-xattr-get-empty-name ok
+dynelf	check	sys-xattr-get-long-name	init: test dynelf.sys-xattr-get-long-name ok
+dynelf	check	sys-xattr-get-name-255	init: test dynelf.sys-xattr-get-name-255 ok
+dynelf	check	sys-xattr-get-enoent	init: test dynelf.sys-xattr-get-enoent ok
+dynelf	check	sys-xattr-get-user	init: test dynelf.sys-xattr-get-user ok
+dynelf	check	sys-xattr-get-ebadf	init: test dynelf.sys-xattr-get-ebadf ok
+dynelf	check	sys-xattr-get-security	init: test dynelf.sys-xattr-get-security ok
+dynelf	check	sys-xattr-get-trusted	init: test dynelf.sys-xattr-get-trusted ok
+dynelf	check	sys-xattr-get-acl-access	init: test dynelf.sys-xattr-get-acl-access ok
+dynelf	check	sys-xattr-get-acl-default	init: test dynelf.sys-xattr-get-acl-default ok
+dynelf	check	sys-xattr-get-system-other	init: test dynelf.sys-xattr-get-system-other ok
+dynelf	check	sys-xattr-get-unknown-prefix	init: test dynelf.sys-xattr-get-unknown-prefix ok
+dynelf	check	sys-xattr-get-user-empty	init: test dynelf.sys-xattr-get-user-empty ok
+dynelf	check	sys-xattr-get-security-empty	init: test dynelf.sys-xattr-get-security-empty ok
+dynelf	check	sys-xattr-device-user	init: test dynelf.sys-xattr-device-user ok
+dynelf	check	sys-xattr-remove	init: test dynelf.sys-xattr-remove ok
+dynelf	check	sys-xattr-set-flags	init: test dynelf.sys-xattr-set-flags ok
+dynelf	check	sys-xattr-set-too-big	init: test dynelf.sys-xattr-set-too-big ok
+dynelf	check	sys-xattr-set-value-efault	init: test dynelf.sys-xattr-set-value-efault ok
+dynelf	check	sys-xattr-set-replace-missing	init: test dynelf.sys-xattr-set-replace-missing ok
+dynelf	check	sys-xattr-set-name-before-value	init: test dynelf.sys-xattr-set-name-before-value ok
+dynelf	check	sys-xattr-symlink	init: test dynelf.sys-xattr-symlink ok
+dynelf	check	sys-getsockname	init: test dynelf.sys-getsockname ok
+dynelf	check	sys-getpeername	init: test dynelf.sys-getpeername ok
+dynelf	check	sys-accept	init: test dynelf.sys-accept ok
+dynelf	check	sys-accept4	init: test dynelf.sys-accept4 ok
+dynelf	check	sys-connect	init: test dynelf.sys-connect ok
+dynelf	check	sys-bind	init: test dynelf.sys-bind ok
+dynelf	check	sys-listen	init: test dynelf.sys-listen ok
+dynelf	check	sys-shutdown	init: test dynelf.sys-shutdown ok
+dynelf	check	sys-sendto	init: test dynelf.sys-sendto ok
+dynelf	check	sys-recvfrom	init: test dynelf.sys-recvfrom ok
+dynelf	check	sys-sendmsg	init: test dynelf.sys-sendmsg ok
+dynelf	check	sys-recvmsg	init: test dynelf.sys-recvmsg ok
+dynelf	check	sys-sendmmsg	init: test dynelf.sys-sendmmsg ok
+dynelf	check	sys-recvmmsg	init: test dynelf.sys-recvmmsg ok
+dynelf	check	sys-setsockopt	init: test dynelf.sys-setsockopt ok
+dynelf	check	sys-getsockopt	init: test dynelf.sys-getsockopt ok
+dynelf	check	sys-socket	init: test dynelf.sys-socket ok
+dynelf	check	sys-prctl-capbset-read-0	init: test dynelf.sys-prctl-capbset-read-0 ok
+dynelf	check	sys-prctl-capbset-read-1	init: test dynelf.sys-prctl-capbset-read-1 ok
+dynelf	check	sys-prctl-capbset-read-21	init: test dynelf.sys-prctl-capbset-read-21 ok
+dynelf	check	sys-prctl-capbset-read-38	init: test dynelf.sys-prctl-capbset-read-38 ok
+dynelf	check	sys-prctl-capbset-read-39	init: test dynelf.sys-prctl-capbset-read-39 ok
+dynelf	check	sys-prctl-capbset-read-40	init: test dynelf.sys-prctl-capbset-read-40 ok
+dynelf	check	sys-prctl-capbset-read-41	init: test dynelf.sys-prctl-capbset-read-41 ok
+dynelf	check	sys-prctl-capbset-read-huge	init: test dynelf.sys-prctl-capbset-read-huge ok
+dynelf	check	sys-prctl-capbset-read-high-bit	init: test dynelf.sys-prctl-capbset-read-high-bit ok
+dynelf	check	sys-prctl-no-new-privs-get-initial	init: test dynelf.sys-prctl-no-new-privs-get-initial ok
+dynelf	check	sys-prctl-no-new-privs-set-zero	init: test dynelf.sys-prctl-no-new-privs-set-zero ok
+dynelf	check	sys-prctl-no-new-privs-set-two	init: test dynelf.sys-prctl-no-new-privs-set-two ok
+dynelf	check	sys-prctl-no-new-privs-set-extra	init: test dynelf.sys-prctl-no-new-privs-set-extra ok
+dynelf	check	sys-prctl-no-new-privs-get-extra	init: test dynelf.sys-prctl-no-new-privs-get-extra ok
+dynelf	check	sys-prctl-no-new-privs-still-clear	init: test dynelf.sys-prctl-no-new-privs-still-clear ok
+dynelf	check	sys-prctl-no-new-privs-set	init: test dynelf.sys-prctl-no-new-privs-set ok
+dynelf	check	sys-prctl-no-new-privs-get	init: test dynelf.sys-prctl-no-new-privs-get ok
+dynelf	check	sys-prctl-no-new-privs-set-again	init: test dynelf.sys-prctl-no-new-privs-set-again ok
+dynelf	summary	-	init: tests dynelf passed=412 failed=0
 procfs	check	err-noent	init: test procfs.err-noent ok
 procfs	check	err-empty-path	init: test procfs.err-empty-path ok
 procfs	check	err-notdir	init: test procfs.err-notdir ok

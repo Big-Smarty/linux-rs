@@ -24,7 +24,7 @@ pub struct Declared {
     pub enosys: &'static [u32],
 }
 
-pub const DECLARED: [Declared; 14] = [
+pub const DECLARED: [Declared; 16] = [
     Declared {
         symbol: "boot: console=ttyS0",
         value: "the console tty is the 8250 serial line at its default 9600n8: TCGETS reports tty_std_termios with c_cflag B9600|CS8|CREAD|HUPCL|CLOCAL (a vt console would differ: vt.c sets IUTF8 in UTF-8 mode)",
@@ -66,6 +66,20 @@ pub const DECLARED: [Declared; 14] = [
         value: "n (reference config: y): no AT_RSEQ_*, rseq(2) is -ENOSYS",
         source: "init/Kconfig:1910, fs/binfmt_elf.c:287 and the #ifdef in create_elf_tables, kernel/sys_ni.c:392",
         enosys: &[334],
+    },
+    Declared {
+        symbol: "CONFIG_SECURITY_LANDLOCK",
+        value: "n (as the reference config): landlock_create_ruleset(2), landlock_add_rule(2) and landlock_restrict_self(2) are -ENOSYS, and the prctl option PR_SET_NO_NEW_PRIVS is plain task state",
+        source: "kernel/sys_ni.c:167-169 (`COND_SYSCALL(landlock_*)`), kernel/sys.c (`PR_SET_NO_NEW_PRIVS`)",
+        enosys: &[444, 445, 446],
+    },
+    Declared {
+        symbol: "CONFIG_NET",
+        value: "n (as the reference config): there is no socket layer, so every socket system call (socket, connect, accept, sendto, recvfrom, sendmsg, recvmsg, shutdown, bind, listen, getsockname, getpeername, socketpair, setsockopt, getsockopt, accept4, recvmmsg, sendmmsg) is -ENOSYS for every descriptor, including a closed one (the reference System.map holds only the weak sys_ni stubs, no __sys_getsockname and no sock_from_file)",
+        source: "kernel/sys_ni.c:140-161,200-201,233 (`COND_SYSCALL(socket)` .. `COND_SYSCALL(recvmsg)`, accept4, recvmmsg, sendmmsg), net/Makefile and init/Kconfig (CONFIG_NET gates net/socket.c); reference.config:1037",
+        enosys: &[
+            41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 288, 299, 307,
+        ],
     },
     Declared {
         symbol: "CONFIG_X86_USER_SHADOW_STACK",
@@ -131,7 +145,19 @@ mod tests {
         assert_eq!(Sysno::map_shadow_stack as u32, 453);
         assert_eq!(Sysno::uretprobe as u32, 335);
         assert_eq!(Sysno::uprobe as u32, 336);
-        for number in [334, 453, 335, 336] {
+        assert_eq!(Sysno::landlock_create_ruleset as u32, 444);
+        assert_eq!(Sysno::landlock_restrict_self as u32, 446);
+        assert_eq!(Sysno::socket as u32, 41);
+        assert_eq!(Sysno::getsockname as u32, 51);
+        assert_eq!(Sysno::getpeername as u32, 52);
+        assert_eq!(Sysno::setsockopt as u32, 54);
+        assert_eq!(Sysno::getsockopt as u32, 55);
+        assert_eq!(Sysno::accept4 as u32, 288);
+        assert_eq!(Sysno::recvmmsg as u32, 299);
+        assert_eq!(Sysno::sendmmsg as u32, 307);
+        for number in [
+            334, 453, 335, 336, 444, 445, 446, 41, 51, 52, 55, 288, 299, 307,
+        ] {
             assert!(is_disabled_syscall(number));
         }
         for number in [0, 1, 39, 60, 231, 333, 337, 452, 454] {

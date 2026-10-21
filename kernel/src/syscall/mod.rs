@@ -30,6 +30,8 @@
 mod attr;
 #[cfg(test)]
 mod busybox_tests;
+#[cfg(test)]
+mod dynelf_tests;
 mod exec;
 mod fd;
 mod fs;
@@ -54,6 +56,7 @@ mod time;
 pub mod tty;
 #[cfg(test)]
 mod vfs_tests;
+mod xattr;
 
 use crate::{
     config,
@@ -331,6 +334,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         .or_else(|| fs::dispatch(ctx, sysno, args))
         .or_else(|| namei::dispatch(ctx, sysno, args))
         .or_else(|| attr::dispatch(ctx, sysno, args))
+        .or_else(|| xattr::dispatch(ctx, sysno, args))
         .or_else(|| mount::dispatch(ctx, sysno, args))
         .or_else(|| random::dispatch(ctx, sysno, args))
         .or_else(|| reboot::dispatch(ctx, sysno, args))
@@ -405,8 +409,8 @@ mod tests {
             assert_eq!(outcome, neg(Errno::ENOSYS), "{number:?}");
         }
         // Everything else Linux implements still stops loudly.
-        let outcome = dispatch(&mut task, Sysno::mremap as u64, [0; 6]);
-        assert_eq!(outcome, Outcome::Unimplemented(25));
+        let outcome = dispatch(&mut task, Sysno::timer_create as u64, [0; 6]);
+        assert_eq!(outcome, Outcome::Unimplemented(222));
     }
 
     #[test]
@@ -414,7 +418,7 @@ mod tests {
         let mut task = task();
         let setup = dispatch(&mut task, Sysno::io_uring_setup as u64, [0; 6]);
         assert_eq!(setup, Outcome::Unimplemented(425));
-        let mremap = dispatch(&mut task, Sysno::mremap as u64, [0; 6]);
-        assert_eq!(mremap, Outcome::Unimplemented(25));
+        let timer = dispatch(&mut task, Sysno::timer_create as u64, [0; 6]);
+        assert_eq!(timer, Outcome::Unimplemented(222));
     }
 }

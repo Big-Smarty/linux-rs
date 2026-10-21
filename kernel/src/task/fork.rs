@@ -95,6 +95,9 @@ pub struct ForkRequest {
     /// `CLONE_CHILD_CLEARTID`'s pointer (the child's `clear_child_tid`), 0 if
     /// the flag is clear.
     pub clear_child_tid: u64,
+    /// `CLONE_CHILD_SETTID`'s pointer (`set_child_tid`: the child stores its own id there before
+    /// it runs in user mode, `schedule_tail`), 0 if the flag is clear.
+    pub set_child_tid: u64,
     /// `CLONE_VM` (always with `CLONE_VFORK`): the child runs in the caller's address space,
     /// which it borrows until its `execve` or exit.
     pub share_vm: bool,
@@ -110,11 +113,12 @@ pub struct Unsupported;
 
 /// Flags that change nothing observable for a plain process copy: tracing
 /// flags (the caller is never traced), the ignored `CLONE_DETACHED`, and the
-/// two `*_TID` flags handled by the caller or by [`ForkRequest`].
+/// three `*_TID` flags handled by the caller or by [`ForkRequest`].
 const PLAIN_FLAGS: u64 = CLONE_PTRACE
     | CLONE_UNTRACED
     | CLONE_DETACHED
     | CLONE_PARENT_SETTID
+    | CLONE_CHILD_SETTID
     | CLONE_CHILD_CLEARTID
     | CLONE_CLEAR_SIGHAND
     | CLONE_VFORK
@@ -302,7 +306,7 @@ impl CloneArgs {
     /// # Errors
     /// [`Unsupported`] for anything else: threads, shared tables, namespaces,
     /// `CLONE_VM` without `CLONE_VFORK` (a child that runs beside its parent in one
-    /// address space), `CLONE_SETTLS`, `CLONE_CHILD_SETTID`, `CLONE_PIDFD`, a
+    /// address space), `CLONE_SETTLS`, `CLONE_PIDFD`, a
     /// requested thread id, a cgroup, `CLONE_IO`, `CLONE_SYSVSEM`.
     pub fn request(&self) -> Result<ForkRequest, Unsupported> {
         if self.flags & !PLAIN_FLAGS != 0
@@ -316,6 +320,11 @@ impl CloneArgs {
             child_sp: self.stack,
             clear_sighand: self.flags & CLONE_CLEAR_SIGHAND != 0,
             clear_child_tid: if self.flags & CLONE_CHILD_CLEARTID != 0 {
+                self.child_tid
+            } else {
+                0
+            },
+            set_child_tid: if self.flags & CLONE_CHILD_SETTID != 0 {
                 self.child_tid
             } else {
                 0
@@ -463,7 +472,6 @@ mod tests {
             CLONE_FS,
             CLONE_FILES,
             CLONE_SETTLS,
-            CLONE_CHILD_SETTID,
             CLONE_PIDFD,
             CLONE_SYSVSEM,
             CLONE_INTO_CGROUP,
@@ -479,6 +487,12 @@ mod tests {
             .request(),
             Err(Unsupported)
         );
+        // CLONE_CHILD_SETTID: the pointer is kept for the child's first return (glibc's fork).
+        let mut a = args(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID);
+        a.child_tid = 0x2468;
+        let r = a.request().unwrap();
+        assert_eq!((r.set_child_tid, r.clear_child_tid), (0x2468, 0x2468));
+        assert_eq!(args(0).request().unwrap().set_child_tid, 0);
         assert_eq!(args(CLONE_PARENT_SETTID).parent_settid(), Some(0));
         assert_eq!(args(0).parent_settid(), None);
     }

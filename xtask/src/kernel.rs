@@ -160,6 +160,10 @@ enum Module {
     /// The second module of the `busybox` oracle group: the host's `BusyBox` program, its applet
     /// links and the group's data files (`fixture::busybox_initramfs`).
     Busybox,
+    /// The second module of the `dynelf` oracle group: the host's dynamically linked programs,
+    /// the shared objects and the loader they need, a few Python modules and the data files
+    /// (`fixture::dynamic_initramfs`).
+    Dynamic,
 }
 
 impl Module {
@@ -170,6 +174,7 @@ impl Module {
             Self::Empty => "initramfs-empty.cpio",
             Self::NoInit => "initramfs-noinit.cpio",
             Self::Busybox => "busybox.cpio",
+            Self::Dynamic => "dynamic.cpio",
         }
     }
 }
@@ -926,6 +931,31 @@ const DEBUG_CASES: &[DebugCase] = &[
         forbid_success: false,
         modules: &[Module::Archive, Module::Busybox],
         user: User::OracleHost("busybox"),
+        framebuffers: 1,
+        plat: Platform {
+            kvm: true,
+            mode: "x2apic",
+            reason: "hypervisor",
+            event: "lapic-deadline",
+            tsc_sources: &["pit", "hpet"],
+            ..Q35_TCG
+        },
+    },
+    // Dynamically linked glibc programs and the ELF loader's interpreter paths (`user/init` group
+    // `dynelf`, mode `-- dynrun`): the host's coreutils, bash, grep, sed, gawk, find, tar, gzip and
+    // Python run through `ld-linux-x86-64.so.2`; synthetic `ET_DYN`/`PT_INTERP` images show the
+    // addresses `load_elf_binary` chooses and the errors it returns. A second initramfs module
+    // carries the programs and libraries (pinned by SHA-256); the case is `unavailable` without
+    // those exact files, KVM or AVX-512.
+    DebugCase {
+        name: "oracle-dynelf",
+        cmdline: Some("-- dynrun"),
+        cpu: "host",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: &[Module::Archive, Module::Dynamic],
+        user: User::OracleHost("dynelf"),
         framebuffers: 1,
         plat: Platform {
             kvm: true,
@@ -3521,6 +3551,8 @@ struct Fixtures {
     noinit_sha256: String,
     /// The `busybox` group's second module, when the host can supply it; otherwise why not.
     busybox: Result<BusyboxModule, String>,
+    /// The `dynelf` group's second module, when the host can supply it; otherwise why not.
+    dynamic: Result<DynamicModule, String>,
     /// What the kernel must report for the generated archive and the built `/init`, by construction.
     expected: fixture::Expected,
 }
@@ -3532,6 +3564,17 @@ struct BusyboxModule {
     program_sha256: String,
     /// SHA-256 of the whole module.
     module_sha256: String,
+}
+
+/// The generated `dynamic.cpio` and the evidence of the host files inside it.
+struct DynamicModule {
+    /// SHA-256 of the whole module.
+    module_sha256: String,
+    /// SHA-256 of the text `<module path> <SHA-256 of the host file>` per file, sorted: the
+    /// identity of the set of programs and libraries the expected lines were recorded with.
+    inputs_sha256: String,
+    /// Files in the module that came from the host.
+    files: usize,
 }
 
 impl Fixtures {
@@ -3575,14 +3618,26 @@ impl Fixtures {
                 }
             }
         };
+        // The host's dynamically linked programs, libraries and Python modules (never committed).
+        let mut dynamic_counts = None;
+        let dynamic = match dynamic_module(output, sha256sum, &write) {
+            Ok((module, counts)) => {
+                dynamic_counts = Some(counts);
+                Ok(module)
+            }
+            Err(DynamicError::Unavailable(reason)) => Err(reason),
+            Err(DynamicError::Io(error)) => return Err(error),
+        };
         Ok(Self {
             busybox,
+            dynamic,
             archive_sha256: write(Module::Archive, &archive)?,
             corrupt_sha256: write(Module::Corrupt, fixture::CORRUPT_MODULE)?,
             noinit_sha256: write(Module::NoInit, &fixture::initramfs_without_init()?)?,
             expected: fixture::Expected {
                 archive_counts: fixture::archive_counts(archive.len(), &facts),
                 busybox_counts,
+                dynamic_counts,
                 init: facts,
             },
             dir,
@@ -3599,8 +3654,69 @@ impl Fixtures {
                 .busybox
                 .as_ref()
                 .map_or("unavailable", |module| &module.module_sha256),
+            Module::Dynamic => self
+                .dynamic
+                .as_ref()
+                .map_or("unavailable", |module| &module.module_sha256),
         }
     }
+}
+
+/// Why the `dynelf` module could not be made: the host cannot run the group (a reason, not a
+/// failure of the harness), or the harness itself failed.
+enum DynamicError {
+    Unavailable(String),
+    Io(io::Error),
+}
+
+impl From<io::Error> for DynamicError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Build `dynamic.cpio` from the host's files when they are the ones the expected lines were
+/// recorded with ([`fixture::DYNAMIC_PINS`]); returns the module's evidence and the
+/// `CHECK image inspected` tail the kernel must print for it.
+fn dynamic_module(
+    output: &Path,
+    sha256sum: &Path,
+    write: &dyn Fn(Module, &[u8]) -> io::Result<String>,
+) -> Result<(DynamicModule, String), DynamicError> {
+    let unavailable = |reason: String| DynamicError::Unavailable(reason);
+    let files = fixture::dynamic_files(
+        Path::new(fixture::DYNAMIC_HOST_BIN),
+        Path::new(fixture::DYNAMIC_HOST_LIB),
+    )
+    .map_err(unavailable)?;
+    let mut digests = Vec::with_capacity(files.len());
+    for file in &files {
+        digests.push(file_hash(output, sha256sum, &file.host_path)?);
+    }
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    if let Some(reason) = fixture::dynamic_unavailable(&cpuinfo, &files, &digests) {
+        return Err(unavailable(reason));
+    }
+    let module = fixture::dynamic_initramfs(&files)?;
+    let counts = fixture::dynamic_counts(module.len(), &files)?;
+    let module_sha256 = write(Module::Dynamic, &module)?;
+    let mut listing = String::new();
+    for (file, digest) in files.iter().zip(&digests) {
+        let _ = writeln!(listing, "{} {digest}", file.module_path);
+    }
+    // The listing is hashed through the same tool as everything else: a file in the run's
+    // `fixtures` directory.
+    let listing_path = output.join("fixtures").join("dynamic.inputs");
+    write_new(&listing_path, listing.as_bytes())?;
+    let inputs_sha256 = file_hash(output, sha256sum, &listing_path)?;
+    Ok((
+        DynamicModule {
+            module_sha256,
+            inputs_sha256,
+            files: files.len(),
+        },
+        counts,
+    ))
 }
 
 fn stage_image_modules(
@@ -4016,7 +4132,8 @@ fn kvm_usable() -> bool {
 
 /// Why `case` cannot run on this host (it is then `unavailable`, not a failure): no usable
 /// `/dev/kvm` for a KVM case, a host CPU without the features its group drives (`xstate`:
-/// AVX-512 and protection keys), a missing or different `BusyBox` for the `busybox` group.
+/// AVX-512 and protection keys), a missing or different `BusyBox` for the `busybox` group, a missing or different
+/// set of host programs and libraries for the `dynelf` group.
 fn unavailable_reason(case: &DebugCase, tools: &QemuTools) -> Option<String> {
     if case.plat.kvm && !kvm_usable() {
         return Some("/dev/kvm is not usable read/write".to_owned());
@@ -4041,6 +4158,11 @@ fn unavailable_reason(case: &DebugCase, tools: &QemuTools) -> Option<String> {
     }
     if case.modules.contains(&Module::Busybox)
         && let Err(reason) = &tools.fixtures.busybox
+    {
+        return Some(reason.clone());
+    }
+    if case.modules.contains(&Module::Dynamic)
+        && let Err(reason) = &tools.fixtures.dynamic
     {
         return Some(reason.clone());
     }
@@ -5142,6 +5264,22 @@ fn corrupt_module_skipped(lines: &[&str], index: usize) -> bool {
         && !lines.iter().any(|line| line.starts_with(&inspected))
 }
 
+/// The `CHECK image inspected` tail the kernel must print for `module`.
+fn expected_image_counts(module: Module, expected: &fixture::Expected) -> Result<&str, String> {
+    Ok(match module {
+        Module::Empty => EMPTY_MODULE_COUNTS,
+        Module::Busybox => expected
+            .busybox_counts
+            .as_deref()
+            .ok_or_else(|| "no expected counts for the busybox module".to_owned())?,
+        Module::Dynamic => expected
+            .dynamic_counts
+            .as_deref()
+            .ok_or_else(|| "no expected counts for the dynelf module".to_owned())?,
+        _ => expected.archive_counts.as_str(),
+    })
+}
+
 fn validate_image_serial(
     lines: &[&str],
     modules: &[Module],
@@ -5185,14 +5323,7 @@ fn validate_image_serial(
             }
             continue;
         }
-        let expected = match module {
-            Module::Empty => EMPTY_MODULE_COUNTS,
-            Module::Busybox => expected_counts
-                .busybox_counts
-                .as_deref()
-                .ok_or_else(|| "no expected counts for the busybox module".to_owned())?,
-            _ => expected_counts.archive_counts.as_str(),
-        };
+        let expected = expected_image_counts(*module, expected_counts)?;
         let prefix = format!("CHECK image inspected module={index} physical=");
         let mut records = lines
             .iter()
@@ -5445,6 +5576,26 @@ fn record_fixtures(
             }
         }
         Err(reason) => manifest_value(values, "busybox_unavailable", reason.clone()),
+    }
+    // The `dynelf` group's module and the identity of its host inputs.
+    match &fixtures.dynamic {
+        Ok(module) => {
+            manifest_value(
+                values,
+                "sha256_fixture_dynamic_module",
+                module.module_sha256.clone(),
+            );
+            manifest_value(
+                values,
+                "sha256_dynamic_inputs_listing",
+                module.inputs_sha256.clone(),
+            );
+            manifest_value(values, "dynamic_host_files", module.files.to_string());
+            if let Some(counts) = &fixtures.expected.dynamic_counts {
+                manifest_value(values, "expected_dynamic_image_record", counts.clone());
+            }
+        }
+        Err(reason) => manifest_value(values, "dynamic_unavailable", reason.clone()),
     }
     manifest_value(
         values,
@@ -6990,12 +7141,15 @@ mod tests {
     // What the kernel prints for a generated archive; `physical=` varies per module.
     // The same for the busybox module (a program and a few links).
     const BUSYBOX_COUNTS: &str = "reserved=1318912 bytes=1311484 records=7 files=6 regular=2 symlinks=3 trailers=1 skipped=0 elf=1 loads=4 interpreters=0 execution=false rootfs=false";
+    // And for the dynelf module (many ELF files, most with an interpreter).
+    const DYNAMIC_COUNTS: &str = "reserved=16134144 bytes=16132004 records=101 files=100 regular=85 symlinks=7 trailers=1 skipped=0 elf=72 loads=288 interpreters=62 execution=false rootfs=false";
     const COUNTS: &str = "reserved=8192 bytes=4500 records=4 files=3 regular=1 symlinks=1 trailers=1 skipped=0 elf=1 loads=2 interpreters=0 execution=false rootfs=false";
 
     fn expected() -> fixture::Expected {
         fixture::Expected {
             archive_counts: COUNTS.to_owned(),
             busybox_counts: Some(BUSYBOX_COUNTS.to_owned()),
+            dynamic_counts: Some(DYNAMIC_COUNTS.to_owned()),
             init: fixture::ElfFacts {
                 executable_segments: vec![(0x20_47b0, 0x20_c000)],
                 executable_file_extents: vec![(0x20_47b0, 0x20_c000)],
@@ -7166,6 +7320,7 @@ mod tests {
                     Module::Empty => format!("CHECK image inspected module={index} physical={physical:#x} {EMPTY_MODULE_COUNTS}"),
                     Module::Corrupt => format!("WARN Initramfs unpacking failed: module={index} {CORRUPT_MODULE_WARNING}"),
                     Module::Busybox => format!("CHECK image inspected module={index} physical={physical:#x} {BUSYBOX_COUNTS}"),
+                    Module::Dynamic => format!("CHECK image inspected module={index} physical={physical:#x} {DYNAMIC_COUNTS}"),
                     Module::NoInit => unreachable!("only negative cases boot without /init"),
                 }
             })
@@ -7190,6 +7345,17 @@ mod tests {
             )
             .is_err(),
             "a second ELF in the busybox module is not the one expected"
+        );
+        // The dynelf group: the archive and a module of many ELF files.
+        let dynamic = [Module::Archive, Module::Dynamic];
+        assert!(check(&success_serial_for(&dynamic), &dynamic).is_ok());
+        assert!(
+            check(
+                &success_serial_for(&dynamic).replace("interpreters=62", "interpreters=61"),
+                &dynamic
+            )
+            .is_err(),
+            "an interpreter count that is not the module's"
         );
         for (before, after) in [
             ("elf=1 ", "elf=0 "),
@@ -8459,6 +8625,19 @@ mod tests {
                             line.contains(" exit=") || line.contains(" signal="),
                             "{line}"
                         );
+                    } else if group == "dynelf"
+                        && !name.starts_with("sys-")
+                        && !name.starts_with("exec-")
+                    {
+                        // A program's (or a synthetic image's) status and output.
+                        assert!(
+                            line.starts_with(&format!("init: test dynelf.{name} ")),
+                            "{line}"
+                        );
+                        assert!(
+                            line.contains(" exit=") || line.contains(" signal="),
+                            "{line}"
+                        );
                     } else {
                         assert_eq!(line, format!("init: test {group}.{name} ok"));
                     }
@@ -8484,7 +8663,7 @@ mod tests {
         }
         let groups = [
             "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe", "xstate", "tty",
-            "ttyin", "ttykbd", "names", "busybox", "procfs",
+            "ttyin", "ttykbd", "names", "busybox", "dynelf", "procfs",
         ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),

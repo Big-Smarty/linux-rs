@@ -941,29 +941,44 @@ impl Tables {
         self.zero.is_some()
     }
 
+    /// The user range `[start, start + pages * 4096)` clamped to the user half, as `(start, end)`.
+    fn user_range(start: u64, pages: u64) -> (u64, u64) {
+        let end = pages
+            .checked_mul(PAGE)
+            .and_then(|n| start.checked_add(n))
+            .map_or(TASK_SIZE_MAX, |end| end.min(TASK_SIZE_MAX));
+        (start & !(PAGE - 1), end)
+    }
+
+    /// The next present leaf table at or after `*address` below `end`, skipping absent table
+    /// levels; `*address` is advanced to the first page that table covers in the range. `None`
+    /// once the range holds no more tables.
+    fn next_user_table(&self, address: &mut u64, end: u64) -> Option<Physical> {
+        'range: while *address < end {
+            let mut table = self.root;
+            for shift in [39u32, 30, 21] {
+                let index = ((*address >> shift) & 511) as usize;
+                let entry = self.read(table, index).unwrap_or(0);
+                // A huge or supervisor entry in the user half is an isolation
+                // bug the audit reports; never walk through it.
+                if entry & PRESENT == 0 || entry & HUGE != 0 || entry & USER == 0 {
+                    *address = (*address | ((1u64 << shift) - 1)) + 1;
+                    continue 'range;
+                }
+                table = Physical(entry & ADDRESS);
+            }
+            return Some(table);
+        }
+        None
+    }
+
     /// Visit the leaf slots of `[start, start + pages * 4096)` (clamped to the
     /// user range) whose page tables exist, skipping absent table levels so a
     /// sparse multi-terabyte range costs only the tables that are present.
     /// `visit(address, slot)`; the slot is a valid PTE address (`pointer`).
     fn for_each_user_slot(&self, start: u64, pages: u64, mut visit: impl FnMut(u64, *mut u64)) {
-        let end = pages
-            .checked_mul(PAGE)
-            .and_then(|n| start.checked_add(n))
-            .map_or(TASK_SIZE_MAX, |end| end.min(TASK_SIZE_MAX));
-        let mut address = start & !(PAGE - 1);
-        'range: while address < end {
-            let mut table = self.root;
-            for shift in [39u32, 30, 21] {
-                let index = ((address >> shift) & 511) as usize;
-                let entry = self.read(table, index).unwrap_or(0);
-                // A huge or supervisor entry in the user half is an isolation
-                // bug the audit reports; never walk through it.
-                if entry & PRESENT == 0 || entry & HUGE != 0 || entry & USER == 0 {
-                    address = (address | ((1u64 << shift) - 1)) + 1;
-                    continue 'range;
-                }
-                table = Physical(entry & ADDRESS);
-            }
+        let (mut address, end) = Self::user_range(start, pages);
+        while let Some(table) = self.next_user_table(&mut address, end) {
             let table_end = (address | (LARGE - 1)) + 1;
             while address < end.min(table_end) {
                 if let Ok(slot) = self.pointer(table, ((address >> 12) & 511) as usize) {
@@ -972,6 +987,27 @@ impl Tables {
                 address += PAGE;
             }
         }
+    }
+
+    /// The first user page at or after `from` in `[from, end)` whose entry is mapped (the pages
+    /// [`Tables::mm_move_one`] moves), skipping absent table levels.
+    fn next_mapped_user_page(&self, from: u64, end: u64) -> Option<u64> {
+        let mut address = from;
+        while let Some(table) = self.next_user_table(&mut address, end) {
+            let table_end = (address | (LARGE - 1)) + 1;
+            while address < end.min(table_end) {
+                if let Ok(slot) = self.pointer(table, ((address >> 12) & 511) as usize) {
+                    // SAFETY: `pointer` returns a valid, aligned PTE slot of this tree inside
+                    // the direct map; a volatile read creates no reference (as `mm_resident`).
+                    let entry = unsafe { ptr::read_volatile(slot) };
+                    if entry & MAPPED != 0 && entry & USER != 0 {
+                        return Some(address);
+                    }
+                }
+                address += PAGE;
+            }
+        }
+        None
     }
 
     /// The resident pages of `[start, start + pages * 4096)` that are not the
@@ -1245,6 +1281,95 @@ impl Tables {
         freed
     }
 
+    /// `move_page_tables`: move the user entries of `pages` pages from `old_start` to
+    /// `new_start` (frames, flags and the resident counters unchanged; the old translations are
+    /// invalidated). The destination must be free. All or nothing: when a table for the
+    /// destination cannot be allocated the entries moved so far are moved back (their tables
+    /// exist) and the error is returned.
+    ///
+    /// # Errors
+    /// Table exhaustion (`Error::Memory`).
+    pub fn mm_move(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        old_start: u64,
+        new_start: u64,
+        pages: u64,
+    ) -> Result<(), Error> {
+        // Only the mapped entries are visited: a sparse range costs the tables that are present
+        // (`move_page_tables` skips empty PMD/PUD extents the same way).
+        let (_, old_end) = Self::user_range(old_start, pages);
+        let mut cursor = old_start;
+        let mut failure = None;
+        while let Some(from) = self.next_mapped_user_page(cursor, old_end) {
+            match self.mm_move_one(allocator, from, new_start + (from - old_start)) {
+                Ok(()) => cursor = from + PAGE,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let Some(error) = failure else {
+            return Ok(());
+        };
+        // Move back what moved (the destination holds exactly those entries): the source
+        // entries' tables still exist and the entries are not present there any more, so this
+        // cannot fail.
+        let new_end = new_start + (cursor - old_start);
+        let mut back_from = new_start;
+        while let Some(from) = self.next_mapped_user_page(back_from, new_end) {
+            let back = self.mm_move_one(allocator, from, old_start + (from - new_start));
+            assert!(back.is_ok(), "mm_move: revert of a moved entry failed");
+            back_from = from + PAGE;
+        }
+        Err(error)
+    }
+
+    /// One entry of [`Tables::mm_move`]: a mapped user entry at `from` becomes the entry at `to`.
+    fn mm_move_one(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        from: u64,
+        to: u64,
+    ) -> Result<(), Error> {
+        let Some(slot) = self.user_slot(from)? else {
+            return Ok(());
+        };
+        // SAFETY: `slot` is a PTE of this tree (see `user_slot`); `&mut self` excludes software
+        // writers and `AtomicU64` makes the swap atomic against the hardware's accessed/dirty
+        // updates.
+        let entry = unsafe { AtomicU64::from_ptr(slot) };
+        let seen = entry.load(Ordering::Acquire);
+        // Never move what is not a user page.
+        if seen & MAPPED == 0 || seen & USER == 0 {
+            return Ok(());
+        }
+        // Build the destination first (it may need tables): a failure leaves the source alone.
+        // `map` accounts the new leaf, so the old one is un-accounted here.
+        let old = entry.swap(0, Ordering::AcqRel);
+        self.account(old, 0);
+        if old & PRESENT != 0 {
+            tlb::flush(VirtAddr::new(from));
+        }
+        let flags = old & !ADDRESS;
+        match self.map(
+            allocator,
+            Virtual(to),
+            Physical(frame_bits(old)),
+            flags,
+            false,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // SAFETY: the slot was emptied above and nothing else touched it.
+                entry.store(old, Ordering::Release);
+                self.account(0, old);
+                Err(error)
+            }
+        }
+    }
+
     /// `change_protection`: re-protect the mapped pages of the range. The write
     /// bit is only ever cleared here (a private page becomes writable again
     /// through the write fault), `!exec` sets NX, and `!accessible` turns the
@@ -1358,6 +1483,15 @@ macro_rules! mm_pages {
             }
             fn protect(&mut self, start: u64, pages: u64, prot: kernel::mm::PageProt) {
                 self.parts(|tables, _| tables.mm_protect(start, pages, prot));
+            }
+            fn move_pages(
+                &mut self,
+                old_start: u64,
+                new_start: u64,
+                pages: u64,
+            ) -> Result<(), kernel::mm::OutOfMemory> {
+                self.parts(|tables, frames| tables.mm_move(frames, old_start, new_start, pages))
+                    .map_err(out_of_memory)
             }
         }
     };

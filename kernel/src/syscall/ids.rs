@@ -534,8 +534,12 @@ const PR_SET_DUMPABLE: i32 = 4;
 const PR_GET_TIMING: i32 = 13;
 const PR_SET_TIMING: i32 = 14;
 const PR_SET_NAME: i32 = 15;
+/// `PR_CAPBSET_READ` and `CAP_LAST_CAP` (`CAP_CHECKPOINT_RESTORE`).
+const PR_CAPBSET_READ: i32 = 23;
+const CAP_LAST_CAP: u64 = 40;
 const PR_GET_NAME: i32 = 16;
 const PR_GET_TIMERSLACK: i32 = 30;
+const PR_SET_NO_NEW_PRIVS: i32 = 38;
 const PR_GET_NO_NEW_PRIVS: i32 = 39;
 /// `SUID_DUMP_DISABLE` and `SUID_DUMP_USER`: `PR_GET_DUMPABLE` reports the
 /// task's `mm`; `PR_SET_DUMPABLE` takes only these two.
@@ -598,11 +602,19 @@ fn prctl<C: Context>(ctx: &mut C, option: i32, args: [u64; 4]) -> Res {
             Ok(0)
         }
         PR_GET_TIMERSLACK => Ok(TIMER_SLACK_NS),
+        // `task_set_no_new_privs`: `arg2` must be 1 and the rest zero.
+        PR_SET_NO_NEW_PRIVS => {
+            if args[0] != 1 || args[1..].iter().any(|&arg| arg != 0) {
+                return Err(Errno::EINVAL.into());
+            }
+            ctx.attrs().no_new_privs = true;
+            Ok(0)
+        }
         PR_GET_NO_NEW_PRIVS => {
             if args.iter().any(|&arg| arg != 0) {
                 return Err(Errno::EINVAL.into());
             }
-            Ok(0)
+            Ok(i64::from(ctx.attrs().no_new_privs))
         }
         PR_SET_NAME => {
             // `comm[15] = 0`; `strncpy_from_user(comm, arg2, 15)`; the name is
@@ -622,6 +634,15 @@ fn prctl<C: Context>(ctx: &mut C, option: i32, args: [u64; 4]) -> Res {
                 return Err(Errno::EFAULT.into());
             }
             Ok(0)
+        }
+        // `cap_task_prctl`: `cap_valid(arg2)` is `0..=CAP_LAST_CAP`. No task here ever drops a
+        // capability from its bounding set (`PR_CAPBSET_DROP` and `capset` stop loudly), so
+        // every valid one is raised.
+        PR_CAPBSET_READ => {
+            if args[0] > CAP_LAST_CAP {
+                return Err(Errno::EINVAL.into());
+            }
+            Ok(1)
         }
         // `PR_TIMING_STATISTICAL` (0) is the only timing method.
         PR_SET_TIMING if args[0] != 0 => Err(Errno::EINVAL.into()),
@@ -1461,6 +1482,34 @@ mod tests {
                 "{option:#x}"
             );
         }
+        // PR_SET_NO_NEW_PRIVS: `arg2` must be 1, the others 0; sticky; PR_GET_NO_NEW_PRIVS
+        // takes no arguments.
+        assert_eq!(call(&mut t, Sysno::prctl, &[39]), ok(0));
+        for bad in [[38u64, 0], [38, 2]] {
+            assert_eq!(
+                call(&mut t, Sysno::prctl, &bad),
+                err(Errno::EINVAL),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(call(&mut t, Sysno::prctl, &[38, 1, 1]), err(Errno::EINVAL));
+        assert_eq!(call(&mut t, Sysno::prctl, &[38, 1]), ok(0));
+        assert_eq!(call(&mut t, Sysno::prctl, &[39]), ok(1));
+        assert_eq!(call(&mut t, Sysno::prctl, &[39, 1]), err(Errno::EINVAL));
+        assert_eq!(
+            call(&mut t, Sysno::prctl, &[38, 1]),
+            ok(0),
+            "set again is fine"
+        );
+        // PR_CAPBSET_READ: every capability up to CAP_CHECKPOINT_RESTORE (40) is in the bounding
+        // set, nothing above is a capability.
+        assert_eq!(call(&mut t, Sysno::prctl, &[23, 0]), ok(1));
+        assert_eq!(call(&mut t, Sysno::prctl, &[23, 40]), ok(1));
+        assert_eq!(call(&mut t, Sysno::prctl, &[23, 41]), err(Errno::EINVAL));
+        assert_eq!(
+            call(&mut t, Sysno::prctl, &[23, u64::MAX]),
+            err(Errno::EINVAL)
+        );
         // Options with real behaviour that this slice does not have.
         for option in [
             1u64,
@@ -1470,7 +1519,6 @@ mod tests {
             77,
             78,
             35,
-            38,
             41,
             47,
             0x5356_4d41,

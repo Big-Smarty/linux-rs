@@ -638,6 +638,16 @@ mod tests {
         assert_eq!((t.forked[6].share_vm, t.forked[6].vfork), (true, true));
         assert_eq!(call(&mut t, Sysno::clone, &[0x4000 | 0x11, 0, 0, 0, 0]), 9);
         assert_eq!((t.forked[7].share_vm, t.forked[7].vfork), (false, true));
+        // glibc's fork: CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD with the child's
+        // tid pointer in the fourth argument; the request carries it for the child's store.
+        let t_flags = 0x0100_0000 | 0x20_0000 | 0x11;
+        let pid = call(&mut t, Sysno::clone, &[t_flags, 0, 0, 0x1ff0, 0]);
+        assert!(pid > 0, "{pid}");
+        let r = t.forked.last().unwrap();
+        assert_eq!((r.set_child_tid, r.clear_child_tid), (0x1ff0, 0x1ff0));
+        // Without the flag nothing is stored.
+        assert!(call(&mut t, Sysno::clone, &[0x11, 0, 0, 0x1ff0, 0]) > 0);
+        assert_eq!(t.forked.last().unwrap().set_child_tid, 0);
         // A signal pending before the fork restarts it (-ERESTARTNOINTR).
         let handled = t.state.hand.actions[usize::from(SIGUSR1) - 1];
         assert_ne!(handled.handler, 0);
@@ -645,7 +655,7 @@ mod tests {
             .send_signal(SIGUSR1, SigInfo::kill(SIGUSR1, 0, 1, 0), Target::Process)
             .unwrap();
         assert_eq!(call(&mut t, Sysno::fork, &[]), -513);
-        assert_eq!(t.forked.len(), 8);
+        assert_eq!(t.forked.len(), 10);
     }
 
     #[test]
