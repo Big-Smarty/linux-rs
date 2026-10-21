@@ -213,8 +213,7 @@ pub fn charge_tick(user: bool, periods: u64) {
     }
 }
 
-/// Scheduler slots in use, the idle task excluded (leak checks).
-#[cfg(feature = "qemu-self-test")]
+/// Scheduler slots in use, the idle task excluded (leak checks, `/proc/meminfo`).
 pub fn tasks_in_use() -> usize {
     RQ.lock().tasks_in_use()
 }

@@ -855,7 +855,7 @@ fn external_interrupt(vector: u64, user: bool) -> bool {
     // `kstat_incr_irqs_this_cpu` / `inc_irq_stat`: the counters of /proc/stat
     // and /proc/interrupts. Only deliveries that are handled are counted.
     if (base..base + 16).contains(&vector) && vector != base + 7 && vector != base + 15 {
-        ISA_IRQS[(vector - base) as usize].fetch_add(1, Ordering::Relaxed);
+        ISA_IRQS[usize::try_from(vector - base).unwrap_or(0)].fetch_add(1, Ordering::Relaxed);
     } else if vector == u64::from(LOCAL_TIMER_VECTOR) {
         LOCAL_TIMER_IRQS.fetch_add(1, Ordering::Relaxed);
     } else if vector == u64::from(SPURIOUS_VECTOR) {

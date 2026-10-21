@@ -1009,22 +1009,21 @@ fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Res
             })
             .flatten()
     });
-    let args = match kept {
-        Some(args) => args,
-        None => {
-            let len = layout.1.saturating_sub(layout.0).min(MAX_PUBLISHED_ARGS);
-            let mut bytes = Vec::new();
-            if len > 0 && layout.0 != 0 {
-                let len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
-                bytes.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
-                for _ in 0..len {
-                    let _ = bytes.push_within_capacity(0);
-                }
-                let missing = usercopy::copy_from_user(space, &mut bytes, layout.0);
-                bytes.truncate(len - missing);
+    let args = if let Some(args) = kept {
+        args
+    } else {
+        let len = layout.1.saturating_sub(layout.0).min(MAX_PUBLISHED_ARGS);
+        let mut bytes = Vec::new();
+        if len > 0 && layout.0 != 0 {
+            let len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+            bytes.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
+            for _ in 0..len {
+                let _ = bytes.push_within_capacity(0);
             }
-            bytes
+            let missing = usercopy::copy_from_user(space, &mut bytes, layout.0);
+            bytes.truncate(len - missing);
         }
+        bytes
     };
     let rss = space.rss(own.space.vmas());
     let view = TaskView::collect(Collect {
@@ -1057,6 +1056,7 @@ fn publish_current() {
 /// The machine's counters for the global files of /proc.
 ///
 /// Context: task; takes `FRAMES` and `LOAD` (leaf locks) while `process` is held.
+#[allow(clippy::too_many_lines)] // one straight list of the counters /proc shows
 fn host_info(process: &Process, own: &Owned) -> Result<HostInfo, Errno> {
     let up = timer::ktime_get_boottime_ns();
     let now = timer::ktime_get_ns();
