@@ -2,7 +2,7 @@
 # Linux 6.18.57 reference kernel: QEMU q35, -cpu qemu64 (TCG), -smp 1 -m 512M, "console=ttyS0 panic=-1 vdso=0 norandmaps -- <mode>",
 # the harness-built /init and generated initramfs (target/linux-reference/init-reference-006 for mm ids time signal fs proc, -009/-010 for fork, -011 for jobctl and pipe, -014 for tty, ttyin and ttykbd (ttyin/ttykbd are driven through the serial port / QMP send-key by `xtask tty-oracle`; ttykbd runs with "console=ttyS0 console=tty0" so that /dev/console is the vt; kinds stage and echo are the driver's transcript rows, see docs/kernel-tooling.md); docs/implementation.md#oracle-syscall-test-suite).
 # The `xstate` group is the exception to the machine: it drives AVX-512 and PKRU state, so it was recorded under KVM with -cpu host (AMD Zen 5) and runs only where KVM does (target/linux-reference/init-reference-012; docs/implementation.md#extended-cpu-state-xsave-pkru). Its `info` rows name the machine (XCR0, sizes, offsets) and are not compared by value.
-# The `names` group (mkdir, rmdir, rename, link, symlink, chmod, chown, utimensat, truncate, fsync, statfs, writev, sendfile, getrandom's argument errors, `#!` scripts, vfork) is CPU independent: recorded under TCG `-cpu qemu64` like the first groups (target/linux-reference/init-reference-016). The `busybox` group runs the host's BusyBox v1.36.1 (sha256 1097cdef...f0d, static, x86-64-v4) through `user/init` mode `bbrun` and was recorded under KVM `-cpu host` with `initramfs.cpio` followed by the generated `busybox.cpio` as the initrd (init-reference-016): each row is a command's exit status or signal and its escaped output, and the case is `unavailable` without that exact program, KVM or AVX-512 (docs/implementation.md#busybox-lane).
+# The `names` group (mkdir, rmdir, rename, link, symlink, chmod, chown, utimensat, truncate, fsync, statfs, writev, sendfile, getrandom's argument errors, reboot's checks, mknodat, `#!` scripts, vfork including an expiring ITIMER_REAL and a nested vfork killed by its child) is CPU independent: recorded under TCG `-cpu qemu64` like the first groups (target/linux-reference/init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017). The `busybox` group runs the host's BusyBox v1.36.1 (sha256 1097cdef...f0d, static, x86-64-v4) through `user/init` mode `bbrun` and was recorded under KVM `-cpu host` with `initramfs.cpio` followed by the generated `busybox.cpio` as the initrd (init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017: the `getrandom` clamp rows): each row is a command's exit status or signal and its escaped output, and the case is `unavailable` without that exact program, KVM or AVX-512 (docs/implementation.md#busybox-lane).
 # Columns: group, kind (check|info|summary|stage|echo), name, line (the exact stdout line without the newline).
 # A consumer matches "check" and "summary" rows exactly; "info" rows are recorded observations (tmpfs d_off cookies), not requirements.
 # Kernel printk lines may interleave with console output and must be filtered by the consumer (keep lines that start with
@@ -2072,6 +2072,44 @@ names	check	getrandom-insecure-random	init: test names.getrandom-insecure-random
 names	check	getrandom-zero	init: test names.getrandom-zero ok
 names	check	getrandom-efault	init: test names.getrandom-efault ok
 names	check	getrandom-access-ok-huge	init: test names.getrandom-access-ok-huge ok
+names	check	reboot-bad-magic1	init: test names.reboot-bad-magic1 ok
+names	check	reboot-bad-magic2	init: test names.reboot-bad-magic2 ok
+names	check	reboot-unknown-command	init: test names.reboot-unknown-command ok
+names	check	reboot-magic2-a	init: test names.reboot-magic2-a ok
+names	check	reboot-magic2-b	init: test names.reboot-magic2-b ok
+names	check	reboot-magic2-c	init: test names.reboot-magic2-c ok
+names	check	reboot-magic2-d	init: test names.reboot-magic2-d ok
+names	check	reboot-magic-upper-halves-ignored	init: test names.reboot-magic-upper-halves-ignored ok
+names	check	reboot-cad-off	init: test names.reboot-cad-off ok
+names	check	reboot-cad-on	init: test names.reboot-cad-on ok
+names	check	reboot-restart2-bad-pointer	init: test names.reboot-restart2-bad-pointer ok
+names	check	reboot-kexec-without-image	init: test names.reboot-kexec-without-image ok
+names	check	reboot-sw-suspend-without-hibernation	init: test names.reboot-sw-suspend-without-hibernation ok
+names	check	mknodat-regular	init: test names.mknodat-regular ok
+names	check	mknodat-regular-attributes	init: test names.mknodat-regular-attributes ok
+names	check	mknodat-type-zero-is-regular	init: test names.mknodat-type-zero-is-regular ok
+names	check	mknodat-type-zero-attributes	init: test names.mknodat-type-zero-attributes ok
+names	check	mknodat-umask	init: test names.mknodat-umask ok
+names	check	mknodat-umask-attributes	init: test names.mknodat-umask-attributes ok
+names	check	mknodat-directory	init: test names.mknodat-directory ok
+names	check	mknodat-symlink-type	init: test names.mknodat-symlink-type ok
+names	check	mknodat-exists	init: test names.mknodat-exists ok
+names	check	mknodat-exists-slash	init: test names.mknodat-exists-slash ok
+names	check	mknodat-enoent-parent	init: test names.mknodat-enoent-parent ok
+names	check	mknodat-enoent-empty	init: test names.mknodat-enoent-empty ok
+names	check	mknodat-efault	init: test names.mknodat-efault ok
+names	check	mknodat-char-device	init: test names.mknodat-char-device ok
+names	check	mknodat-char-device-attributes	init: test names.mknodat-char-device-attributes ok
+names	check	mknodat-block-device	init: test names.mknodat-block-device ok
+names	check	mknodat-fifo	init: test names.mknodat-fifo ok
+names	check	mknodat-socket	init: test names.mknodat-socket ok
+names	check	mknodat-special-attributes	init: test names.mknodat-special-attributes ok
+names	check	mknodat-mkdir	init: test names.mknodat-mkdir ok
+names	check	mknodat-dirfd	init: test names.mknodat-dirfd ok
+names	check	mknodat-dirfd-result	init: test names.mknodat-dirfd-result ok
+names	check	mknodat-file-fd	init: test names.mknodat-file-fd ok
+names	check	mknodat-bad-fd	init: test names.mknodat-bad-fd ok
+names	check	mknodat-absolute-ignores-fd	init: test names.mknodat-absolute-ignores-fd ok
 names	check	script-exit-status	init: test names.script-exit-status ok
 names	check	script-argv	init: test names.script-argv ok
 names	check	script-relative-name-kept	init: test names.script-relative-name-kept ok
@@ -2092,7 +2130,17 @@ names	check	vfork-mapping-survives-the-exec	init: test names.vfork-mapping-survi
 names	check	vfork-unmap-mapping	init: test names.vfork-unmap-mapping ok
 names	check	clone-vfork-without-vm-memory-private	init: test names.clone-vfork-without-vm-memory-private ok
 names	check	clone-vfork-without-vm-status	init: test names.clone-vfork-without-vm-status ok
-names	summary	-	init: tests names passed=289 failed=0
+names	check	itimer-armed	init: test names.itimer-armed ok
+names	check	vfork-itimer-expires-while-waiting	init: test names.vfork-itimer-expires-while-waiting ok
+names	check	vfork-itimer-child-status	init: test names.vfork-itimer-child-status ok
+names	check	vfork-nested-killed-parent-status	init: test names.vfork-nested-killed-parent-status ok
+names	check	vfork-nested-grandchild-reaped	init: test names.vfork-nested-grandchild-reaped ok
+names	check	vfork-nested-grandchild-status	init: test names.vfork-nested-grandchild-status ok
+names	check	vfork-nested-memory-visible	init: test names.vfork-nested-memory-visible ok
+names	check	vfork-nested-mmap-after	init: test names.vfork-nested-mmap-after ok
+names	check	vfork-nested-mapping-works	init: test names.vfork-nested-mapping-works ok
+names	check	vfork-nested-munmap-after	init: test names.vfork-nested-munmap-after ok
+names	summary	-	init: tests names passed=337 failed=0
 busybox	check	echo	init: test busybox.echo exit=0 out="hello world\n"
 busybox	check	echo-n	init: test busybox.echo-n exit=0 out="no newline"
 busybox	check	echo-e	init: test busybox.echo-e exit=0 out="a\tb\\cA\n"
@@ -2398,4 +2446,6 @@ busybox	check	getrandom-fills	init: test busybox.getrandom-fills ok
 busybox	check	getrandom-differs	init: test busybox.getrandom-differs ok
 busybox	check	getrandom-partial	init: test busybox.getrandom-partial ok
 busybox	check	getrandom-nothing-copied	init: test busybox.getrandom-nothing-copied ok
-busybox	summary	-	init: tests busybox passed=305 failed=0
+busybox	check	getrandom-clamp-before-access-ok	init: test busybox.getrandom-clamp-before-access-ok ok
+busybox	check	getrandom-clamp-just-over	init: test busybox.getrandom-clamp-just-over ok
+busybox	summary	-	init: tests busybox passed=307 failed=0

@@ -1449,6 +1449,25 @@ fn random_checks(passed: &mut u32, failed: &mut u32) {
     check("partial", got == Ok(10), &got);
     let got = sys(Sysno::getrandom, &[page + 4096, 100, 0]);
     check("nothing-copied", got == Err(Errno::EFAULT), &got);
+    // `import_ubuf` clamps the length to MAX_RW_COUNT before `access_ok`: a huge request at a buffer
+    // low enough that the clamped range stays below TASK_SIZE_MAX is a partial copy up to the
+    // unmapped page, not EFAULT (the `mmap` area above is too close to the top for that).
+    let low = 0x2000_0000;
+    let got = sys(
+        Sysno::mmap,
+        &[low, 8192, 3, 0x22 | 0x10_0000, usize::MAX, 0],
+    );
+    if got == Ok(low) {
+        let _ = sys(Sysno::munmap, &[low + 4096, 4096]);
+        let got = sys(Sysno::getrandom, &[low, 1 << 62, 0]);
+        check("clamp-before-access-ok", got == Ok(4096), &got);
+        let got = sys(Sysno::getrandom, &[low, 0x7fff_f000 + 1, 0]);
+        check("clamp-just-over", got == Ok(4096), &got);
+        let _ = sys(Sysno::munmap, &[low, 4096]);
+    } else {
+        check("clamp-before-access-ok", false, &got);
+        check("clamp-just-over", false, &got);
+    }
     let _ = sys(Sysno::munmap, &[page, 4096]);
 }
 

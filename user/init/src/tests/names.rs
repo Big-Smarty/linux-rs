@@ -140,6 +140,8 @@ pub fn run() -> bool {
     truncate_sync_statfs(&mut t);
     vectors_and_sendfile(&mut t);
     random(&mut t);
+    reboot(&mut t);
+    mknodat(&mut t);
     scripts(&mut t);
     vfork(&mut t);
     t.finish()
@@ -1740,6 +1742,250 @@ fn random(t: &mut T) {
     );
 }
 
+/// `AT_EMPTY_PATH` with a pipe descriptor: Linux walks from the pipe's own pipefs inode, so
+/// the call acts on the pipe and the working directory stays as it was. This kernel has no inode
+/// for a pipe and stops loudly at the first call (`Stop::Unimplemented`, `syscall::fs::env_for_at`),
+/// so this mode is a record of the pinned Linux only (`init-reference-018`), not an oracle group
+/// of `expected.tsv`.
+pub fn pipe_empty_path() -> bool {
+    const AT_EMPTY_PATH: usize = 0x1000;
+    let mut t = T::new("pipeempty");
+    let _ = mkdir(b"/pe\0", 0o755);
+    let _ = sys(Sysno::chdir, &[addr(b"/pe\0")]);
+    let (r, _w) = pipe();
+    let fstat = |fd: usize| {
+        let mut st = Stat::default();
+        let r = sys(
+            Sysno::newfstatat,
+            &[fd, addr(b"\0"), addr_mut(&mut st), AT_EMPTY_PATH],
+        );
+        r.map(|_| st.mode)
+    };
+    t.eq("cwd-mode-before", facts(b".\0").map(|f| f.0), Ok(0o040_755));
+    t.eq("pipe-mode-before", fstat(r), Ok(0o010_600));
+    t.eq(
+        "fchmodat2-pipe",
+        sys(Sysno::fchmodat2, &[r, addr(b"\0"), 0o700, AT_EMPTY_PATH]),
+        Ok(0),
+    );
+    t.eq("pipe-mode-after", fstat(r), Ok(0o010_700));
+    t.eq("cwd-mode-after", facts(b".\0").map(|f| f.0), Ok(0o040_755));
+    t.eq(
+        "fchownat-pipe",
+        sys(Sysno::fchownat, &[r, addr(b"\0"), 0, 0, AT_EMPTY_PATH]),
+        Ok(0),
+    );
+    t.eq(
+        "utimensat-pipe",
+        sys(Sysno::utimensat, &[r, addr(b"\0"), 0, AT_EMPTY_PATH]),
+        Ok(0),
+    );
+    t.eq(
+        "linkat-pipe",
+        sys(
+            Sysno::linkat,
+            &[r, addr(b"\0"), AT_FDCWD, addr(b"lnk\0"), AT_EMPTY_PATH],
+        ),
+        Err(Errno::EXDEV),
+    );
+    t.eq("linkat-pipe-no-entry", lfacts(b"lnk\0"), Err(Errno::ENOENT));
+    t.finish()
+}
+
+/// `reboot`: the checks that come before the machine is touched. The commands that end or
+/// restart the machine are not called. `CAD_OFF` is undone (Linux boots with `C_A_D` = 1).
+fn reboot(t: &mut T) {
+    const M1: usize = 0xfee1_dead;
+    const M2: usize = 672_274_793;
+    const CAD_ON: usize = 0x89ab_cdef;
+    const CAD_OFF: usize = 0;
+    const RESTART2: usize = 0xa1b2_c3d4;
+    const SW_SUSPEND: usize = 0xd000_fce2;
+    const KEXEC: usize = 0x4558_4543;
+    let call =
+        |m1: usize, m2: usize, cmd: usize, arg: usize| sys(Sysno::reboot, &[m1, m2, cmd, arg]);
+    t.eq(
+        "reboot-bad-magic1",
+        call(0, M2, CAD_ON, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "reboot-bad-magic2",
+        call(M1, 1, CAD_ON, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "reboot-unknown-command",
+        call(M1, M2, 5, 0),
+        Err(Errno::EINVAL),
+    );
+    for (name, magic2) in [
+        ("reboot-magic2-a", 672_274_793usize),
+        ("reboot-magic2-b", 85_072_278),
+        ("reboot-magic2-c", 369_367_448),
+        ("reboot-magic2-d", 537_993_216),
+    ] {
+        t.eq(name, call(M1, magic2, CAD_ON, 0), Ok(0));
+    }
+    // The magic numbers are `int`s: the upper halves are ignored.
+    t.eq(
+        "reboot-magic-upper-halves-ignored",
+        call(M1 | 1 << 40, M2 | 1 << 33, CAD_ON, 0),
+        Ok(0),
+    );
+    t.eq("reboot-cad-off", call(M1, M2, CAD_OFF, 0), Ok(0));
+    t.eq("reboot-cad-on", call(M1, M2, CAD_ON, 0), Ok(0));
+    t.eq(
+        "reboot-restart2-bad-pointer",
+        call(M1, M2, RESTART2, BAD),
+        Err(Errno::EFAULT),
+    );
+    t.eq(
+        "reboot-kexec-without-image",
+        call(M1, M2, KEXEC, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "reboot-sw-suspend-without-hibernation",
+        call(M1, M2, SW_SUSPEND, 0),
+        Err(Errno::EINVAL),
+    );
+}
+
+/// `mknodat`: the file types `may_mknod` accepts and refuses, the directory descriptor and the
+/// errors in `filename_create` order.
+fn mknodat(t: &mut T) {
+    let node = |dfd: usize, path: &[u8], mode: usize, dev: usize| {
+        sys(Sysno::mknodat, &[dfd, addr(path), mode, dev])
+    };
+    t.eq(
+        "mknodat-regular",
+        node(AT_FDCWD, b"mk-reg\0", 0o100_640, 0),
+        Ok(0),
+    );
+    t.eq(
+        "mknodat-regular-attributes",
+        facts(b"mk-reg\0").map(|f| (f.0, f.1, f.2)),
+        Ok((0o100_640, 1, 0)),
+    );
+    t.eq(
+        "mknodat-type-zero-is-regular",
+        node(AT_FDCWD, b"mk-zero\0", 0o644, 0),
+        Ok(0),
+    );
+    t.eq(
+        "mknodat-type-zero-attributes",
+        facts(b"mk-zero\0").map(|f| f.0),
+        Ok(0o100_644),
+    );
+    t.eq(
+        "mknodat-umask",
+        node(AT_FDCWD, b"mk-umask\0", 0o100_777, 0),
+        Ok(0),
+    );
+    t.eq(
+        "mknodat-umask-attributes",
+        facts(b"mk-umask\0").map(|f| f.0),
+        Ok(0o100_755),
+    );
+    t.eq(
+        "mknodat-directory",
+        node(AT_FDCWD, b"mk-dir\0", 0o040_755, 0),
+        Err(Errno::EPERM),
+    );
+    t.eq(
+        "mknodat-symlink-type",
+        node(AT_FDCWD, b"mk-lnk\0", 0o120_777, 0),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "mknodat-exists",
+        node(AT_FDCWD, b"mk-reg\0", 0o100_644, 0),
+        Err(Errno::EEXIST),
+    );
+    t.eq(
+        "mknodat-exists-slash",
+        node(AT_FDCWD, b"mk-reg/\0", 0o100_644, 0),
+        Err(Errno::EEXIST),
+    );
+    t.eq(
+        "mknodat-enoent-parent",
+        node(AT_FDCWD, b"mk-no/x\0", 0o100_644, 0),
+        Err(Errno::ENOENT),
+    );
+    t.eq(
+        "mknodat-enoent-empty",
+        node(AT_FDCWD, b"\0", 0o100_644, 0),
+        Err(Errno::ENOENT),
+    );
+    t.eq(
+        "mknodat-efault",
+        sys(Sysno::mknodat, &[AT_FDCWD, BAD, 0o100_644, 0]),
+        Err(Errno::EFAULT),
+    );
+    t.eq(
+        "mknodat-char-device",
+        node(AT_FDCWD, b"mk-chr\0", 0o020_666, (1 << 8) | 3),
+        Ok(0),
+    );
+    t.eq(
+        "mknodat-char-device-attributes",
+        facts(b"mk-chr\0").map(|f| f.0),
+        Ok(0o020_644),
+    );
+    t.eq(
+        "mknodat-block-device",
+        node(AT_FDCWD, b"mk-blk\0", 0o060_600, 7 << 8),
+        Ok(0),
+    );
+    t.eq(
+        "mknodat-fifo",
+        node(AT_FDCWD, b"mk-fifo\0", 0o010_644, 0),
+        Ok(0),
+    );
+    t.eq(
+        "mknodat-socket",
+        node(AT_FDCWD, b"mk-sock\0", 0o140_644, 0),
+        Ok(0),
+    );
+    t.eq(
+        "mknodat-special-attributes",
+        (
+            facts(b"mk-blk\0").map(|f| f.0),
+            facts(b"mk-fifo\0").map(|f| f.0),
+            facts(b"mk-sock\0").map(|f| f.0),
+        ),
+        (Ok(0o060_600), Ok(0o010_644), Ok(0o140_644)),
+    );
+    // A directory descriptor, a file descriptor, a bad one, an absolute name.
+    t.eq("mknodat-mkdir", mkdir(b"mk-d\0", 0o755), Ok(0));
+    let dir = open(b"mk-d\0", O_RDONLY | O_DIRECTORY, 0).unwrap_or(99);
+    t.eq("mknodat-dirfd", node(dir, b"x\0", 0o100_644, 0), Ok(0));
+    t.eq(
+        "mknodat-dirfd-result",
+        lfacts(b"mk-d/x\0").map(|f| f.0),
+        Ok(0o100_644),
+    );
+    let file = open(b"mk-reg\0", O_RDONLY, 0).unwrap_or(99);
+    t.eq(
+        "mknodat-file-fd",
+        node(file, b"x\0", 0o100_644, 0),
+        Err(Errno::ENOTDIR),
+    );
+    t.eq(
+        "mknodat-bad-fd",
+        node(77, b"x\0", 0o100_644, 0),
+        Err(Errno::EBADF),
+    );
+    t.eq(
+        "mknodat-absolute-ignores-fd",
+        node(77, b"/n/mk-abs\0", 0o100_644, 0),
+        Ok(0),
+    );
+    close(dir);
+    close(file);
+}
+
 /// A script run through `execve` with this very program as its interpreter: `/init execd ...`
 /// prints its own `argv` (the `proc` group's `execd` image), here through a pipe.
 fn scripts(t: &mut T) {
@@ -1928,6 +2174,98 @@ fn vfork_map_exec(at: usize, path: usize, argv: usize, envp: usize) -> R {
     Errno::from_ret(pid)
 }
 
+/// `struct timespec` of 300 ms: how long the vfork children below stay alive.
+static NAP: [u64; 2] = [0, 300_000_000];
+
+/// `vfork` whose child sleeps 300 ms, stores `value` in `FLAG` and exits with `code`.
+#[inline(never)]
+fn vfork_nap_exit(value: usize, code: usize) -> R {
+    let pid: usize;
+    // SAFETY: as `vfork_exit`; the child additionally runs `nanosleep` on `NAP`, a static it only
+    // reads, and touches neither the stack nor any register the parent needs.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 2f",
+            "mov rdi, {nap}",
+            "xor esi, esi",
+            "mov eax, 35",
+            "syscall",
+            "mov qword ptr [{flag}], {value}",
+            "mov eax, 231",
+            "mov rdi, {code}",
+            "syscall",
+            "ud2",
+            "2:",
+            nap = in(reg) core::ptr::addr_of!(NAP),
+            flag = in(reg) core::ptr::addr_of!(FLAG),
+            value = in(reg) value,
+            code = in(reg) code,
+            inlateout("rax") 58usize => pid,
+            out("rcx") _,
+            out("r11") _,
+            out("rdi") _,
+            out("rsi") _,
+        );
+    }
+    Errno::from_ret(pid)
+}
+
+/// A `vfork` child (B) that `vfork`s a child (C) of its own and is killed by C while it waits; C
+/// sleeps 300 ms, stores `value` in `FLAG` and exits with status 4.
+#[inline(never)]
+fn vfork_nested_killed(value: usize) -> R {
+    let pid: usize;
+    // SAFETY: as `vfork_exit`, twice over: B and C run only register-based system calls on the
+    // parent's stack without pushing or calling, B leaves through `exit_group` if it is ever
+    // resumed, and the only memory C touches is `FLAG` and the read-only `NAP`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 3f",
+            // B: vfork again.
+            "mov eax, 58",
+            "syscall",
+            "test rax, rax",
+            "jnz 4f",
+            // C: getppid -> kill(ppid, SIGKILL) -> nanosleep(NAP) -> FLAG = value -> exit_group(4).
+            "mov eax, 110",
+            "syscall",
+            "mov rdi, rax",
+            "mov esi, 9",
+            "mov eax, 62",
+            "syscall",
+            "mov rdi, {nap}",
+            "xor esi, esi",
+            "mov eax, 35",
+            "syscall",
+            "mov qword ptr [{flag}], {value}",
+            "mov edi, 4",
+            "mov eax, 231",
+            "syscall",
+            "ud2",
+            // B, back from its vfork (not reached once C has killed it).
+            "4:",
+            "xor edi, edi",
+            "mov eax, 231",
+            "syscall",
+            "ud2",
+            "3:",
+            nap = in(reg) core::ptr::addr_of!(NAP),
+            flag = in(reg) core::ptr::addr_of!(FLAG),
+            value = in(reg) value,
+            inlateout("rax") 58usize => pid,
+            out("rcx") _,
+            out("r11") _,
+            out("rdi") _,
+            out("rsi") _,
+        );
+    }
+    Errno::from_ret(pid)
+}
+
 fn vfork(t: &mut T) {
     FLAG.store(0, Relaxed);
     let pid = vfork_exit(0x1234, 7);
@@ -2003,6 +2341,62 @@ fn vfork(t: &mut T) {
         "clone-vfork-without-vm-status",
         super::proc::wait4(pid.unwrap_or(usize::MAX) as isize, 0).1,
         5 << 8,
+    );
+    super::proc::reap_all();
+    // The parent's interval timer runs out while it waits for its child: the wait still ends
+    // when the child does (SIGALRM is ignored, so nothing else is visible).
+    let ignore = [1u64, 0, 0, 0];
+    let timer = [0i64, 0, 0, 100_000];
+    let _ = sys(Sysno::rt_sigaction, &[14, addr(&ignore), 0, 8]);
+    t.eq(
+        "itimer-armed",
+        sys(Sysno::setitimer, &[0, addr(&timer), 0]),
+        Ok(0),
+    );
+    FLAG.store(0, Relaxed);
+    let pid = vfork_nap_exit(0x77, 3);
+    t.eq(
+        "vfork-itimer-expires-while-waiting",
+        FLAG.load(Relaxed),
+        0x77,
+    );
+    t.eq(
+        "vfork-itimer-child-status",
+        super::proc::wait4(pid.unwrap_or(usize::MAX) as isize, 0).1,
+        3 << 8,
+    );
+    let _ = sys(Sysno::setitimer, &[0, addr(&[0i64; 4]), 0]);
+    let _ = sys(Sysno::rt_sigaction, &[14, addr(&[0u64; 4]), 0, 8]);
+    // A `vfork` child killed while its own `vfork` child still works in the borrowed address
+    // space: the parent keeps a usable address space whenever it resumes, and both children are
+    // reaped with the statuses they died with.
+    FLAG.store(0, Relaxed);
+    let pid = vfork_nested_killed(0x99);
+    let pid = pid.unwrap_or(usize::MAX);
+    t.eq(
+        "vfork-nested-killed-parent-status",
+        super::proc::wait4(pid as isize, 0).1,
+        9,
+    );
+    let (grandchild, status) = super::proc::wait4(-1, 0);
+    t.holds(
+        "vfork-nested-grandchild-reaped",
+        grandchild.is_ok_and(|g| g != pid),
+        &grandchild,
+        "the grandchild's pid",
+    );
+    t.eq("vfork-nested-grandchild-status", status, 4 << 8);
+    t.eq("vfork-nested-memory-visible", FLAG.load(Relaxed), 0x99);
+    // The parent's address space still works: map, store, load, unmap.
+    let at = 0x6000_0000_0000usize;
+    let page = super::mmap(at, 4096, 3, 0x22 | 0x10, usize::MAX, 0);
+    t.eq("vfork-nested-mmap-after", page, Ok(at));
+    super::poke(at, 0x3c);
+    t.eq("vfork-nested-mapping-works", super::peek(at), 0x3c);
+    t.eq(
+        "vfork-nested-munmap-after",
+        sys(Sysno::munmap, &[at, 4096]),
+        Ok(0),
     );
     super::proc::reap_all();
 }

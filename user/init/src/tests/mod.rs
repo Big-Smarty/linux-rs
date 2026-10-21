@@ -363,6 +363,8 @@ pub fn run_mode(mode: &[u8]) -> bool {
         }
         b"fs" => fs::run(),
         b"names" => names::run(),
+        // `AT_EMPTY_PATH` with a pipe: a record of the pinned Linux only (this kernel stops).
+        b"pipeempty" => names::pipe_empty_path(),
         b"proc" => proc::run(),
         b"jobctl" => jobctl::run(),
         b"pipe" => pipe::run(),
