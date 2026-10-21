@@ -1585,7 +1585,7 @@ impl Syscall<'_> {
                 // The parent's view is brought up to date with the address space it lends
                 // (what it mapped or exec'd since it last published), then it follows the
                 // child, who works in the same `mm_struct`.
-                let _ = publish(process, &self.own, &mut self.space);
+                let _ = publish(process, self.own, &mut self.space);
                 process
                     .vfs
                     .fs
