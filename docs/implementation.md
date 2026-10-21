@@ -64,7 +64,7 @@ cargo +nightly test --workspace --locked --offline                  # kernel 524
 env PATH="/bin:$PATH" cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/fresh-v020 --timeout-seconds 60
 target Clippy x4: qemu-self-test, freestanding, freestanding+baremetal-suite, qemu-self-test+baremetal-suite
 cargo +1.88.0 run -p xtask --locked --offline -- check            # 97,294 pinned entries, 2,623 workstreams, 16 skills, 23 vendored packages verified
-cargo +1.88.0 run -p xtask --locked --offline -- status           # 35 in_progress, 2588 not_started of 2623
+cargo +1.88.0 run -p xtask --locked --offline -- status           # 36 in_progress, 2587 not_started of 2623
 ```
 
 `kernel-test` printed `43/43 debug-exit cases matched` and `4/4 baremetal-suite cases matched` (47 case statuses, all `matched`) in the fresh clone and, run separately on the `main` checkout, in `target/kernel-tooling/main-v020` (log `target/main-v020-kernel-test.log`, read by the author of this record). The four suite cases are `baremetal-suite`, `-two-displays` and `-kvm`, each ending `SUITE complete ok=true groups=9/9 proofs=23/23` (`RESULT: ALL PASS`, nine groups, 23 self-tests), and `-stops`, which ends `ok=false groups=1/7 proofs=23/23` by design (stop and time-bound handling) and is matched as such. The target Clippy steps ran with the `--cfg=no_global_oom_handling` rustflag as in the [foundation record](#kernel-services-foundation).
@@ -162,7 +162,7 @@ cargo +nightly clippy --workspace --all-targets --locked --offline -- -D warning
 cargo +nightly test --workspace --locked --offline                  # kernel 121, xtask 70, baremetal 10, 2 doc tests
 env PATH="/bin:$PATH" cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/final-001 --timeout-seconds 60
 cargo +1.88.0 run -p xtask --locked --offline -- check            # 22 vendored packages verified
-cargo +1.88.0 run -p xtask --locked --offline -- status           # 35 in_progress, 2588 not_started of 2623
+cargo +1.88.0 run -p xtask --locked --offline -- status           # 36 in_progress, 2587 not_started of 2623
 ```
 
 Both target strict Clippy profiles (`qemu-self-test`, `freestanding`) also passed, run with `--config target/kernel-tooling/final-001/freestanding-build/cargo-home/config.toml` (the per-run merged vendor source; see [kernel tooling](kernel-tooling.md#vendored-dependencies-and-the-fresh-clone-build)). `final-001` matched **18/18** cases: bad-map, bad-module, cpu-max, cpu-without-pat, empty-module, init-segfault, irq-restore-early, no-init, panic, rseq, sse, success, unexpected-breakpoint, unexpected-fault, unexpected-interrupt, unexpected-page-fault, unimplemented-syscall, unmasked-timer.
