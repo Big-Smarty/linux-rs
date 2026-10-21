@@ -3507,6 +3507,19 @@ procfs	check	mmap-noreplace-first	init: test procfs.mmap-noreplace-first ok
 procfs	check	mmap-noreplace-first-intact	init: test procfs.mmap-noreplace-first-intact ok
 procfs	check	mmap-fixed-eio-empty	init: test procfs.mmap-fixed-eio-empty ok
 procfs	check	mmap-eio-leaves-no-mapping	init: test procfs.mmap-eio-leaves-no-mapping ok
+procfs	check	rss-file-created	init: test procfs.rss-file-created ok
+procfs	check	rss-file-mapped	init: test procfs.rss-file-mapped ok
+procfs	check	rss-file-map-resident-nothing	init: test procfs.rss-file-map-resident-nothing ok
+procfs	check	rss-file-read-data	init: test procfs.rss-file-read-data ok
+procfs	check	rss-file-read-counters	init: test procfs.rss-file-read-counters ok
+procfs	check	rss-file-write-counters	init: test procfs.rss-file-write-counters ok
+procfs	check	rss-file-write-copy	init: test procfs.rss-file-write-copy ok
+procfs	check	rss-file-write-file-untouched	init: test procfs.rss-file-write-file-untouched ok
+procfs	check	rss-file-protect-read-counters	init: test procfs.rss-file-protect-read-counters ok
+procfs	check	rss-file-protect-write-counters	init: test procfs.rss-file-protect-write-counters ok
+procfs	check	rss-file-rewrite-counters	init: test procfs.rss-file-rewrite-counters ok
+procfs	check	rss-file-cow-counters	init: test procfs.rss-file-cow-counters ok
+procfs	check	rss-file-unmapped-counters	init: test procfs.rss-file-unmapped-counters ok
 procfs	check	statfs-default-mount	init: test procfs.statfs-default-mount ok
 procfs	check	statfs-default-path	init: test procfs.statfs-default-path ok
 procfs	check	statfs-default-fd	init: test procfs.statfs-default-fd ok
@@ -3627,4 +3640,4 @@ procfs	check	root-umount-again	init: test procfs.root-umount-again ok
 procfs	check	root-remount-rw	init: test procfs.root-remount-rw ok
 procfs	check	root-rw-again	init: test procfs.root-rw-again ok
 procfs	check	root-rw-create	init: test procfs.root-rw-create ok
-procfs	summary	-	init: tests procfs passed=1168 failed=0
+procfs	summary	-	init: tests procfs passed=1181 failed=0

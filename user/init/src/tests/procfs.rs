@@ -127,6 +127,7 @@ macro_rules! text {
 }
 
 mod attr;
+mod rss;
 pub mod vfork;
 
 /// `s` followed by a NUL, for a system call argument.
@@ -422,6 +423,7 @@ pub fn run() -> bool {
     attr::setattr(&mut t);
     attr::llseek(&mut t);
     attr::mmap_files(&mut t);
+    rss::private_file(&mut t);
     attr::statfs_flags(&mut t);
     vfork::window(&mut t);
     vfork::exec(&mut t);
