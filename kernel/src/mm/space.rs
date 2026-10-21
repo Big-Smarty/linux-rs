@@ -640,25 +640,29 @@ impl Mm {
     /// `vma_modify_flags`: make `[start, end)` of `vmas[idx]` take `flags`,
     /// merging into a neighbour if possible, otherwise splitting. Returns the
     /// index of the VMA covering exactly the range (its flags are *not* yet
-    /// changed unless merged into a VMA that already had them).
+    /// changed unless merged into a VMA that already had them). After a merge `*flags` is the
+    /// merged VMA's flags: sticky flags (`VM_MAYBE_GUARD`) the neighbour carried survive, and
+    /// the caller resets the VMA to them, as `vma_modify_flags` hands them back through
+    /// `vm_flags_ptr` (mm/vma.c:1696-1703).
     pub(super) fn vma_modify(
         &mut self,
         env: &Env,
         idx: usize,
         start: u64,
         end: u64,
-        flags: VmFlags,
+        flags: &mut VmFlags,
     ) -> Result<usize, Errno> {
         let v = self.vmas[idx];
         let req = MergeReq {
             start,
             end,
-            flags,
+            flags: *flags,
             pgoff: v.pgoff + ((start - v.start) >> PAGE_SHIFT),
             file: v.file,
             anon: v.anon,
         };
         if let Some(i) = self.merge_existing_range(idx, &req) {
+            *flags = self.vmas[i].flags;
             return Ok(i);
         }
         let mut at = idx;

@@ -4808,5 +4808,31 @@ madvise	check	closed-pidfd	init: test madvise.closed-pidfd ok
 madvise	check	console-is-no-pidfd	init: test madvise.console-is-no-pidfd ok
 madvise	check	empty-vector	init: test madvise.empty-vector ok
 madvise	check	advice-after-pidfd	init: test madvise.advice-after-pidfd ok
+madvise	check	self-thread	init: test madvise.self-thread ok
+madvise	check	self-group	init: test madvise.self-group ok
+madvise	check	self-thread-is-an-int	init: test madvise.self-thread-is-an-int ok
+madvise	check	self-neighbour-pidfs-root	init: test madvise.self-neighbour-pidfs-root ok
+madvise	check	self-neighbour-below	init: test madvise.self-neighbour-below ok
+madvise	check	self-empty-vector	init: test madvise.self-empty-vector ok
+madvise	check	self-empty-vector-bad-advice	init: test madvise.self-empty-vector-bad-advice ok
+madvise	check	self-bad-advice	init: test madvise.self-bad-advice ok
+madvise	check	self-dontneed-two-segments	init: test madvise.self-dontneed-two-segments ok
+madvise	check	self-dontneed-zeroes	init: test madvise.self-dontneed-zeroes ok
+madvise	check	self-zero-length-segment	init: test madvise.self-zero-length-segment ok
+madvise	check	self-only-zero-length-segments	init: test madvise.self-only-zero-length-segments ok
+madvise	check	self-trailing-zero-length-segment-is-not-judged	init: test madvise.self-trailing-zero-length-segment-is-not-judged ok
+madvise	check	self-leading-zero-length-segment-is-judged	init: test madvise.self-leading-zero-length-segment-is-judged ok
+madvise	check	self-first-segment-fails	init: test madvise.self-first-segment-fails ok
+madvise	check	self-first-segment-fails-kept-all	init: test madvise.self-first-segment-fails-kept-all ok
+madvise	check	self-second-segment-fails-returns-bytes-done	init: test madvise.self-second-segment-fails-returns-bytes-done ok
+madvise	check	self-second-segment-fails-stops	init: test madvise.self-second-segment-fails-stops ok
+madvise	check	self-hole-first	init: test madvise.self-hole-first ok
+madvise	check	self-hole-second-returns-bytes-done	init: test madvise.self-hole-second-returns-bytes-done ok
+madvise	check	self-hole-inside-a-segment	init: test madvise.self-hole-inside-a-segment ok
+madvise	check	self-populate-write	init: test madvise.self-populate-write ok
+madvise	check	self-guard-install	init: test madvise.self-guard-install ok
+madvise	check	self-populate-stops-at-the-guard	init: test madvise.self-populate-stops-at-the-guard ok
+madvise	check	self-guard-remove	init: test madvise.self-guard-remove ok
+madvise	check	self-group-after-the-leader-exited	init: test madvise.self-group-after-the-leader-exited ok
 madvise	check	every-mapping-was-made	init: test madvise.every-mapping-was-made ok
-madvise	summary	-	init: tests madvise passed=374 failed=0
+madvise	summary	-	init: tests madvise passed=400 failed=0

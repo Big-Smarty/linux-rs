@@ -810,7 +810,7 @@ impl Mm {
         } else if oldflags.contains(VmFlags::ACCOUNT) && v.is_anonymous() && v.anon.is_none() {
             *newflags &= !VmFlags::ACCOUNT;
         }
-        let at = self.vma_modify(env, idx, start, end, *newflags)?;
+        let at = self.vma_modify(env, idx, start, end, newflags)?;
         self.vmas[at].flags = *newflags;
         pt.protect(start, nrpages, page_prot(*newflags));
         // Private VM_LOCKED VMA becoming writable: trigger COW to avoid major

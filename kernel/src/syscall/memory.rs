@@ -34,12 +34,13 @@
 //!   pages in exactly like Linux; `RLIMIT_MEMLOCK` and friends come from the
 //!   fixed `INIT_RLIMITS` in `mm::Env`, not from `setrlimit`.
 
-use super::{AddressSpace, Context, Files, Outcome, error, fd::import_segs};
+use super::{AddressSpace, Context, Files, Outcome, Tasks, error, fd::import_segs};
 use crate::{
     mm::{
         Env, FileMapping, MADV_POPULATE_READ, MADV_POPULATE_WRITE, MADV_REMOVE, MADV_WIPEONFORK,
         MAP_ANONYMOUS, Madvise, Mmap, PAGE_SIZE, VmFlags, madvise_range, mmap_off_to_pgoff,
     },
+    task::tasklist::ExitState,
     vfs::mapping::Mappable,
 };
 use syscalls::{Errno, Sysno};
@@ -128,10 +129,11 @@ fn mmap<C: Context>(ctx: &mut C, [addr, len, prot, flags, fd, off]: [u64; 6]) ->
 ///
 /// * `/dev/zero` (`mmap_zero`): a private mapping is anonymous
 ///   (`vma_set_anonymous`); a shared one is `shmem_zero_setup`, not ported.
-///   shortcut: the VMA does not keep `vm_file`, so only `/proc/self/maps`
-///   (which does not exist here) and the segfault line's ` in zero[...]`
-///   could tell it from plain anonymous memory; the latter stops loudly once
-///   such a mapping was made ([`crate::vfs::Vfs::zero_mapped`]). Its `pgoff` is
+///   shortcut: the VMA does not keep `vm_file`, so `/proc/<pid>/maps`
+///   (Linux names it `/dev/zero (deleted)`; `procfs` lists it as anonymous), `MADV_REMOVE`,
+///   `MADV_WIPEONFORK` and the segfault line's ` in zero[...]` could tell it from plain
+///   anonymous memory; the last two stop loudly once such a mapping was made
+///   ([`crate::vfs::Vfs::zero_mapped`]). Its `pgoff` is
 ///   the file offset as in Linux, which keeps it from merging with its
 ///   neighbours.
 /// * a tmpfs file (`shmem_mmap`): private mappings fault their pages in from
@@ -208,13 +210,17 @@ pub(super) fn unpin_unmapped<C: Context>(ctx: &mut C) {
     }
 }
 
-/// `SYSCALL_DEFINE3(madvise)`: `do_madvise` for the caller's address space. The checks and the
-/// walk are the model's ([`crate::mm::madvise_range`], [`crate::mm::Mm::madvise`]);
-/// `MADV_POPULATE_*` faults the pages in through the task's own user-memory view.
+/// `SYSCALL_DEFINE3(madvise)`: `do_madvise` for the caller's address space.
 fn madvise<C: Context>(ctx: &mut C, [start, len_in, behavior, ..]: [u64; 6]) -> Outcome {
     // `int behavior`.
     #[allow(clippy::cast_possible_truncation)]
-    let behavior = (behavior as u32).cast_signed();
+    do_madvise(ctx, start, len_in, (behavior as u32).cast_signed())
+}
+
+/// `do_madvise`: the checks and the walk are the model's ([`crate::mm::madvise_range`],
+/// [`crate::mm::Mm::madvise`]); `MADV_POPULATE_*` faults the pages in through the task's own
+/// user-memory view. Returns 0, `-errno` or the loud stop.
+fn do_madvise<C: Context>(ctx: &mut C, start: u64, len_in: u64, behavior: i32) -> Outcome {
     let end = match madvise_range(start, len_in, behavior) {
         Ok(Some(end)) => end,
         Ok(None) => return Outcome::Return(0),
@@ -225,6 +231,9 @@ fn madvise<C: Context>(ctx: &mut C, [start, len_in, behavior, ..]: [u64; 6]) -> 
     }
     // A private `/dev/zero` mapping is anonymous memory here but has `vm_file` in Linux, which
     // `MADV_REMOVE` (`EACCES`, not `EINVAL`) and `MADV_WIPEONFORK` (`EINVAL`) look at.
+    // shortcut: the mark is the Vfs-wide `zero_mapped`, so one such mapping anywhere stops these
+    // two requests everywhere (a conservative loud stop, never a wrong answer); keep a per-VMA
+    // marker when a program mixes `/dev/zero` with `MADV_WIPEONFORK`.
     if (behavior == MADV_REMOVE || behavior == MADV_WIPEONFORK) && ctx.files().vfs.zero_mapped() {
         return Outcome::Unimplemented(Sysno::madvise as u32);
     }
@@ -262,22 +271,78 @@ fn populate<C: Context>(ctx: &mut C, start: u64, end: u64, write: bool) -> Outco
     Outcome::Return(0)
 }
 
+/// `PIDFD_SELF_THREAD` / `PIDFD_SELF_THREAD_GROUP` (include/uapi/linux/fcntl.h:110-111): the
+/// two "descriptors" `pidfd_get_task` serves without a file.
+const PIDFD_SELF_THREAD: i32 = -10000;
+const PIDFD_SELF_THREAD_GROUP: i32 = -10001;
+
 /// `SYSCALL_DEFINE5(process_madvise)`: `flags` must be 0, the vector is imported (`ITER_DEST`),
-/// then `pidfd_get_task` wants a pidfd. No pidfd exists here (`pidfd_open` and `CLONE_PIDFD` stop
-/// the kernel), so a descriptor that is not one is `EBADF`, as in Linux for any other file or a
-/// closed descriptor; nothing after that step can be reached.
+/// then `pidfd_get_task`: the two self values name the caller's thread or thread-group leader
+/// (the leader's `mm`, which is the caller's own, or `ESRCH` once the leader has exited), any
+/// other descriptor must be a pidfd. No pidfd exists here (`pidfd_open` and `CLONE_PIDFD` stop
+/// the kernel), so any other value is `EBADF`, as in Linux for any other file or a closed
+/// descriptor (`pidfd_pid` has no `/proc/<pid>` fallback). The `mm` is then always `current->mm`:
+/// the remote-process checks do not apply and `vector_madvise` runs.
 fn process_madvise<C: Context>(
     ctx: &mut C,
-    [_pidfd, vec, vlen, _behavior, flags, _]: [u64; 6],
+    [pidfd, vec, vlen, behavior, flags, _]: [u64; 6],
 ) -> Outcome {
     // `unsigned int flags`.
     if flags & 0xffff_ffff != 0 {
         return Outcome::Return(error(Errno::EINVAL));
     }
-    if let Err(errno) = import_segs(ctx, vec, vlen) {
-        return Outcome::Return(error(errno));
+    let (segs, total) = match import_segs(ctx, vec, vlen) {
+        Ok(imported) => imported,
+        Err(errno) => return Outcome::Return(error(errno)),
+    };
+    // `int pidfd`, `int behavior`.
+    #[allow(clippy::cast_possible_truncation)]
+    let (pidfd, behavior) = (
+        (pidfd as u32).cast_signed(),
+        (behavior as u32).cast_signed(),
+    );
+    match pidfd {
+        PIDFD_SELF_THREAD => {}
+        PIDFD_SELF_THREAD_GROUP => {
+            // `get_task_mm(leader)` of a leader that has exited (`exit_mm`) is NULL: `ESRCH`.
+            let Tasks { list, current, .. } = ctx.tasks();
+            let leader = list.group_leader(current);
+            if list
+                .task(leader)
+                .is_none_or(|task| task.exit_state != ExitState::Live)
+            {
+                return Outcome::Return(error(Errno::ESRCH));
+            }
+        }
+        _ => return Outcome::Return(error(Errno::EBADF)),
     }
-    Outcome::Return(error(Errno::EBADF))
+    vector_madvise(ctx, &segs, total, behavior)
+}
+
+/// `vector_madvise`: the advice over each segment in turn while `iov_iter_count` (the bytes left,
+/// `total` at first) is not zero, so zero-length segments after the last byte are never looked
+/// at; stopping at the first error. The result is the bytes advised, or the error if there
+/// were none. (`-ERESTARTNOINTR` cannot arise: the model never drops the address-space lock.)
+fn vector_madvise<C: Context>(
+    ctx: &mut C,
+    segs: &[(u64, u64)],
+    total: u64,
+    behavior: i32,
+) -> Outcome {
+    let mut done: u64 = 0;
+    for &(start, len) in segs {
+        if done == total {
+            break;
+        }
+        match do_madvise(ctx, start, len, behavior) {
+            Outcome::Return(0) => done += len,
+            Outcome::Return(err) => {
+                return Outcome::Return(if done == 0 { err } else { done.cast_signed() });
+            }
+            stop => return stop,
+        }
+    }
+    Outcome::Return(done.cast_signed())
 }
 
 #[cfg(test)]

@@ -225,11 +225,87 @@ fn process_madvise_checks_then_needs_a_pidfd_that_cannot_exist() {
     // A negative length is EINVAL as the vector is copied, before any base is checked.
     assert_eq!(pm(&mut t, 0, 0x4020, 1, 0), neg(Errno::EINVAL));
     assert_eq!(pm(&mut t, 0, 0x4000, 3, 0), neg(Errno::EINVAL));
-    // No pidfd exists: a descriptor that is open, closed or negative is EBADF.
+    // No pidfd exists: a descriptor that is open, closed or negative (but for the two
+    // `PIDFD_SELF_*` values, below) is EBADF.
     assert_eq!(pm(&mut t, 0, 0x4000, 2, 0), neg(Errno::EBADF));
     assert_eq!(pm(&mut t, u64::MAX, 0x4000, 2, 0), neg(Errno::EBADF));
     assert_eq!(pm(&mut t, 77, 0, 0, 0), neg(Errno::EBADF));
     // `unsigned nr_segs`: the upper half of the register is dropped.
     assert_eq!(pm(&mut t, 0, 0x4000, 0x1_0000_0002, 0), neg(Errno::EBADF));
     assert_eq!(pm(&mut t, 0, 0xdead, 0x1_0000_0000, 0), neg(Errno::EBADF));
+}
+
+#[test]
+fn process_madvise_self_pidfds_run_the_vector_on_the_callers_space() {
+    const SELF_THREAD: u64 = (-10000i64).cast_unsigned();
+    const SELF_GROUP: u64 = (-10001i64).cast_unsigned();
+    let mut t = task();
+    let base = match dispatch(&mut t, Sysno::mmap as u64, [0, 3 * P, RW, ANON, 0, 0]) {
+        Outcome::Return(a) => a.cast_unsigned(),
+        other => panic!("{other:?}"),
+    };
+    t.pages.map(0x4000, true);
+    let put = |t: &mut _, segments: &[(u64, u64)]| {
+        for (i, (seg_base, len)) in segments.iter().enumerate() {
+            let mut raw = [0u8; 16];
+            raw[..8].copy_from_slice(&seg_base.to_le_bytes());
+            raw[8..].copy_from_slice(&len.to_le_bytes());
+            crate::usercopy::copy_to_user(t, 0x4000 + i as u64 * 16, &raw);
+        }
+        segments.len() as u64
+    };
+    let pm = |t: &mut _, pidfd: u64, vlen: u64, advice: u64| {
+        dispatch(
+            t,
+            Sysno::process_madvise as u64,
+            [pidfd, 0x4000, vlen, advice, 0, 0],
+        )
+    };
+    let n = put(&mut t, &[(base, P), (base + P, 2 * P)]);
+    // `int pidfd`: the upper half of the register is dropped.
+    for pidfd in [
+        SELF_THREAD,
+        SELF_GROUP,
+        (1 << 32) | (SELF_THREAD & 0xffff_ffff),
+    ] {
+        assert_eq!(
+            pm(&mut t, pidfd, n, 20),
+            Outcome::Return((3 * P).cast_signed())
+        );
+    }
+    for pidfd in [
+        (-10002i64).cast_unsigned(),
+        (-9999i64).cast_unsigned(),
+        0,
+        77,
+    ] {
+        assert_eq!(pm(&mut t, pidfd, n, 20), neg(Errno::EBADF), "{pidfd:#x}");
+    }
+    // The first failing segment ends it: the bytes before it, or its error if none.
+    let n = put(&mut t, &[(base, P), (base + 1, P), (base + P, P)]);
+    assert_eq!(
+        pm(&mut t, SELF_THREAD, n, 20),
+        Outcome::Return(P.cast_signed())
+    );
+    let n = put(&mut t, &[(base + 1, P), (base, P)]);
+    assert_eq!(pm(&mut t, SELF_THREAD, n, 20), neg(Errno::EINVAL));
+    let n = put(&mut t, &[(base + 3 * P, P)]);
+    assert_eq!(pm(&mut t, SELF_THREAD, n, 20), neg(Errno::ENOMEM));
+    // Only while bytes are left: a trailing empty segment is not looked at, a leading one is.
+    let n = put(&mut t, &[(base, P), (base + 1, 0)]);
+    assert_eq!(
+        pm(&mut t, SELF_THREAD, n, 20),
+        Outcome::Return(P.cast_signed())
+    );
+    let n = put(&mut t, &[(base + 1, 0), (base, P)]);
+    assert_eq!(pm(&mut t, SELF_THREAD, n, 20), neg(Errno::EINVAL));
+    let n = put(&mut t, &[(base + 3 * P, P)]);
+    // The advice is judged per segment: an empty vector is 0 whatever it is.
+    assert_eq!(pm(&mut t, SELF_GROUP, 0, 12), Outcome::Return(0));
+    assert_eq!(pm(&mut t, SELF_GROUP, n, 12), neg(Errno::EINVAL));
+    // A leader that has exited has no address space left: ESRCH for the group, not the thread.
+    let leader = t.tasks.group_leader(t.current);
+    t.tasks.task_mut(leader).unwrap().exit_state = crate::task::tasklist::ExitState::Zombie;
+    assert_eq!(pm(&mut t, SELF_GROUP, n, 20), neg(Errno::ESRCH));
+    assert_eq!(pm(&mut t, SELF_THREAD, n, 20), neg(Errno::ENOMEM));
 }

@@ -1345,26 +1345,31 @@ impl Tables {
         freed
     }
 
-    /// `madvise_guard_install`: every page of the range becomes a guard marker. Populated pages
-    /// are zapped first (`zap_page_range_single`: their data is gone), markers already there
-    /// stay, page tables are allocated for the rest.
+    /// `madvise_guard_install`: every page of the range becomes a guard marker. A populated page
+    /// is zapped just before its marker is written (`zap_page_range_single`: its data is gone),
+    /// markers already there stay, page tables are allocated for the rest.
     ///
     /// # Errors
-    /// Table exhaustion (`Error::Memory`): the pages before the failing one are guards.
+    /// Table exhaustion (`Error::Memory`): the pages before the failing one are guards, the
+    /// others (data included) are as they were.
     pub fn mm_install_guards(
         &mut self,
         allocator: &mut Allocator<'_>,
         start: u64,
         pages: u64,
     ) -> Result<(), Error> {
-        self.mm_zap(allocator, start, pages);
         for done in 0..pages {
             let page = done
                 .checked_mul(PAGE)
                 .and_then(|n| start.checked_add(n))
                 .ok_or(Error::Overflow)?;
-            if matches!(self.mm_lookup(page), kernel::mm::Pte::Guard) {
-                continue;
+            match self.mm_lookup(page) {
+                kernel::mm::Pte::Guard => continue,
+                kernel::mm::Pte::Absent => {}
+                // Zapping page by page keeps the data of the pages after a failing one.
+                kernel::mm::Pte::ZeroPage | kernel::mm::Pte::Anon { .. } => {
+                    self.mm_zap(allocator, page, 1);
+                }
             }
             // `guard_install_set_pte`: the marker is written into an empty slot; the hardware
             // never walks a non-present entry, so no invalidation is needed.

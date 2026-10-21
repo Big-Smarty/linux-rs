@@ -127,7 +127,7 @@ pub fn madvise_range(start: u64, len_in: u64, behavior: i32) -> Result<Option<u6
 
 impl Mm {
     /// `madvise_walk_vmas` over `[start, end)` (both page aligned, `start < end`, as
-    /// [`madvise_range`] returns) for every advice but `MADV_POPULATE_*`.
+    /// [`madvise_range`] returns) for every advice but `MADV_POPULATE_*` (refused with `EINVAL`).
     ///
     /// # Errors
     /// Linux's: `ENOMEM` for a hole in the range (after the rest was done) or a failed split,
@@ -231,7 +231,7 @@ impl Mm {
     ) -> Result<usize, Madvise> {
         let v = self.vmas[idx];
         let old = v.flags;
-        let new = match behavior {
+        let mut new = match behavior {
             MADV_NORMAL => old & !(VmFlags::RAND_READ | VmFlags::SEQ_READ),
             MADV_SEQUENTIAL => (old & !VmFlags::RAND_READ) | VmFlags::SEQ_READ,
             MADV_RANDOM => (old & !VmFlags::SEQ_READ) | VmFlags::RAND_READ,
@@ -256,21 +256,23 @@ impl Mm {
                 old & !VmFlags::WIPEONFORK
             }
             MADV_DONTDUMP => old | VmFlags::DONTDUMP,
-            _ => {
-                debug_assert_eq!(behavior, MADV_DODUMP);
+            MADV_DODUMP => {
                 // (A hugetlb VMA may be dumped whatever its flags; none exists here.)
                 if old.intersects(VmFlags::SPECIAL) || old.contains(VmFlags::DROPPABLE) {
                     return Err(Errno::EINVAL.into());
                 }
                 old & !VmFlags::DONTDUMP
             }
+            // `MADV_POPULATE_*` is the system call layer's (`madvise_do_behavior` runs it before
+            // the walk); the model refuses it instead of guessing an action.
+            _ => return Err(Errno::EINVAL.into()),
         };
         // madvise_update_vma
         if new == old {
             return Ok(idx);
         }
         let at = self
-            .vma_modify(env, idx, start, end, new)
+            .vma_modify(env, idx, start, end, &mut new)
             .map_err(|errno| {
                 if errno == Errno::ENOMEM {
                     Errno::EAGAIN

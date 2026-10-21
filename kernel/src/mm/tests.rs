@@ -2537,6 +2537,59 @@ fn vm_maybe_guard_is_sticky_and_never_blocks_a_merge() {
     w.check_invariants();
 }
 
+/// src: mm/vma.c:1696-1703 (`vma_modify_flags` hands the merged VMA's flags back through
+/// `vm_flags_ptr`, "sticky flags may have been retained"), mm/madvise.c:165-186
+/// (`madvise_update_vma`), mm/mprotect.c (`mprotect_fixup`): a flag change that merges into a
+/// neighbour that may hold guards keeps `VM_MAYBE_GUARD`, for `madvise` and `mprotect` alike.
+#[test]
+fn a_flag_change_that_merges_into_a_guarded_neighbour_keeps_the_sticky_flag() {
+    let mut w = W::new();
+    let at = 0x5000_0000_0000;
+    // madvise: the neighbour has DONTFORK and a guard; the new flags make the other half equal.
+    let a = w.map(at, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    w.madvise(a, 2 * P, MADV_DONTFORK).unwrap();
+    w.madvise(a, P, MADV_GUARD_INSTALL).unwrap();
+    let b = w.map(a + 2 * P, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    assert_eq!(w.mm.find_vma(b).unwrap().start, b, "not merged yet");
+    w.madvise(b, 2 * P, MADV_DONTFORK).unwrap();
+    let merged = *w.mm.find_vma(b).unwrap();
+    assert_eq!((merged.start, merged.end), (a, a + 4 * P));
+    assert!(merged.flags.contains(VmFlags::MAYBE_GUARD), "{merged:?}");
+    // mprotect: the same through the other caller of `vma_modify`.
+    let c = w.map(at + 0x100_0000, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    w.madvise(c, P, MADV_GUARD_INSTALL).unwrap();
+    let d = w
+        .map(c + 2 * P, 2 * P, PROT_READ, ANON | MAP_FIXED)
+        .unwrap();
+    assert_eq!(w.mm.find_vma(d).unwrap().start, d, "not merged yet");
+    w.mprotect(d, 2 * P, RW).unwrap();
+    let merged = *w.mm.find_vma(d).unwrap();
+    assert_eq!((merged.start, merged.end), (c, c + 4 * P));
+    assert!(merged.flags.contains(VmFlags::MAYBE_GUARD), "{merged:?}");
+    w.check_invariants();
+}
+
+/// src: mm/gup.c:1925-1990 (`__mm_populate` with `ignore_errors`), `populate_vma_page_range`:
+/// the first page that cannot be faulted in (a guard marker) ends its VMA, the pages after it
+/// are not populated, the next VMA is.
+#[test]
+fn populate_ends_a_vma_at_the_first_page_that_fails() {
+    let mut w = W::new();
+    let a = w
+        .map(0x5000_0000_0000, 4 * P, RW, ANON | MAP_FIXED)
+        .unwrap();
+    let b = w
+        .map(a + 4 * P, 2 * P, PROT_READ, ANON | MAP_FIXED)
+        .unwrap();
+    w.madvise(a + P, P, MADV_GUARD_INSTALL).unwrap();
+    w.mm.populate(&mut w.pt, a, 6 * P);
+    let kinds: Vec<Pte> = (0..6).map(|i| w.pt.lookup(a + i * P)).collect();
+    assert_eq!(kinds[1], Pte::Guard);
+    assert_ne!(kinds[0], Pte::Absent);
+    assert_eq!((kinds[2], kinds[3]), (Pte::Absent, Pte::Absent));
+    assert_ne!(w.pt.lookup(b), Pte::Absent, "the next VMA is populated");
+}
+
 /// src: kernel/fork.c `dup_mmap` (`VM_DONTCOPY`, `VM_WIPEONFORK`) and mm/mmap.c
 /// `vm_stat_account` (oracle `madvise.dontfork-*`, `wipeonfork-*`).
 #[test]
@@ -2682,7 +2735,16 @@ fn zap_keeps_markers_and_unmap_drops_them() {
     );
     assert_eq!(pt.unmap(0x1000, 3), 0);
     assert_eq!(pt.lookup(0x1000), Pte::Absent);
-    // Table exhaustion: the pages before the failing one are guards.
+    // Table exhaustion: the pages before the failing one are guards, the data after it stays.
+    pt.map_anon_page(
+        0x12_000,
+        PageProt {
+            accessible: true,
+            write: true,
+            exec: false,
+        },
+    )
+    .unwrap();
     pt.fail_maps = Some(2);
     assert_eq!(pt.install_guards(0x10_000, 4), Err(OutOfMemory));
     assert_eq!(
@@ -2691,6 +2753,6 @@ fn zap_keeps_markers_and_unmap_drops_them() {
             pt.lookup(0x11_000),
             pt.lookup(0x12_000)
         ),
-        (Pte::Guard, Pte::Guard, Pte::Absent)
+        (Pte::Guard, Pte::Guard, Pte::Anon { writable: true })
     );
 }

@@ -247,7 +247,9 @@ impl Mm {
     /// `mm_populate` / `__mm_populate` with `ignore_errors`: fault in the
     /// pages of `[start, start + len)` that lie in accessible anonymous VMAs,
     /// writing where `populate_vma_page_range` sets `FOLL_WRITE`
-    /// (`(vm_flags & (VM_WRITE | VM_SHARED)) == VM_WRITE`). Errors are ignored.
+    /// (`(vm_flags & (VM_WRITE | VM_SHARED)) == VM_WRITE`). Errors are ignored, but the first
+    /// failing page (a guard marker, no memory) ends its VMA: `__get_user_pages` stops there and
+    /// the retry at that page fails with nothing done, so `ignore_errors` moves to the next VMA.
     pub fn populate(&mut self, pt: &mut (impl UserPages + ?Sized), start: u64, len: u64) {
         let end = start.saturating_add(len);
         let mut idx = self.lower(start);
@@ -262,7 +264,9 @@ impl Mm {
                 let write = (v.flags & (VmFlags::WRITE | VmFlags::SHARED)) == VmFlags::WRITE;
                 let mut a = v.start.max(page_floor(start));
                 while a < v.end.min(end) {
-                    let _ = self.fault_one(pt, idx, a, write);
+                    if self.fault_one(pt, idx, a, write).is_err() {
+                        break;
+                    }
                     a += PAGE_SIZE;
                 }
             }

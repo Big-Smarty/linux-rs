@@ -1704,5 +1704,163 @@ fn process_madvise(t: &mut T) {
         pm(0, addr(&iov), 1, 12, 0),
         Err(Errno::EBADF),
     );
+    self_pidfds(t, a);
     unmap(a, 2);
+}
+
+/// `pidfd_get_task` serves `PIDFD_SELF_THREAD` (-10000) and `PIDFD_SELF_THREAD_GROUP` (-10001)
+/// without a file: the advice runs on the caller's own address space (`mm == current->mm`, no
+/// remote checks) and `vector_madvise` returns the bytes advised, stopping at the first error.
+/// `a` is a two-page anonymous read/write mapping (window 0).
+fn self_pidfds(t: &mut T, a: usize) {
+    /// The thread group's leader once it has exited has no `mm` (`get_task_mm` is NULL): `ESRCH`,
+    /// while the thread itself still has one. The leader's exit is waited for by polling.
+    fn worker(control: &'static Control) -> usize {
+        let a = control.arg;
+        let iov = [a, P];
+        let group = |iov: &[usize; 2]| {
+            sys(
+                Sysno::process_madvise,
+                &[-10001isize as usize, addr(iov), 1, COLD, 0],
+            )
+        };
+        let mut gone = 0;
+        for _ in 0..2000 {
+            if group(&iov) == Err(Errno::ESRCH) {
+                gone = 1;
+                break;
+            }
+            super::proc::nap(1);
+        }
+        let own = sys(
+            Sysno::process_madvise,
+            &[-10000isize as usize, addr(&iov), 1, COLD, 0],
+        ) == Ok(P);
+        super::threads::exit_group(gone | usize::from(own) << 1)
+    }
+
+    const SELF_THREAD: usize = -10000isize as usize;
+    const SELF_GROUP: usize = -10001isize as usize;
+    let pm = |pidfd: usize, vec: &[usize], vlen: usize, advice: usize| {
+        sys(Sysno::process_madvise, &[pidfd, addr(vec), vlen, advice, 0])
+    };
+    let whole = [a, 2 * P];
+    t.eq("self-thread", pm(SELF_THREAD, &whole, 1, COLD), Ok(2 * P));
+    t.eq("self-group", pm(SELF_GROUP, &whole, 1, COLD), Ok(2 * P));
+    // `int pidfd`: the register's upper half is dropped.
+    t.eq(
+        "self-thread-is-an-int",
+        pm((1 << 32) | (SELF_THREAD & 0xffff_ffff), &whole, 1, COLD),
+        Ok(2 * P),
+    );
+    // Neighbouring negative values are no descriptor: `FD_PIDFS_ROOT`, `FD_NSFS_ROOT`, -10002.
+    t.eq(
+        "self-neighbour-pidfs-root",
+        pm(-10002isize as usize, &whole, 1, COLD),
+        Err(Errno::EBADF),
+    );
+    t.eq(
+        "self-neighbour-below",
+        pm(-9999isize as usize, &whole, 1, COLD),
+        Err(Errno::EBADF),
+    );
+    t.eq("self-empty-vector", pm(SELF_THREAD, &[], 0, COLD), Ok(0));
+    // The advice is not looked at for an empty vector, but for the first segment.
+    t.eq(
+        "self-empty-vector-bad-advice",
+        pm(SELF_GROUP, &[], 0, 12),
+        Ok(0),
+    );
+    t.eq("self-bad-advice", pm(SELF_GROUP, &whole, 1, 12), E_INVAL);
+    // The effect: `MADV_DONTNEED` empties the pages of the segments.
+    fill(a, 2 * P, 3);
+    t.eq(
+        "self-dontneed-two-segments",
+        pm(SELF_THREAD, &[a, P, a + P, P], 2, DONTNEED),
+        Ok(2 * P),
+    );
+    t.holds("self-dontneed-zeroes", zeroed(a, 2 * P), "other", "zero");
+    // A zero-length segment is skipped and adds nothing.
+    t.eq(
+        "self-zero-length-segment",
+        pm(SELF_GROUP, &[a, 0, a, P, a, 0], 3, COLD),
+        Ok(P),
+    );
+    // The loop runs while bytes are left: trailing empty segments are never looked at, a leading
+    // one is judged like any other.
+    t.eq(
+        "self-only-zero-length-segments",
+        pm(SELF_GROUP, &[a, 0, a + 1, 0], 2, COLD),
+        Ok(0),
+    );
+    t.eq(
+        "self-trailing-zero-length-segment-is-not-judged",
+        pm(SELF_GROUP, &[a, P, a + 1, 0], 2, COLD),
+        Ok(P),
+    );
+    t.eq(
+        "self-leading-zero-length-segment-is-judged",
+        pm(SELF_GROUP, &[a + 1, 0, a, P], 2, COLD),
+        E_INVAL,
+    );
+    // The first error ends the walk; the bytes done before it are the result.
+    fill(a, 2 * P, 3);
+    t.eq(
+        "self-first-segment-fails",
+        pm(SELF_THREAD, &[a + 1, P, a, P], 2, DONTNEED),
+        E_INVAL,
+    );
+    t.holds(
+        "self-first-segment-fails-kept-all",
+        striped(a, 2 * P, 3),
+        "other",
+        "untouched",
+    );
+    t.eq(
+        "self-second-segment-fails-returns-bytes-done",
+        pm(SELF_THREAD, &[a, P, a + 1, P, a + P, P], 3, DONTNEED),
+        Ok(P),
+    );
+    t.holds(
+        "self-second-segment-fails-stops",
+        zeroed(a, P) && striped(a + P, P, 3),
+        "other",
+        "page 0 only",
+    );
+    t.eq(
+        "self-hole-first",
+        pm(SELF_THREAD, &[a + 2 * P, P], 1, COLD),
+        E_NOMEM,
+    );
+    t.eq(
+        "self-hole-second-returns-bytes-done",
+        pm(SELF_THREAD, &[a, P, a + 2 * P, P, a, P], 3, COLD),
+        Ok(P),
+    );
+    // A hole inside one segment is reported after the rest was done, so nothing is "done".
+    t.eq(
+        "self-hole-inside-a-segment",
+        pm(SELF_THREAD, &[a, 3 * P, a, P], 2, COLD),
+        E_NOMEM,
+    );
+    t.eq(
+        "self-populate-write",
+        pm(SELF_GROUP, &whole, 1, POPULATE_WRITE),
+        Ok(2 * P),
+    );
+    t.eq("self-guard-install", madv(a + P, P, GUARD_INSTALL), Ok(0));
+    t.eq(
+        "self-populate-stops-at-the-guard",
+        pm(SELF_THREAD, &[a, P, a, 2 * P, a, P], 3, POPULATE_WRITE),
+        Ok(P),
+    );
+    t.eq("self-guard-remove", madv(a + P, P, GUARD_REMOVE), Ok(0));
+    t.eq(
+        "self-group-after-the-leader-exited",
+        child(|| {
+            let _ = spawn_thread(worker, a);
+            super::threads::exit_thread(0)
+        }),
+        exited(3),
+    );
 }
