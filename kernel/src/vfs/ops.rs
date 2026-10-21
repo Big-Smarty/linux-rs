@@ -1537,9 +1537,14 @@ impl Vfs {
     pub fn take_pipe_events(&mut self) -> bool {
         let changed = self.pipe_events != self.pipe_events_seen;
         self.pipe_events_seen = self.pipe_events;
-        // A change of the mount table wakes the `poll` sleepers on `mounts`/`mountinfo`
-        // (`touch_mnt_namespace`'s `wake_up_interruptible(&ns->poll)`), who share the key.
-        self.fs.ns.take_event() || changed
+        changed
+    }
+
+    /// Whether the mount table changed since the last call: the owner of the scheduler then
+    /// wakes the `poll` sleepers on `mounts`/`mountinfo` (`touch_mnt_namespace`'s
+    /// `wake_up_interruptible(&ns->poll)`), and no pipe sleeper.
+    pub fn take_mount_events(&mut self) -> bool {
+        self.fs.ns.take_event()
     }
 
     /// Shared access for the syscall layer.

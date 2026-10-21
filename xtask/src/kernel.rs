@@ -1057,6 +1057,21 @@ const SUITE_CASES: &[DebugCase] = &[
         framebuffers: 2,
         plat: Q35_TCG,
     },
+    // The BusyBox module is on the stick but `qemu64` has no XSAVE or AVX-512: the group is
+    // unavailable for the CPU's sake, and nothing else runs.
+    DebugCase {
+        name: "baremetal-suite-busybox-cpu",
+        cmdline: Some("suite_pause_ms=50 suite_groups=busybox"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: &[Module::Archive, Module::Busybox],
+        user: User::Suite(suite::BUSYBOX_CPU),
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    // The host CPU with the BusyBox module: `xstate`, `procfs` and `busybox` run and pass.
     DebugCase {
         name: "baremetal-suite-kvm",
         cmdline: Some("suite_pause_ms=50"),
@@ -1064,7 +1079,7 @@ const SUITE_CASES: &[DebugCase] = &[
         expected_exit: 33,
         required: SUCCESS_MARKERS,
         forbid_success: false,
-        modules: ARCHIVE_ONLY,
+        modules: &[Module::Archive, Module::Busybox],
         user: User::Suite(suite::ALL_PASS_HOST),
         framebuffers: 1,
         plat: Platform {
@@ -3511,6 +3526,7 @@ struct Fixtures {
 }
 
 /// The generated `busybox.cpio` and the evidence of the program inside it.
+#[derive(Clone)]
 struct BusyboxModule {
     /// SHA-256 of the host program (`fixture::BUSYBOX_HOST_PATH`) copied into the module.
     program_sha256: String,
@@ -4015,6 +4031,13 @@ fn unavailable_reason(case: &DebugCase, tools: &QemuTools) -> Option<String> {
         )
     {
         return Some(format!("the host CPU lacks {flag}"));
+    }
+    // A suite run that expects `busybox` to pass needs the host CPU's x86-64-v4 AVX-512 as well.
+    if matches!(case.user, User::Suite(groups) if groups.contains(&("busybox", suite::Expect::Pass)))
+        && let Err(reason) =
+            fixture::busybox_cpu(&fs::read_to_string("/proc/cpuinfo").unwrap_or_default())
+    {
+        return Some(reason);
     }
     if case.modules.contains(&Module::Busybox)
         && let Err(reason) = &tools.fixtures.busybox

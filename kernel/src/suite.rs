@@ -23,17 +23,29 @@
 pub const ORACLE_EXPECTED: &[u8] = include_bytes!("../../xtask/oracle/expected.tsv");
 
 /// Oracle groups the kernel can run today, in run order. `xstate` drives AVX-512 and the
-/// protection keys: on a CPU without them it is reported unavailable, not failed
-/// (`baremetal::unavailable_reason`).
-pub const GROUPS: [&str; 11] = [
+/// protection keys, `busybox` runs the host's x86-64-v4 `BusyBox` from a second initramfs module:
+/// where the CPU or the stick lacks what they need they are reported unavailable, not failed
+/// (`baremetal::unavailable_reason`). `tty`, `ttyin` and `ttykbd` are not here: they drive the
+/// console device itself (a serial line, the PS/2 keyboard), which the suite's framebuffer console
+/// on a physical machine is not.
+pub const GROUPS: [&str; 13] = [
     "ids", "time", "mm", "fs", "names", "signal", "fork", "proc", "jobctl", "pipe", "xstate",
+    "procfs", "busybox",
 ];
 
 /// Oracle groups that exist in `user/init` but are not run, with the reason
-/// that appears on the summary screen. None today: `proc` needed pipes between
-/// tasks, `poll` and job control, not procfs, and runs since the
-/// [job-control lane](../../docs/implementation.md#pipes-poll-and-job-control).
-pub const UNSUPPORTED: [(&str, &str); 0] = [];
+/// that appears on the summary screen. The three tty groups test the console tty through a
+/// device the harness drives from outside (the recorded rows come from a serial console, a
+/// serial-port input driver and QMP `send-key` at the PS/2 controller); the suite's console on
+/// a physical machine is the framebuffer, so they would compare nothing meaningful there.
+pub const UNSUPPORTED: [(&str, &str); 3] = [
+    (
+        "tty",
+        "console-specific (rows recorded on a serial console)",
+    ),
+    ("ttyin", "needs a driver at the serial port"),
+    ("ttykbd", "needs scripted PS/2 keys (QMP send-key)"),
+];
 
 /// Longest line text kept for a report; longer lines are cut (and end in `~`).
 pub const LINE_MAX: usize = 100;

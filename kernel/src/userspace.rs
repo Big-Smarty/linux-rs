@@ -83,7 +83,7 @@ use kernel::{
         view::Collect,
     },
     ratelimit::RateLimit,
-    sched::{CLASS_VFORK, PIPE_KEY, SchedId, TaskState, WaitKey, WakeMode},
+    sched::{CLASS_VFORK, PIPE_KEY, POLL_KEY, SchedId, TaskState, WaitKey, WakeMode},
     signal::{
         self, SIGSTOP, State,
         deliver::{self, Outcome as SignalOutcome},
@@ -574,7 +574,8 @@ impl Waker for SchedWaker {
 
 /// A pipe changed (data written or consumed, an end closed, the capacity
 /// changed) since the last look: wake its sleepers (`wake_up_interruptible` on
-/// `rd_wait`/`wr_wait`, and the `poll` sleepers, which share the key). The
+/// `rd_wait`/`wr_wait`) and the `poll` sleepers (their own key, so a tty or mount
+/// event never wakes a pipe reader). The
 /// pure VFS only counts the changes ([`Vfs::take_pipe_events`]); this runs
 /// before a task sleeps itself (what it just wrote may be what the others wait
 /// for), when a system call ends, and when a task exits. Takes `RQ` under the
@@ -585,14 +586,20 @@ fn wake_sleepers(process: &mut Process) {
     } = process;
     // The count of files on the console tty (`tty->count`) and its last close.
     syscall::tty::housekeeping(vfs, tty, tasks);
-    if vfs.take_pipe_events() {
+    let pipes = vfs.take_pipe_events();
+    // A change of the mount table wakes the `poll` sleepers on `mounts`/`mountinfo`.
+    let mounts = vfs.take_mount_events();
+    if pipes {
         ktask::wake_up_key(PIPE_KEY, WakeMode::Interruptible, 0);
     }
     // A change of the tty (input, output drained, termios) wakes its readers
-    // and writers, and the `poll` sleepers, who share the pipes' key.
-    if tty.take_events() {
+    // and writers, and the `poll` sleepers.
+    let console = tty.take_events();
+    if console {
         ktask::wake_up_key(kernel::sched::TTY_KEY, WakeMode::Interruptible, 0);
-        ktask::wake_up_key(PIPE_KEY, WakeMode::Interruptible, 0);
+    }
+    if pipes || mounts || console {
+        ktask::wake_up_key(POLL_KEY, WakeMode::Interruptible, 0);
     }
 }
 
@@ -3147,7 +3154,11 @@ pub fn run(user: Result<Loaded, Error>) {
 /// so the group's uptime bounds count from there; `ram`: bytes of RAM the
 /// memory map declares, the ceiling of `ids.sysinfo-ram` on any machine).
 /// The module payloads are unreadable once the owned tables are active, so the
-/// suite keeps heap copies (`baremetal::retain_archives`).
+/// suite keeps heap copies (`baremetal::retain_archives`). Module 0 is the
+/// harness archive every group unpacks; module 1, the `busybox` group's program
+/// and data files, is unpacked for that group only, as the oracle's own boots do:
+/// its `/bin`, `/bb` and `/tmp` would change the root directory that `fs.stat-root`
+/// and `fs.getdents-root-order` of the other groups compare with the pinned Linux's.
 ///
 /// Context: BSP, IF clear, no group running, no lock held. Locks `TABLES`
 /// for the load (`TABLES` -> heap -> `FRAMES`, the documented order).
@@ -3171,7 +3182,12 @@ pub fn load_group(
         }
     }
     let mut rootfs = new_rootfs()?;
-    for (index, bytes) in archives.iter().enumerate() {
+    let wanted = if group == "busybox" {
+        archives.len()
+    } else {
+        1
+    };
+    for (index, bytes) in archives.iter().enumerate().take(wanted) {
         rootfs.unpack(index, bytes);
     }
     // "-- <group> <decimal uptime> <decimal ram>", at most 20 digits each.

@@ -111,6 +111,29 @@ fn wake_up_key_wakes_only_that_key_newest_non_exclusive_first() {
 }
 
 #[test]
+fn pipe_readers_pollers_and_tty_sleepers_have_their_own_keys() {
+    use TaskState::Interruptible as I;
+    assert!(PIPE_KEY != POLL_KEY && POLL_KEY != TTY_KEY && PIPE_KEY != TTY_KEY);
+    let mut rq = rq(8);
+    let [reader, poller, console] = [(); 3].map(|()| spawn(&mut rq));
+    sleep_in_order(
+        &mut rq,
+        &[
+            (reader, PIPE_KEY, false, I),
+            (poller, POLL_KEY, false, I),
+            (console, TTY_KEY, false, I),
+        ],
+    );
+    // What a tty write or a mount wakes (the console's sleepers and the pollers) leaves a task
+    // blocked in `read(2)` of a pipe asleep: it must not show as running in /proc.
+    assert_eq!(rq.wake_up_key(TTY_KEY, WakeMode::Interruptible, 0), 1);
+    assert_eq!(rq.wake_up_key(POLL_KEY, WakeMode::Interruptible, 0), 1);
+    assert_eq!(rq.state(reader), Some(I));
+    assert_eq!(rq.wake_up_key(PIPE_KEY, WakeMode::Interruptible, 0), 1);
+    assert_eq!(rq.state(reader), Some(TaskState::Running));
+}
+
+#[test]
 fn exclusive_waiters_queue_behind_and_wake_oldest_first_up_to_the_count() {
     use TaskState::Interruptible as I;
     let mut rq = rq(8);

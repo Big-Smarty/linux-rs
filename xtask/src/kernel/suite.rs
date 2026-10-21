@@ -30,12 +30,20 @@ pub(super) enum Expect {
     Pass,
     /// Ends abnormally or differs (the probes).
     Fail,
-    /// Not run because the CPU lacks what the group drives: neither a pass nor a failure.
-    Unavailable,
+    /// Not run because the CPU or the stick lacks what the group needs: neither a pass nor a
+    /// failure. The text is the start of the kernel's reason (`baremetal::unavailable_reason`),
+    /// [`CPU_LACKS`] or [`NO_BUSYBOX`].
+    Unavailable(&'static str),
 }
 
+/// The start of the reason of a group the CPU cannot run (`the CPU has no avx512f`).
+pub(super) const CPU_LACKS: &str = "the CPU has no ";
+/// The reason of `busybox` on a stick without the `BusyBox` module.
+pub(super) const NO_BUSYBOX: &str = "no busybox module on the stick";
+
 /// The groups of a normal run on a CPU model without AVX-512 and protection keys (QEMU TCG
-/// `qemu64`), in the kernel's order: all pass except `xstate`, which is unavailable.
+/// `qemu64`) from a stick without the `BusyBox` module, in the kernel's order: all pass except
+/// `xstate` (the CPU) and `busybox` (the stick), which are unavailable.
 pub(super) const ALL_PASS: &[(&str, Expect)] = &[
     ("ids", Expect::Pass),
     ("time", Expect::Pass),
@@ -47,9 +55,15 @@ pub(super) const ALL_PASS: &[(&str, Expect)] = &[
     ("proc", Expect::Pass),
     ("jobctl", Expect::Pass),
     ("pipe", Expect::Pass),
-    ("xstate", Expect::Unavailable),
+    ("xstate", Expect::Unavailable(CPU_LACKS)),
+    ("procfs", Expect::Pass),
+    ("busybox", Expect::Unavailable(NO_BUSYBOX)),
 ];
-/// The same on a host CPU (`-cpu host` with AVX-512 and PKU): `xstate` runs and passes.
+/// `busybox` alone, from a stick that has the module, on a CPU without XSAVE and AVX-512 (TCG
+/// `qemu64`): the module is there, so the CPU is the reason.
+pub(super) const BUSYBOX_CPU: &[(&str, Expect)] = &[("busybox", Expect::Unavailable(CPU_LACKS))];
+/// The same on a host CPU (`-cpu host` with AVX-512 and PKU) from a stick with the `BusyBox`
+/// module: `xstate` and `busybox` run and pass.
 pub(super) const ALL_PASS_HOST: &[(&str, Expect)] = &[
     ("ids", Expect::Pass),
     ("time", Expect::Pass),
@@ -62,6 +76,8 @@ pub(super) const ALL_PASS_HOST: &[(&str, Expect)] = &[
     ("jobctl", Expect::Pass),
     ("pipe", Expect::Pass),
     ("xstate", Expect::Pass),
+    ("procfs", Expect::Pass),
+    ("busybox", Expect::Pass),
 ];
 /// A run that selects six probes ending abnormally (a SIGSEGV, an unimplemented
 /// syscall, a loop that outruns the one-second group bound, that loop in a child while init
@@ -143,7 +159,7 @@ pub(super) fn validate(
     for &(group, expect) in groups {
         cursor = check_group(lines, group, expect, cursor)?;
         passed += usize::from(expect == Expect::Pass);
-        unavailable += usize::from(expect == Expect::Unavailable);
+        unavailable += usize::from(matches!(expect, Expect::Unavailable(_)));
     }
     let ok = passed + unavailable == groups.len();
     let complete = format!(
@@ -172,7 +188,7 @@ pub(super) fn validate(
         )
     } else if ok {
         format!(
-            "RESULT: ALL PASS ({passed} groups, {unavailable} unavailable on this CPU, {} self-tests)",
+            "RESULT: ALL PASS ({passed} groups, {unavailable} unavailable, {} self-tests)",
             PROOFS.len()
         )
     } else {
@@ -211,7 +227,7 @@ fn check_group(
     expect: Expect,
     cursor: usize,
 ) -> Result<usize, String> {
-    if expect == Expect::Unavailable {
+    if let Expect::Unavailable(why) = expect {
         // Never started: the kernel says why (`baremetal::unavailable_reason`) and records it.
         let prefix = format!("SUITE group {group} result=");
         let end = lines[cursor..]
@@ -220,9 +236,11 @@ fn check_group(
             .map(|offset| offset + cursor)
             .ok_or_else(|| format!("group {group} has no result record"))?;
         let result = lines[end];
-        let reason = "cause=\"unavailable on this CPU: no ";
-        if record_field(result, "result") != Some("unavailable") || !result.contains(reason) {
-            return Err(format!("group {group} must be unavailable: {result}"));
+        let reason = format!("cause=\"unavailable: {why}");
+        if record_field(result, "result") != Some("unavailable") || !result.contains(&reason) {
+            return Err(format!(
+                "group {group} must be unavailable (`{why}...`): {result}"
+            ));
         }
         if lines[cursor..end]
             .iter()
@@ -374,8 +392,20 @@ pub(super) fn record(
 }
 
 /// The `limine.conf` of the stick: a visible menu with a countdown, one entry,
-/// no forced video mode (the firmware's own mode, whatever the monitor is).
-const LIMINE_CONF: &str = "timeout: 5\n\n/linux-rs bare-metal suite (A21)\n    protocol: limine\n    path: boot():/linux-rs-kernel\n    module_path: boot():/initramfs.cpio\n    module_string: initramfs.cpio\n";
+/// no forced video mode (the firmware's own mode, whatever the monitor is). The command line
+/// spells out the kernel's defaults (`baremetal::DEFAULT_PAUSE_MS`, `DEFAULT_TIMEOUT_S`) so
+/// that `/proc/cmdline`, which the `procfs` group's `cmdline-*` rows read, is not empty; the
+/// pinned Linux recorded those rows with a non-empty command line. The `BusyBox` module is
+/// listed only when the tree has it (`busybox` is `unavailable` without).
+fn limine_conf(busybox: bool) -> String {
+    let mut conf = String::from(
+        "timeout: 5\n\n/linux-rs bare-metal suite (A21)\n    protocol: limine\n    path: boot():/linux-rs-kernel\n    cmdline: suite_pause_ms=6000 suite_timeout_s=120\n    module_path: boot():/initramfs.cpio\n    module_string: initramfs.cpio\n",
+    );
+    if busybox {
+        conf.push_str("    module_path: boot():/busybox.cpio\n    module_string: busybox.cpio\n");
+    }
+    conf
+}
 
 /// The source commit, marked when the tree has uncommitted changes: what the
 /// summary screen prints as the build.
@@ -388,7 +418,32 @@ pub(super) fn build_id(root: &Path) -> String {
     )
 }
 
-fn readme(id: &str, kernel_sha: &str) -> String {
+/// The README's file line, the `cp` argument and the `BUSYBOX` paragraph of a tree with (or
+/// without) the `BusyBox` module.
+fn busybox_readme(
+    busybox: &Result<super::BusyboxModule, String>,
+) -> (&'static str, &'static str, String) {
+    match busybox {
+        Ok(module) => (
+            "  busybox.cpio           generated archive holding the host's BusyBox (see BUSYBOX)\n",
+            "busybox.cpio ",
+            format!(
+                "\nBUSYBOX\n  This tree carries busybox.cpio: the BusyBox v1.36.1 program that was installed at\n  /usr/bin/busybox on the machine that built the tree (sha256 {}),\n  its applet links and the group's data files. It is the exact program the pinned\n  Linux's output was recorded with; it is read at build time and never committed.\n  The group `busybox` runs real BusyBox commands as a fresh /init and compares each\n  command's exit status and output with the pinned Linux's. The program is built\n  for x86-64-v4, so the group runs only where the CPU has XSAVE, AVX-512\n  F/BW/CD/DQ/VL and RDSEED or RDRAND; otherwise it is N/A (neither pass nor fail).\n",
+                module.program_sha256
+            ),
+        ),
+        Err(reason) => (
+            "",
+            "",
+            format!(
+                "\nBUSYBOX\n  This tree has no busybox.cpio ({reason}), so the group `busybox` is N/A\n  (neither pass nor fail) on the summary screen.\n"
+            ),
+        ),
+    }
+}
+
+fn readme(id: &str, kernel_sha: &str, busybox: &Result<super::BusyboxModule, String>) -> String {
+    let (busybox_files, copy_extra, busybox_note) = busybox_readme(busybox);
     format!(
         "\
 linux-rs bare-metal test suite (decision A21)
@@ -402,9 +457,13 @@ WHAT THIS IS
   with Limine 12.9.3 (the BOOTX64.EFI of your /usr/share/limine). The kernel
   runs its boot self-tests, prints a hardware inventory (CPU, memory map, ACPI,
   APIC/timers, framebuffers, PCI ids), runs the oracle syscall groups ids,
-  time, mm, fs, signal, fork, proc, jobctl and pipe each as a fresh /init on a fresh
-  rootfs, compares each group's output line by line with what the pinned
-  Linux 6.18.57 printed, and ends on a summary screen.
+  time, mm, fs, names, signal, fork, proc, jobctl, pipe, xstate, procfs and
+  busybox each as a fresh /init on a fresh rootfs, compares each group's output
+  line by line with what the pinned Linux 6.18.57 printed, and ends on a summary
+  screen. xstate (AVX-512 and protection keys) and busybox (an x86-64-v4 program)
+  run only on a CPU that has what they execute and are otherwise N/A.
+  The tty groups are not run: they test the console through a serial line and
+  scripted PS/2 keys, which a framebuffer console cannot be given.
 
 WHAT IT NEVER DOES
   It has no disk, USB-storage, network or sound driver and calls no firmware
@@ -434,10 +493,11 @@ WHAT YOU DO (the tool never writes to a block device; you do the copy)
      A desktop may automount it again after formatting: unmount that mount
      before step 3 (or use its mount point instead of /mnt below).
   3. Mount it and, from inside this directory (the one holding EFI/,
-     limine.conf, linux-rs-kernel and initramfs.cpio), copy the tree and
+     limine.conf, linux-rs-kernel and initramfs.cpio, and busybox.cpio if the
+     list under FILES has it), copy the tree and
      check the files:
          sudo mount /dev/sdX1 /mnt
-         sudo cp -r EFI limine.conf linux-rs-kernel initramfs.cpio /mnt/
+         sudo cp -r EFI limine.conf linux-rs-kernel initramfs.cpio {copy_extra}/mnt/
          sync
          (cd /mnt && sha256sum -c <this-directory>/SHA256SUMS)
          sudo umount /mnt
@@ -469,11 +529,12 @@ IF NOTHING APPEARS
 
 FILES
   EFI/BOOT/BOOTX64.EFI   Limine 12.9.3 (copy of /usr/share/limine/BOOTX64.EFI)
-  limine.conf            one entry, 5 s timeout, no forced resolution
+  limine.conf            one entry, 5 s timeout, no forced resolution; the command
+                         line repeats the kernel's defaults so /proc/cmdline is not empty
   linux-rs-kernel        the suite kernel (freestanding + baremetal-suite)
   initramfs.cpio         generated archive holding the harness /init
-  SHA256SUMS             sha256 of every file above
-"
+{busybox_files}  SHA256SUMS             sha256 of every file above
+{busybox_note}"
     )
 }
 
@@ -568,7 +629,10 @@ fn tree_image(
         disk_sha256_initial,
         kernel_image_sha256: verified["linux-rs-kernel"].clone(),
         limine_image_sha256: verified["EFI/BOOT/BOOTX64.EFI"].clone(),
-        module_image_sha256: vec![("initramfs.cpio", verified["initramfs.cpio"].clone())],
+        module_image_sha256: ["initramfs.cpio", "busybox.cpio"]
+            .into_iter()
+            .filter_map(|name| verified.get(name).map(|hash| (name, hash.clone())))
+            .collect(),
     })
 }
 
@@ -656,7 +720,18 @@ struct Tree {
     dir: PathBuf,
     id: String,
     /// `(path on the stick, sha256)`, in `SHA256SUMS` order.
-    hashes: [(&'static str, String); 4],
+    hashes: Vec<(&'static str, String)>,
+    /// The `BusyBox` module's evidence, or why the stick has none.
+    busybox: Result<super::BusyboxModule, String>,
+}
+
+impl Tree {
+    fn hash(&self, name: &str) -> &str {
+        self.hashes
+            .iter()
+            .find(|(file, _)| *file == name)
+            .map_or("", |(_, hash)| hash)
+    }
 }
 
 /// Write the tree the user copies, named exactly as on the stick, with its
@@ -683,28 +758,56 @@ fn stage_tree(output: &Output, tools: &QemuTools, suite_build: &Build) -> io::Re
         &tools.fixtures.dir.join(super::Module::Archive.file()),
         &tree.join("initramfs.cpio"),
     )?;
-    write_new(&tree.join("limine.conf"), LIMINE_CONF.as_bytes())?;
+    // The host's BusyBox goes onto the stick only as the exact program the rows were recorded
+    // with (`Fixtures::generate` checked it); the copy is verified against that module's hash.
+    let busybox = match &tools.fixtures.busybox {
+        Ok(module) => {
+            let hash = put(
+                output,
+                tools,
+                &tools.fixtures.dir.join(super::Module::Busybox.file()),
+                &tree.join("busybox.cpio"),
+            )?;
+            if hash != module.module_sha256 {
+                return Err(invalid(
+                    "busybox.cpio changed between generation and staging",
+                ));
+            }
+            Some(hash)
+        }
+        Err(_) => None,
+    };
+    write_new(
+        &tree.join("limine.conf"),
+        limine_conf(busybox.is_some()).as_bytes(),
+    )?;
     let conf = file_hash(
         &output.root,
         &tools.sha256sum.path,
         &tree.join("limine.conf"),
     )?;
-    let hashes = [
+    let mut hashes = vec![
         ("EFI/BOOT/BOOTX64.EFI", limine),
         ("limine.conf", conf),
         ("linux-rs-kernel", kernel.clone()),
         ("initramfs.cpio", initramfs),
     ];
+    hashes.extend(busybox.map(|hash| ("busybox.cpio", hash)));
     let mut sums = String::new();
     for (name, hash) in &hashes {
         writeln!(sums, "{hash}  {name}").map_err(io::Error::other)?;
     }
     write_new(&tree.join("SHA256SUMS"), sums.as_bytes())?;
-    write_new(&tree.join("README.txt"), readme(&id, &kernel).as_bytes())?;
+    let busybox = tools.fixtures.busybox.clone();
+    write_new(
+        &tree.join("README.txt"),
+        readme(&id, &kernel, &busybox).as_bytes(),
+    )?;
     Ok(Tree {
         dir: tree,
         id,
         hashes,
+        busybox,
     })
 }
 
@@ -740,7 +843,7 @@ fn write_report(report: &Report<'_>) -> io::Result<()> {
         ),
         (
             "tree_boot_machine",
-            "QEMU q35 TCG qemu64 512M, OVMF, std VGA, no serial",
+            "QEMU q35 TCG qemu64 512M, OVMF, std VGA, no serial (xstate unavailable: no XSAVE/AVX-512 on qemu64)",
         ),
         ("tree_boot_final_screen_format", format),
         (
@@ -766,6 +869,21 @@ fn write_report(report: &Report<'_>) -> io::Result<()> {
             &format!("sha256_{}", name.replace('/', "_")),
             hash,
         );
+    }
+    match &tree.busybox {
+        Ok(module) => {
+            manifest_value(
+                &mut manifest,
+                "sha256_busybox_program",
+                &module.program_sha256,
+            );
+            manifest_value(
+                &mut manifest,
+                "sha256_busybox_module",
+                &module.module_sha256,
+            );
+        }
+        Err(reason) => manifest_value(&mut manifest, "busybox_unavailable", reason),
     }
     manifest_value(&mut manifest, "sha256_init_elf", (*init_sha256).to_owned());
     manifest_value(
@@ -833,9 +951,9 @@ pub fn create(root: &Path, requested: &Path, timeout: Duration) -> io::Result<()
     if file_hash(&output.root, sha, &image.disk)? != image.disk_sha256_initial {
         return Err(invalid("the stick image changed during the QEMU boot"));
     }
-    let kernel = &tree.hashes[2].1;
-    if &file_hash(&output.root, sha, &tree.dir.join("linux-rs-kernel"))? != kernel
-        || &suite_build.elf_hash != kernel
+    let kernel = tree.hash("linux-rs-kernel");
+    if file_hash(&output.root, sha, &tree.dir.join("linux-rs-kernel"))? != kernel
+        || suite_build.elf_hash != kernel
     {
         return Err(invalid(
             "the kernel in the tree differs from the build snapshot",
@@ -902,6 +1020,7 @@ mod tests {
 
     /// A serial log the kernel would print for `groups` (a passing group repeats
     /// the pinned Linux's lines for it), with a correct digest.
+    #[allow(clippy::too_many_lines)] // one straight list of the lines the kernel prints
     fn log_of(groups: &[(&str, Expect)]) -> String {
         let mut log = String::from("firmware noise\n");
         let begin = log.len();
@@ -911,9 +1030,14 @@ mod tests {
         }
         let (mut passed, mut unavailable) = (0, 0);
         for &(group, expect) in groups {
-            if expect == Expect::Unavailable {
-                writeln!(log, "SUITE group {group} not run: the CPU has no avx512f").unwrap();
-                writeln!(log, "SUITE group {group} result=unavailable cause=\"unavailable on this CPU: no avx512f\" matched=0 expected=0 observed=0 mismatches=0 millis=0").unwrap();
+            if let Expect::Unavailable(why) = expect {
+                let reason = if why == NO_BUSYBOX {
+                    format!("{NO_BUSYBOX} (no matching host program)")
+                } else {
+                    format!("{why}avx512f")
+                };
+                writeln!(log, "SUITE group {group} not run: {reason}").unwrap();
+                writeln!(log, "SUITE group {group} result=unavailable cause=\"unavailable: {reason}\" matched=0 expected=0 observed=0 mismatches=0 millis=0").unwrap();
                 unavailable += 1;
                 continue;
             }
@@ -959,7 +1083,7 @@ mod tests {
         } else if ok {
             writeln!(
                 log,
-                "RESULT: ALL PASS ({passed} groups, {unavailable} unavailable on this CPU, {n} self-tests)"
+                "RESULT: ALL PASS ({passed} groups, {unavailable} unavailable, {n} self-tests)"
             )
             .unwrap();
         } else {
@@ -1011,6 +1135,7 @@ mod tests {
     fn a_log_the_kernel_would_print_is_accepted() {
         judge(&log_of(ALL_PASS), ALL_PASS).unwrap();
         judge(&log_of(ALL_PASS_HOST), ALL_PASS_HOST).unwrap();
+        judge(&log_of(BUSYBOX_CPU), BUSYBOX_CPU).unwrap();
         judge(&log_of(STOPS), STOPS).unwrap();
     }
 
@@ -1025,10 +1150,15 @@ mod tests {
         // An unavailable group is not a pass, and a group that ran is not unavailable.
         let error = judge(&log, &[("xstate", Expect::Pass)]).unwrap_err();
         assert!(error.contains("xstate"), "{error}");
-        let error = judge(&log, &[("ids", Expect::Unavailable)]).unwrap_err();
+        let error = judge(&log, &[("ids", Expect::Unavailable(CPU_LACKS))]).unwrap_err();
         assert!(error.contains("unavailable"), "{error}");
+        // The reason matters: a missing module is not a CPU limit, nor the reverse.
+        let error = judge(&log, &[("busybox", Expect::Unavailable(CPU_LACKS))]).unwrap_err();
+        assert!(error.contains("must be unavailable"), "{error}");
+        let error = judge(&log, &[("xstate", Expect::Unavailable(NO_BUSYBOX))]).unwrap_err();
+        assert!(error.contains("must be unavailable"), "{error}");
         // The summary counts it separately.
-        let error = judge(&log.replace("unavailable=1", "unavailable=0"), ALL_PASS).unwrap_err();
+        let error = judge(&log.replace("unavailable=2", "unavailable=1"), ALL_PASS).unwrap_err();
         assert!(error.contains("SUITE complete"), "{error}");
         // One character of the captured transcript changes: the digest no longer fits.
         let error =
@@ -1076,10 +1206,37 @@ mod tests {
 
     #[test]
     fn the_limine_config_has_one_entry_a_countdown_and_no_forced_mode() {
-        assert!(LIMINE_CONF.contains("timeout: 5"));
-        assert_eq!(LIMINE_CONF.matches("\n/").count(), 1);
-        assert!(!LIMINE_CONF.contains("resolution"));
-        assert!(LIMINE_CONF.contains("path: boot():/linux-rs-kernel"));
-        assert!(LIMINE_CONF.contains("module_path: boot():/initramfs.cpio"));
+        for busybox in [false, true] {
+            let conf = limine_conf(busybox);
+            assert!(conf.contains("timeout: 5"));
+            assert_eq!(conf.matches("\n/").count(), 1);
+            assert!(!conf.contains("resolution"));
+            assert!(conf.contains("path: boot():/linux-rs-kernel"));
+            assert!(conf.contains("module_path: boot():/initramfs.cpio"));
+            // The procfs group reads /proc/cmdline: the line must exist.
+            assert!(conf.contains("\n    cmdline: suite_pause_ms=6000 suite_timeout_s=120\n"));
+            // The second module is listed exactly when the tree has it, after the archive.
+            assert_eq!(conf.contains("busybox.cpio"), busybox);
+            if busybox {
+                assert!(
+                    conf.find("module_path: boot():/initramfs.cpio")
+                        < conf.find("module_path: boot():/busybox.cpio")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_readme_names_the_busybox_module_only_when_the_tree_has_it() {
+        let module = super::super::BusyboxModule {
+            program_sha256: "ab".repeat(32),
+            module_sha256: "cd".repeat(32),
+        };
+        let with = readme("id", "k", &Ok(module));
+        assert!(with.contains(&"ab".repeat(32)) && with.contains("busybox.cpio  "));
+        assert!(with.contains("initramfs.cpio busybox.cpio /mnt/"));
+        let without = readme("id", "k", &Err("no program".to_owned()));
+        assert!(!without.contains("busybox.cpio  ") && without.contains("no program"));
+        assert!(without.contains("initramfs.cpio /mnt/"));
     }
 }
