@@ -2,7 +2,7 @@
 
 A whole-kernel, direct-source Linux-to-Rust porting program targeting the behavior of **Linux 6.18.57 LTS**. The intended result is a Rust-implemented kernel that runs existing Linux userspace on every architecture and facility in the pinned baseline, with performance at least as good as the reference Linux kernel on the qualified workload/hardware matrix.
 
-**Current status: a bounded single-CPU Rust kernel, not a completed Linux kernel.** The GPL-2.0-only `no_std` x86_64 kernel boots under Limine and OVMF in QEMU, runs processes, threads and unmodified Linux programs, and is checked against recordings of the pinned Linux 6.18.57. It was last tagged `v0.2.0`; `main` is 100 commits (PRs #29–#35) past that tag. The single authoritative description of what exists, what was tested at which commit and what is open is the [current status](docs/implementation.md#current-status-at-main-9804570); the working queue with an acceptance test per item is [next steps](docs/next-steps.md). Nothing here is physical-hardware, performance, M1 or full-compatibility qualification, and none of it lowers the complete 6.18.57 scope.
+**Current status: a bounded single-CPU Rust kernel, not a completed Linux kernel.** The GPL-2.0-only `no_std` x86_64 kernel boots under Limine and OVMF in QEMU, runs processes, threads and unmodified Linux programs, and is checked against recordings of the pinned Linux 6.18.57. It was last tagged `v0.2.0`; `main` is 100 commits (PRs #29–#35) past that tag. The single authoritative description of what exists, what was tested at which commit and what is open is the [current status](docs/implementation.md#current-status); the working queue with an acceptance test per item is [next steps](docs/next-steps.md). Nothing here is physical-hardware, performance, M1 or full-compatibility qualification, and none of it lowers the complete 6.18.57 scope.
 
 ## What runs today
 
@@ -11,7 +11,7 @@ A whole-kernel, direct-source Linux-to-Rust porting program targeting the behavi
 - **Filesystems and I/O:** a tmpfs rootfs unpacked from the initramfs, `mount` for `tmpfs` and `proc`, a `procfs`, pipes and `poll`, a console tty with serial and PS/2 input.
 - **What the runtime userspace is:** the boot `/init` is the harness-built test program `user/init` (`xtask` builds it; it is not a general init). Real programs run only inside its oracle test groups, from extra initramfs modules: the host's static BusyBox and 61 host glibc programs (bash, coreutils, python3.14 and others), each pinned by sha256 and never committed. There is no interactive shell yet.
 - **Evidence:** 19 oracle groups whose serial output equals the pinned Linux's for the compared lines; the last recorded gate matched 54 debug-exit and 5 suite cases; 698 kernel library tests (re-run at `main`) and the 108 host-tool tests (`xtask` 98, `baremetal` 10; re-run on this documentation change, whose Rust sources equal `main`'s) pass. QEMU only: **no physical-hardware result exists**, and the user-run bare-metal suite is prepared but has never been run. See [what each command establishes](docs/verification.md#what-each-command-establishes).
-- **What stops the kernel:** a syscall Linux implements and this kernel does not, and several other conditions, stop the **whole kernel** loudly instead of one task ([item 13](docs/next-steps.md#item-13-whole-kernel-stops)). The [support matrix](docs/compatibility.md#current-support-matrix-at-main-9804570) lists supported, partial and unsupported areas.
+- **What stops the kernel:** a syscall Linux implements and this kernel does not, and several other conditions, stop the **whole kernel** loudly instead of one task ([item 13](docs/next-steps.md#item-13-whole-kernel-stops)). The [support matrix](docs/compatibility.md#current-support-matrix) lists supported, partial and unsupported areas.
 
 ## Build and test
 
@@ -39,7 +39,7 @@ Use a genuinely new output directory and the exact running OS release; the envir
 
 ## Start here
 
-1. Read the [current status](docs/implementation.md#current-status-at-main-9804570), [next steps](docs/next-steps.md), [architecture](docs/architecture.md) and [approved decisions and unresolved questions](docs/decisions.md); the [roadmap](docs/roadmap.md) is the complete M0–M8 program and inventory.
+1. Read the [current status](docs/implementation.md#current-status), [next steps](docs/next-steps.md), [architecture](docs/architecture.md) and [approved decisions and unresolved questions](docs/decisions.md); the [roadmap](docs/roadmap.md) is the complete M0–M8 program and inventory.
 2. Establish the [compatibility contract](docs/compatibility.md) (requirement and a short present-support matrix), [complete structural coverage inventory](docs/coverage.md), and [reference provenance](planning/reference.tsv).
 3. Follow the [toolchain contract](docs/toolchain.md), [maintained kernel tooling](docs/kernel-tooling.md), [dependency policy](docs/dependencies.md), and [licensing/provenance rules](docs/licensing.md) before importing or implementing source.
 4. Prepare [correctness verification](docs/verification.md), [performance comparisons](docs/performance.md), and the [physical-hardware lab](docs/bare-metal.md) together. QEMU is the first debugger target, not a substitute for real machines.
