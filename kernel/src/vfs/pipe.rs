@@ -25,7 +25,8 @@ use super::{KResult, PAGE_SIZE, Timespec, try_push};
 /// `PIPE_DEF_BUFFERS`: a new pipe holds sixteen pages (`F_GETPIPE_SZ` 65536).
 pub const PIPE_DEF_BUFFERS: usize = 16;
 
-struct PipeBuf {
+/// One page buffer of a pipe (`struct pipe_buffer`), also the unit `splice` moves between pipes.
+pub struct PipeBuf {
     page: Vec<u8>,
     offset: usize,
     len: usize,
@@ -96,6 +97,93 @@ impl Pipe {
         self.bufs
             .first()
             .map(|buf| &buf.page[buf.offset..buf.offset + buf.len])
+    }
+
+    /// Copy up to `max` buffered bytes, oldest first, into `out` (a gather for a write that may
+    /// take less; nothing is consumed).
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn peek(&self, max: usize, out: &mut Vec<u8>) -> KResult<()> {
+        let mut left = max;
+        for buf in &self.bufs {
+            let take = buf.len.min(left);
+            out.try_reserve(take).map_err(|_| Errno::ENOMEM)?;
+            for &byte in &buf.page[buf.offset..buf.offset + take] {
+                // The room was reserved above.
+                let _ = out.push_within_capacity(byte);
+            }
+            left -= take;
+            if left == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume `count` bytes from the oldest buffers (the "dismiss the fully eaten buffers,
+    /// adjust the partial one" loop of `iter_file_splice_write`).
+    pub fn consume_bytes(&mut self, mut count: usize) {
+        while count > 0 {
+            let Some(len) = self.bufs.first().map(|buf| buf.len) else {
+                break;
+            };
+            let take = len.min(count);
+            self.consume(take);
+            count -= take;
+        }
+    }
+
+    /// Bytes of the oldest buffer.
+    #[must_use]
+    pub fn front_len(&self) -> usize {
+        self.bufs.first().map_or(0, |buf| buf.len)
+    }
+
+    /// Detach the oldest buffer as it is (`splice_pipe_to_pipe` moving a whole buffer).
+    pub fn take_front(&mut self) -> Option<PipeBuf> {
+        if self.bufs.is_empty() {
+            None
+        } else {
+            Some(self.bufs.remove(0))
+        }
+    }
+
+    /// A buffer holding the first `len` bytes of the oldest one, which loses them (the page is
+    /// copied where Linux takes a reference; the copy does not inherit `CAN_MERGE`).
+    ///
+    /// # Errors
+    /// `ENOMEM`; `EINVAL` if `len` exceeds the oldest buffer or the pipe is empty.
+    pub fn split_front(&mut self, len: usize) -> KResult<PipeBuf> {
+        let front = self.bufs.first().ok_or(Errno::EINVAL)?;
+        if len > front.len {
+            return Err(Errno::EINVAL);
+        }
+        let mut page = Vec::new();
+        page.try_reserve_exact(PAGE_SIZE)
+            .map_err(|_| Errno::ENOMEM)?;
+        for &byte in &front.page {
+            page.push_within_capacity(byte).map_err(|_| Errno::ENOMEM)?;
+        }
+        let copy = PipeBuf {
+            page,
+            offset: front.offset,
+            len,
+            can_merge: false,
+        };
+        self.consume(len);
+        Ok(copy)
+    }
+
+    /// Append a buffer taken from another pipe.
+    ///
+    /// # Errors
+    /// `ENOMEM`; `EINVAL` when the pipe is full.
+    pub fn push_buf(&mut self, buf: PipeBuf) -> KResult<()> {
+        if self.is_full() {
+            return Err(Errno::EINVAL);
+        }
+        try_push(&mut self.bufs, buf)
     }
 
     /// Consume `count` bytes of the oldest buffer; an emptied buffer is released.

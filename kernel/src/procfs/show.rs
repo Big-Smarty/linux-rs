@@ -413,7 +413,13 @@ fn status(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
         ),
     )?;
     // task_seccomp
-    seq.puts("NoNewPrivs:\t0\nSeccomp:\t0\n")?;
+    seq::print(
+        seq,
+        format_args!(
+            "NoNewPrivs:\t{}\nSeccomp:\t0\n",
+            u8::from(view.attrs.no_new_privs)
+        ),
+    )?;
     seq.puts("Speculation_Store_Bypass:\t")?;
     seq.puts(super::bugs::ssb_text())?;
     seq.puts("\nSpeculationIndirectBranch:\t")?;

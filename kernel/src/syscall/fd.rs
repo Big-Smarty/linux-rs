@@ -13,7 +13,13 @@
 // fs/libfs.c (`offset_dir_llseek`), drivers/char/mem.c (`null_fops`,
 // `zero_fops`, `full_fops`), drivers/tty/tty_io.c and n_tty.c (`TCGETS`,
 // `TIOCGWINSZ`, `TIOCGPGRP`, `FIONREAD`), include/uapi/asm-generic/ioctls.h,
-// fs/open.c (`do_sys_ftruncate`). All GPL-2.0 / GPL-2.0-only.
+// fs/open.c (`do_sys_ftruncate`), fs/splice.c (`SYSCALL_DEFINE6(splice)`,
+// `__do_splice`, `do_splice`, `splice_file_to_pipe`, `wait_for_space`, `do_splice_read`,
+// `SYSCALL_DEFINE4(vmsplice)`, `iter_to_pipe`, `vmsplice_to_user`, `__splice_from_pipe`),
+// fs/read_write.c (`SYSCALL_DEFINE6(copy_file_range)`, `vfs_copy_file_range`,
+// `generic_copy_file_checks`, `generic_file_rw_checks`), fs/ioctl.c (`ioctl_file_clone`),
+// fs/remap_range.c (`vfs_clone_file_range`).
+// All GPL-2.0 / GPL-2.0-only.
 // Transformation: the user-space iterators become `Dest`/bounce-buffer loops
 // with the same page-sized fault granularity; waits are interruptible sleeps
 // on `sched::PIPE_KEY` (the pipe wait queues), woken when another task changes
@@ -75,6 +81,9 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Op
         Sysno::preadv => preadv(ctx, a[0], a[1], a[2], a[3]),
         Sysno::writev => writev(ctx, a[0], a[1], a[2]),
         Sysno::sendfile => sendfile(ctx, a[0], a[1], a[2], a[3]),
+        Sysno::splice => splice(ctx, a),
+        Sysno::vmsplice => vmsplice(ctx, a[0], a[1], a[2], a[3]),
+        Sysno::copy_file_range => copy_file_range(ctx, a),
         Sysno::pwritev => pwritev(ctx, a[0], a[1], a[2], a[3]),
         Sysno::ioctl => ioctl(ctx, a[0], a[1], a[2]),
         // `SYSCALL_DEFINE1(pipe, ...)`: `do_pipe2(fildes, 0)`.
@@ -1024,7 +1033,14 @@ fn do_sendfile<C: Context>(
         count = (max - cursor) as u64;
     }
     let moved = if let FileKind::Pipe { pipe, writer: true } = output.kind {
-        splice_file_to_pipe(ctx, &input, &output, pipe, &mut cursor, count)?
+        splice_file_to_pipe(
+            ctx,
+            &input,
+            output.flags & O_NONBLOCK != 0,
+            pipe,
+            &mut cursor,
+            count,
+        )?
     } else {
         // do_splice_direct's own checks, then the rw_verify_area of do_sendfile.
         verify_area(out_pos, count)?;
@@ -1076,7 +1092,7 @@ fn splice_source(input: &View) -> Result<InodeId, Stop> {
 fn splice_file_to_pipe<C: Context>(
     ctx: &mut C,
     input: &View,
-    output: &View,
+    nonblock: bool,
     pipe: crate::vfs::PipeId,
     pos: &mut i64,
     count: u64,
@@ -1090,7 +1106,7 @@ fn splice_file_to_pipe<C: Context>(
         if !p.is_full() {
             break;
         }
-        if output.flags & O_NONBLOCK != 0 {
+        if nonblock {
             return Err(Errno::EAGAIN.into());
         }
         if let Err(restart) = wait_event_interruptible(ctx, PIPE_KEY, |c| pipe_writable(c, pipe)) {
@@ -1235,6 +1251,492 @@ fn splice_direct<C: Context>(
         Some(stop) => Err(stop),
         None => Ok(0),
     }
+}
+
+// ---- splice --------------------------------------------------------------------
+
+/// `SPLICE_F_NONBLOCK` and `SPLICE_F_ALL` (`MOVE | NONBLOCK | MORE | GIFT`).
+const SPLICE_F_NONBLOCK: u64 = 2;
+const SPLICE_F_ALL: u64 = 0xf;
+
+/// `SYSCALL_DEFINE6(splice)`: `fd_in`/`fd_out` are `int`s, `off_in`/`off_out` optional
+/// `loff_t *` read before and written back after the copy, `len` a `size_t`, `flags` an
+/// `unsigned int`.
+///
+/// * Checks in Linux's order: a zero length is 0 (before anything else), unknown flags are
+///   `EINVAL`, `fd_in` then `fd_out` `EBADF`, an offset for a pipe `ESPIPE` (`__do_splice`),
+///   the offsets are read (`EFAULT`), then `do_splice`: `FMODE_READ`/`FMODE_WRITE` (`EBADF`),
+///   and the pipe combination.
+/// * A regular file into a pipe is `splice_file_to_pipe` (what `sendfile` shares), a pipe into a
+///   pipe `splice_pipe_to_pipe` (buffers are moved, a partly used one is copied), a pipe into a
+///   file `iter_file_splice_write` (a regular file, the tty or `/dev/null`/`/dev/zero`).
+///   shortcut: the non-regular inputs (`copy_splice_read`) pass every check and stop loudly
+///   (the tty `->splice_read` is not ported); two non-pipes are `EINVAL`, and a pipe spliced
+///   to itself too.
+fn splice<C: Context>(ctx: &mut C, a: [u64; 6]) -> Sys {
+    let [fd_in, off_in, fd_out, off_out, len, flags] = a;
+    if len == 0 {
+        return Ok(0);
+    }
+    if (flags & 0xffff_ffff) & !SPLICE_F_ALL != 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    let input = fdget(ctx, fd_in, false)?;
+    let output = fdget(ctx, fd_out, false)?;
+    let ipipe = matches!(input.kind, FileKind::Pipe { .. });
+    let opipe = matches!(output.kind, FileKind::Pipe { .. });
+    if (ipipe && off_in != 0) || (opipe && off_out != 0) {
+        return Err(Errno::ESPIPE.into());
+    }
+    let read_offset = |ctx: &mut C, at: u64| -> Result<Option<i64>, Errno> {
+        if at == 0 {
+            return Ok(None);
+        }
+        let mut raw = [0u8; 8];
+        if copy_from_user(ctx, &mut raw, at) != 0 {
+            return Err(Errno::EFAULT);
+        }
+        Ok(Some(i64::from_le_bytes(raw)))
+    };
+    // __do_splice reads off_out first, then off_in.
+    let mut out_offset = read_offset(ctx, off_out)?;
+    let mut in_offset = read_offset(ctx, off_in)?;
+    // do_splice
+    if input.mode & FMODE_READ == 0 || output.mode & FMODE_WRITE == 0 {
+        return Err(Errno::EBADF.into());
+    }
+    let moved = if let (FileKind::Pipe { pipe: from, .. }, FileKind::Pipe { pipe: to, .. }) =
+        (input.kind, output.kind)
+    {
+        if from == to {
+            return Err(Errno::EINVAL.into());
+        }
+        let nonblock =
+            flags & SPLICE_F_NONBLOCK != 0 || (input.flags | output.flags) & O_NONBLOCK != 0;
+        splice_pipe_to_pipe(ctx, from, to, len, nonblock)?
+    } else if let FileKind::Pipe { pipe: from, .. } = input.kind {
+        if out_offset.is_some() && output.mode & FMODE_PWRITE == 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        if output.flags & O_APPEND != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        let mut cursor = out_offset.unwrap_or(output.pos);
+        verify_area(cursor, len)?;
+        let nonblock = flags & SPLICE_F_NONBLOCK != 0 || input.flags & O_NONBLOCK != 0;
+        let moved = splice_from_pipe(ctx, from, &output, &mut cursor, len, nonblock)?;
+        match out_offset.as_mut() {
+            Some(offset) => *offset = cursor,
+            None => set_pos(ctx, &output, cursor),
+        }
+        moved
+    } else if let FileKind::Pipe { pipe, .. } = output.kind {
+        let mut cursor = match in_offset {
+            Some(offset) => {
+                if input.mode & FMODE_PREAD == 0 {
+                    return Err(Errno::EINVAL.into());
+                }
+                offset
+            }
+            None => input.pos,
+        };
+        verify_area(cursor, len)?;
+        let nonblock = flags & SPLICE_F_NONBLOCK != 0 || output.flags & O_NONBLOCK != 0;
+        // do_splice_read: not more than the pipe has room for, not more than MAX_RW_COUNT.
+        let count = len.min(u64::from(MAX_RW_COUNT));
+        let moved = splice_file_to_pipe(ctx, &input, nonblock, pipe, &mut cursor, count)?;
+        match in_offset.as_mut() {
+            Some(offset) => *offset = cursor,
+            None => set_pos(ctx, &input, cursor),
+        }
+        moved
+    } else {
+        return Err(Errno::EINVAL.into());
+    };
+    // __do_splice: the offsets go back (a fault here replaces the count).
+    if let Some(offset) = out_offset.as_mut()
+        && copy_to_user(ctx, off_out, &offset.to_le_bytes()) != 0
+    {
+        return Err(Errno::EFAULT.into());
+    }
+    if let Some(offset) = in_offset
+        && copy_to_user(ctx, off_in, &offset.to_le_bytes()) != 0
+    {
+        return Err(Errno::EFAULT.into());
+    }
+    Ok(moved)
+}
+
+/// `ipipe_prep`: wait for data in `pipe` (`Err` carries the system call's final result).
+fn ipipe_prep<C: Context>(
+    ctx: &mut C,
+    pipe: crate::vfs::PipeId,
+    nonblock: bool,
+) -> Result<(), Sys> {
+    while ctx.files().vfs.pipe_ref(pipe).is_empty() {
+        if ctx.state().signal_pending() {
+            return Err(Ok(-crate::signal::wait::ERESTARTSYS));
+        }
+        if ctx.files().vfs.pipe_ref(pipe).writers == 0 {
+            break;
+        }
+        if nonblock {
+            return Err(Err(Errno::EAGAIN.into()));
+        }
+        let readable = |c: &mut C| {
+            let p = c.files().vfs.pipe_ref(pipe);
+            !p.is_empty() || p.writers == 0
+        };
+        if let Err(restart) = wait_event_interruptible(ctx, PIPE_KEY, readable) {
+            return Err(Ok(restart));
+        }
+    }
+    Ok(())
+}
+
+/// `opipe_prep`: wait for room in `pipe`.
+fn opipe_prep<C: Context>(
+    ctx: &mut C,
+    pipe: crate::vfs::PipeId,
+    nonblock: bool,
+) -> Result<(), Sys> {
+    while ctx.files().vfs.pipe_ref(pipe).is_full() {
+        if ctx.files().vfs.pipe_ref(pipe).readers == 0 {
+            ctx.state().send_sig(SIGPIPE);
+            return Err(Err(Errno::EPIPE.into()));
+        }
+        if nonblock {
+            return Err(Err(Errno::EAGAIN.into()));
+        }
+        if ctx.state().signal_pending() {
+            return Err(Ok(-crate::signal::wait::ERESTARTSYS));
+        }
+        if let Err(restart) = wait_event_interruptible(ctx, PIPE_KEY, |c| pipe_writable(c, pipe)) {
+            return Err(Ok(restart));
+        }
+    }
+    Ok(())
+}
+
+/// `splice_pipe_to_pipe`: move buffers from `from` to `to`, up to `len` bytes.
+fn splice_pipe_to_pipe<C: Context>(
+    ctx: &mut C,
+    from: crate::vfs::PipeId,
+    to: crate::vfs::PipeId,
+    mut len: u64,
+    nonblock: bool,
+) -> Sys {
+    'retry: loop {
+        if let Err(done) = ipipe_prep(ctx, from, nonblock) {
+            return done;
+        }
+        if let Err(done) = opipe_prep(ctx, to, nonblock) {
+            return done;
+        }
+        let mut ret: i64 = 0;
+        loop {
+            if ctx.files().vfs.pipe_ref(to).readers == 0 {
+                ctx.state().send_sig(SIGPIPE);
+                if ret == 0 {
+                    return Err(Errno::EPIPE.into());
+                }
+                break;
+            }
+            let (empty, writers) = {
+                let p = ctx.files().vfs.pipe_ref(from);
+                (p.is_empty(), p.writers)
+            };
+            if empty && writers == 0 {
+                break;
+            }
+            // Cannot make any progress: the input is empty or the output is full.
+            if empty || ctx.files().vfs.pipe_ref(to).is_full() {
+                if ret != 0 {
+                    break;
+                }
+                if nonblock {
+                    return Err(Errno::EAGAIN.into());
+                }
+                // Raced with another reader or writer: a zero would mean EOF, so retry.
+                continue 'retry;
+            }
+            let front = ctx.files().vfs.pipe_ref(from).front_len() as u64;
+            let (buf, moved) = if len >= front {
+                let buf = ctx.files().vfs.pipe_mut(from).take_front();
+                (buf.ok_or(Errno::EINVAL)?, front)
+            } else {
+                let buf = ctx.files().vfs.pipe_mut(from).split_front(len as usize)?;
+                (buf, len)
+            };
+            ctx.files().vfs.pipe_mut(to).push_buf(buf)?;
+            ret += moved as i64;
+            len -= moved;
+            if len == 0 {
+                break;
+            }
+        }
+        return Ok(ret);
+    }
+}
+
+/// `iter_file_splice_write` (and the `splice_write_null`/`zero` of the memory devices): gather
+/// the buffered bytes, write them to `output`, consume what was written, until `len` bytes are
+/// done, the pipe is drained after at least one write, or it is empty with no writer left.
+/// Outputs without a `->splice_write` are `EINVAL` once there are data.
+fn splice_from_pipe<C: Context>(
+    ctx: &mut C,
+    pipe: crate::vfs::PipeId,
+    output: &View,
+    pos: &mut i64,
+    len: u64,
+    nonblock: bool,
+) -> Sys {
+    let splice_write = match output.kind {
+        FileKind::Regular
+        | FileKind::Char(
+            CharDev::Null
+            | CharDev::Zero
+            | CharDev::Console
+            | CharDev::TtyAux
+            | CharDev::TtyS0
+            | CharDev::HungUp,
+        ) => true,
+        FileKind::Char(CharDev::Full) | FileKind::Directory => false,
+        _ => return Err(Stop::Unimplemented),
+    };
+    let mut total = len;
+    let mut spliced: i64 = 0;
+    let mut result: Sys = Ok(0);
+    while total > 0 {
+        // splice_from_pipe_next
+        if ctx.state().signal_pending() {
+            result = Ok(-crate::signal::wait::ERESTARTSYS);
+            break;
+        }
+        let mut stop = false;
+        while ctx.files().vfs.pipe_ref(pipe).is_empty() {
+            if ctx.files().vfs.pipe_ref(pipe).writers == 0 || spliced > 0 {
+                stop = true;
+                result = Ok(0);
+                break;
+            }
+            if nonblock {
+                stop = true;
+                result = Err(Errno::EAGAIN.into());
+                break;
+            }
+            if ctx.state().signal_pending() {
+                stop = true;
+                result = Ok(-crate::signal::wait::ERESTARTSYS);
+                break;
+            }
+            let readable = |c: &mut C| {
+                let p = c.files().vfs.pipe_ref(pipe);
+                !p.is_empty() || p.writers == 0
+            };
+            if let Err(restart) = wait_event_interruptible(ctx, PIPE_KEY, readable) {
+                stop = true;
+                result = Ok(restart);
+                break;
+            }
+        }
+        if stop {
+            break;
+        }
+        // Build the vector: at most `total` bytes of the buffers.
+        let mut data = Vec::new();
+        let take = usize::try_from(total).unwrap_or(usize::MAX);
+        ctx.files().vfs.pipe_ref(pipe).peek(take, &mut data)?;
+        let gathered = data.len() as i64;
+        if gathered == 0 {
+            break;
+        }
+        let written = if splice_write {
+            let mut src = Src::kernel(data);
+            match output.kind {
+                FileKind::Regular => match output.inode {
+                    Some(inode) => write_regular(ctx, output, inode, &mut src, pos),
+                    None => Err(Errno::EINVAL.into()),
+                },
+                FileKind::Char(CharDev::Null | CharDev::Zero) => Ok(gathered),
+                _ => tty::write(ctx, output, &mut src),
+            }
+        } else {
+            Err(Errno::EINVAL.into()) // warn_unsupported(out, "write")
+        };
+        match written {
+            Ok(n) if n > 0 => {
+                ctx.files().vfs.pipe_mut(pipe).consume_bytes(n as usize);
+                spliced += n;
+                total -= n as u64;
+            }
+            Ok(_) => break,
+            Err(failure) => {
+                result = Err(failure);
+                break;
+            }
+        }
+    }
+    if spliced > 0 { Ok(spliced) } else { result }
+}
+
+/// `SYSCALL_DEFINE4(vmsplice)`: `fd` an `int`, `nr_segs` an `unsigned long`, `flags` an
+/// `unsigned int`. The write end of a pipe takes user memory (`ITER_SOURCE`), the read end
+/// gives it out (`ITER_DEST`); anything else is `EBADF`.
+///
+/// shortcut: the pipe gets copies of the user pages (`iter_to_pipe` pins them, so a later store
+/// to the buffer shows in the pipe until it is read; the manual forbids relying on that).
+fn vmsplice<C: Context>(ctx: &mut C, fd: u64, uiov: u64, nr_segs: u64, flags: u64) -> Sys {
+    if (flags & 0xffff_ffff) & !SPLICE_F_ALL != 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    let view = fdget(ctx, u64::from(fd as u32), false)?;
+    let source = if view.mode & FMODE_WRITE != 0 {
+        true
+    } else if view.mode & FMODE_READ != 0 {
+        false
+    } else {
+        return Err(Errno::EBADF.into());
+    };
+    let FileKind::Pipe { pipe, .. } = view.kind else {
+        return Err(Errno::EBADF.into());
+    };
+    let (segs, total) = import_segs(ctx, uiov, nr_segs)?;
+    if total == 0 {
+        return Ok(0);
+    }
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
+    if source {
+        vmsplice_to_pipe(ctx, pipe, &segs, nonblock)
+    } else {
+        vmsplice_to_user(ctx, pipe, segs, total, nonblock)
+    }
+}
+
+/// `vmsplice_to_pipe`: `wait_for_space`, then `iter_to_pipe`, one buffer per user page.
+fn vmsplice_to_pipe<C: Context>(
+    ctx: &mut C,
+    pipe: crate::vfs::PipeId,
+    segs: &[(u64, u64)],
+    nonblock: bool,
+) -> Sys {
+    // wait_for_space
+    loop {
+        if ctx.files().vfs.pipe_ref(pipe).readers == 0 {
+            ctx.state().send_sig(SIGPIPE);
+            return Err(Errno::EPIPE.into());
+        }
+        if !ctx.files().vfs.pipe_ref(pipe).is_full() {
+            break;
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN.into());
+        }
+        if ctx.state().signal_pending() {
+            return Ok(-crate::signal::wait::ERESTARTSYS);
+        }
+        if let Err(restart) = wait_event_interruptible(ctx, PIPE_KEY, |c| pipe_writable(c, pipe)) {
+            return Ok(restart);
+        }
+    }
+    let mut total: i64 = 0;
+    let mut failure: Option<Errno> = None;
+    let mut page = [0u8; PAGE_SIZE];
+    'segments: for &(base, len) in segs {
+        let mut done = 0u64;
+        while done < len {
+            let at = base + done;
+            let chunk = (len - done).min((PAGE_SIZE as u64) - at % PAGE_SIZE as u64) as usize;
+            // iov_iter_get_pages2: a page that cannot be pinned ends the walk.
+            if copy_from_user(ctx, &mut page[..chunk], at) != 0 {
+                failure = Some(Errno::EFAULT);
+                break 'segments;
+            }
+            // add_to_pipe: a full pipe ends it with EAGAIN.
+            let vfs = &mut *ctx.files().vfs;
+            if vfs.pipe_ref(pipe).is_full() {
+                failure = Some(Errno::EAGAIN);
+                break 'segments;
+            }
+            vfs.pipe_mut(pipe).push_spliced(&page[..chunk])?;
+            total += chunk as i64;
+            done += chunk as u64;
+        }
+    }
+    if total > 0 {
+        return Ok(total);
+    }
+    Err(failure.unwrap_or(Errno::EINVAL).into())
+}
+
+/// `vmsplice_to_user` -> `__splice_from_pipe(pipe_to_user)`.
+fn vmsplice_to_user<C: Context>(
+    ctx: &mut C,
+    pipe: crate::vfs::PipeId,
+    segs: Vec<(u64, u64)>,
+    count: u64,
+    nonblock: bool,
+) -> Sys {
+    let mut dest = Dest {
+        segs,
+        seg: 0,
+        used: 0,
+        remaining: count,
+    };
+    let mut total = count;
+    let mut spliced: i64 = 0;
+    let mut result: Sys = Ok(0);
+    'outer: while total > 0 {
+        // splice_from_pipe_next
+        if ctx.state().signal_pending() {
+            result = Ok(-crate::signal::wait::ERESTARTSYS);
+            break;
+        }
+        while ctx.files().vfs.pipe_ref(pipe).is_empty() {
+            if ctx.files().vfs.pipe_ref(pipe).writers == 0 || spliced > 0 {
+                result = Ok(0);
+                break 'outer;
+            }
+            if nonblock {
+                result = Err(Errno::EAGAIN.into());
+                break 'outer;
+            }
+            if ctx.state().signal_pending() {
+                result = Ok(-crate::signal::wait::ERESTARTSYS);
+                break 'outer;
+            }
+            let readable = |c: &mut C| {
+                let p = c.files().vfs.pipe_ref(pipe);
+                !p.is_empty() || p.writers == 0
+            };
+            if let Err(restart) = wait_event_interruptible(ctx, PIPE_KEY, readable) {
+                result = Ok(restart);
+                break 'outer;
+            }
+        }
+        // splice_from_pipe_feed
+        while total > 0 && !ctx.files().vfs.pipe_ref(pipe).is_empty() {
+            let mut piece = Vec::new();
+            let want = usize::try_from(total).unwrap_or(usize::MAX);
+            let front = ctx.files().vfs.pipe_ref(pipe).front_len().min(want);
+            ctx.files().vfs.pipe_ref(pipe).peek(front, &mut piece)?;
+            if piece.is_empty() {
+                // eat_empty_buffer
+                ctx.files().vfs.pipe_mut(pipe).consume(0);
+                break;
+            }
+            // pipe_to_user: a short copy is -EFAULT (and the bytes stay in the pipe).
+            let copied = dest.copy_out(ctx, &piece);
+            if copied != piece.len() {
+                result = Err(Errno::EFAULT.into());
+                break 'outer;
+            }
+            ctx.files().vfs.pipe_mut(pipe).consume(copied);
+            spliced += copied as i64;
+            total -= copied as u64;
+        }
+    }
+    if spliced > 0 { Ok(spliced) } else { result }
 }
 
 // ---- lseek --------------------------------------------------------------------
@@ -1659,13 +2161,22 @@ fn ioctl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
             let len = if cmd == FS_IOC_GETFLAGS { 4 } else { 28 };
             return put(ctx, arg, &[0u8; 28][..len]);
         }
-        // ->fileattr_set, FIEMAP, reflink and dedupe, filesystem UUID and sysfs
-        // path have answers other than ENOTTY on tmpfs that are not ported.
+        FICLONE => return file_clone(ctx, &view, arg),
+        FICLONERANGE => {
+            // ioctl_file_clone_range: `struct file_clone_range` is {s64 src_fd; u64 src_offset;
+            // u64 src_length; u64 dest_offset}; the descriptor is read as the `s64` low word.
+            let mut raw = [0u8; 32];
+            if copy_from_user(ctx, &mut raw, arg) != 0 {
+                return Err(Errno::EFAULT.into());
+            }
+            let src_fd = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
+            return file_clone(ctx, &view, src_fd);
+        }
+        // ->fileattr_set, FIEMAP, dedupe, filesystem UUID and sysfs path have answers other
+        // than ENOTTY on tmpfs that are not ported.
         FS_IOC_SETFLAGS
         | FS_IOC_FSSETXATTR
         | FS_IOC_FIEMAP
-        | FICLONE
-        | FICLONERANGE
         | FIDEDUPERANGE
         | FS_IOC_GETFSUUID
         | FS_IOC_GETFSSYSFSPATH => {
@@ -1712,6 +2223,165 @@ fn ioctl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
         FileKind::Unsupported => Err(Stop::Unimplemented),
         _ => Err(Errno::ENOTTY.into()),
     }
+}
+
+/// `generic_file_rw_checks`: a directory is `EISDIR`, anything but two regular files `EINVAL`,
+/// then the modes (`EBADF`).
+fn generic_file_rw_checks<C: Context>(ctx: &mut C, src: &View, dst: &View) -> Result<(), Stop> {
+    let fs = &ctx.files().vfs.fs;
+    let kind = |view: &View| match view.kind {
+        FileKind::Directory => crate::vfs::S_IFDIR,
+        FileKind::Regular => crate::vfs::S_IFREG,
+        FileKind::Proc => view
+            .inode
+            .map_or(0, |inode| fs.node_attr(inode).mode & S_IFMT),
+        FileKind::Pipe { .. } => 0o010_000,
+        _ => 0o020_000,
+    };
+    let (in_type, out_type) = (kind(src), kind(dst));
+    if in_type == crate::vfs::S_IFDIR || out_type == crate::vfs::S_IFDIR {
+        return Err(Errno::EISDIR.into());
+    }
+    if in_type != crate::vfs::S_IFREG || out_type != crate::vfs::S_IFREG {
+        return Err(Errno::EINVAL.into());
+    }
+    if src.mode & FMODE_READ == 0 || dst.mode & FMODE_WRITE == 0 || dst.flags & O_APPEND != 0 {
+        return Err(Errno::EBADF.into());
+    }
+    Ok(())
+}
+
+/// Whether two open files are on the same super block (a pipe's inode is on pipefs).
+fn same_super_block<C: Context>(ctx: &mut C, a: &View, b: &View) -> Result<bool, Stop> {
+    let fs = &ctx.files().vfs.fs;
+    let sb_of = |view: &View| view.inode.map(|inode| fs.sb_of(inode));
+    Ok(match (&a.kind, &b.kind) {
+        (FileKind::Pipe { .. }, FileKind::Pipe { .. }) => true,
+        (FileKind::Pipe { .. }, _) | (_, FileKind::Pipe { .. }) => false,
+        _ => match (sb_of(a), sb_of(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => return Err(Stop::Unimplemented),
+        },
+    })
+}
+
+/// `SYSCALL_DEFINE6(copy_file_range)` -> `vfs_copy_file_range`. Every file system here is
+/// without `->copy_file_range` and `->remap_file_range`, so a copy within one super block is
+/// `do_splice_direct` and a copy across two is `EXDEV` (`generic_copy_file_checks`).
+fn copy_file_range<C: Context>(ctx: &mut C, a: [u64; 6]) -> Sys {
+    let [fd_in, off_in, fd_out, off_out, len, flags] = a;
+    let input = fdget(ctx, fd_in, false)?;
+    let output = fdget(ctx, fd_out, false)?;
+    let read_offset = |ctx: &mut C, at: u64, default: i64| -> Result<i64, Errno> {
+        if at == 0 {
+            return Ok(default);
+        }
+        let mut raw = [0u8; 8];
+        if copy_from_user(ctx, &mut raw, at) != 0 {
+            return Err(Errno::EFAULT);
+        }
+        Ok(i64::from_le_bytes(raw))
+    };
+    let mut pos_in = read_offset(ctx, off_in, input.pos)?;
+    let mut pos_out = read_offset(ctx, off_out, output.pos)?;
+    if flags & 0xffff_ffff != 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    // generic_copy_file_checks
+    generic_file_rw_checks(ctx, &input, &output)?;
+    if !same_super_block(ctx, &input, &output)? {
+        return Err(Errno::EXDEV.into());
+    }
+    // (IS_IMMUTABLE and IS_SWAPFILE never hold.)
+    let mut count = len;
+    if (pos_in as u64).wrapping_add(count) < pos_in as u64
+        || (pos_out as u64).wrapping_add(count) < pos_out as u64
+    {
+        return Err(Errno::EOVERFLOW.into());
+    }
+    // Shorten the copy to EOF.
+    let (Some(in_inode), Some(out_inode)) = (input.inode, output.inode) else {
+        return Err(Stop::Unimplemented);
+    };
+    let size_in = i64::try_from(ctx.files().vfs.fs.inode(in_inode).size).unwrap_or(i64::MAX);
+    count = if pos_in >= size_in {
+        0
+    } else {
+        count.min((size_in - pos_in) as u64)
+    };
+    // generic_write_check_limits
+    let limit = ctx.rlimit_fsize();
+    if limit != RLIM_INFINITY {
+        let limit = limit as i64;
+        if pos_out >= limit {
+            ctx.state().send_sig(SIGXFSZ);
+            return Err(Errno::EFBIG.into());
+        }
+        count = count.min((limit - pos_out) as u64);
+    }
+    let max_size = if output.flags & O_LARGEFILE == 0 {
+        MAX_NON_LFS
+    } else {
+        MAX_LFS_FILESIZE
+    };
+    if pos_out >= max_size {
+        return Err(Errno::EFBIG.into());
+    }
+    count = count.min((max_size - pos_out) as u64);
+    // Don't allow overlapped copying within the same file.
+    if in_inode == out_inode
+        && (pos_out as u64).wrapping_add(count) > pos_in as u64
+        && (pos_out as u64) < (pos_in as u64).wrapping_add(count)
+    {
+        return Err(Errno::EINVAL.into());
+    }
+    verify_area(pos_in, count)?;
+    verify_area(pos_out, count)?;
+    if count == 0 {
+        return Ok(0);
+    }
+    let count = count.min(u64::from(MAX_RW_COUNT));
+    // do_splice_direct
+    if output.flags & O_APPEND != 0 {
+        return Err(Errno::EINVAL.into());
+    }
+    let mut cursor = pos_in;
+    let mut out_cursor = pos_out;
+    let moved = splice_direct(ctx, &input, &output, &mut cursor, &mut out_cursor, count)?;
+    if moved > 0 {
+        pos_in += moved;
+        pos_out += moved;
+        if off_in != 0 {
+            if copy_to_user(ctx, off_in, &pos_in.to_le_bytes()) != 0 {
+                return Err(Errno::EFAULT.into());
+            }
+        } else {
+            set_pos(ctx, &input, pos_in);
+        }
+        if off_out != 0 {
+            if copy_to_user(ctx, off_out, &pos_out.to_le_bytes()) != 0 {
+                return Err(Errno::EFAULT.into());
+            }
+        } else {
+            set_pos(ctx, &output, pos_out);
+        }
+    }
+    Ok(moved)
+}
+
+/// `ioctl_file_clone` -> `vfs_clone_file_range` up to the first answer that needs the file
+/// system: `EBADF` for a bad source, `EXDEV` across super blocks, `generic_file_rw_checks`
+/// (`EISDIR`, `EINVAL`, `EBADF`), then `EOPNOTSUPP`: tmpfs, procfs and pipefs have no
+/// `->remap_file_range`, so no clone ever succeeds here and the offsets and length are never
+/// looked at.
+fn file_clone<C: Context>(ctx: &mut C, dst: &View, src_fd: u64) -> Sys {
+    // `CLASS(fd, src_file)(srcfd)`: the argument is an `unsigned long` taken as an `int`.
+    let src = fdget(ctx, u64::from(src_fd as u32), false)?;
+    if !same_super_block(ctx, &src, dst)? {
+        return Err(Errno::EXDEV.into());
+    }
+    generic_file_rw_checks(ctx, &src, dst)?;
+    Err(Errno::EOPNOTSUPP.into())
 }
 
 fn put<C: Context>(ctx: &mut C, arg: u64, bytes: &[u8]) -> Sys {

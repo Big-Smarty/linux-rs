@@ -30,6 +30,8 @@
 mod attr;
 #[cfg(test)]
 mod busybox_tests;
+#[cfg(test)]
+mod dynelf_tests;
 mod exec;
 mod fd;
 mod fs;
@@ -48,12 +50,14 @@ mod procview_tests;
 mod random;
 mod reboot;
 mod signal;
+mod socket;
 #[cfg(test)]
 mod testing;
 mod time;
 pub mod tty;
 #[cfg(test)]
 mod vfs_tests;
+mod xattr;
 
 use crate::{
     config,
@@ -331,6 +335,8 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         .or_else(|| fs::dispatch(ctx, sysno, args))
         .or_else(|| namei::dispatch(ctx, sysno, args))
         .or_else(|| attr::dispatch(ctx, sysno, args))
+        .or_else(|| xattr::dispatch(ctx, sysno, args))
+        .or_else(|| socket::dispatch(ctx, sysno, args))
         .or_else(|| mount::dispatch(ctx, sysno, args))
         .or_else(|| random::dispatch(ctx, sysno, args))
         .or_else(|| reboot::dispatch(ctx, sysno, args))

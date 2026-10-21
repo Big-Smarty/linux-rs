@@ -29,7 +29,8 @@ use crate::{
     usercopy::{copy_from_user, copy_to_user, strncpy_from_user},
     vfs::{
         AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE,
-        AT_SYMLINK_NOFOLLOW, InodeId, Kstat, O_LARGEFILE, PATH_MAX, major, minor, new_encode_dev,
+        AT_SYMLINK_NOFOLLOW, InodeId, Kstat, O_CREAT, O_LARGEFILE, O_TRUNC, O_WRONLY, PATH_MAX,
+        major, minor, new_encode_dev,
         ops::{Env, build_open_flags, stat_lookup_flags},
         path::{LOOKUP_DIRECTORY, LOOKUP_FOLLOW},
         try_copy,
@@ -39,6 +40,14 @@ use crate::{
 pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Option<Outcome> {
     let result = match sysno {
         Sysno::open => open(ctx, AT_FDCWD, a[0], a[1], a[2]),
+        // `SYSCALL_DEFINE2(creat)`: `O_CREAT | O_WRONLY | O_TRUNC` (`open` adds `O_LARGEFILE`).
+        Sysno::creat => open(
+            ctx,
+            AT_FDCWD,
+            a[0],
+            u64::from(O_CREAT | O_WRONLY | O_TRUNC),
+            a[1],
+        ),
         Sysno::openat => open(ctx, dfd(a[0]), a[1], a[2], a[3]),
         Sysno::mknod => mknod(ctx, AT_FDCWD, a[0], a[1], a[2]),
         Sysno::mknodat => mknod(ctx, dfd(a[0]), a[1], a[2], a[3]),

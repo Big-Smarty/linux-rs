@@ -215,6 +215,9 @@ pub struct Attributes {
     pub clear_child_tid: u64,
     /// `task_struct::robust_list` (`set_robust_list`), walked at exit only.
     pub robust_list: u64,
+    /// `PFA_NO_NEW_PRIVS` (`PR_SET_NO_NEW_PRIVS`): set once, inherited by `fork`, kept by
+    /// `execve`, never cleared.
+    pub no_new_privs: bool,
 }
 
 impl Attributes {
@@ -232,6 +235,7 @@ impl Attributes {
             personality: 0,
             clear_child_tid: 0,
             robust_list: 0,
+            no_new_privs: false,
         }
     }
 }

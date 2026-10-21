@@ -24,7 +24,7 @@ pub struct Declared {
     pub enosys: &'static [u32],
 }
 
-pub const DECLARED: [Declared; 14] = [
+pub const DECLARED: [Declared; 15] = [
     Declared {
         symbol: "boot: console=ttyS0",
         value: "the console tty is the 8250 serial line at its default 9600n8: TCGETS reports tty_std_termios with c_cflag B9600|CS8|CREAD|HUPCL|CLOCAL (a vt console would differ: vt.c sets IUTF8 in UTF-8 mode)",
@@ -66,6 +66,12 @@ pub const DECLARED: [Declared; 14] = [
         value: "n (reference config: y): no AT_RSEQ_*, rseq(2) is -ENOSYS",
         source: "init/Kconfig:1910, fs/binfmt_elf.c:287 and the #ifdef in create_elf_tables, kernel/sys_ni.c:392",
         enosys: &[334],
+    },
+    Declared {
+        symbol: "CONFIG_SECURITY_LANDLOCK",
+        value: "n (as the reference config): landlock_create_ruleset(2), landlock_add_rule(2) and landlock_restrict_self(2) are -ENOSYS, and the prctl option PR_SET_NO_NEW_PRIVS is plain task state",
+        source: "kernel/sys_ni.c:167-169 (`COND_SYSCALL(landlock_*)`), kernel/sys.c (`PR_SET_NO_NEW_PRIVS`)",
+        enosys: &[444, 445, 446],
     },
     Declared {
         symbol: "CONFIG_X86_USER_SHADOW_STACK",
@@ -131,7 +137,9 @@ mod tests {
         assert_eq!(Sysno::map_shadow_stack as u32, 453);
         assert_eq!(Sysno::uretprobe as u32, 335);
         assert_eq!(Sysno::uprobe as u32, 336);
-        for number in [334, 453, 335, 336] {
+        assert_eq!(Sysno::landlock_create_ruleset as u32, 444);
+        assert_eq!(Sysno::landlock_restrict_self as u32, 446);
+        for number in [334, 453, 335, 336, 444, 445, 446] {
             assert!(is_disabled_syscall(number));
         }
         for number in [0, 1, 39, 60, 231, 333, 337, 452, 454] {
