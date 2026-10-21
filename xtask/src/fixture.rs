@@ -159,9 +159,274 @@ pub(crate) fn initramfs_without_init() -> io::Result<Vec<u8>> {
     )
 }
 
+/// The host program the `busybox` oracle group runs (`BusyBox` v1.36.1, static, GPL-2.0-only). It is a
+/// test input read at build time: never committed, its SHA-256 goes into the run's evidence, and
+/// the case is `unavailable` when it is missing ([`busybox_unavailable`]).
+pub(crate) const BUSYBOX_HOST_PATH: &str = "/usr/bin/busybox";
+
+/// `mtime` of every file of the busybox archive (2001-09-09 01:46:40 UTC), so `ls -l` and
+/// `stat` print the same on both kernels.
+const BUSYBOX_MTIME: u32 = 1_000_000_000;
+
+/// The applets the group executes by path (`/bin/<name>` -> `busybox`, as `busybox --install -s`
+/// lays them out): `sh` runs its commands by `PATH` lookup, the group's runner by `argv[0]`.
+pub(crate) const BUSYBOX_APPLETS: &[&str] = &[
+    "[",
+    "awk",
+    "basename",
+    "cat",
+    "chmod",
+    "cmp",
+    "cp",
+    "cut",
+    "dd",
+    "diff",
+    "dirname",
+    "du",
+    "echo",
+    "env",
+    "expr",
+    "false",
+    "find",
+    "grep",
+    "head",
+    "id",
+    "ln",
+    "ls",
+    "md5sum",
+    "mkdir",
+    "mv",
+    "nl",
+    "od",
+    "paste",
+    "printf",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rev",
+    "rm",
+    "rmdir",
+    "sed",
+    "seq",
+    "sh",
+    "sha1sum",
+    "sha256sum",
+    "sleep",
+    "sort",
+    "stat",
+    "tac",
+    "tail",
+    "tee",
+    "test",
+    "touch",
+    "tr",
+    "true",
+    "uniq",
+    "wc",
+    "xargs",
+    "yes",
+    "base64",
+    "cksum",
+    "comm",
+    "date",
+    "expand",
+    "fold",
+    "hexdump",
+    "install",
+    "kill",
+    "sync",
+    "timeout",
+    "truncate",
+    "uname",
+    "unlink",
+    "whoami",
+    "xxd",
+    "ash",
+    "printenv",
+    "tty",
+    "bc",
+    "dc",
+    "factor",
+    "gzip",
+    "gunzip",
+    "bzip2",
+    "bunzip2",
+    "xz",
+    "unxz",
+    "tar",
+    "cpio",
+    "patch",
+    "usleep",
+    "hostname",
+    "nproc",
+    "shuf",
+    "chgrp",
+    "chown",
+    "mktemp",
+];
+
+/// Directories of the busybox archive: (name, mode), parents first.
+const BUSYBOX_DIRS: &[(&str, u32)] = &[
+    ("bin", 0o040_755),
+    ("tmp", 0o041_777),
+    ("bb", 0o040_755),
+    ("bb/tree", 0o040_755),
+    ("bb/tree/a", 0o040_755),
+    ("bb/tree/a/b", 0o040_755),
+];
+
+/// The data files of the `busybox` group (name, mode, data). The bytes are part of the oracle
+/// contract, like [`TEST_FILES`]. `bb/bin.dat` is generated: the 256 byte values in order.
+const BUSYBOX_FILES: &[(&str, u32, &[u8])] = &[
+    ("bb/hello.txt", 0o100_644, b"hello world\n"),
+    (
+        "bb/lines.txt",
+        0o100_644,
+        b"banana\napple\ncherry\napple\nbanana\napple\n",
+    ),
+    ("bb/nums.txt", 0o100_644, b"10\n9\n100\n1\n55\n"),
+    ("bb/csv.txt", 0o100_644, b"a,b,c\n1,2,3\n4,5,6\n"),
+    (
+        "bb/words.txt",
+        0o100_644,
+        b"the quick brown fox\njumps over the lazy dog\n",
+    ),
+    ("bb/empty", 0o100_644, b""),
+    ("bb/noperm", 0o100_000, b"secret\n"),
+    (
+        "bb/script.sh",
+        0o100_755,
+        b"#!/bin/sh\necho script $# $1\nexit 7\n",
+    ),
+    ("bb/tree/e.txt", 0o100_644, b"e\n"),
+    ("bb/tree/a/d.txt", 0o100_644, b"dd\n"),
+    ("bb/tree/a/b/c.txt", 0o100_644, b"ccc\n"),
+    ("bb/tree/exec.sh", 0o100_755, b"#!/bin/sh\necho exec\n"),
+];
+
+/// Every non-data entry of [`busybox_initramfs`] besides the directories and `bin/busybox`:
+/// symlinks (name, target).
+const BUSYBOX_LINKS: &[(&str, &str)] =
+    &[("bb/tree/link", "e.txt"), ("bb/tree/dangling", "nowhere")];
+
+/// The 256 byte values in order: the input of the `od`/`md5sum` checks.
+fn busybox_bin_dat() -> Vec<u8> {
+    (0..=255u8).collect()
+}
+
+/// The deterministic second initramfs module of the `busybox` group: `/bin/busybox` (the host's
+/// program, `0755`), a `/bin/<applet>` symlink per [`BUSYBOX_APPLETS`], `/tmp` and the data files
+/// of [`BUSYBOX_FILES`] / [`BUSYBOX_LINKS`] with the fixed mtime [`BUSYBOX_MTIME`]. Linux unpacks
+/// concatenated archives into one rootfs, so the pinned reference gets `init.cpio` + this one.
+pub(crate) fn busybox_initramfs(busybox: &[u8]) -> io::Result<Vec<u8>> {
+    if u32::try_from(busybox.len()).is_err() {
+        return Err(invalid("busybox does not fit a newc file size"));
+    }
+    let bin_dat = busybox_bin_dat();
+    let mut entries: Vec<(NewcBuilder, &[u8])> = Vec::new();
+    let new = |name: &str, mode: u32| NewcBuilder::new(name).mode(mode).mtime(BUSYBOX_MTIME);
+    for &(name, mode) in BUSYBOX_DIRS {
+        entries.push((new(name, mode).nlink(2), &[]));
+    }
+    entries.push((new("bin/busybox", 0o100_755), busybox));
+    for applet in BUSYBOX_APPLETS {
+        entries.push((
+            // `new` borrows the name only for the call; the builder owns its copy.
+            new(&format!("bin/{applet}"), 0o120_777),
+            b"busybox",
+        ));
+    }
+    for &(name, mode, data) in BUSYBOX_FILES {
+        entries.push((new(name, mode), data));
+    }
+    entries.push((new("bb/bin.dat", 0o100_644), &bin_dat));
+    for &(name, target) in BUSYBOX_LINKS {
+        entries.push((new(name, 0o120_777), target.as_bytes()));
+    }
+    write_cpio(
+        entries
+            .into_iter()
+            .map(|(builder, data)| (builder, Cursor::new(data))),
+        Vec::new(),
+    )
+}
+
+/// The `CHECK image inspected` tail the kernel must print for [`busybox_initramfs`] (one ELF: the
+/// busybox program, whose `PT_LOAD`/`PT_INTERP` counts come from its headers).
+pub(crate) fn busybox_counts(archive_len: usize, program: &ElfFacts) -> String {
+    let reserved = archive_len.next_multiple_of(PAGE).max(PAGE);
+    // dirs + busybox + applet links + data files + bin.dat + links; the trailer is one more record.
+    let files = BUSYBOX_DIRS.len()
+        + 1
+        + BUSYBOX_APPLETS.len()
+        + BUSYBOX_FILES.len()
+        + 1
+        + BUSYBOX_LINKS.len();
+    let regular = 1 + BUSYBOX_FILES.len() + 1;
+    let symlinks = BUSYBOX_APPLETS.len() + BUSYBOX_LINKS.len();
+    format!(
+        "reserved={reserved} bytes={archive_len} records={} files={files} regular={regular} symlinks={symlinks} trailers=1 skipped=0 elf=1 loads={} interpreters={} execution=false rootfs=false",
+        files + 1,
+        program.loads,
+        program.interpreters
+    )
+}
+
+/// SHA-256 of the `BusyBox` program (`BusyBox` v1.36.1, static, x86-64-v4) the expected lines of the
+/// `busybox` group were recorded with on the pinned Linux. Another program may print other
+/// lines, so the group is `unavailable` on a host with a different one.
+pub(crate) const BUSYBOX_SHA256: &str =
+    "1097cdefbbfc633d390ce9487872158b60a857155d7f680658f1dca3c7febf0d";
+
+/// The host program for the `busybox` group, or why this host cannot run the group: the file is
+/// missing, it is not a static x86-64 `ET_EXEC` program, or the CPU lacks the AVX-512
+/// instructions it was built for (x86-64-v4: F, BW, CD, DQ, VL). `cpuinfo` is `/proc/cpuinfo`.
+pub(crate) fn busybox_input(path: &str, cpuinfo: &str) -> Result<Vec<u8>, String> {
+    let program = std::fs::read(path).map_err(|error| format!("{path}: {error}"))?;
+    let facts = elf_facts(&program).map_err(|error| format!("{path}: {error}"))?;
+    if facts.interpreters != 0 || facts.dynamics != 0 {
+        return Err(format!("{path} is not a static program"));
+    }
+    busybox_cpu(cpuinfo)?;
+    Ok(program)
+}
+
+/// The CPU half of [`busybox_input`].
+pub(crate) fn busybox_cpu(cpuinfo: &str) -> Result<(), String> {
+    match missing_cpu_flag(cpuinfo, &BUSYBOX_CPU_FLAGS) {
+        Some(flag) => Err(format!(
+            "the CPU lacks {flag} (BusyBox is built for x86-64-v4)"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The AVX-512 subset x86-64-v4 requires.
+const BUSYBOX_CPU_FLAGS: [&str; 5] = ["avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"];
+
+/// What the `xstate` group needs of the host CPU under KVM `-cpu host`: AVX-512 F/BW/DQ/VL, the
+/// protection keys and `XSAVE`.
+pub(crate) const XSTATE_CPU_FLAGS: [&str; 6] = [
+    "xsave", "avx512f", "avx512bw", "avx512dq", "avx512vl", "pku",
+];
+
+/// The first of `wanted` that the `flags` line of `/proc/cpuinfo` does not list.
+pub(crate) fn missing_cpu_flag<'a>(cpuinfo: &str, wanted: &[&'a str]) -> Option<&'a str> {
+    let flags = cpuinfo
+        .lines()
+        .find(|line| line.starts_with("flags"))
+        .unwrap_or_default();
+    wanted
+        .iter()
+        .copied()
+        .find(|flag| !flags.split_ascii_whitespace().any(|word| word == *flag))
+}
+
 /// What the kernel must report for the generated archive and run `/init` (qemu64 constants).
 pub(crate) struct Expected {
     pub(crate) archive_counts: String,
+    /// The `CHECK image inspected` tail of `busybox.cpio`, when the host provides it.
+    pub(crate) busybox_counts: Option<String>,
     pub(crate) init: ElfFacts,
 }
 
@@ -199,7 +464,7 @@ mod tests {
     }
 
     /// Independent newc walk: (name, mode, nlink, data) per entry, asserting the framing.
-    fn entries(archive: &[u8]) -> Vec<(String, u32, u32, Vec<u8>)> {
+    fn entries(archive: &[u8], mtime: u32) -> Vec<(String, u32, u32, Vec<u8>)> {
         let (mut at, mut found) = (0, Vec::new());
         while at < archive.len() {
             assert_eq!(at % 4, 0, "entry starts 4-byte aligned");
@@ -207,9 +472,10 @@ mod tests {
             let field = |n: usize| &archive[at + 6 + 8 * n..at + 14 + 8 * n];
             let (mode, nlink, size, name_size) =
                 (hex(field(1)), hex(field(4)), hex(field(6)), hex(field(11)));
+            let trailer = &archive[at + 110..at + 110 + 10] == b"TRAILER!!!";
             assert_eq!(
                 (hex(field(2)), hex(field(3)), hex(field(5))),
-                (0, 0, 0),
+                (0, 0, if trailer { 0 } else { mtime }),
                 "uid, gid, mtime"
             );
             assert_eq!(hex(field(12)), 0, "newc checksum field");
@@ -250,7 +516,7 @@ mod tests {
         let archive = initramfs(&init).unwrap();
         assert_eq!(archive.len() % 4, 0);
         assert_eq!(archive, initramfs(&init).unwrap(), "deterministic");
-        let found = entries(&archive);
+        let found = entries(&archive, 0);
         let summary = found
             .iter()
             .map(|(n, m, l, d)| (n.as_str(), *m, *l, d.len()))
@@ -363,7 +629,7 @@ mod tests {
         let program = synthetic_elf(&[(1, 5, 0x20_0000, 16, 16), (1, 6, 0x30_0000, 8, 8)], 62);
         let facts = elf_facts(&program).unwrap();
         let archive = initramfs(&program).unwrap();
-        let found = entries(&archive);
+        let found = entries(&archive, 0);
         let of_type = |kind: u32| {
             found
                 .iter()
@@ -386,6 +652,87 @@ mod tests {
         );
         let counts = archive_counts(archive.len(), &facts);
         assert!(counts.contains(&expected), "{counts} vs {expected}");
+    }
+
+    /// A static program as `elf_facts` accepts it: one executable `PT_LOAD`.
+    fn program() -> Vec<u8> {
+        synthetic_elf(&[(1, 5, 0x40_0000, 16, 32), (1, 6, 0x50_0000, 8, 8)], 62)
+    }
+
+    #[test]
+    fn busybox_module_is_framed_deterministic_and_counted() {
+        let program = program();
+        let archive = busybox_initramfs(&program).unwrap();
+        assert_eq!(archive.len() % 4, 0);
+        assert_eq!(archive, busybox_initramfs(&program).unwrap());
+        let found = entries(&archive, BUSYBOX_MTIME);
+        let named = |name: &str| found.iter().find(|entry| entry.0 == name).unwrap();
+        // The program, its links and the data the group names, with the fixed mtime.
+        assert_eq!(named("bin/busybox").1, 0o100_755);
+        assert_eq!(named("bin/busybox").3, program);
+        assert_eq!(named("bin/sh").1, 0o120_777);
+        assert_eq!(named("bin/sh").3, b"busybox");
+        assert_eq!(named("tmp").1, 0o041_777);
+        assert_eq!(named("bb/hello.txt").3, b"hello world\n");
+        assert_eq!(named("bb/bin.dat").3, (0..=255u8).collect::<Vec<_>>());
+        assert_eq!(named("bb/tree/link").3, b"e.txt");
+        assert_eq!(named("bb/noperm").1, 0o100_000);
+        // Parents come first, so Linux's unpacker (which never creates parents) finds them.
+        let position = |name: &str| found.iter().position(|e| e.0 == name).unwrap();
+        let listed = BUSYBOX_DIRS
+            .iter()
+            .map(|entry| entry.0)
+            .chain(BUSYBOX_FILES.iter().map(|entry| entry.0));
+        for name in listed {
+            if let Some((parent, _)) = name.rsplit_once('/') {
+                assert!(position(parent) < position(name), "{name}");
+            }
+        }
+        // Every applet is a link to the program and none is listed twice.
+        let mut applets = BUSYBOX_APPLETS.to_vec();
+        applets.sort_unstable();
+        applets.dedup();
+        assert_eq!(applets.len(), BUSYBOX_APPLETS.len());
+        for applet in BUSYBOX_APPLETS {
+            assert_eq!(named(&format!("bin/{applet}")).3, b"busybox", "{applet}");
+        }
+        // The counts the kernel must print for it.
+        let facts = elf_facts(&program).unwrap();
+        let counts = busybox_counts(archive.len(), &facts);
+        let trailers = found.iter().filter(|e| e.0 == "TRAILER!!!").count();
+        let of_type = |kind: u32| {
+            found
+                .iter()
+                .filter(|e| e.0 != "TRAILER!!!" && e.1 & 0o170_000 == kind)
+                .count()
+        };
+        let expected = format!(
+            "records={} files={} regular={} symlinks={} trailers={trailers} skipped=0 elf=1 loads=2 interpreters=0 ",
+            found.len(),
+            found.len() - trailers,
+            of_type(0o100_000),
+            of_type(0o120_000),
+        );
+        assert!(counts.contains(&expected), "{counts} vs {expected}");
+    }
+
+    #[test]
+    fn busybox_is_unavailable_without_the_program_or_the_cpu_features() {
+        let avx512 = "flags\t: fpu sse2 avx512f avx512bw avx512cd avx512dq avx512vl pku xsave";
+        assert_eq!(busybox_cpu(avx512), Ok(()));
+        for missing in ["avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"] {
+            let flags = avx512.replace(missing, "other");
+            let reason = busybox_cpu(&flags).unwrap_err();
+            assert!(reason.contains(missing), "{reason}");
+        }
+        assert!(busybox_cpu("model name\t: nothing").is_err());
+        assert_eq!(missing_cpu_flag(avx512, &XSTATE_CPU_FLAGS), None);
+        assert_eq!(
+            missing_cpu_flag(&avx512.replace("pku", "ospke"), &XSTATE_CPU_FLAGS),
+            Some("pku")
+        );
+        let error = busybox_input("/nonexistent/busybox", avx512).unwrap_err();
+        assert!(error.contains("/nonexistent/busybox"), "{error}");
     }
 
     #[test]

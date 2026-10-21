@@ -87,6 +87,10 @@ pub const CLASS_TTY: u32 = 3;
 /// The key every tty sleeper uses ([`CLASS_TTY`]).
 pub const TTY_KEY: WaitKey = WaitKey::new(CLASS_TTY, 0);
 
+/// Wait-key class of `vfork_done` (`struct completion`): the id is the slot of the sleeping
+/// parent (`CLONE_VFORK`); its child wakes it when it gives the address space back.
+pub const CLASS_VFORK: u32 = 4;
+
 /// A task handle: slot index plus the slot's generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedId {

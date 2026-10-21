@@ -10,7 +10,8 @@
 // `max_usage` page buffers; waiting is the caller's decision (`syscall::fd`
 // sleeps on `sched::PIPE_KEY` and the owner of the scheduler wakes it when
 // [`crate::vfs::Vfs::take_pipe_events`] reports a change); no wait queues,
-// fasync, watch queue, packet mode, splice or per-user buffer accounting.
+// fasync, watch queue, packet mode or per-user buffer accounting; `splice` into a pipe
+// copies the file bytes (the pipe does not share the page cache's pages).
 #![forbid(unsafe_code)]
 //! Anonymous pipes. The syscall layer moves bytes between user memory and the
 //! buffers one page at a time, exactly as `anon_pipe_read`/`anon_pipe_write`
@@ -28,6 +29,9 @@ struct PipeBuf {
     page: Vec<u8>,
     offset: usize,
     len: usize,
+    /// `PIPE_BUF_FLAG_CAN_MERGE`: set on the buffers `anon_pipe_write` creates, not on
+    /// the file pages `splice` puts into a pipe.
+    can_merge: bool,
 }
 
 pub struct Pipe {
@@ -61,6 +65,12 @@ impl Pipe {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bufs.is_empty()
+    }
+
+    /// `pipe_occupancy`: the slots in use.
+    #[must_use]
+    pub fn slots_used(&self) -> usize {
+        self.bufs.len()
     }
 
     #[must_use]
@@ -102,9 +112,13 @@ impl Pipe {
     /// Room left in the newest buffer for a merging write.
     #[must_use]
     pub fn merge_room(&self) -> usize {
-        self.bufs
-            .last()
-            .map_or(0, |buf| PAGE_SIZE - (buf.offset + buf.len))
+        self.bufs.last().map_or(0, |buf| {
+            if buf.can_merge {
+                PAGE_SIZE - (buf.offset + buf.len)
+            } else {
+                0
+            }
+        })
     }
 
     /// Append to the newest buffer (the `PIPE_BUF_FLAG_CAN_MERGE` path).
@@ -150,11 +164,26 @@ impl Pipe {
         Ok(())
     }
 
-    /// Add a fresh page buffer holding `data` (at most a page).
+    /// Add a fresh page buffer holding `data` (at most a page), as `anon_pipe_write`
+    /// does: later small writes may merge into it.
     ///
     /// # Errors
     /// `ENOMEM`; `EINVAL` when the pipe is full or `data` exceeds a page.
     pub fn push_page(&mut self, data: &[u8]) -> KResult<()> {
+        self.push(data, true)
+    }
+
+    /// Add a buffer holding the file bytes `splice` moved in (`splice_folio_into_pipe`):
+    /// a later write never merges into it. The bytes are copied, not shared with the
+    /// page cache.
+    ///
+    /// # Errors
+    /// As [`Pipe::push_page`].
+    pub fn push_spliced(&mut self, data: &[u8]) -> KResult<()> {
+        self.push(data, false)
+    }
+
+    fn push(&mut self, data: &[u8], can_merge: bool) -> KResult<()> {
         if self.is_full() || data.len() > PAGE_SIZE {
             return Err(Errno::EINVAL);
         }
@@ -173,6 +202,7 @@ impl Pipe {
                 page,
                 offset: 0,
                 len: data.len(),
+                can_merge,
             },
         )
     }

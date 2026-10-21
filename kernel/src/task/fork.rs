@@ -95,6 +95,12 @@ pub struct ForkRequest {
     /// `CLONE_CHILD_CLEARTID`'s pointer (the child's `clear_child_tid`), 0 if
     /// the flag is clear.
     pub clear_child_tid: u64,
+    /// `CLONE_VM` (always with `CLONE_VFORK`): the child runs in the caller's address space,
+    /// which it borrows until its `execve` or exit.
+    pub share_vm: bool,
+    /// `CLONE_VFORK`: the caller sleeps until the child has released its address space
+    /// (`wait_for_vfork_done`).
+    pub vfork: bool,
 }
 
 /// A request that passed Linux's checks but asks for something this kernel
@@ -110,7 +116,9 @@ const PLAIN_FLAGS: u64 = CLONE_PTRACE
     | CLONE_DETACHED
     | CLONE_PARENT_SETTID
     | CLONE_CHILD_CLEARTID
-    | CLONE_CLEAR_SIGHAND;
+    | CLONE_CLEAR_SIGHAND
+    | CLONE_VFORK
+    | CLONE_VM;
 
 impl CloneArgs {
     /// `SYSCALL_DEFINE0(fork)`.
@@ -287,14 +295,20 @@ impl CloneArgs {
         if invalid { Err(Errno::EINVAL) } else { Ok(()) }
     }
 
-    /// Whether the (validated) request is a plain copy of the process.
+    /// Whether the (validated) request is a plain copy of the process, or a `vfork`
+    /// (`CLONE_VM | CLONE_VFORK`, the caller asleep until the child execs or exits;
+    /// `CLONE_VFORK` alone is the same wait on an ordinary copy).
     ///
     /// # Errors
     /// [`Unsupported`] for anything else: threads, shared tables, namespaces,
-    /// `vfork`, `CLONE_SETTLS`, `CLONE_CHILD_SETTID`, `CLONE_PIDFD`, a
+    /// `CLONE_VM` without `CLONE_VFORK` (a child that runs beside its parent in one
+    /// address space), `CLONE_SETTLS`, `CLONE_CHILD_SETTID`, `CLONE_PIDFD`, a
     /// requested thread id, a cgroup, `CLONE_IO`, `CLONE_SYSVSEM`.
     pub fn request(&self) -> Result<ForkRequest, Unsupported> {
-        if self.flags & !PLAIN_FLAGS != 0 || self.set_tid_size != 0 {
+        if self.flags & !PLAIN_FLAGS != 0
+            || self.set_tid_size != 0
+            || (self.flags & CLONE_VM != 0 && self.flags & CLONE_VFORK == 0)
+        {
             return Err(Unsupported);
         }
         Ok(ForkRequest {
@@ -306,6 +320,8 @@ impl CloneArgs {
             } else {
                 0
             },
+            share_vm: self.flags & CLONE_VM != 0,
+            vfork: self.flags & CLONE_VFORK != 0,
         })
     }
 
@@ -434,11 +450,18 @@ mod tests {
             ),
             (0xfe, 0x8000, true, 0x1234)
         );
+        // vfork: the child borrows the address space, the caller waits; CLONE_VFORK alone only waits.
+        for (flags, share_vm, vfork) in [
+            (CLONE_VFORK | CLONE_VM, true, true),
+            (CLONE_VFORK, false, true),
+        ] {
+            let r = args(flags).request().unwrap();
+            assert_eq!((r.share_vm, r.vfork), (share_vm, vfork), "{flags:#x}");
+        }
         for flags in [
             CLONE_VM,
             CLONE_FS,
             CLONE_FILES,
-            CLONE_VFORK | CLONE_VM,
             CLONE_SETTLS,
             CLONE_CHILD_SETTID,
             CLONE_PIDFD,

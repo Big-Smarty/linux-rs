@@ -29,15 +29,23 @@ fn next_terminator(buf: &[u8], first: usize, last: usize) -> Option<usize> {
     (first..=last).find(|&index| spacetab(buf[index]) || buf[index] == 0)
 }
 
-/// The interpreter path named by a `#!` line.
+/// The `#!` line of a script: the interpreter's path and the optional single
+/// argument (the rest of the line, trailing spaces and tabs trimmed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shebang<'a> {
+    pub name: &'a [u8],
+    pub arg: Option<&'a [u8]>,
+}
+
+/// `load_script`'s parse of the `#!` line.
 ///
 /// `Ok(None)` when the file does not start with `#!` (not a script),
-/// `Ok(Some(path))` when `load_script` would call `open_exec(path)`.
+/// `Ok(Some(line))` when `load_script` would go on to `open_exec(line.name)`.
 ///
 /// # Errors
 /// `-ENOEXEC` for the lines `load_script` rejects: no interpreter, only
 /// spaces/tabs, or a path that may be truncated by the 256-byte buffer.
-pub fn interpreter(file: &[u8]) -> Result<Option<&[u8]>, Errno> {
+pub fn parse(file: &[u8]) -> Result<Option<Shebang<'_>>, Errno> {
     // prepare_binprm: the buffer is cleared, then filled by a short read.
     let mut buf = [0u8; BUF];
     let count = file.len().min(BUF);
@@ -67,8 +75,25 @@ pub fn interpreter(file: &[u8]) -> Result<Option<&[u8]>, Errno> {
         _ => return Err(Errno::ENOEXEC),
     };
     // The name ends at the separator before an optional argument, else at i_end.
-    let stop = next_terminator(&buf, name, end).map_or(end, |sep| sep.min(end));
-    Ok(Some(&file[name..stop.min(file.len())]))
+    let sep = next_terminator(&buf, name, end);
+    let stop = sep.map_or(end, |sep| sep.min(end));
+    // `i_sep && *i_sep != '\0'`: an argument starts at the first non-blank after it.
+    let arg = sep
+        .filter(|&sep| buf[sep] != 0)
+        .and_then(|sep| next_non_spacetab(&buf, sep, end))
+        .map(|first| &file[first.min(file.len())..end.min(file.len())]);
+    Ok(Some(Shebang {
+        name: &file[name..stop.min(file.len())],
+        arg,
+    }))
+}
+
+/// The interpreter path named by a `#!` line ([`parse`] without the argument).
+///
+/// # Errors
+/// As [`parse`].
+pub fn interpreter(file: &[u8]) -> Result<Option<&[u8]>, Errno> {
+    parse(file).map(|line| line.map(|line| line.name))
 }
 
 #[cfg(test)]
@@ -100,6 +125,27 @@ mod tests {
         for line in [&b"#!\n"[..], b"#!   \n", b"#!\t \t\n"] {
             assert_eq!(interpreter(line), Err(Errno::ENOEXEC), "{line:?}");
         }
+    }
+
+    #[test]
+    fn the_rest_of_the_line_is_one_argument() {
+        use super::{Shebang, parse};
+        let line =
+            |name: &'static [u8], arg: Option<&'static [u8]>| Ok(Some(Shebang { name, arg }));
+        assert_eq!(parse(b"#!/bin/sh\n"), line(b"/bin/sh", None));
+        assert_eq!(parse(b"#!/bin/sh -e\n"), line(b"/bin/sh", Some(b"-e")));
+        assert_eq!(
+            parse(b"#! /bin/sh \t -e -x \t\n"),
+            line(b"/bin/sh", Some(b"-e -x"))
+        );
+        assert_eq!(
+            parse(b"#!/usr/bin/env python\nprint"),
+            line(b"/usr/bin/env", Some(b"python"))
+        );
+        assert_eq!(parse(b"#!/bin/sh   \n"), line(b"/bin/sh", None));
+        // No newline in the buffer: a NUL ends the name, there is no argument.
+        assert_eq!(parse(b"#!/bin/sh"), line(b"/bin/sh", None));
+        assert_eq!(parse(b"#!/bin/sh -e"), line(b"/bin/sh", Some(b"-e")));
     }
 
     #[test]

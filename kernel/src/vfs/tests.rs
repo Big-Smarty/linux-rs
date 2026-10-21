@@ -49,6 +49,7 @@ fn user(uid: u32) -> Cred {
         chown: false,
         fsetid: false,
         sys_admin: false,
+        sys_boot: false,
     }
 }
 
@@ -841,6 +842,7 @@ fn unpacks_directories_files_symlinks_and_devices_with_their_attributes() {
     archive.extend(newc("etc/link", 0o120_777, 1, 3, b"motd", (0, 0)));
     archive.extend(newc("dev/null", 0o020_666, 1, 4, b"", (1, 3)));
     archive.extend(newc("empty", 0o100_600, 1, 5, b"", (0, 0)));
+    archive.extend(newc("etc/dangling", 0o120_777, 1, 6, b"nowhere", (0, 0)));
     archive.extend(trailer());
     let (mut vfs, env, message) = unpacked(&archive);
     assert_eq!(message, None);
@@ -859,6 +861,15 @@ fn unpacks_directories_files_symlinks_and_devices_with_their_attributes() {
     assert_eq!(vfs.lookup(&env, b"/etc/link", LOOKUP_FOLLOW), Ok(motd));
     let link = vfs.lookup(&env, b"/etc/link", 0).unwrap();
     assert_eq!(vfs.fs.getattr(link).size, 4);
+    // `init_utimes` does not follow the link: the symlink itself has the archive time, the file
+    // it names keeps its own (here the same), and a dangling link is dated too.
+    let time = Timespec {
+        sec: 0x1234,
+        nsec: 0,
+    };
+    assert_eq!(vfs.fs.getattr(link).mtime, time);
+    let dangling = vfs.lookup(&env, b"/etc/dangling", 0).unwrap();
+    assert_eq!(vfs.fs.getattr(dangling).mtime, time);
     // Directory mtimes are applied after the whole archive (`dir_utime`).
     let etc = vfs.lookup(&env, b"/etc", 0).unwrap();
     assert_eq!(
@@ -1044,4 +1055,36 @@ fn a_symlinked_init_resolves_and_a_name_with_a_missing_parent_is_dropped() {
         Err(Errno::ENOENT)
     );
     assert!(vfs.lookup(&env, b"/after", 0).is_ok());
+}
+
+#[test]
+fn chown_that_drops_a_set_id_bit_also_needs_the_mode_change_permission() {
+    let (mut vfs, env) = rootfs(1 << 10);
+    vfs.mknod(&env, b"/su", S_IFREG | 0o4755, 0).unwrap();
+    vfs.mknod(&env, b"/plain", S_IFREG | 0o644, 0).unwrap();
+    let su = vfs.lookup(&env, b"/su", 0).unwrap();
+    let plain = vfs.lookup(&env, b"/plain", 0).unwrap();
+    // CAP_CHOWN without CAP_FOWNER, not the owner: `setattr_prepare` refuses ATTR_MODE.
+    let chowner = Env {
+        cred: Cred {
+            chown: true,
+            ..user(1000)
+        },
+        ..env
+    };
+    assert_eq!(
+        vfs.chown(&chowner, su, u32::MAX, u32::MAX),
+        Err(Errno::EPERM)
+    );
+    assert_eq!(vfs.fs.getattr(su).mode, S_IFREG | 0o4755, "nothing changed");
+    assert_eq!(vfs.chown(&chowner, plain, 7, 8), Ok(()));
+    let both = Env {
+        cred: Cred {
+            fowner: true,
+            ..chowner.cred
+        },
+        ..chowner
+    };
+    assert_eq!(vfs.chown(&both, su, 7, u32::MAX), Ok(()));
+    assert_eq!(vfs.fs.getattr(su).mode, S_IFREG | 0o755);
 }

@@ -123,6 +123,10 @@ pub struct Task<P = Space, C = Sink> {
     pub exe: Option<FileId>,
     /// `(ip, sp)` of the last `start_thread`.
     pub started: Option<(u64, u64)>,
+    /// The state of the fake hardware generator ([`Context::hw_random`]).
+    pub random_state: u64,
+    /// A CPU without a hardware generator.
+    pub no_hw_random: bool,
     /// shortcut: this is a second signal object for the task `current`, whose
     /// own is in `tasks` (the binary has only the latter, via
     /// `Tasklist::signal_state`). Exec, wait and exit tests that touch both
@@ -200,6 +204,8 @@ impl<P, C> Task<P, C> {
             wake: NoWake,
             exe: None,
             started: None,
+            random_state: 0,
+            no_hw_random: false,
             state,
             now: 0,
             waits: 0,
@@ -301,6 +307,10 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
             hwcap: 0x0183_fbff,
             random: *b"0123456789abcdef",
         }
+    }
+    fn hw_random(&mut self) -> Option<u64> {
+        self.random_state = self.random_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        (!self.no_hw_random).then_some(self.random_state)
     }
     fn start_thread(&mut self, ip: u64, sp: u64) {
         self.started = Some((ip, sp));

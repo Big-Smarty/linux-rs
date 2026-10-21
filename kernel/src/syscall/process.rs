@@ -607,7 +607,6 @@ mod tests {
         );
         // Valid but unimplemented requests are loud stops, not errors.
         for (sysno, args) in [
-            (Sysno::vfork, [0u64; 6]),
             (Sysno::clone, [0x100 | 0x11, 0, 0, 0, 0, 0]),
             (Sysno::clone, [0x8_0000 | 0x11, 0, 0, 0, 0, 0]),
             (
@@ -634,6 +633,11 @@ mod tests {
         assert_eq!(copy_to_user(&mut t, 0x1000, &args), 0);
         assert_eq!(call(&mut t, Sysno::clone3, &[0x1000, 88]), 7);
         assert_eq!(t.forked[5].child_sp, 0x8000);
+        // vfork borrows the address space and waits; CLONE_VFORK alone only waits.
+        assert_eq!(call(&mut t, Sysno::vfork, &[]), 8);
+        assert_eq!((t.forked[6].share_vm, t.forked[6].vfork), (true, true));
+        assert_eq!(call(&mut t, Sysno::clone, &[0x4000 | 0x11, 0, 0, 0, 0]), 9);
+        assert_eq!((t.forked[7].share_vm, t.forked[7].vfork), (false, true));
         // A signal pending before the fork restarts it (-ERESTARTNOINTR).
         let handled = t.state.hand.actions[usize::from(SIGUSR1) - 1];
         assert_ne!(handled.handler, 0);
@@ -641,7 +645,7 @@ mod tests {
             .send_signal(SIGUSR1, SigInfo::kill(SIGUSR1, 0, 1, 0), Target::Process)
             .unwrap();
         assert_eq!(call(&mut t, Sysno::fork, &[]), -513);
-        assert_eq!(t.forked.len(), 6);
+        assert_eq!(t.forked.len(), 8);
     }
 
     #[test]

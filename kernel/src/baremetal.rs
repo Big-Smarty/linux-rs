@@ -69,7 +69,7 @@ use kernel::suite::{
     self, Fnv64, GROUPS, GroupReport, ORACLE_EXPECTED, RowBudget, Text, UNSUPPORTED,
     civil_from_unix, hex16,
 };
-use raw_cpuid::{CpuId, ExtendedFeatures, ExtendedProcessorFeatureIdentifiers};
+use raw_cpuid::{CpuId, ExtendedFeatures, ExtendedProcessorFeatureIdentifiers, FeatureInfo};
 
 /// Identifies this build on the summary: set by `xtask baremetal-suite`
 /// (`LINUX_RS_BUILD_ID`, the source commit and whether the tree was clean).
@@ -85,13 +85,13 @@ const DEFAULT_PAUSE_MS: usize = 6000;
 /// slow framebuffer should not come near this.
 const DEFAULT_TIMEOUT_S: u64 = 120;
 /// Groups that sleep on the monotonic clock and so cannot run without it.
-const NEEDS_CLOCK: [&str; 6] = ["time", "signal", "fork", "proc", "jobctl", "pipe"];
+const NEEDS_CLOCK: [&str; 7] = ["time", "signal", "fork", "proc", "jobctl", "pipe", "xstate"];
 const CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_PROOFS: usize = 40;
 /// Inventory facts the summary repeats: cpu, memory, platform, time, display, pci, adapters.
 const KEYS: usize = 7;
 const NONE: usize = usize::MAX;
-const MAX_GROUPS: usize = 10;
+const MAX_GROUPS: usize = 12;
 /// Extra `suite_groups=` words of the QEMU harness: `/init` modes that end a
 /// run abnormally (a SIGSEGV; a syscall Linux has and this kernel does not; a
 /// loop that never ends; the same loop in a child while init waits for it, so the time bound
@@ -290,6 +290,9 @@ enum Cause {
     TimedOut,
     /// Not run: it needs the monotonic clock and `timer::init` failed.
     NoClock,
+    /// Not run: the CPU lacks a feature the group needs, or has AMX state it does not cover
+    /// (neither a pass nor a failure); the text completes "the CPU has ...".
+    Unavailable(&'static str),
 }
 
 impl Cause {
@@ -303,6 +306,9 @@ impl Cause {
             Self::Stopped => Text::from_args(format_args!("kernel stop")),
             Self::TimedOut => Text::from_args(format_args!("timeout")),
             Self::NoClock => Text::from_args(format_args!("skipped, no clock")),
+            Self::Unavailable(reason) => {
+                Text::from_args(format_args!("unavailable on this CPU: {reason}"))
+            }
         }
     }
 }
@@ -320,6 +326,11 @@ struct GroupRun {
 impl GroupRun {
     fn passed(&self) -> bool {
         self.cause == Cause::Exited(0) && self.report.is_some_and(|report| report.passed())
+    }
+
+    /// The CPU cannot run the group: it counts as neither a pass nor a failure.
+    fn unavailable(&self) -> bool {
+        matches!(self.cause, Cause::Unavailable(_))
     }
 }
 
@@ -831,6 +842,64 @@ fn finish_group() {
     ktask::reset_group();
 }
 
+/// Why this CPU cannot run `group`, or `None`: the first CPU feature it lacks (`no <flag>`), or AMX
+/// where the recorded rows assume none. Only `xstate` has needs: it reads and writes the AVX-512
+/// registers and the protection-key register, and checks the `XSAVE` frame that holds them.
+/// (`/init` of every other group runs on any x86-64 CPU.)
+fn unavailable_reason(group: &str) -> Option<&'static str> {
+    if group != "xstate" {
+        return None;
+    }
+    let cpuid = CpuId::new();
+    let basic = cpuid.get_feature_info();
+    let extended = cpuid.get_extended_feature_info();
+    let missing = [
+        (
+            "no xsave",
+            basic.as_ref().is_some_and(FeatureInfo::has_xsave),
+        ),
+        (
+            "no avx512f",
+            extended.as_ref().is_some_and(ExtendedFeatures::has_avx512f),
+        ),
+        (
+            "no avx512bw",
+            extended
+                .as_ref()
+                .is_some_and(ExtendedFeatures::has_avx512bw),
+        ),
+        (
+            "no avx512dq",
+            extended
+                .as_ref()
+                .is_some_and(ExtendedFeatures::has_avx512dq),
+        ),
+        (
+            "no avx512vl",
+            extended
+                .as_ref()
+                .is_some_and(ExtendedFeatures::has_avx512vl),
+        ),
+        (
+            "no pku",
+            extended.as_ref().is_some_and(ExtendedFeatures::has_pku),
+        ),
+    ];
+    missing
+        .into_iter()
+        .find(|(_, present)| !present)
+        .map(|(reason, _)| reason)
+        // The recorded rows (`req-perm-17`, `req-perm-18`: `EOPNOTSUPP`) are Linux's answers on a
+        // CPU without AMX; with AMX Linux grants the tile-data permission and this kernel stops
+        // loudly (`xstate::Config::amx`). Neither is a result this group can compare.
+        .or_else(|| {
+            extended
+                .as_ref()
+                .is_some_and(ExtendedFeatures::has_amx_tile)
+                .then_some("AMX tile state (not covered)")
+        })
+}
+
 fn start_next() -> ! {
     loop {
         let index = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -838,6 +907,17 @@ fn start_next() -> ! {
             late_proofs();
             summary(None)
         };
+        if let Some(reason) = unavailable_reason(group) {
+            log!("SUITE group {} not run: the CPU has {}\n", group, reason);
+            let run = GroupRun {
+                cause: Cause::Unavailable(reason),
+                report: None,
+                stop: None,
+                millis: 0,
+            };
+            record(index, group, &run);
+            continue;
+        }
         if NEEDS_CLOCK.contains(&group) && !timer::clock_published() {
             // Its sleeps could never end: say so instead of hanging (`Time bounds`).
             log!("SUITE group {} not run: the clock is not running\n", group);
@@ -888,7 +968,13 @@ fn record(index: usize, group: &'static str, run: &GroupRun) {
     log!(
         "SUITE group {} result={} cause=\"{}\" matched={} expected={} observed={} mismatches={} millis={}\n",
         group,
-        if run.passed() { "pass" } else { "fail" },
+        if run.passed() {
+            "pass"
+        } else if run.unavailable() {
+            "unavailable"
+        } else {
+            "fail"
+        },
         run.cause.describe(),
         report.map_or(0, |r| r.matched),
         report.map_or(0, |r| r.expected),
@@ -921,7 +1007,7 @@ fn group_ended(cause: Cause) -> ! {
         copy_range(start, end).map(|output| suite::compare_group(ORACLE_EXPECTED, group, &output));
     let stop = match cause {
         Cause::Stopped | Cause::TimedOut => last_line_with(start, end, b"FAIL"),
-        Cause::Exited(_) | Cause::NoClock => None,
+        Cause::Exited(_) | Cause::NoClock | Cause::Unavailable(_) => None,
     };
     let run = GroupRun {
         cause,
@@ -1045,11 +1131,17 @@ fn summary(abort: Option<Text>) -> ! {
         .flatten()
         .filter(|g| g.passed())
         .count();
+    let groups_unavailable = results
+        .groups
+        .iter()
+        .flatten()
+        .filter(|g| g.unavailable())
+        .count();
     let proofs_passed = results.proofs().iter().filter(|p| p.ok).count();
     let proofs = results.proofs().len();
     let ok = abort.is_none()
         && groups_run == results.selected_count
-        && groups_passed == results.selected_count
+        && groups_passed + groups_unavailable == results.selected_count
         && proofs_passed == proofs
         && results.proofs_lost == 0
         && dropped == 0;
@@ -1068,9 +1160,15 @@ fn summary(abort: Option<Text>) -> ! {
             groups_run,
             reason
         ),
-        None if ok => log!(
+        None if ok && groups_unavailable == 0 => log!(
             "RESULT: ALL PASS ({} groups, {} self-tests)\n",
             groups_passed,
+            proofs
+        ),
+        None if ok => log!(
+            "RESULT: ALL PASS ({} groups, {} unavailable on this CPU, {} self-tests)\n",
+            groups_passed,
+            groups_unavailable,
             proofs
         ),
         None => log!(
@@ -1092,10 +1190,11 @@ fn summary(abort: Option<Text>) -> ! {
         core::str::from_utf8(&hex16(digest)).unwrap_or("?")
     );
     log!(
-        "SUITE complete ok={} groups={}/{} proofs={}/{}\n",
+        "SUITE complete ok={} groups={}/{} unavailable={} proofs={}/{}\n",
         ok,
         groups_passed,
         results.selected_count,
+        groups_unavailable,
         proofs_passed,
         proofs
     );
@@ -1116,7 +1215,13 @@ fn summary_groups(results: &Results) {
                 log!(
                     "  {:<7} {}  {}/{}  {}  {} ms\n",
                     name,
-                    if run.passed() { "PASS" } else { "FAIL" },
+                    if run.passed() {
+                        "PASS"
+                    } else if run.unavailable() {
+                        "N/A "
+                    } else {
+                        "FAIL"
+                    },
                     matched,
                     expected,
                     run.cause.describe(),
@@ -1157,7 +1262,7 @@ fn detail_row(budget: &mut RowBudget, args: core::fmt::Arguments<'_>) {
 /// below the cursor allow (the replay pages hold the rest). Last on the
 /// screen, before the final line, so it can never push the rest off the top.
 fn summary_failures(results: &Results) {
-    let shown = |run: &GroupRun| !run.passed() && run.cause != Cause::NoClock;
+    let shown = |run: &GroupRun| !run.passed() && run.cause != Cause::NoClock && !run.unavailable();
     let failing = results
         .runs()
         .filter(|(_, run)| run.as_ref().is_some_and(shown))

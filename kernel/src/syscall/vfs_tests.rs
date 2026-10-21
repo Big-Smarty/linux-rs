@@ -26,13 +26,13 @@ use crate::vfs::{
 };
 use syscalls::{Errno, Sysno};
 
-const PATH: u64 = 0x1000;
-const PATH2: u64 = 0x1800;
-const BUF: u64 = 0x2000;
-const OUT: u64 = 0x3000;
-const BAD: u64 = 0x9000;
+pub(super) const PATH: u64 = 0x1000;
+pub(super) const PATH2: u64 = 0x1800;
+pub(super) const BUF: u64 = 0x2000;
+pub(super) const OUT: u64 = 0x3000;
+pub(super) const BAD: u64 = 0x9000;
 
-fn t() -> Task {
+pub(super) fn t() -> Task {
     let mut t = task();
     for page in [0x1000, 0x2000, 0x3000, 0x4000] {
         t.pages.map(page, true);
@@ -41,56 +41,56 @@ fn t() -> Task {
     t
 }
 
-fn call(t: &mut Task, sysno: Sysno, args: &[u64]) -> Outcome {
+pub(super) fn call(t: &mut Task, sysno: Sysno, args: &[u64]) -> Outcome {
     let mut full = [0; 6];
     full[..args.len()].copy_from_slice(args);
     dispatch(t, sysno as u64, full)
 }
 
-fn ok(value: i64) -> Outcome {
+pub(super) fn ok(value: i64) -> Outcome {
     Outcome::Return(value)
 }
 
-fn err(errno: Errno) -> Outcome {
+pub(super) fn err(errno: Errno) -> Outcome {
     Outcome::Return(error(errno))
 }
 
-fn put(t: &mut Task, at: u64, data: &[u8]) {
+pub(super) fn put(t: &mut Task, at: u64, data: &[u8]) {
     let page = t.pages.0.get_mut(&(at & !0xfff)).unwrap();
     let start = (at & 0xfff) as usize;
     page.0[start..start + data.len()].copy_from_slice(data);
 }
 
-fn get(t: &mut Task, at: u64, len: usize) -> Vec<u8> {
+pub(super) fn get(t: &mut Task, at: u64, len: usize) -> Vec<u8> {
     let page = t.pages.0.get_mut(&(at & !0xfff)).unwrap();
     let start = (at & 0xfff) as usize;
     page.0[start..start + len].to_vec()
 }
 
-fn cstr(t: &mut Task, at: u64, text: &str) -> u64 {
+pub(super) fn cstr(t: &mut Task, at: u64, text: &str) -> u64 {
     let mut bytes = text.as_bytes().to_vec();
     bytes.push(0);
     put(t, at, &bytes);
     at
 }
 
-fn open(t: &mut Task, path: &str, flags: u32, mode: u32) -> Outcome {
+pub(super) fn open(t: &mut Task, path: &str, flags: u32, mode: u32) -> Outcome {
     let at = cstr(t, PATH, path);
     call(t, Sysno::open, &[at, u64::from(flags), u64::from(mode)])
 }
 
-fn fd(outcome: Outcome) -> u64 {
+pub(super) fn fd(outcome: Outcome) -> u64 {
     match outcome {
         Outcome::Return(n) if n >= 0 => n as u64,
         other => panic!("{other:?}"),
     }
 }
 
-fn u64_at(t: &mut Task, at: u64) -> u64 {
+pub(super) fn u64_at(t: &mut Task, at: u64) -> u64 {
     u64::from_le_bytes(get(t, at, 8).try_into().unwrap())
 }
 
-fn u32_at(t: &mut Task, at: u64) -> u32 {
+pub(super) fn u32_at(t: &mut Task, at: u64) -> u32 {
     u32::from_le_bytes(get(t, at, 4).try_into().unwrap())
 }
 

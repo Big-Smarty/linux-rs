@@ -36,11 +36,13 @@ use syscalls::{Errno, Sysno};
 
 use crate::exit;
 
+pub mod busybox;
 pub mod fork;
 pub mod fs;
 pub mod ids;
 pub mod jobctl;
 pub mod mm;
+pub mod names;
 pub mod pipe;
 pub mod proc;
 pub mod signal;
@@ -360,6 +362,9 @@ pub fn run_mode(mode: &[u8]) -> bool {
             return true;
         }
         b"fs" => fs::run(),
+        b"names" => names::run(),
+        // `AT_EMPTY_PATH` with a pipe: a record of the pinned Linux only (this kernel stops).
+        b"pipeempty" => names::pipe_empty_path(),
         b"proc" => proc::run(),
         b"jobctl" => jobctl::run(),
         b"pipe" => pipe::run(),
@@ -368,6 +373,8 @@ pub fn run_mode(mode: &[u8]) -> bool {
         b"tty" => tty::run(),
         b"ttyin" => ttyin::run(),
         b"ttykbd" => ttyin::run_kbd(),
+        // Real BusyBox commands (needs the second initramfs module and, on the host, AVX-512).
+        b"bbrun" => busybox::run(),
         _ => return false,
     };
     conclude(ok);

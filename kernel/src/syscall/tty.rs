@@ -415,7 +415,7 @@ fn n_tty_write<C: Context>(ctx: &mut C, view: &View, buf: &[u8]) -> Sys {
 /// The tty copies at most 2048 bytes at a time (`iterate_tty_write`). A chunk
 /// that cannot be fully copied from user memory is not written at all: the call
 /// returns the bytes of the earlier chunks, or `-EFAULT` when there are none.
-pub(super) fn write<C: Context>(ctx: &mut C, view: &View, buffer: u64, count: u64) -> Sys {
+pub(super) fn write<C: Context>(ctx: &mut C, view: &View, src: &mut super::fd::Src) -> Sys {
     // hung_up_tty_write
     if hung_up(ctx, view) {
         return Err(Errno::EIO.into());
@@ -435,8 +435,7 @@ pub(super) fn write<C: Context>(ctx: &mut C, view: &View, buffer: u64, count: u6
         }
         ctx.wait(TTY_KEY, None);
     }
-    let mut remaining = usize::try_from(count).unwrap_or(usize::MAX);
-    let mut at = buffer;
+    let mut remaining = usize::try_from(src.remaining).unwrap_or(usize::MAX);
     let mut written = 0usize;
     let mut ret: i64 = 0;
     let mut chunk = [0u8; WRITE_CHUNK];
@@ -444,7 +443,7 @@ pub(super) fn write<C: Context>(ctx: &mut C, view: &View, buffer: u64, count: u6
     // (TOSTOP check, echo flush, signal and hangup checks) once.
     loop {
         let size = remaining.min(WRITE_CHUNK);
-        if copy_from_user(ctx, &mut chunk[..size], at) != 0 {
+        if src.copy_in(ctx, &mut chunk[..size]) != size {
             ret = neg(Errno::EFAULT);
             break;
         }
@@ -462,7 +461,10 @@ pub(super) fn write<C: Context>(ctx: &mut C, view: &View, buffer: u64, count: u6
         }
         let consumed = usize::try_from(consumed).unwrap_or(0);
         written += consumed;
-        at += consumed as u64;
+        if consumed < size {
+            // `iov_iter_revert(from, size - ret)`
+            src.revert((size - consumed) as u64);
+        }
         remaining -= consumed;
         if remaining == 0 {
             break;
