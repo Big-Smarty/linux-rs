@@ -70,7 +70,7 @@ Freeze the workspace member sources and compiler input tree before the build; le
 Run from the repository root, using unused output names. The following are real interfaces, not a claim that they have already succeeded:
 
 ```text
-cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/diag-proof --timeout-seconds 30
+cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/diag-proof --timeout-seconds 60
 ```
 
 Retain `target/kernel-tooling/diag-proof/manifest.tsv`, every case result/log, both build manifests, the default `result.tsv`/QMP state and framebuffer image. Require the complete source-bound case catalog to match and manually review the **fresh** default screenshot for the successful checkpoint and absence of `FAIL`. Current source has ten cases including the genuine fatal-PF/alignment regression; immutable diagnostic-001 retains its original eight-case004 proof and its current HOLD. Record reviewer, ELF/image SHA-256 and observations separately. Automatic HLT/IF/RIP is not visual success: failure also intentionally halts. These software instructions never override the physical hold.

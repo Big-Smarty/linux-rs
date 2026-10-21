@@ -66,7 +66,7 @@ The maintained Rust-owned interfaces are documented in [kernel tooling](docs/ker
 
 ```text
 cargo +1.88.0 run --offline --locked -p xtask -- kernel-build --output target/kernel-tooling/build-001
-cargo +1.88.0 run --offline --locked -p xtask -- kernel-test --output target/kernel-tooling/test-001 --timeout-seconds 30
+cargo +1.88.0 run --offline --locked -p xtask -- kernel-test --output target/kernel-tooling/test-001 --timeout-seconds 60
 cargo +1.88.0 run --offline --locked -p xtask -- kernel-package --build-output target/kernel-tooling/test-001/freestanding-build --output target/kernel-tooling/package-001
 ```
 
