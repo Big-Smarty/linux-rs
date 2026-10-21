@@ -33,6 +33,10 @@ use crate::signal::{
 };
 use syscalls::Errno;
 
+fn t_dumpable(list: &Tasklist, target: TaskId) -> bool {
+    list.dumpable(target)
+}
+
 /// `PIDTYPE_PID` (a thread) or the group (`PIDTYPE_TGID`, `PGID`, `MAX`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendTo {
@@ -48,6 +52,28 @@ impl Tasklist {
         };
         let (c, tc) = (s.cred, t.cred);
         c.euid == tc.suid || c.euid == tc.uid || c.uid == tc.suid || c.uid == tc.uid || c.cap_kill
+    }
+
+    /// `ptrace_may_access(target, PTRACE_MODE_READ_REALCREDS)` for the task `caller`: the same
+    /// thread group, or the same real, effective and saved ids with a dumpable target, or the
+    /// capability (root here).
+    #[must_use]
+    pub fn ptrace_may_access(&self, caller: TaskId, target: TaskId) -> bool {
+        if self.same_thread_group(caller, target) {
+            return true;
+        }
+        let (Some(c), Some(t)) = (self.task(caller), self.task(target)) else {
+            return false;
+        };
+        let (c, t) = (c.cred, t.cred);
+        let same = c.euid == t.euid
+            && c.euid == t.suid
+            && c.euid == t.uid
+            && c.egid == t.egid
+            && c.egid == t.sgid
+            && c.egid == t.gid;
+        let privileged = c.cap_kill;
+        (same || privileged) && (t_dumpable(self, target) || privileged)
     }
 
     /// `check_kill_permission(sig, info, t)` for a signal sent by `sender`

@@ -131,9 +131,9 @@ fn victim(
     fdt.install(fd, read);
     let mut attrs = Attributes::init(1000);
     attrs.cred = cred;
-    attrs.fs = t.attrs.fs;
     let view = TaskView::collect(Collect {
         attrs: &attrs,
+        fs: t.fs,
         fdt: &fdt,
         files: &t.vfs.files,
         mm: Some(&t.mm),

@@ -52,7 +52,7 @@ every range is bounded by `timespec64_valid*` or `KTIME_MAX` at the call site"
 //! `rt_sigreturn` resets the block to `do_no_restart_syscall`
 //! (`restore_sigcontext`).
 
-use super::{Context, Outcome, error};
+use super::{Context, Outcome, error, outcome};
 use crate::{
     time::{HZ, NSEC_PER_SEC, TICK_NSEC},
     usercopy::{copy_from_user, copy_to_user},
@@ -106,6 +106,18 @@ pub enum RestartFn {
     /// `do_restart_poll` (`syscall::poll`): `rmtp` is `ufds`, `clockid` the
     /// bits of `nfds`, `expires_ns` the absolute end (-1: no timeout).
     Poll,
+    /// `futex_wait_restart` (`syscall::futex`): [`RestartBlock::futex`] is the call,
+    /// `expires_ns` the absolute deadline on the clock its flags name.
+    Futex,
+}
+
+/// `restart_block->futex.{uaddr,val,flags,bitset}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FutexRestart {
+    pub uaddr: u64,
+    pub val: u32,
+    pub flags: u32,
+    pub bitset: u32,
 }
 
 /// The `restart_block.nanosleep` fields `nanosleep`/`clock_nanosleep` fill.
@@ -119,6 +131,8 @@ pub struct RestartBlock {
     pub expires_ns: i64,
     /// `rmtp` user pointer, 0 for `TT_NONE`.
     pub rmtp: u64,
+    /// The `futex_wait` call of [`RestartFn::Futex`].
+    pub futex: FutexRestart,
 }
 
 impl RestartBlock {
@@ -128,6 +142,12 @@ impl RestartBlock {
         clockid: 0,
         expires_ns: 0,
         rmtp: 0,
+        futex: FutexRestart {
+            uaddr: 0,
+            val: 0,
+            flags: 0,
+            bitset: 0,
+        },
     };
 }
 
@@ -223,6 +243,9 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
             let block = ctx.restart_block();
             if block.func == RestartFn::Poll {
                 return Some(super::poll::restart(ctx, block, sysno));
+            }
+            if block.func == RestartFn::Futex {
+                return Some(outcome(sysno as u32, Ok(super::futex::restart(ctx, block))));
             }
             restart_syscall(ctx)
         }
@@ -530,6 +553,7 @@ fn sleep_to<C: Context>(
         clockid: resume.clockid,
         expires_ns: i64::try_from(resume.expires_ns.clamp(0, KTIME_MAX)).unwrap_or(i64::MAX),
         rmtp: rem_out.unwrap_or(0),
+        ..RestartBlock::NONE
     });
     -ERESTART_RESTARTBLOCK
 }
@@ -546,7 +570,7 @@ fn restart_syscall<C: Context>(ctx: &mut C) -> i64 {
     // boottime, 11 TAI) or the `alarmtimer_type` (0 realtime, 1 boottime).
     let kclock = match (block.func, block.clockid) {
         // `do_restart_poll` is dispatched before this function.
-        (RestartFn::None | RestartFn::Poll, _) => return error(Errno::EINTR),
+        (RestartFn::None | RestartFn::Poll | RestartFn::Futex, _) => return error(Errno::EINTR),
         (RestartFn::Hrtimer, 1) => Kclock::Monotonic,
         (RestartFn::Hrtimer, 7) => Kclock::Boottime,
         (RestartFn::Hrtimer, _) => Kclock::Tai,
@@ -1245,6 +1269,7 @@ mod tests {
             clockid,
             expires_ns,
             rmtp,
+            ..RestartBlock::NONE
         };
         let none = |rmtp| block(RestartFn::None, 0, 0, rmtp);
         t.clocks.state.boot_offset_ns = 1_000;
@@ -1350,6 +1375,7 @@ mod tests {
             clockid,
             expires_ns,
             rmtp: BUF + 16,
+            ..RestartBlock::NONE
         };
         // `do_no_restart_syscall`.
         assert_eq!(

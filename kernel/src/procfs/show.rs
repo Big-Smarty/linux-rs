@@ -295,7 +295,7 @@ fn status(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     }
     seq.putc(b'\n')?;
     // task_state
-    if let Some(umask) = view.has_fs.then_some(view.attrs.fs.umask) {
+    if let Some(umask) = view.has_fs.then_some(view.fs.umask) {
         seq::print(seq, format_args!("Umask:\t{umask:04o}\n"))?;
     }
     let cred = view.attrs.cred;

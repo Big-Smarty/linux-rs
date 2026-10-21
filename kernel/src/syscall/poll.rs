@@ -143,6 +143,7 @@ fn sys_poll<C: Context>(ctx: &mut C, ufds: u64, nfds: u32, timeout_msecs: i32) -
             clockid: nfds as i32,
             expires_ns: end.to_restart(),
             rmtp: ufds,
+            ..RestartBlock::NONE
         });
         return Ok(-ERESTART_RESTARTBLOCK);
     }

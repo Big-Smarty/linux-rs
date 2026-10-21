@@ -195,6 +195,9 @@ pub struct TaskStruct {
     pub(super) parent_exec_id: u64,
     /// `PF_*`.
     pub flags: u32,
+    /// `robust_list`: the user address `set_robust_list` registered (0: none); walked when
+    /// the task leaves its address space. Per thread; a new task starts without one.
+    pub robust_list: u64,
     pub cred: CredSnapshot,
     /// `get_dumpable(mm) == SUID_DUMP_USER` (`MMF_DUMPABLE`): copied by `fork`,
     /// set again by `execve`, cleared by `PR_SET_DUMPABLE` and by a change of
@@ -425,6 +428,7 @@ impl Tasklist {
                 self_exec_id: 0,
                 parent_exec_id: 0,
                 flags: 0,
+                robust_list: 0,
                 cred: CredSnapshot::of(cred),
                 dumpable: true,
                 utime_ns: 0,
@@ -678,6 +682,7 @@ impl Tasklist {
                 exec_id
             },
             flags: PF_FORKNOEXEC,
+            robust_list: 0,
             cred,
             // mm_init: the child's mm takes the parent's dumpability.
             dumpable,

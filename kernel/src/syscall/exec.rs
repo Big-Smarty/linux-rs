@@ -26,9 +26,7 @@
 //!   descriptor) is `Unimplemented`: the name `comm` and `/dev/fd/N` take from
 //!   the dentry is not resolved yet.
 //! * shortcut: user page-table pages of the replaced image are not freed
-//!   (only the frames of its mappings), and the robust-futex list of the old
-//!   image is dropped without the `exit_robust_list` walk. Upgrade with
-//!   per-task page-table roots and the futex lane.
+//!   (only the frames of its mappings). Upgrade with per-task page-table roots.
 
 use super::{
     AddressSpace, Context, Files, Outcome, error,
@@ -333,12 +331,9 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
         let Files { vfs, fdt, .. } = ctx.files();
         vfs.do_close_on_exec(fdt);
     }
-    // exec_mm_release: the old mm's `clear_child_tid` and robust list.
-    {
-        let attrs = ctx.attrs();
-        attrs.clear_child_tid = 0;
-        attrs.robust_list = 0;
-    }
+    // exec_mm_release: the old mm's robust list is walked and `clear_child_tid` written and
+    // its waiters woken (`futex_exec_release`, `mm_release`).
+    super::futex::mm_release(ctx);
     // set_mm_exe_file: the new file is `mm->exe_file`.
     let id = u64::from(p.file.index());
     if let Some(old) = ctx.replace_exe_file(p.file) {
@@ -760,8 +755,8 @@ mod tests {
         t.state.me.altstack.sp = 0x7000;
         t.state.me.altstack.size = 0x2000;
         t.attrs.clear_child_tid = 0x1111;
-        t.attrs.robust_list = 0x2222;
-        t.attrs.fs.umask = 0o77;
+        t.tasks.task_mut(t.current).unwrap().robust_list = 0x2222;
+        t.fs.umask = 0o77;
         // A previous image: one mapping that must disappear.
         {
             let crate::syscall::AddressSpace { mm, env, pages } = Context::address_space(&mut t);
@@ -794,8 +789,11 @@ mod tests {
         assert_eq!((t.state.me.altstack.sp, t.state.me.altstack.size), (0, 0));
         // Attributes: name, cleared user pointers; umask and cwd are kept.
         assert_eq!(&t.attrs.comm[..9], b"bin-init\0");
-        assert_eq!((t.attrs.clear_child_tid, t.attrs.robust_list), (0, 0));
-        assert_eq!(t.attrs.fs.umask, 0o77);
+        assert_eq!(
+            (t.attrs.clear_child_tid, t.tasks.task(t.current).unwrap().robust_list),
+            (0, 0)
+        );
+        assert_eq!(t.fs.umask, 0o77);
         // The address space is the new image's: the old mapping is gone, the
         // stack VMA and the program's segments are in.
         let vmas = t.mm.vmas();

@@ -1033,7 +1033,7 @@ fn a_removed_directory_is_dead_for_a_process_still_inside_it() {
         err(Errno::ENOENT)
     );
     let env = crate::vfs::ops::Env {
-        start: t.attrs.fs.pwd,
+        start: t.fs.pwd,
         ..env
     };
     assert_eq!(

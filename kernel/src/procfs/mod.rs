@@ -878,54 +878,10 @@ impl ProcState {
         Some(&mut self.views[at].1)
     }
 
-    /// The address space `/proc/<tgid>` shows: the task's own, or, while a `vfork` child works in
-    /// it, the child's -- one `mm_struct` however many `vfork`s deep.
+    /// The address space `/proc/<tgid>` shows: the one the task last published.
     #[must_use]
     pub fn mm_of(&self, tgid: i32) -> Option<&MmView> {
-        let mut view = self.view(tgid)?;
-        // A chain of holders cannot be longer than the number of views.
-        for _ in 0..=self.views.len() {
-            let Some(next) = view.lent_to else {
-                return view.mm.as_ref();
-            };
-            view = self.view(next)?;
-        }
-        None
-    }
-
-    /// `copy_mm` with `CLONE_VM` for a `vfork`: the address space of `tgid` is now the one
-    /// `holder` works in.
-    pub fn lend_mm(&mut self, tgid: i32, holder: i32) {
-        if let Ok(at) = self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
-            let view = &mut self.views[at].1;
-            self.totals.sub(MmTotals::of(view));
-            view.mm = None;
-            view.lent_to = Some(holder);
-        }
-    }
-
-    /// The address space is back with `tgid` (`holder` exec'd or exited, `mm_release`): its view
-    /// shows what the holder's showed when it let go.
-    pub fn return_mm(&mut self, tgid: i32, holder: i32) {
-        let mm = self.view(holder).and_then(|view| view.mm.clone());
-        if let Ok(at) = self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
-            let view = &mut self.views[at].1;
-            view.lent_to = None;
-            view.mm = mm;
-            self.totals.add(MmTotals::of(view));
-        }
-    }
-
-    /// `holder` borrowed the address space of `tgid` and exited while its own `vfork` child still
-    /// works in it: `tgid` waits for that child now.
-    pub fn skip_lent(&mut self, tgid: i32, holder: i32) {
-        let next = self.view(holder).and_then(|view| view.lent_to);
-        if let Ok(at) = self.views.binary_search_by_key(&tgid, |(t, _)| *t) {
-            let view = &mut self.views[at].1;
-            if view.lent_to == Some(holder) {
-                view.lent_to = next;
-            }
-        }
+        self.view(tgid)?.mm.as_ref()
     }
 
     /// Bring the address-space part of the view of `tgid` up to date with `mm`, which the task
@@ -963,7 +919,6 @@ impl ProcState {
             let view = &mut self.views[at].1;
             self.totals.sub(MmTotals::of(view));
             view.mm = None;
-            view.lent_to = None;
             view.exe = None;
             view.fds = view::FdView::default();
             view.has_files = false;

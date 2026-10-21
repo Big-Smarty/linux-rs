@@ -189,20 +189,16 @@ impl Cred {
     }
 }
 
-/// `current->fs`: the root, the working directory and the file-creation mask.
-/// The VFS spine owns the type ([`crate::vfs::FsStruct`]); `umask(2)` edits
-/// `umask`, `chdir`/`fchdir`/`getcwd` use the directory handles.
-pub use crate::vfs::FsStruct;
-
 /// `TASK_COMM_LEN`.
 pub const COMM_LEN: usize = 16;
 
-/// Everything the identity group keeps per task.
+/// Everything the identity group keeps per task. The filesystem context (`current->fs`) is
+/// shared between the tasks that cloned with `CLONE_FS` and so lives apart
+/// ([`crate::vfs::FsStruct`], `userspace::FsShared`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attributes {
     pub cred: Cred,
     pub rlimits: Rlimits,
-    pub fs: FsStruct,
     /// `task_struct::comm`, NUL-padded. A task started by `execve("/init")`
     /// is named after the file: `init`.
     pub comm: [u8; COMM_LEN],
@@ -213,8 +209,6 @@ pub struct Attributes {
     /// only when `mm_users > 1`; every mm here is private, so it is
     /// unobservable until `CLONE_VM` exists).
     pub clear_child_tid: u64,
-    /// `task_struct::robust_list` (`set_robust_list`), walked at exit only.
-    pub robust_list: u64,
     /// `PFA_NO_NEW_PRIVS` (`PR_SET_NO_NEW_PRIVS`): set once, inherited by `fork`, kept by
     /// `execve`, never cleared.
     pub no_new_privs: bool,
@@ -230,11 +224,9 @@ impl Attributes {
         Self {
             cred: Cred::root(),
             rlimits: Rlimits::init(max_threads),
-            fs: FsStruct::INIT,
             comm,
             personality: 0,
             clear_child_tid: 0,
-            robust_list: 0,
             no_new_privs: false,
         }
     }

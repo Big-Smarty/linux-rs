@@ -15,6 +15,7 @@ pub mod cputime;
 pub mod exec;
 pub mod fbtext;
 pub mod firmware;
+pub mod futex;
 pub mod heap;
 pub mod image;
 pub mod intc;

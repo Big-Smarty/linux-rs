@@ -35,6 +35,7 @@ mod dynelf_tests;
 mod exec;
 mod fd;
 mod fs;
+mod futex;
 mod ids;
 mod io;
 mod memory;
@@ -70,6 +71,7 @@ use crate::{
 };
 use syscalls::{Errno, Sysno};
 
+pub use futex::mm_release;
 pub use ids::{UTS_RELEASE, UTS_VERSION};
 pub use io::{MAX_RW_COUNT, TTY_CHUNK};
 pub use process::exit_code;
@@ -170,6 +172,8 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     }
     /// The task list, `current` and the wake-up path.
     fn tasks(&mut self) -> Tasks<'_>;
+    /// The futex queues and the caller's place in them.
+    fn futex(&mut self) -> FutexParts<'_>;
     /// `set_mm_exe_file`: the open description the new image was loaded from
     /// becomes `mm->exe_file`; the previous one is returned for `fput`. The
     /// binary also keeps the id the fault report names the program by.
@@ -243,6 +247,21 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     fn rlimit_nofile(&mut self) -> u64 {
         self.attrs().rlimits.get(RLIMIT_NOFILE).cur
     }
+}
+
+/// The futex queues with the identity of the caller in them (`current->mm`, `task_pid_vnr`, the
+/// scheduling slot a waker names to wake it) and the way to wake a sleeper.
+pub struct FutexParts<'a> {
+    pub queue: &'a mut crate::futex::Futexes,
+    pub waker: &'a mut dyn crate::futex::FutexWaker,
+    /// The scheduler slot of the caller: its waiters' owner.
+    pub owner: u32,
+    /// The identity of `current->mm` for private keys.
+    pub mm: u64,
+    /// `mm->mm_users`: tasks that share the address space (the caller included).
+    pub mm_users: u32,
+    /// `task_pid_vnr(current)`.
+    pub tid: u32,
 }
 
 /// What `sysinfo` reads from the machine rather than from the task.
@@ -342,6 +361,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
         .or_else(|| exec::dispatch(ctx, sysno, args))
+        .or_else(|| futex::dispatch(ctx, sysno, args))
         .or_else(|| ids::dispatch(ctx, sysno, args))
         .or_else(|| time::dispatch(ctx, sysno, args))
         .or_else(|| signal::dispatch(ctx, sysno, args));

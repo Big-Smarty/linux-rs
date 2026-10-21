@@ -97,8 +97,8 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
         Sysno::setrlimit => setrlimit(ctx, uint(a0), a1),
         Sysno::prlimit64 => prlimit64(ctx, int(a0), uint(a1), a2, a3),
         Sysno::umask => {
-            let fs = &mut ctx.attrs().fs;
-            let old = core::mem::replace(&mut fs.umask, uint(a0) & 0o777);
+            let files = ctx.files();
+            let old = core::mem::replace(&mut files.fs.umask, uint(a0) & 0o777);
             Ok(i64::from(old))
         }
         Sysno::uname => uname(ctx, a0),
@@ -209,7 +209,10 @@ fn set_robust_list<C: Context>(ctx: &mut C, head: u64, len: u64) -> Res {
     if len != 24 {
         return Err(Errno::EINVAL.into());
     }
-    ctx.attrs().robust_list = head;
+    let tasks = ctx.tasks();
+    if let Some(task) = tasks.list.task_mut(tasks.current) {
+        task.robust_list = head;
+    }
     Ok(0)
 }
 
@@ -780,12 +783,12 @@ mod tests {
         assert_eq!(t.attrs.clear_child_tid, BUF);
         assert_eq!(call(&mut t, Sysno::set_tid_address, &[0]), ok(1));
         assert_eq!(call(&mut t, Sysno::set_robust_list, &[0x1000, 24]), ok(0));
-        assert_eq!(t.attrs.robust_list, 0x1000);
+        assert_eq!(t.tasks.task(t.current).unwrap().robust_list, 0x1000);
         assert_eq!(
             call(&mut t, Sysno::set_robust_list, &[0x2000, 16]),
             err(Errno::EINVAL)
         );
-        assert_eq!(t.attrs.robust_list, 0x1000);
+        assert_eq!(t.tasks.task(t.current).unwrap().robust_list, 0x1000);
 
         assert_eq!(call(&mut t, Sysno::personality, &[0xffff_ffff]), ok(0));
         assert_eq!(call(&mut t, Sysno::personality, &[0x1_ffff_ffff]), ok(0));

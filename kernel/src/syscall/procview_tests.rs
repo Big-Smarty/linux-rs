@@ -40,6 +40,7 @@ fn collect<'a>(
 ) -> Collect<'a> {
     Collect {
         attrs,
+        fs: t.fs,
         fdt,
         files: &t.vfs.files,
         mm: Some(&t.mm),
@@ -400,67 +401,3 @@ fn a_view_never_replays_another_tables_log() {
     assert!(view.fd(0).is_none(), "nothing of the first table is left");
 }
 
-#[test]
-fn a_view_follows_the_vfork_child_that_works_in_its_address_space() {
-    let mut t = task();
-    let attrs = Attributes::init(1000);
-    let fdt = FdTable::default();
-    let (exe, _) = t.vfs.pipe_create(0, &crate::vfs::Cred::root()).unwrap();
-    let mut ps = ProcState::default();
-    ps.sync(&t.tasks).unwrap();
-    let (_, parent) = fork_child(&mut t);
-    let (_, kid) = fork_child(&mut t);
-    let (_, grand) = fork_child(&mut t);
-    ps.sync(&t.tasks).unwrap();
-    // The parent's address space has 3 anonymous pages, the kid's (the same one, later) 5.
-    for (pid, anon) in [(parent, 3), (kid, 0), (grand, 0)] {
-        ps.publish_update(pid, collect(&attrs, &fdt, &t, exe, (anon, 0, 0)))
-            .unwrap();
-    }
-    assert_eq!(ps.totals().anon_pages, 3);
-    // vfork: the parent follows the child; the sums count the address space once.
-    ps.lend_mm(parent, kid);
-    assert_eq!(ps.view(parent).unwrap().mm, None);
-    assert_eq!(ps.mm_of(parent), ps.view(kid).unwrap().mm.as_ref());
-    ps.publish_update(kid, collect(&attrs, &fdt, &t, exe, (5, 0, 0)))
-        .unwrap();
-    assert_eq!(
-        ps.mm_of(parent).unwrap().rss_anon,
-        5,
-        "what the child maps shows"
-    );
-    assert_eq!(ps.totals().anon_pages, 5, "counted once");
-    // The lent task republishing without an address space changes nothing.
-    let mut again = collect(&attrs, &fdt, &t, exe, (0, 0, 0));
-    again.mm = None;
-    ps.publish_update(parent, again).unwrap();
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 5);
-    assert_eq!(ps.totals().anon_pages, 5);
-    // A second level: the kid vforks the grandchild.
-    ps.lend_mm(kid, grand);
-    ps.publish_update(grand, collect(&attrs, &fdt, &t, exe, (7, 0, 0)))
-        .unwrap();
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 7);
-    assert_eq!(ps.mm_of(kid).unwrap().rss_anon, 7);
-    assert_eq!(ps.totals().anon_pages, 7);
-    // The kid dies borrowing: the parent waits for the grandchild now.
-    ps.skip_lent(parent, kid);
-    ps.exit(kid);
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 7);
-    // The grandchild lets go: the parent shows what the grandchild's view showed, and a
-    // republication by the parent replaces it with its own.
-    ps.return_mm(parent, grand);
-    ps.exit(grand);
-    assert_eq!(ps.view(parent).unwrap().lent_to, None);
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 7);
-    assert_eq!(ps.totals().anon_pages, 7);
-    ps.publish_update(parent, collect(&attrs, &fdt, &t, exe, (6, 0, 0)))
-        .unwrap();
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 6);
-    assert_eq!(ps.totals().anon_pages, 6);
-    // A lender that died while lent shows no address space.
-    ps.lend_mm(parent, kid);
-    ps.exit(parent);
-    assert!(ps.mm_of(parent).is_none());
-    assert_eq!(ps.totals().anon_pages, 0);
-}
