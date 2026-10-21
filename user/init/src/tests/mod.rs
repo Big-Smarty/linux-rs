@@ -44,6 +44,7 @@ pub mod fs;
 pub mod futex;
 pub mod ids;
 pub mod jobctl;
+pub mod madvise;
 pub mod mm;
 pub mod names;
 pub mod pipe;
@@ -388,10 +389,12 @@ pub fn run_mode(mode: &[u8]) -> bool {
         b"bbrun" | b"busybox" => busybox::run(),
         // The host's dynamically linked glibc programs and synthetic ET_DYN/PT_INTERP images
         // (needs the generated `dynamic.cpio` module and, on the host, AVX-512): see `dynelf`.
-        b"dynrun" => dynelf::run(),
+        // `dynelf` is the group name the bare-metal suite passes.
+        b"dynrun" | b"dynelf" => dynelf::run(),
         b"procfs" => procfs::run(),
         b"threads" => threads::run(),
         b"futex" => futex::run(),
+        b"madvise" => madvise::run(),
         // Reference-only (the pinned Linux; this kernel has no `setuid` family): the permission
         // matrix of /proc. Prints `info` rows, no checks: see `procfs::perm_probe`.
         b"procperm" => {

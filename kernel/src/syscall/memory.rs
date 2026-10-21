@@ -3,15 +3,16 @@
 // 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: mm/mmap.c (`SYSCALL_DEFINE1(brk)`,
 // `ksys_mmap_pgoff`, `SYSCALL_DEFINE2(munmap)`), mm/mremap.c (`SYSCALL_DEFINE5(mremap)`), arch/x86/kernel/sys_x86_64.c
 // (`SYSCALL_DEFINE6(mmap)`), mm/mprotect.c (`SYSCALL_DEFINE3(mprotect)`),
-// mm/madvise.c (`do_madvise`, `is_valid_madvise`, `madvise_should_skip`,
-// `madvise_walk_vmas`, `madvise_vma_behavior` for `MADV_NORMAL`),
-// drivers/tty/tty_io.c (`console_fops`: no `->mmap`). All GPL-2.0.
+// mm/madvise.c (`SYSCALL_DEFINE3(madvise)`, `do_madvise`, `madvise_populate`,
+// `SYSCALL_DEFINE5(process_madvise)`), mm/gup.c (`faultin_page_range`), lib/iov_iter.c
+// (`import_iovec`), kernel/pid.c (`pidfd_get_task`), drivers/tty/tty_io.c (`console_fops`: no
+// `->mmap`). All GPL-2.0.
 // Transformation: the decisions are `crate::mm`'s (this file decodes the
 // register arguments, resolves the file descriptor and maps the model's
 // outcomes to a return value); a request Linux serves with a shared file page,
 // shmem or hugetlb object this kernel does not have yet ends in `Unimplemented`.
 #![forbid(unsafe_code)]
-//! Memory syscalls: `brk`, `mmap`, `munmap`, `mremap`, `mprotect`, `madvise`.
+//! Memory syscalls: `brk`, `mmap`, `munmap`, `mremap`, `mprotect`, `madvise`, `process_madvise`.
 //!
 //! Context: the one task, address-space lock held by construction (the
 //! binary's `Process` lock). Heap storage for the VMA vector is reserved by
@@ -21,8 +22,10 @@
 //!   stop), never an errno Linux would not return: `MAP_SHARED|MAP_ANONYMOUS`
 //!   (shmem), `MAP_HUGETLB` (hugetlbfs), a `MAP_SHARED` mapping of a file that
 //!   can be written through it or of `/dev/zero` (pages shared with the file or
-//!   with `shmem_zero_setup`), a device whose driver is not ported and every
-//!   `madvise` behaviour except `MADV_NORMAL`, and a tmpfs file mapping with
+//!   with `shmem_zero_setup`), a device whose driver is not ported, the two `madvise`
+//!   requests the model cannot answer ([`crate::mm::MadviseUnsupported`]; `MADV_REMOVE` and
+//!   `MADV_WIPEONFORK` after a private `/dev/zero` mapping, which the model keeps as plain
+//!   anonymous memory although Linux gives its VMA a file), and a tmpfs file mapping with
 //!   `MAP_POPULATE`/`MAP_LOCKED` (`mm_populate` would take the private copies
 //!   at `mmap` time, which the copy-at-fault model cannot reproduce without
 //!   the page cache). `MAP_PRIVATE` mappings of tmpfs files (and read-only
@@ -31,9 +34,12 @@
 //!   pages in exactly like Linux; `RLIMIT_MEMLOCK` and friends come from the
 //!   fixed `INIT_RLIMITS` in `mm::Env`, not from `setrlimit`.
 
-use super::{AddressSpace, Context, Files, Outcome, error};
+use super::{AddressSpace, Context, Files, Outcome, error, fd::import_segs};
 use crate::{
-    mm::{FileMapping, MAP_ANONYMOUS, Mmap, PAGE_SIZE, VmFlags, mmap_off_to_pgoff},
+    mm::{
+        Env, FileMapping, MADV_POPULATE_READ, MADV_POPULATE_WRITE, MADV_REMOVE, MADV_WIPEONFORK,
+        MAP_ANONYMOUS, Madvise, Mmap, PAGE_SIZE, VmFlags, madvise_range, mmap_off_to_pgoff,
+    },
     vfs::mapping::Mappable,
 };
 use syscalls::{Errno, Sysno};
@@ -75,6 +81,7 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
             }
         }
         Sysno::madvise => madvise(ctx, args),
+        Sysno::process_madvise => process_madvise(ctx, args),
         _ => return None,
     })
 }
@@ -201,68 +208,76 @@ pub(super) fn unpin_unmapped<C: Context>(ctx: &mut C) {
     }
 }
 
-/// `MADV_*` values `madvise_behavior_valid` accepts under the declared
-/// configuration (`CONFIG_KSM`, `CONFIG_TRANSPARENT_HUGEPAGE` and
-/// `CONFIG_MEMORY_FAILURE` are off, so MERGEABLE/UNMERGEABLE, HUGEPAGE/
-/// NOHUGEPAGE/COLLAPSE and `HWPOISON`/`SOFT_OFFLINE` are `-EINVAL`).
-const fn madvise_behavior_valid(behavior: i32) -> bool {
-    matches!(
-        behavior,
-        0..=4 | 8..=11 | 16..=24 | 102 | 103 // 0-2 hints, 3 WILLNEED, 4 DONTNEED, 8 FREE, 9 REMOVE, 10/11 FORK, 16-24, guard
-    )
-}
-
-const MADV_NORMAL: i32 = 0;
-
-/// `madvise(2)`: `is_valid_madvise` and `madvise_should_skip`, then the walk
-/// over the VMAs of the range. Only `MADV_NORMAL` is implemented: it clears
-/// `VM_RAND_READ|VM_SEQ_READ`, which no VMA here can have set, so it changes
-/// nothing; its result is `madvise_walk_vmas`' (`-ENOMEM` for any hole).
+/// `SYSCALL_DEFINE3(madvise)`: `do_madvise` for the caller's address space. The checks and the
+/// walk are the model's ([`crate::mm::madvise_range`], [`crate::mm::Mm::madvise`]);
+/// `MADV_POPULATE_*` faults the pages in through the task's own user-memory view.
 fn madvise<C: Context>(ctx: &mut C, [start, len_in, behavior, ..]: [u64; 6]) -> Outcome {
     // `int behavior`.
     #[allow(clippy::cast_possible_truncation)]
     let behavior = (behavior as u32).cast_signed();
-    if !madvise_behavior_valid(behavior) || start & (PAGE_SIZE - 1) != 0 {
-        return Outcome::Return(error(Errno::EINVAL));
-    }
-    // PAGE_ALIGN(len_in) wrapped to zero from a small negative length.
-    let Some(aligned) = len_in
-        .checked_add(PAGE_SIZE - 1)
-        .map(|n| n & !(PAGE_SIZE - 1))
-    else {
-        return Outcome::Return(error(Errno::EINVAL));
+    let end = match madvise_range(start, len_in, behavior) {
+        Ok(Some(end)) => end,
+        Ok(None) => return Outcome::Return(0),
+        Err(errno) => return Outcome::Return(error(errno)),
     };
-    if start.checked_add(aligned).is_none() {
-        return Outcome::Return(error(Errno::EINVAL));
+    if behavior == MADV_POPULATE_READ || behavior == MADV_POPULATE_WRITE {
+        return populate(ctx, start, end, behavior == MADV_POPULATE_WRITE);
     }
-    if aligned == 0 {
-        return Outcome::Return(0);
-    }
-    if behavior != MADV_NORMAL {
+    // A private `/dev/zero` mapping is anonymous memory here but has `vm_file` in Linux, which
+    // `MADV_REMOVE` (`EACCES`, not `EINVAL`) and `MADV_WIPEONFORK` (`EINVAL`) look at.
+    if (behavior == MADV_REMOVE || behavior == MADV_WIPEONFORK) && ctx.files().vfs.zero_mapped() {
         return Outcome::Unimplemented(Sysno::madvise as u32);
     }
-    let end = start + aligned;
-    let AddressSpace { mm, .. } = ctx.address_space();
-    // madvise_walk_vmas: carry on past a hole, remember ENOMEM.
-    let mut at = start;
-    let mut unmapped = 0;
-    loop {
-        let Some(vma) = mm.find_vma(at) else {
-            return Outcome::Return(error(Errno::ENOMEM));
-        };
-        if at < vma.start {
-            unmapped = error(Errno::ENOMEM);
-            at = vma.start;
-            if at >= end {
-                break;
-            }
-        }
-        if vma.end.min(end) >= end {
-            break;
-        }
-        at = vma.end;
+    let AddressSpace { mm, env, pages } = ctx.address_space();
+    match mm.madvise(env, pages, start, end, behavior) {
+        Ok(()) => Outcome::Return(0),
+        Err(Madvise::Errno(errno)) => Outcome::Return(error(errno)),
+        Err(Madvise::Unsupported(_)) => Outcome::Unimplemented(Sysno::madvise as u32),
     }
-    Outcome::Return(unmapped)
+}
+
+/// `madvise_populate`: `faultin_page_range` one VMA at a time. Each page is faulted in as the
+/// task's own kernel access would be (`FaultPages`: a read maps the zero page or the file's
+/// page, a write makes the private copy), which is what `handle_mm_fault` does for `gup`.
+fn populate<C: Context>(ctx: &mut C, start: u64, end: u64, write: bool) -> Outcome {
+    let pkru = ctx.pkru();
+    let mut at = start;
+    while at < end {
+        let span_end = {
+            let AddressSpace { mm, env, .. } = ctx.address_space();
+            let env = Env { pkru, ..*env };
+            match mm.populate_span(&env, at, end, write) {
+                Ok(span_end) => span_end,
+                Err(errno) => return Outcome::Return(error(errno)),
+            }
+        };
+        while at < span_end {
+            if ctx.page(at, write).is_none() {
+                let AddressSpace { mm, pages, .. } = ctx.address_space();
+                return Outcome::Return(error(mm.populate_error(&*pages, at)));
+            }
+            at += PAGE_SIZE;
+        }
+    }
+    Outcome::Return(0)
+}
+
+/// `SYSCALL_DEFINE5(process_madvise)`: `flags` must be 0, the vector is imported (`ITER_DEST`),
+/// then `pidfd_get_task` wants a pidfd. No pidfd exists here (`pidfd_open` and `CLONE_PIDFD` stop
+/// the kernel), so a descriptor that is not one is `EBADF`, as in Linux for any other file or a
+/// closed descriptor; nothing after that step can be reached.
+fn process_madvise<C: Context>(
+    ctx: &mut C,
+    [_pidfd, vec, vlen, _behavior, flags, _]: [u64; 6],
+) -> Outcome {
+    // `unsigned int flags`.
+    if flags & 0xffff_ffff != 0 {
+        return Outcome::Return(error(Errno::EINVAL));
+    }
+    if let Err(errno) = import_segs(ctx, vec, vlen) {
+        return Outcome::Return(error(errno));
+    }
+    Outcome::Return(error(Errno::EBADF))
 }
 
 #[cfg(test)]

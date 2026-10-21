@@ -359,8 +359,14 @@ fn new_rootfs() -> Result<Rootfs, Error> {
 
 impl Rootfs {
     /// `unpack_to_rootfs` of boot module `index`.
+    #[cfg(not(feature = "baremetal-suite"))]
     fn unpack(&mut self, index: usize, bytes: &[u8]) {
-        if let Some(message) = self.unpacker.unpack(&mut self.vfs, bytes) {
+        self.unpack_chunks(index, &[bytes]);
+    }
+
+    /// `unpack_to_rootfs` of boot module `index`, held in `chunks` (in order).
+    fn unpack_chunks(&mut self, index: usize, chunks: &[&[u8]]) {
+        if let Some(message) = self.unpacker.unpack_chunks(&mut self.vfs, chunks) {
             // CONFIG_BLK_DEV_RAM=n (`do_populate_rootfs`): the unpacker's own
             // message; the entries before the failure stay in the tree.
             if message == vfs::initramfs::NOT_PORTED {
@@ -1747,7 +1753,11 @@ impl Syscall<'_> {
             None
         } else {
             let space = parent_mm.space.dup(&parent_mm.env)?;
-            match parent_mm.tables.user_space().fork_tables() {
+            match parent_mm
+                .tables
+                .user_space()
+                .fork_tables(parent_mm.space.vmas())
+            {
                 Ok(tables) => Some((space, tables)),
                 Err(error) => {
                     drop(space);
@@ -1810,6 +1820,12 @@ impl Syscall<'_> {
         {
             fork_undo(vfs, sched, copied, new_fdt, None, None);
             return Err(errno);
+        }
+        // A `VM_DONTCOPY` VMA is not in the child, and holds no reference to its file.
+        if let Some((space, _)) = &copied {
+            vfs.pin_retain(child_pin, |id| {
+                space.vmas().iter().any(|v| v.file == Some(id))
+            });
         }
         let new_fs = (!request.share_fs).then(|| vfs.dup_fs(&must(fs_structs, fs_id).fs));
         if !request.share_vm {
@@ -2103,6 +2119,9 @@ impl Context for Syscall<'_> {
             env,
             pages: tables,
         }
+    }
+    fn pkru(&self) -> u32 {
+        fpu::read_pkru()
     }
     fn files(&mut self) -> Files<'_> {
         let (mm, files, fs) = (self.own.mm, self.own.files, self.own.fs);
@@ -3685,7 +3704,7 @@ pub fn run(user: Result<Loaded, Error>) {
 /// for the load (`TABLES` -> heap -> `FRAMES`, the documented order).
 #[cfg(feature = "baremetal-suite")]
 pub fn load_group(
-    archives: &[Vec<u8>],
+    archives: &[crate::baremetal::Archive],
     group: &str,
     uptime_s: u64,
     ram_bytes: u64,
@@ -3703,13 +3722,19 @@ pub fn load_group(
         }
     }
     let mut rootfs = new_rootfs()?;
-    let wanted = if group == "busybox" {
-        archives.len()
-    } else {
-        1
-    };
-    for (index, bytes) in archives.iter().enumerate().take(wanted) {
-        rootfs.unpack(index, bytes);
+    // The base archive, and the module of the group's host programs when it has one.
+    let module = kernel::suite::module_of_group(group);
+    for (index, archive) in archives.iter().enumerate() {
+        if index == 0 || module.is_some_and(|wanted| archive.kind == wanted) {
+            let mut pieces: Vec<&[u8]> = Vec::new();
+            pieces
+                .try_reserve_exact(archive.chunks.len())
+                .map_err(|_| Error::Vfs(Errno::ENOMEM))?;
+            for chunk in &archive.chunks {
+                let _ = pieces.push_within_capacity(chunk.as_slice());
+            }
+            rootfs.unpack_chunks(index, &pieces);
+        }
     }
     // "-- <group> <decimal uptime> <decimal ram>", at most 20 digits each.
     let (mut up, mut ram) = ([0u8; 20], [0u8; 20]);

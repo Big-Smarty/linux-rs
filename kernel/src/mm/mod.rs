@@ -5,8 +5,8 @@
 //! Reproduces, for one single-threaded process under the declared
 //! configuration (x86-64, 4-level paging, `norandmaps`, no THP, no KSM, no
 //! userfaultfd, no protection keys, `CONFIG_COMPAT_BRK=n`), the VMA set,
-//! mmap placement, and the decisions of `mmap`, `munmap`, `mprotect`, `brk`
-//! and the user page fault of Linux 6.18.57. Page-table effects go through
+//! mmap placement, and the decisions of `mmap`, `munmap`, `mprotect`, `brk`,
+//! `madvise` and the user page fault of Linux 6.18.57. Page-table effects go through
 //! the [`UserPages`] trait; the kernel binary implements it on its tables.
 //! See `docs/implementation.md#memory-mapping-model`.
 
@@ -14,6 +14,7 @@ mod env;
 mod fault;
 mod flags;
 mod layout;
+mod madvise;
 mod ops;
 mod pt;
 mod remap;
@@ -29,6 +30,9 @@ pub use fault::{
 };
 pub use flags::*;
 pub use layout::{DEFAULT_MAP_WINDOW, mmap_address_hint_valid, pick_mmap_base, round_hint_to_min};
+pub use madvise::{
+    Madvise, Unsupported as MadviseUnsupported, madvise_behavior_valid, madvise_range,
+};
 pub use ops::{FileMapping, Mmap, Unsupported, mmap_off_to_pgoff};
 pub use pt::{OutOfMemory, Pte, UserPages};
 pub use remap::{MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE};

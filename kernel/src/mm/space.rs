@@ -197,9 +197,12 @@ impl Mm {
     /// longer merge on that account). A `VM_ACCOUNT` VMA is charged to the
     /// overcommit policy again, as `security_vm_enough_memory_mm` does.
     ///
-    /// The caller copies the pages (`copy_page_range`): this returns only the
-    /// model. `VM_DONTCOPY` (`madvise(MADV_DONTFORK)`) and `VM_WIPEONFORK` are
-    /// not reachable (`madvise` implements only `MADV_NORMAL`).
+    /// A `VM_DONTCOPY` VMA (`madvise(MADV_DONTFORK)`) is not copied and its pages come off the
+    /// child's counters (`vm_stat_account(mm, flags, -pages)`), without being charged. A
+    /// `VM_WIPEONFORK` VMA is copied without an `anon_vma` ("a clean slate": it gets one at the
+    /// first write fault); [`Mm::copies_pages`] says its pages stay behind.
+    ///
+    /// The caller copies the pages (`copy_page_range`): this returns only the model.
     ///
     /// # Errors
     /// `ENOMEM`: the VMA vector cannot be reserved, or the charge is refused.
@@ -210,18 +213,23 @@ impl Mm {
             .map_err(|_| Errno::ENOMEM)?;
         let mut next_anon = self.next_anon;
         for vma in self.vmas.iter() {
+            if vma.flags.contains(VmFlags::DONTCOPY) {
+                continue;
+            }
             if vma.flags.contains(VmFlags::ACCOUNT) && !env.enough_memory(vma.pages()) {
                 return enomem();
             }
             let mut copy = *vma;
             copy.flags = VmFlags(copy.flags.0 & !(VmFlags::LOCKED.0 | VmFlags::LOCKONFAULT.0));
-            if copy.anon.is_some() {
+            if copy.flags.contains(VmFlags::WIPEONFORK) {
+                copy.anon = None;
+            } else if copy.anon.is_some() {
                 copy.anon = Some(next_anon);
                 next_anon += 1;
             }
             vmas.push_within_capacity(copy).map_err(|_| Errno::ENOMEM)?;
         }
-        Ok(Self {
+        let mut child = Self {
             vmas: VmaList {
                 list: vmas,
                 version: 0,
@@ -252,7 +260,25 @@ impl Mm {
             // VM_LOCKED from mlockall(MCL_FUTURE) never crosses a fork.
             def_flags: VmFlags::NONE,
             next_anon,
-        })
+        };
+        for vma in self
+            .vmas
+            .iter()
+            .filter(|v| v.flags.contains(VmFlags::DONTCOPY))
+        {
+            child.stat_sub(vma.flags, vma.pages());
+        }
+        Ok(child)
+    }
+
+    /// Whether `fork` copies the pages of a VMA with `flags` into the child: not for
+    /// `VM_DONTCOPY` (the VMA is not in the child at all) and not for `VM_WIPEONFORK`
+    /// (`if (!(tmp->vm_flags & VM_WIPEONFORK)) copy_page_range()`). Every other populated page
+    /// is copied, a guard marker included (`VM_MAYBE_GUARD` is in `VM_COPY_ON_FORK`, and a
+    /// marker cannot be rebuilt by a fault).
+    #[must_use]
+    pub const fn copies_pages(flags: VmFlags) -> bool {
+        !flags.intersects(VmFlags(VmFlags::DONTCOPY.0 | VmFlags::WIPEONFORK.0))
     }
 
     /// `create_elf_tables` / `load_elf_binary`: where the program's stack
@@ -509,23 +535,28 @@ impl Mm {
         let right = !just_expand
             && Self::can_merge_right(next.as_ref(), req, if left { prev.as_ref() } else { None });
         match (left, right) {
+            // `vma_expand` ORs the sticky flags of the request, the target and a removed `next`
+            // into the target.
             (true, true) => {
                 let p = lo - 1;
                 let n = self.vmas[lo];
                 self.vmas[p].end = n.end;
                 // dup_anon_vma(target, next)
                 self.vmas[p].anon = self.vmas[p].anon.or(n.anon);
+                self.vmas[p].flags |= (req.flags | n.flags) & VmFlags::STICKY;
                 self.vmas.remove(lo);
                 Some(p)
             }
             (true, false) => {
                 self.vmas[lo - 1].end = req.end;
+                self.vmas[lo - 1].flags |= req.flags & VmFlags::STICKY;
                 Some(lo - 1)
             }
             (false, true) => {
                 let n = &mut self.vmas[lo];
                 n.start = req.start;
                 n.pgoff = req.pgoff;
+                n.flags |= req.flags & VmFlags::STICKY;
                 Some(lo)
             }
             (false, false) => None,
@@ -565,18 +596,23 @@ impl Mm {
         }
         let remove_middle = left_side && right_side;
         let pglen = (req.end - req.start) >> PAGE_SHIFT;
+        // `vm_flags_set(vmg->target, sticky_flags)`: the request's sticky flags and those of the
+        // neighbours that merge. (Callers then reset the target's flags to the request's, as
+        // `mprotect_fixup` and `madvise_update_vma` do.)
         if merge_left && merge_right {
             let n = self.vmas[mid + 1];
             let p = &mut self.vmas[mid - 1];
             p.end = n.end;
             // dup_anon_vma(prev, next->anon_vma ? next : middle)
             p.anon = p.anon.or(n.anon.or(m.anon));
+            p.flags |= (req.flags | n.flags) & VmFlags::STICKY;
             self.vmas.drain(mid..=mid + 1);
             Some(mid - 1)
         } else if merge_left {
             let p = mid - 1;
             self.vmas[p].end = req.end;
             self.vmas[p].anon = self.vmas[p].anon.or(m.anon);
+            self.vmas[p].flags |= req.flags & VmFlags::STICKY;
             if remove_middle {
                 self.vmas.remove(mid);
             } else {
@@ -588,6 +624,7 @@ impl Mm {
             let n = mid + 1;
             let nv = self.vmas[n];
             self.vmas[n].anon = nv.anon.or(m.anon);
+            self.vmas[n].flags |= req.flags & VmFlags::STICKY;
             self.vmas[n].start = req.start;
             self.vmas[n].pgoff = nv.pgoff - pglen;
             if remove_middle {

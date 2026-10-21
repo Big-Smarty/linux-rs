@@ -326,44 +326,70 @@ impl Src {
     }
 }
 
-/// `__import_iovec`: the segments of `vlen` iovecs at `vec`, each range
-/// checked with `access_ok`, and the total clamped to `MAX_RW_COUNT`.
-fn import_segs<C: Context>(
-    ctx: &mut C,
-    vec: u64,
-    vlen: u64,
-) -> Result<(Vec<(u64, u64)>, u64), Errno> {
-    if vlen > UIO_MAXIOV {
+/// `iovec_from_user`: `nr` iovecs at `vec`, all read before any is judged
+/// (`copy_iovec_from_user`: an unreadable vector is `EFAULT`, a length that is negative as an
+/// `ssize_t` is `EINVAL`, whichever comes first in the order of the segments).
+fn copy_iovecs<C: Context>(ctx: &mut C, vec: u64, nr: u64) -> Result<Vec<(u64, u64)>, Errno> {
+    // (A zero count returns before the limit is looked at.)
+    if nr > UIO_MAXIOV {
         return Err(Errno::EINVAL);
     }
     let mut segs = Vec::new();
-    segs.try_reserve_exact(vlen as usize)
+    segs.try_reserve_exact(nr as usize)
         .map_err(|_| Errno::ENOMEM)?;
-    let mut total: i64 = 0;
-    for i in 0..vlen {
+    // `user_access_begin(uiov, nr * sizeof(*uiov))`
+    if nr != 0 && !access_ok(vec, nr * 16) {
+        return Err(Errno::EFAULT);
+    }
+    for i in 0..nr {
         let mut raw = [0u8; 16];
         if copy_from_user(ctx, &mut raw, vec.wrapping_add(i * 16)) != 0 {
             return Err(Errno::EFAULT);
         }
         let base = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
         let len = u64::from_le_bytes(raw[8..].try_into().unwrap_or([0; 8]));
-        #[allow(clippy::cast_possible_wrap)]
-        let signed = len as i64;
-        if !access_ok(base, len) {
+        // "check for size_t not fitting in ssize_t .."
+        if len > i64::MAX as u64 {
+            return Err(Errno::EINVAL);
+        }
+        try_push(&mut segs, (base, len))?;
+    }
+    Ok(segs)
+}
+
+/// `__import_iovec`: the segments of `vlen` iovecs at `vec` and their total. `vlen` is the
+/// `unsigned nr_segs` of `import_iovec` (the upper half of a register is dropped). One segment
+/// is `__import_iovec_ubuf` (`import_ubuf` clamps the length to `MAX_RW_COUNT` and then checks
+/// the range with `access_ok`); several are each checked with `access_ok` as given, then the
+/// running total is clamped to `MAX_RW_COUNT`.
+pub(super) fn import_segs<C: Context>(
+    ctx: &mut C,
+    vec: u64,
+    vlen: u64,
+) -> Result<(Vec<(u64, u64)>, u64), Errno> {
+    #[allow(clippy::cast_possible_truncation)]
+    let nr = u64::from(vlen as u32);
+    let mut segs = copy_iovecs(ctx, vec, nr)?;
+    if segs.len() == 1 {
+        let (base, len) = &mut segs[0];
+        *len = (*len).min(u64::from(MAX_RW_COUNT));
+        if !access_ok(*base, *len) {
             return Err(Errno::EFAULT);
         }
-        // `__import_iovec`: clamp the running total to MAX_RW_COUNT.
-        let mut len = signed;
-        let max = i64::from(MAX_RW_COUNT);
-        if len > max - total {
-            len = max - total;
-        }
-        total += len;
-        #[allow(clippy::cast_sign_loss)]
-        try_push(&mut segs, (base, len.max(0) as u64))?;
+        let total = *len;
+        return Ok((segs, total));
     }
-    #[allow(clippy::cast_sign_loss)]
-    Ok((segs, total.max(0) as u64))
+    let max = u64::from(MAX_RW_COUNT);
+    let mut total: u64 = 0;
+    for (base, len) in &mut segs {
+        if !access_ok(*base, *len) {
+            return Err(Errno::EFAULT);
+        }
+        // Clamp the running total to MAX_RW_COUNT.
+        *len = (*len).min(max - total);
+        total += *len;
+    }
+    Ok((segs, total))
 }
 
 /// `import_iovec` for `ITER_DEST`.
