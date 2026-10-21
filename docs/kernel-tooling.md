@@ -6,7 +6,7 @@
 
 The implemented first boot cell uses QEMU `q35` with OVMF, Limine 12.9.3, and Limine protocol base revision 5. This is an engineering sequencing choice, not a newly attributed detailed user approval. Tool/firmware provenance and the independent Linux tag verification remain in `target/implementation-prereqs/{tooling-manifest.txt,upstream-verification.txt}`; the latter records `TRUST_UNDEFINED`, not Web-of-Trust certification.
 
-This page specifies the maintained interface and acceptance rules and owns the per-case descriptions. What passed at which commit is in the [current status](implementation.md#current-status-at-main-9804570): at `main` 9804570 the catalog is 54 debug-exit cases and 5 suite cases (last recorded matching gate `threads-int-1`), 19 oracle groups, host tests `xtask` 98 and `baremetal` 10, and 698 kernel library tests. Historical manual `cell9` results are not relabelled as maintained-harness results; the `integrated-*` runs, the retained `integrated-001` failure and the withdrawn `diagnostic-001` package are history in [implementation](implementation.md) and [diagnostic handoff](diagnostic-handoff.md). Newly captured screenshots always begin with human review pending. Counts and case lists in the descriptive paragraphs below were written at the lane that introduced them and are superseded by the catalog `DEBUG_CASES`/`SUITE_CASES` in `xtask/src/kernel.rs`.
+This page specifies the maintained interface and acceptance rules and owns the per-case descriptions. What passed at which commit is in the [current status](implementation.md#current-status). Historical manual `cell9` results are not relabelled as maintained-harness results; history: [implementation](implementation.md) and [diagnostic handoff](diagnostic-handoff.md). Newly captured screenshots always begin with human review pending. Counts and case lists in the descriptive paragraphs below were written at the lane that introduced them and are superseded by the catalog `DEBUG_CASES`/`SUITE_CASES` in `xtask/src/kernel.rs`.
 
 ## Commands
 
@@ -17,12 +17,12 @@ cargo +1.88.0 run --offline --locked -p xtask -- check
 cargo +1.88.0 run --offline --locked -p xtask -- status
 cargo +1.88.0 run --offline --locked -p xtask -- kernel-build --output target/kernel-tooling/build-001
 cargo +1.88.0 run --offline --locked -p xtask -- kernel-test --output target/kernel-tooling/test-001
-cargo +1.88.0 run --offline --locked -p xtask -- kernel-test --output target/kernel-tooling/test-002 --timeout-seconds 30
+cargo +1.88.0 run --offline --locked -p xtask -- kernel-test --output target/kernel-tooling/test-002 --timeout-seconds 60
 cargo +1.88.0 run --offline --locked -p xtask -- kernel-package --build-output target/kernel-tooling/test-002/freestanding-build --output target/kernel-tooling/package-001
 cargo +1.88.0 run --offline --locked -p xtask -- baremetal-suite --output target/kernel-tooling/suite-001
 ```
 
-These are examples with unused output names, not transcripts. The recorded gate runs of the current catalog use `--timeout-seconds 60`, not the 30 shown; a toolchain or prerequisite problem is listed in [Prerequisites and known gaps](#prerequisites-and-known-gaps).
+These are examples with unused output names, not transcripts. A toolchain or prerequisite problem is listed in [Prerequisites and known gaps](#prerequisites-and-known-gaps).
 
 `baremetal-suite` is the [kernel-run bare-metal suite](#kernel-run-bare-metal-suite-a21) builder: it produces the directory tree the user copies to a separate USB stick (it never writes to a block device) and boots that exact tree once in QEMU.
 
@@ -37,9 +37,7 @@ These are examples with unused output names, not transcripts. The recorded gate 
 3. **Expected kernel record, by construction.** The `CHECK image inspected` tail is computed, not observed: `records=21 files=20 regular=5 symlinks=2 trailers=1 skipped=0 elf=1` (computed from `TEST_FILES`, not hard-coded), `loads` and `interpreters` from the `elf` crate's `PT_LOAD`/`PT_INTERP` count of the init, `bytes` the archive length and `reserved` that length rounded up to 4096 (a zero-byte module keeps one page). It is recorded as `expected_image_record` in the top manifest and compared field-for-field with the kernel's serial record; a mismatch fails the case.
 4. **Per-case module layouts.** Every case's module 0 is the generated archive (`fixtures/initramfs.cpio`, hash bound at generation, again after the per-case snapshot copy and again after extraction from the FAT image). `empty-module` appends a genuinely empty second module (expected `reserved=4096 bytes=0`, epoch `modules=2`). `bad-module` is `fixtures/initramfs-corrupt.cpio` (deterministic garbage starting with the gzip magic `1f 8b`) as module 0 and the archive as module 1: the kernel must print exactly `WARN Initramfs unpacking failed: module=0 error=Archive { offset: 0, error: CompressionPending(Gzip) } skipped=true`, no `CHECK image inspected module=0`, the archive's record as `module=1`, epoch `modules=2`, then every success marker and exit 33 (Linux reports a bad initramfs and still boots). The success-marker list is `SUCCESS_MARKERS` in `xtask/src/kernel.rs`; per-module image records are validated in `validate_image_serial` because they depend on the layout.
 
-**Fresh-clone procedure.** See [Prerequisites and known gaps](#prerequisites-and-known-gaps): the prerequisites table, the exact recorded command and its limits. Everything else (vendored crates, init, archive) comes from the clone; recorded in [implementation](implementation.md#generated-initramfs-fixtures-and-the-built-init).
-
-Userspace execution **is** asserted: every case that boots `/init` requires the `CHECK userspace exec` record, init's output lines and the Linux "Attempted to kill init" panic with exit code 0 (see the [self-test cases](#automated-self-test-cases) and the [oracle-group cases](#oracle-group-cases)). What these checks do not assert is any behaviour outside the compared lines.
+Userspace execution **is** asserted: what each case requires of `/init` is listed under the [self-test cases](#automated-self-test-cases) and the [oracle-group cases](#oracle-group-cases). What these checks do not assert is any behaviour outside the compared lines.
 
 ## Prerequisites and known gaps
 
@@ -51,7 +49,7 @@ What a clone needs beyond the repository. Paths marked *fixed* are compile-time 
 | The qualified nightly with `rust-src` | `rustup which --toolchain nightly` (alias), then an exact commit check | `kernel-build`, `kernel-test`, `kernel-package`, `baremetal-suite` | rustc commit `5c543b0b8c73c7b72bc8284ced4fb22ead15734d`, cargo `3d7cf6e937d6127d0f49881bf689c560b36d35c4`; no installable dated name is recorded ([item 1](next-steps.md#item-1-compiler-discovery-in-the-build-tooling)) |
 | A compiler reachable from `/usr/bin` | the isolated `PATH` is forced to `/usr/bin:/bin` | the vendor gate in `check` and in every kernel build | on the maintainer workstation `/usr/bin/{cargo,rustc}` are rustup proxies; without them the gate fails (item 1) |
 | `qemu-system-x86_64`, `limine` (must print `Limine 12.9.3`), `mkfs.fat`, `mmd`, `mcopy`, `sha256sum`, `readelf`, `git` | absolute entries of `PATH` | `kernel-test`, `baremetal-suite`, `kernel-build` | `mtools` and `dosfstools` provide the FAT tools |
-| `/usr/bin/setpriv`, `/usr/bin/kill` | *fixed* | long-lived children (`cargo`, QEMU) and process-group cleanup | util-linux and procps |
+| `/usr/bin/setpriv`, `/usr/bin/kill` | *fixed* | long-lived children (`cargo`, QEMU) and process-group cleanup | util-linux |
 | `/usr/share/edk2/x64/OVMF_CODE.4m.fd`, `OVMF_VARS.4m.fd` | *fixed* (`OVMF_CODE`, `OVMF_VARS`) | `kernel-test`, `baremetal-suite` | firmware; licence notices copied from `/usr/share/licenses/edk2-ovmf/` (*fixed*) |
 | `/usr/share/limine/BOOTX64.EFI`, `/usr/share/doc/limine/{COPYING,3RDPARTY.md}` | *fixed* (`LIMINE_EFI`, `LIMINE_DOCS`) | image staging | Limine 12.9.3 |
 | `/dev/kvm` | probed | the `kvm`, `signals-kvm`, `oracle-xstate`, `oracle-busybox`, `oracle-dynelf` and `baremetal-suite-kvm` cases | without it the case is `unavailable` (not a pass) |
@@ -62,13 +60,29 @@ What a clone needs beyond the repository. Paths marked *fixed* are compile-time 
 
 A case reported `unavailable` is neither passed nor failed and the command still exits 0; compare the matched count with the catalog size before calling a run a pass.
 
-**Fresh-clone verification, as recorded.** The command below is the one run on the maintainer workstation in a fresh clone with an empty `CARGO_HOME` (once at `6aaeb93`, 18/18; same host, user, toolchain installation and firmware; not another machine, not independently attested). It has not been repeated on another machine, and the current catalog (54 + 5 cases) was last matched in the `threads-int-1` gate at `41b16bb` on the author's workstation, not by a fresh-clone run:
+**Fresh-clone command.** Run from a fresh clone with an empty `CARGO_HOME`; the last recorded fresh-clone result is in the [current status](implementation.md#current-status):
 
 ```text
 env PATH="/bin:$PATH" CARGO_HOME=<empty dir> CARGO_NET_OFFLINE=true cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/<new-name> --timeout-seconds 60
 ```
 
-**The gate sequence has no committed command.** The integrator's gate runner is the ignored script `target/gates.sh` (fmt; host 1.88 clippy and tests; nightly clippy and tests; `kernel-test`; the four target Clippy profiles; `xtask check`; `xtask status`), and there is no CI workflow. Both are [item 6](next-steps.md#item-6-reproducible-verification-off-the-original-workstation). Until then a clone can run each step by hand from this page and [verification](verification.md#what-each-command-establishes), but not reproduce the recorded gate as one command.
+### Gate sequence
+
+**The gate sequence has no committed command.** The integrator's gate runner is the ignored script `target/gates.sh`, and there is no CI workflow; both are [item 6](next-steps.md#item-6-reproducible-verification-off-the-original-workstation). By hand, from the repository root, the recorded sequence is the following, with `<run>` and `<new>` unused names; `kernel-test` comes before the target Clippy runs because they reuse its merged vendor configuration ([fallible-only allocation](#fallible-only-kernel-allocation) explains the `--cfg`):
+
+```text
+cargo fmt --all --check
+cargo +1.88.0 clippy -p xtask -p baremetal --all-targets --locked --offline -- -D warnings
+cargo +1.88.0 test -p xtask -p baremetal --locked --offline
+cargo +nightly clippy --workspace --all-targets --locked --offline -- -D warnings
+cargo +nightly test --workspace --locked --offline
+env PATH="/bin:$PATH" cargo +1.88.0 run -p xtask --locked --offline -- kernel-test --output target/kernel-tooling/<run> --timeout-seconds 60
+# target Clippy, once for each of the four kernel profiles <f>:
+#   qemu-self-test, freestanding, freestanding,baremetal-suite, qemu-self-test,baremetal-suite
+env CARGO_ENCODED_RUSTFLAGS=--cfg=no_global_oom_handling cargo +nightly clippy --config target/kernel-tooling/<run>/freestanding-build/cargo-home/config.toml -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem -p kernel --bin linux-rs-kernel --target x86_64-unknown-none --target-dir target/kernel-tooling/<new> --release --locked --offline --no-default-features --features <f> -- -D warnings -Crelocation-model=static -Clink-arg=--no-pie -Clink-arg=-Tkernel/linker.ld -Clink-arg=--no-undefined
+cargo +1.88.0 run -p xtask --locked --offline -- check
+cargo +1.88.0 run -p xtask --locked --offline -- status
+```
 
 ## Build profiles and compiler contract
 
@@ -108,7 +122,7 @@ The ELF must be x86-64 ET_EXEC with executable PT_LOAD ranges. Its immutable sna
 
 ### Fallible-only kernel allocation
 
-The kernel links `alloc` (`-Zbuild-std=core,alloc,compiler_builtins`) rebuilt with `--cfg no_global_oom_handling`, the switch Rust-for-Linux uses: every `alloc` API that can abort when allocation fails (`Box::new`, `Vec::push`/`with_capacity`/`vec!`, `String::from`, `format!`, `Clone` of collections, ...) is compiled out, so kernel code can only use `try_reserve`, `Vec::push_within_capacity`, `Box::try_new` and similar. Observed on `rustc 1.101.0-nightly 5c543b0b8` with a probe crate built exactly this way: the fallible calls compile; `Box::new(1)` fails with `E0599 no associated function or constant named new found for struct Box`, and `Vec::push` with `E0599 no method named push`. The flag must reach the `alloc` build, so it is in the harness's `CARGO_ENCODED_RUSTFLAGS` (kernel only) and in every target Clippy command: `env CARGO_ENCODED_RUSTFLAGS=--cfg=no_global_oom_handling cargo +nightly clippy --config <run>/freestanding-build/cargo-home/config.toml -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem -p kernel --bin linux-rs-kernel --target x86_64-unknown-none ...` (a Clippy run without it would accept infallible calls that the maintained build rejects). The flag is recorded in `cargo_encoded_rustflags` of the build manifest, and a unit test pins the flag set and the build-std list. Third-party crates that call infallible `alloc` APIs fail to compile in this configuration (observed: `allocator-api2` 0.4.0 with feature `alloc`), which is part of the admission test for any crate ([dependencies](dependencies.md#kernel-heap-buddy_system_allocator)). The host library tests link the ordinary `alloc`, so the guarantee is the target build's, not the host unit tests'.
+The kernel links `alloc` (`-Zbuild-std=core,alloc,compiler_builtins`) rebuilt with `--cfg no_global_oom_handling`, the switch Rust-for-Linux uses: every `alloc` API that can abort when allocation fails (`Box::new`, `Vec::push`/`with_capacity`/`vec!`, `String::from`, `format!`, `Clone` of collections, ...) is compiled out, so kernel code can only use `try_reserve`, `Vec::push_within_capacity`, `Box::try_new` and similar. Observed on `rustc 1.101.0-nightly 5c543b0b8` with a probe crate built exactly this way: the fallible calls compile; `Box::new(1)` fails with `E0599 no associated function or constant named new found for struct Box`, and `Vec::push` with `E0599 no method named push`. The flag must reach the `alloc` build, so it is in the harness's `CARGO_ENCODED_RUSTFLAGS` (kernel only) and in every target Clippy command (the complete command is in the [gate sequence](#gate-sequence); a Clippy run without the flag would accept infallible calls that the maintained build rejects). The flag is recorded in `cargo_encoded_rustflags` of the build manifest, and a unit test pins the flag set and the build-std list. Third-party crates that call infallible `alloc` APIs fail to compile in this configuration (observed: `allocator-api2` 0.4.0 with feature `alloc`), which is part of the admission test for any crate ([dependencies](dependencies.md#kernel-heap-buddy_system_allocator)). The host library tests link the ordinary `alloc`, so the guarantee is the target build's, not the host unit tests'.
 
 ### Vendored dependencies and the fresh-clone build
 
