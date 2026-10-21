@@ -24,7 +24,7 @@ pub(crate) mod tests;
 pub use env::{Env, FileInfo, Overcommit, RLIM_INFINITY, STK_LIM};
 pub use fault::{
     FaultOutcome, PF_INSTR, PF_PK, PF_PROT, PF_RSVD, PF_SGX, PF_SHSTK, PF_USER, PF_WRITE, SegvCode,
-    VSYSCALL_ADDR,
+    VSYSCALL_ADDR, pkru_denies_key0,
 };
 pub use flags::*;
 pub use layout::{DEFAULT_MAP_WINDOW, mmap_address_hint_valid, pick_mmap_base, round_hint_to_min};

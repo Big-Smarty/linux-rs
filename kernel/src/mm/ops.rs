@@ -42,6 +42,9 @@ pub enum Unsupported {
     SharedAnonymous,
     /// `MAP_HUGETLB` or a hugetlbfs file: `hugetlb_file_setup`.
     Hugetlb,
+    /// `prot == PROT_EXEC` with protection keys on: `execute_only_pkey` allocates a key and
+    /// the mapping carries it (`VM_PKEY_BIT*`, `arch_set_user_pkey_access`).
+    ExecuteOnlyPkey,
 }
 
 /// A validated file mapping: placement and flags are final, nothing has been
@@ -185,7 +188,10 @@ impl Mm {
         if self.map_count() > u64::from(env.max_map_count) {
             return Err(Errno::ENOMEM);
         }
-        // prot == PROT_EXEC would pick execute_only_pkey(): -1 without OSPKE.
+        // prot == PROT_EXEC picks execute_only_pkey(): -1 without OSPKE, a pkey with it.
+        if prot == PROT_EXEC && env.ospke {
+            return Ok(Prepared::Unsupported(Unsupported::ExecuteOnlyPkey));
+        }
         let mut vm_flags = calc_vm_prot_bits(prot)
             | calc_vm_flag_bits(flags)
             | self.def_flags
@@ -638,7 +644,8 @@ impl Mm {
         (adjacent || self.vmas[p].end > self.start_brk).then_some(p)
     }
 
-    /// `mprotect(2)` (`do_mprotect_pkey` with `pkey == -1`).
+    /// `mprotect(2)` (`do_mprotect_pkey` with `pkey == -1`). `Ok(Some(_))` is a request Linux
+    /// serves with a protection key this model lacks (nothing at or after that VMA changed).
     ///
     /// Errors partway leave the VMAs already processed changed, as in Linux.
     ///
@@ -652,7 +659,7 @@ impl Mm {
         mut start: u64,
         len: u64,
         mut prot: u64,
-    ) -> Result<(), Errno> {
+    ) -> Result<Option<Unsupported>, Errno> {
         let grows = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
         // (rier: READ_IMPLIES_EXEC is never set for a 64-bit task.)
         prot &= !(PROT_GROWSDOWN | PROT_GROWSUP);
@@ -663,7 +670,7 @@ impl Mm {
             return Err(Errno::EINVAL);
         }
         if len == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let len = align_or_zero(len);
         let end = start.wrapping_add(len);
@@ -706,6 +713,10 @@ impl Mm {
             if v.start > cursor {
                 return Err(Errno::ENOMEM);
             }
+            // arch_override_mprotect_pkey: a PROT_EXEC-only mapping takes the execute-only key.
+            if prot == PROT_EXEC && env.ospke {
+                return Ok(Some(Unsupported::ExecuteOnlyPkey));
+            }
             // Each mprotect() call explicitly passes r/w/x permissions.
             let mut newflags = calc_vm_prot_bits(prot) | (v.flags & !VmFlags::ACCESS);
             // newflags >> 4 shift VM_MAY% in place of VM_%
@@ -720,7 +731,7 @@ impl Mm {
         if cursor < end {
             Err(Errno::ENOMEM)
         } else {
-            Ok(())
+            Ok(None)
         }
     }
 

@@ -66,7 +66,8 @@
 pub mod selftest;
 
 use crate::{
-    cpu::{self, FxImage, PtRegs, Segments},
+    cpu::{self, PtRegs, Segments},
+    fpu::{self, XBuf},
     services::Service,
     timer,
 };
@@ -124,7 +125,13 @@ struct Thread {
     /// Whether the task owns user FP and segment state (a ring-3 task). Kernel
     /// threads and idle leave the live registers alone, like `PF_KTHREAD`.
     user: bool,
-    fx: FxImage,
+    /// The saved user FPU/`XSAVE` state (`fpu->fpstate`) of a ring-3 task while it is off the
+    /// CPU; `None` for kernel threads and idle. Allocated when the task is created, released
+    /// when its slot is freed.
+    xs: Option<XBuf>,
+    /// The task's `PKRU` while it is off the CPU (`thread.pkru`): switched eagerly, not part of
+    /// the restore from `xs`.
+    pkru: u32,
     segments: Segments,
     /// `BAD_IRET_DEPTH` of this task while it is off the CPU.
     bad_iret_depth: u64,
@@ -138,7 +145,8 @@ impl Thread {
     const NEW: Self = Self {
         sp: 0,
         user: false,
-        fx: FxImage::ZERO,
+        xs: None,
+        pkru: kernel::xstate::INIT_PKRU,
         segments: Segments {
             ds: 0,
             es: 0,
@@ -309,7 +317,8 @@ const _: () = assert!(size_of::<ForkFrame>().is_multiple_of(16) && size_of::<PtR
 struct Start {
     regs: PtRegs,
     user: bool,
-    fx: FxImage,
+    xs: Option<XBuf>,
+    pkru: u32,
     segments: Segments,
     cr3: u64,
 }
@@ -362,7 +371,8 @@ fn prepare(
         *thread = Thread {
             sp: frame as u64,
             user: start.user,
-            fx: start.fx,
+            xs: start.xs,
+            pkru: start.pkru,
             segments: start.segments,
             bad_iret_depth: 0,
             cr3: start.cr3,
@@ -389,7 +399,13 @@ fn spawn(
         Start {
             regs,
             user,
-            fx: FxImage::initial(),
+            // Selftest threads: an allocation failure here is the same refusal as no slot.
+            xs: if user {
+                Some(XBuf::initial().map_err(|_| NoSlot)?)
+            } else {
+                None
+            },
+            pkru: fpu::NEW_TASK_PKRU,
             segments: Segments::default(),
             cr3: 0,
         },
@@ -412,12 +428,26 @@ pub fn wake_up_new_task(id: SchedId) {
 pub fn cancel_new_task(id: SchedId) {
     let freed = RQ.lock().cancel_new_task(id);
     debug_assert!(freed, "only a prepared task is cancelled");
+    release_state(id.index());
+}
+
+/// Give back the save buffer of slot `slot` (its task is gone). The heap lock is taken here, so
+/// no `RQ` guard may be held. The suite's `reset_group`/`abandon_group` do not come through here:
+/// the buffer of such a slot is released when the slot is next prepared.
+fn release_state(slot: usize) {
+    // SAFETY: module `Threads` argument (a)/(b): the slot is unowned (cancelled before it ever
+    // ran, or freed after its last switch-out) and IF=0 on the single CPU, so nothing else
+    // reads this `Thread`.
+    let state = unsafe { (*thread(slot)).xs.take() };
+    drop(state);
 }
 
 /// `dup_task_struct` + `copy_thread` for a forked child, **not yet runnable**
 /// ([`wake_up_new_task`]): a ring-3 task whose first return to user mode has
 /// `regs`, with a copy of the calling task's live x87/SSE state and segment
-/// registers and bases, and the page tables whose root is `cr3`.
+/// registers and bases, and the page tables whose root is `cr3`. `xs` is the copy of the
+/// caller's live user state made by [`XBuf::from_live`] (allocated early, as `dup_task_struct`
+/// allocates the task's `fpstate`), and the child starts with the caller's `PKRU`.
 ///
 /// Context: the calling task is a ring-3 task inside a system call, IF=0, so
 /// its user FP and segment state is still live in the registers (they are
@@ -425,16 +455,15 @@ pub fn cancel_new_task(id: SchedId) {
 ///
 /// # Errors
 /// [`NoSlot`] when no scheduler slot or stack is free (fork's `-EAGAIN`).
-pub fn prepare_fork(regs: PtRegs, cr3: u64) -> Result<SchedId, NoSlot> {
-    let mut fx = FxImage::initial();
-    cpu::fpu_save(&mut fx);
+pub fn prepare_fork(regs: PtRegs, cr3: u64, xs: XBuf) -> Result<SchedId, NoSlot> {
     prepare(
         None,
         0,
         Start {
             regs,
             user: true,
-            fx,
+            xs: Some(xs),
+            pkru: fpu::read_pkru(),
             segments: Segments::save(),
             cr3,
         },
@@ -478,7 +507,11 @@ pub unsafe fn start_init(entry: u64, sp: u64, cr3: u64, bound: impl FnOnce(Sched
             Start {
                 regs,
                 user: true,
-                fx: FxImage::initial(),
+                xs: Some(crate::unwrap(
+                    XBuf::initial().map_err(|_| "init xstate"),
+                    "init-xstate",
+                )),
+                pkru: fpu::NEW_TASK_PKRU,
                 segments: Segments::default(),
                 cr3,
             },
@@ -666,9 +699,16 @@ fn context_switch(switch: Switch) {
     // `finish_task_switch` of whichever task resumes.
     unsafe {
         if (*prev_thread).user {
-            cpu::fpu_save(&mut (*prev_thread).fx);
+            if let Some(xs) = (*prev_thread).xs.as_mut() {
+                fpu::save(xs);
+            } else {
+                crate::log!("FAIL user task without a save buffer\n");
+                crate::fail();
+            }
             (*prev_thread).segments = Segments::save();
         }
+        // x86_pkru_load: every switch, kernel threads and idle included.
+        fpu::pkru_switch(&mut (*prev_thread).pkru, (*next_thread).pkru);
         (*prev_thread).bad_iret_depth = cpu::swap_bad_iret_depth((*next_thread).bad_iret_depth);
         // `switch_mm_irqs_off`: a task with its own tree gets it; the others
         // (idle, kernel threads) run on whichever is active (`active_mm`).
@@ -683,7 +723,12 @@ fn context_switch(switch: Switch) {
             cpu::activate_tables(next_cr3);
         }
         if (*next_thread).user {
-            cpu::fpu_restore(&(*next_thread).fx);
+            if let Some(xs) = (*next_thread).xs.as_ref() {
+                fpu::restore(xs);
+            } else {
+                crate::log!("FAIL user task without a save buffer\n");
+                crate::fail();
+            }
             (*next_thread).segments.load();
         }
         // `sched_info`/`update_rq_clock` for the two: off the CPU is not their time.
@@ -708,7 +753,14 @@ fn context_switch(switch: Switch) {
 fn finish_task_switch() {
     let prev = SWITCH_PREV.swap(NO_PREV, Ordering::Relaxed);
     if prev != NO_PREV {
-        RQ.lock().free(SchedId::from_raw(prev));
+        let id = SchedId::from_raw(prev);
+        let freed = RQ.lock().free(id);
+        if freed {
+            // The task is dead and its stack is no longer the running one: nothing will switch
+            // to it again, so give the save buffer back (after the `RQ` guard, which is a leaf
+            // below the heap lock).
+            release_state(id.index());
+        }
     }
 }
 

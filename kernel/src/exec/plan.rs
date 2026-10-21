@@ -32,8 +32,9 @@
 //! * shortcut: a file mapping whose last page starts at or beyond EOF fails
 //!   with [`Unsupported::BeyondEof`]; Linux maps it and raises `SIGBUS` on use.
 //! * shortcut: at most [`MAX_LOADS`] `PT_LOAD` segments (Linux: 1170).
-//! * `PF_X`/`PF_W` without `PF_R` map readable too: x86 has no write-only or
-//!   (without protection keys) execute-only pages.
+//! * `PF_X`/`PF_W` without `PF_R` map readable too: x86 has no write-only page and, without
+//!   protection keys, no execute-only page. With them (`Env::ospke`) a `PF_X`-only segment is
+//!   [`Unsupported::ExecuteOnlyPkey`] (a loud stop: Linux gives it the execute-only key).
 //! * `p_flags == 0` segments are `PROT_NONE`: accounted for, never mapped.
 //! * No randomisation: this is Linux with `norandmaps` (`randomize_va_space=0`).
 
@@ -56,6 +57,8 @@ pub enum Unsupported {
     TooManyLoads,
     /// A `#!` script whose interpreter exists in the rootfs.
     Script,
+    /// A `PF_X`-only segment with protection keys on: `do_mmap` gives it the execute-only key.
+    ExecuteOnlyPkey,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

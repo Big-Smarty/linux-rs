@@ -326,6 +326,12 @@ fn run(stack: &Stack) {
     if stack.argv.iter().nth(1) == Some(b"jobwait".as_slice()) {
         tests::jobctl::jobwait();
     }
+    // The image of the `xstate` group's `execve` check: silent, and exits with a bit per register
+    // group that is not in its initial state.
+    if stack.argv.iter().nth(1) == Some(b"xstateexec".as_slice()) {
+        tests::xstate::execd();
+    }
+    tests::xstate::set_minsigstksz(stack.find(AT_MINSIGSTKSZ).unwrap_or(0));
     out!("init: {stack:?}");
 
     expect("rsp_mod16", stack.sp % 16, 0);
@@ -506,6 +512,10 @@ fn run(stack: &Stack) {
             out!("init: rseq enosys");
         }
         Some(b"sse") => fpu_checks(),
+        // `-- exec <path> <argv0> [args..]`: replace this image with a program of the initramfs
+        // (a smoke of the binaries a distribution brings: `busybox echo ok`). The kernel
+        // cannot name another init (`rdinit=` is not implemented), so init execs it.
+        Some(b"exec") => exec_program(&stack),
         Some(b"demand") => {
             demand_paging();
             out!("init: demand ok");
@@ -515,6 +525,23 @@ fn run(stack: &Stack) {
         _ => {}
     }
     out!("init: ok");
+}
+
+/// `-- exec <path> <argv0> [args..]`: `execve(path, [argv0, args..], envp)` with the strings of
+/// the initial stack; only returns (and fails the run) if the call does.
+fn exec_program(stack: &Stack) -> ! {
+    let (Some(path), true) = (stack.argv.iter().nth(2), stack.argv.0.len() > 3) else {
+        fail("exec", "needs <path> <argv0>");
+    };
+    // The argument vector is the tail of the initial stack's own, still NUL-pointer-terminated.
+    let argv = stack.argv.0.as_ptr().wrapping_add(3).expose_provenance();
+    let envp = stack.envp.0.as_ptr().expose_provenance();
+    // SAFETY: `path` is a NUL-terminated string of the initial stack, `argv` points into the
+    // process-entry argv array (terminated by a null word) and `envp` is that array's sibling;
+    // execve reads them and either replaces the image or fails without touching memory.
+    let result =
+        unsafe { syscalls::syscall3(Sysno::execve, path.as_ptr().expose_provenance(), argv, envp) };
+    fail("execve", result)
 }
 
 /// Forks a child that spins for ever; returns its pid in the parent.

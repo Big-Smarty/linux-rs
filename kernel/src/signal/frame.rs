@@ -10,8 +10,12 @@
 // arch/x86/include/asm/{sigframe,sighandling}.h,
 // arch/x86/include/uapi/asm/{sigcontext,ucontext}.h,
 // include/uapi/asm-generic/ucontext.h. All GPL-2.0.
-// Transformation: only the native x86_64 frame, FXSR-only FPU state (no XSAVE,
-// no PKRU, no shadow stack), no FRED, no single-step bookkeeping.
+// arch/x86/kernel/fpu/xstate.h (`xsave_to_user_sigframe`, `xrstor_from_user_sigframe`,
+// `update_pkru_in_sigframe`, `set_xfeature_in_sigframe`). All GPL-2.0.
+// Transformation: only the native x86_64 frame (XSAVE standard format, or FXSAVE under
+// `noxsave`), no shadow stack, no FRED, no single-step bookkeeping. The hardware `XSAVE` writes
+// into a kernel area and exactly the bytes it writes are copied out; `XRSTOR` runs on a kernel
+// area filled with exactly the bytes it reads (see `restore_fpu`).
 #![forbid(unsafe_code)]
 //! The `x86_64` `rt_sigframe`: building it on `handle_signal` and undoing it in
 //! `rt_sigreturn`.
@@ -24,7 +28,8 @@
 //!     cs gs fs ss (u16 each) err trapno oldmask cr2 fpstate reserved1[8]
 //! 304 uc_sigmask                      312 siginfo (128)        440 end
 //! ```
-//! The FXSAVE image sits below the frame at `round_down(sp - 512, 64)`.
+//! The FPU state sits below the frame at `round_down(sp - sigframe_size, 64)`, in the
+//! [`crate::xstate`] standard format (`sigframe_size` is 512 under `noxsave`).
 //!
 //! Bytes Linux never stores (the 4 padding bytes after `ss_flags`, the 64
 //! `reserved1` bytes and `siginfo` when `SA_SIGINFO` is clear) are not stored
@@ -44,7 +49,12 @@ use super::{
     state::State,
     syscalls::{StackT, do_sigaltstack, get_user, put_user},
 };
-use crate::usercopy::{UserPages, access_ok};
+use crate::usercopy::{UserPages, access_ok, copy_from_user};
+use crate::xstate::{
+    self, Config, FP_XSTATE_MAGIC1, FP_XSTATE_MAGIC2, FP_XSTATE_MAGIC2_SIZE, FXSAVE_SIZE,
+    MASK_FPSSE, MASK_PKRU, SW_RESERVED_OFFSET, SW_RESERVED_SIZE, XREGS_SIZE, XSAVE_HDR_OFFSET,
+    XSAVE_HDR_SIZE, XsaveArea,
+};
 
 pub const UC_FP_XSTATE: u64 = 1;
 pub const UC_SIGCONTEXT_SS: u64 = 2;
@@ -67,11 +77,6 @@ const EFLAGS_TF: u64 = 0x100;
 
 /// Red zone skipped below `rsp` (`get_sigframe`, not for ia32 frames).
 pub const REDZONE: u64 = 128;
-pub const FXSAVE_SIZE: usize = 512;
-const FXSAVE_BYTES: u32 = 512;
-/// `FP_XSTATE_MAGIC1` and `FP_XSTATE_MAGIC2_SIZE`.
-pub const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
-pub const FP_XSTATE_MAGIC2_SIZE: u32 = 4;
 
 // Frame offsets (see the module documentation).
 pub const FRAME_SIZE: u64 = 440;
@@ -84,17 +89,6 @@ const UC_SIGMASK: u64 = UC + 296;
 pub const INFO: u64 = UC + 304;
 /// `offsetof(struct sigcontext, reserved1)`: what `restore_sigcontext` reads.
 const SC_READ: usize = 192;
-
-/// `sizeof(struct sigframe_ia32)`: 4 + 4 + `sigcontext_32` (88) +
-/// `_fpstate_32` (624) + `extramask` (4) + `retcode` (8).
-const SIGFRAME_IA32_SIZE: u64 = 4 + 4 + 88 + 624 + 4 + 8;
-/// `fpu_default_state_size` (`fpu__get_fpstate_size`): the 512-byte FXSAVE
-/// area plus `sizeof(struct fregs_state)` (112) because `CONFIG_IA32_EMULATION=y`
-/// reserves room for ia32 frames even when ia32 is disabled at boot.
-pub const FPU_DEFAULT_STATE_SIZE: u64 = 512 + 112;
-/// `max_frame_size`, `AT_MINSIGSTKSZ` (`init_sigframe_size`): frame + 15 +
-/// FPU state + 63, rounded up to 16. Equals the oracle's `0x5a0`.
-pub const MAX_FRAME_SIZE: u64 = (SIGFRAME_IA32_SIZE + 15 + FPU_DEFAULT_STATE_SIZE + 63 + 15) & !15;
 
 /// A signal chosen for delivery (`struct ksignal`): the action is a copy made
 /// before `SA_RESETHAND` reset the installed one.
@@ -141,27 +135,101 @@ fn get_sigframe<P: UserPages, C: Cpu>(
         sp = alt.sp.wrapping_add(alt.size);
         entering_altstack = true;
     }
-    // fpu__alloc_mathframe: 512 bytes (no XSAVE magic), 64-byte aligned.
-    let buf_fx = sp.wrapping_sub(FXSAVE_SIZE as u64) & !63;
+    // fpu__alloc_mathframe: the standard-format area, 64-byte aligned.
+    let math_size = cpu.xstate().sigframe_size() as u64;
+    let buf_fx = sp.wrapping_sub(math_size) & !63;
     sp = buf_fx.wrapping_sub(FRAME_SIZE);
     // round_down(sp, 16) - 8: (sp + 8) is 16-aligned at handler entry.
     sp = (sp & !15).wrapping_sub(8);
     if (nested_altstack || entering_altstack) && !alt.contains(sp) {
         return None;
     }
-    if !access_ok(buf_fx, FXSAVE_SIZE as u64) {
+    // sig_prepare_pkru: enable all pkeys so that the stacks are writable, and give the frame the
+    // `PKRU` the signal interrupted.
+    let pkru = cpu.read_pkru();
+    cpu.write_pkru(0);
+    if !copy_fpstate_to_sigframe(buf_fx, pkru, pages, cpu) {
+        // Restore PKRU to the original, user-defined value.
+        cpu.write_pkru(pkru);
         return None;
     }
-    let mut image = cpu.fxsave();
-    // save_xstate_epilog: `_fpx_sw_bytes` in the software-reserved 464..512.
-    let mut sw = [0u8; 48];
+    Some((sp, buf_fx))
+}
+
+/// `copy_fpstate_to_sigframe` for a 64-bit frame: the live state in the standard format at
+/// `buf` (header cleared first, `XSAVE` writes, `PKRU` and `FPSSE` forced into `xstate_bv`,
+/// `_fpx_sw_bytes`, the trailing magic word). `false` when any part is not writable.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the sizes in `_fpx_sw_bytes` are at most `AREA_MAX`"
+)]
+fn copy_fpstate_to_sigframe<P: UserPages, C: Cpu>(
+    buf: u64,
+    pkru: u32,
+    pages: &mut P,
+    cpu: &mut C,
+) -> bool {
+    let cfg = cpu.xstate();
+    if !access_ok(buf, cfg.sigframe_size() as u64) {
+        return false;
+    }
+    let xsave = cfg.use_xsave();
+    if xsave {
+        // Clear the xsave header first, so that reserved fields are initialized to zero.
+        if !put_user(pages, buf + XSAVE_HDR_OFFSET as u64, &[0; XSAVE_HDR_SIZE]) {
+            return false;
+        }
+    }
+    // The instruction writes into a kernel area; bytes it does not write must keep the stack's
+    // contents (the reserved bytes of the legacy area), so start from them.
+    let mut area = XsaveArea::zeroed();
+    if copy_from_user(pages, &mut area.0[..FXSAVE_SIZE], buf) != 0 {
+        return false;
+    }
+    cpu.xsave(&mut area);
+    let bytes = &mut area.0;
+    if xsave {
+        let mut bv = u64::from_le_bytes(super::le(bytes, XSAVE_HDR_OFFSET));
+        // update_pkru_in_sigframe: mark PKRU in use and give the frame the interrupted value.
+        if let (true, Some(offset)) = (cfg.ospke, cfg.pkru_offset()) {
+            bv |= MASK_PKRU;
+            bytes[offset..offset + 4].copy_from_slice(&pkru.to_le_bytes());
+        }
+        // save_xstate_epilog: always FP and SSE, so a legacy program's changes are captured.
+        bv |= MASK_FPSSE;
+        bytes[XSAVE_HDR_OFFSET..XSAVE_HDR_OFFSET + 8].copy_from_slice(&bv.to_le_bytes());
+    }
+    // save_sw_bytes: `struct _fpx_sw_bytes` in the software-reserved bytes of the legacy area.
+    let mut sw = [0u8; SW_RESERVED_SIZE];
     sw[0..4].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
-    // extended_size = user_size + FP_XSTATE_MAGIC2_SIZE; xfeatures stays 0 and
-    // xstate_size = user_size: `fpu_user_cfg.default_{features,size}` under noxsave.
-    sw[4..8].copy_from_slice(&(FXSAVE_BYTES + FP_XSTATE_MAGIC2_SIZE).to_le_bytes());
-    sw[16..20].copy_from_slice(&FXSAVE_BYTES.to_le_bytes());
-    image[464..512].copy_from_slice(&sw);
-    put_user(pages, buf_fx, &image).then_some((sp, buf_fx))
+    sw[4..8].copy_from_slice(&((cfg.user_size + FP_XSTATE_MAGIC2_SIZE) as u32).to_le_bytes());
+    sw[8..16].copy_from_slice(&cfg.features.to_le_bytes());
+    sw[16..20].copy_from_slice(&(cfg.user_size as u32).to_le_bytes());
+    bytes[SW_RESERVED_OFFSET..SW_RESERVED_OFFSET + SW_RESERVED_SIZE].copy_from_slice(&sw);
+    if !put_user(pages, buf, &bytes[..FXSAVE_SIZE]) {
+        return false;
+    }
+    if !xsave {
+        return true;
+    }
+    if !put_user(
+        pages,
+        buf + XSAVE_HDR_OFFSET as u64,
+        &bytes[XSAVE_HDR_OFFSET..XREGS_SIZE],
+    ) {
+        return false;
+    }
+    for (offset, size) in cfg.ranges(cfg.features) {
+        if !put_user(pages, buf + offset as u64, &bytes[offset..offset + size]) {
+            return false;
+        }
+    }
+    // The trailing magic word.
+    put_user(
+        pages,
+        buf + cfg.user_size as u64,
+        &FP_XSTATE_MAGIC2.to_le_bytes(),
+    )
 }
 
 /// `x64_setup_rt_frame` and the register setup that follows it. On success
@@ -188,7 +256,13 @@ pub fn setup_rt_frame<P: UserPages, C: Cpu>(
     if !access_ok(frame, FRAME_SIZE) {
         return Err(FrameFault);
     }
+    // frame_uc_flags: UC_FP_XSTATE when the frame holds XSAVE state (`boot_cpu_has(XSAVE)`).
     let uc_flags = UC_SIGCONTEXT_SS
+        | if cpu.xstate().use_xsave() {
+            UC_FP_XSTATE
+        } else {
+            0
+        }
         | if user_64bit_mode(regs) {
             UC_STRICT_RESTORE_SS
         } else {
@@ -278,33 +352,130 @@ pub struct Sigreturn {
     pub reached_sigcontext: bool,
 }
 
-/// `fpu__restore_sig(buf, 0)` for FXSR-only state. A null pointer resets the
-/// FPU. Any failure (range, unreadable page, `fxrstor` alignment `#GP`, bad
-/// MXCSR) resets it too and reports `false`.
+/// `fpu__restore_sig(buf, 0)`. A null pointer resets the FPU. Any failure (range, unreadable
+/// page, a state the CPU refuses) resets it too and reports `false`.
 fn restore_fpu<P: UserPages, C: Cpu>(buf: u64, pages: &mut P, cpu: &mut C) -> bool {
     if buf == 0 {
         cpu.fpu_reset();
         return true;
     }
-    let ok = (|| {
-        if !access_ok(buf, FXSAVE_SIZE as u64) {
-            return false;
-        }
-        let Some(image) = get_user::<_, FXSAVE_SIZE>(pages, buf) else {
-            return false;
-        };
-        // FXRSTOR faults with #GP on an unaligned operand or reserved MXCSR bits.
-        let mxcsr = u32::from_le_bytes(super::le(&image, 24));
-        if !buf.is_multiple_of(16) || mxcsr & !cpu.mxcsr_mask() != 0 {
-            return false;
-        }
-        cpu.fxrstor(&image);
-        true
-    })();
+    let ok = __fpu_restore_sig(buf, pages, cpu);
     if !ok {
         cpu.fpu_reset();
     }
     ok
+}
+
+/// `fpu__restore_sig` after the null check and `__fpu_restore_sig`/`check_xstate_in_sigframe`.
+fn __fpu_restore_sig<P: UserPages, C: Cpu>(buf: u64, pages: &mut P, cpu: &mut C) -> bool {
+    let cfg = cpu.xstate();
+    if !access_ok(buf, cfg.sigframe_size() as u64) {
+        return false;
+    }
+    let (mut fx_only, mut ufeatures) = (false, MASK_FPSSE);
+    if cfg.use_xsave() {
+        let Some(sw) = get_user::<_, SW_RESERVED_SIZE>(pages, buf + SW_RESERVED_OFFSET as u64)
+        else {
+            return false;
+        };
+        let magic1 = u32::from_le_bytes(super::le(&sw, 0));
+        let extended_size = u32::from_le_bytes(super::le(&sw, 4)) as usize;
+        let xfeatures = u64::from_le_bytes(super::le(&sw, 8));
+        let xstate_size = u32::from_le_bytes(super::le(&sw, 16)) as usize;
+        // The first magic word and the sizes, then the second magic word at the end of the
+        // layout (detects a program that copied only the legacy part). Anything wrong is not an
+        // error: the frame is taken as a legacy FXSAVE one (`setfx`).
+        let described = magic1 == FP_XSTATE_MAGIC1
+            && xstate_size >= XREGS_SIZE
+            && xstate_size <= cfg.user_size
+            && xstate_size <= extended_size;
+        let genuine = if described {
+            let Some(magic2) = get_user::<_, 4>(pages, buf + xstate_size as u64) else {
+                return false;
+            };
+            u32::from_le_bytes(magic2) == FP_XSTATE_MAGIC2
+        } else {
+            false
+        };
+        if genuine {
+            ufeatures = xfeatures;
+        }
+        fx_only = !genuine;
+    }
+    restore_fpregs_from_user(buf, ufeatures, fx_only, &cfg, pages, cpu)
+}
+
+/// `restore_fpregs_from_user` and `__restore_fpregs_from_user`: restore the described
+/// components, then the initial state for the enabled ones that were not.
+///
+/// What the CPU reads is exactly what the kernel area is filled with: the legacy area and the
+/// header, then the components named by both the request and the header's `xstate_bv` (the CPU
+/// reads no more, so a buffer that ends after the last restored component is valid). A
+/// compacted header (`xcomp_bv` bit 63) makes the CPU use other offsets; that case reads the
+/// whole area.
+/// shortcut: the compacted-header read set is the whole `user_size`, a superset of what the
+/// CPU reads; a buffer shorter than that with a compacted header is refused here and restored
+/// by Linux. Upgrade by walking `Config::compacted_offset` over `xcomp_bv`.
+fn restore_fpregs_from_user<P: UserPages, C: Cpu>(
+    buf: u64,
+    ufeatures: u64,
+    fx_only: bool,
+    cfg: &Config,
+    pages: &mut P,
+    cpu: &mut C,
+) -> bool {
+    let xrestore = ufeatures & cfg.features;
+    let mut area = XsaveArea::zeroed();
+    if cfg.use_xsave() && !fx_only {
+        // XRSTOR: the operand must be 64-byte aligned (#GP before any access).
+        if !buf.is_multiple_of(xstate::XSAVE_ALIGNMENT as u64) {
+            return false;
+        }
+        if copy_from_user(pages, &mut area.0[..XREGS_SIZE], buf) != 0 {
+            return false;
+        }
+        let xstate_bv = u64::from_le_bytes(super::le(&area.0, XSAVE_HDR_OFFSET));
+        let xcomp_bv = u64::from_le_bytes(super::le(&area.0, XSAVE_HDR_OFFSET + 8));
+        if xcomp_bv & xstate::XCOMP_BV_COMPACTED_FORMAT != 0 {
+            if copy_from_user(
+                pages,
+                &mut area.0[XREGS_SIZE..cfg.user_size],
+                buf + XREGS_SIZE as u64,
+            ) != 0
+            {
+                return false;
+            }
+        } else {
+            for (offset, size) in cfg.ranges(xstate_bv & xrestore) {
+                if copy_from_user(
+                    pages,
+                    &mut area.0[offset..offset + size],
+                    buf + offset as u64,
+                ) != 0
+                {
+                    return false;
+                }
+            }
+        }
+        if !cpu.xrstor(&area, xrestore) {
+            return false;
+        }
+    } else {
+        // FXRSTOR: 16-byte aligned, the 512-byte legacy area (x87, SSE, MXCSR).
+        if !buf.is_multiple_of(16)
+            || copy_from_user(pages, &mut area.0[..FXSAVE_SIZE], buf) != 0
+            || !cpu.fxrstor(&area)
+        {
+            return false;
+        }
+    }
+    if cfg.use_xsave() {
+        let init_bv = cfg.features & !xrestore;
+        if init_bv != 0 {
+            cpu.restore_init(init_bv);
+        }
+    }
+    true
 }
 
 /// `restore_sigcontext`.
@@ -423,6 +594,5 @@ pub fn enter_handler<C: Cpu>(regs: &mut Regs, cpu: &mut C) {
 }
 
 const _: () = {
-    assert!(MAX_FRAME_SIZE == 0x5a0);
     assert!(SS_ONSTACK == 1);
 };

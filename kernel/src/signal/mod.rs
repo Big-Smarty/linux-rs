@@ -12,14 +12,14 @@
 // Transformation: one thread group of one thread (pid == tgid == tid), so the
 // per-thread/shared queues, `siglock`, wakeups, ptrace, posix
 // timers, signalfd, `sigtimedwait` and the x32/ia32 frames are not modelled;
-// x86_64 native frames with FXSR-only FPU state (declared `noxsave`) are.
+// x86_64 native frames (FXSR-only state under `noxsave`, the XSAVE standard format otherwise) are.
 #![forbid(unsafe_code)]
 //! Linux signal semantics for `x86_64` as pure, host-tested logic (`WP-M3.4`).
 //!
 //! Nothing here touches hardware: user memory goes through the one
 //! [`crate::usercopy`] mechanism, FPU/segment facts through the [`Cpu`] trait,
 //! and the register file is [`Regs`], which the binary uses as its `PtRegs`
-//! (one type). The binary implements [`Cpu`] (`FXSAVE`/`FXRSTOR`/`LAR`) and
+//! (one type). The binary implements [`Cpu`] (`XSAVE`/`XRSTOR`/`FXSAVE`/`FXRSTOR`/`PKRU`/`LAR`) and
 //! [`Task`], calls [`deliver::handle_pending_signals`] on every return to user
 //! mode and the `sys_*` functions of [`syscalls`], [`wait`] and [`itimer`] from
 //! the syscall dispatcher.
@@ -48,6 +48,8 @@ pub mod wait;
 mod linux_frames;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod xsave_tests;
 
 pub use crate::exec::report::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 
@@ -319,20 +321,38 @@ pub const USER_CS: u64 = 0x33;
 pub const USER_DS: u64 = 0x2b;
 
 /// What the signal code needs from the CPU, supplied by the binary.
+///
+/// The user FPU/`XSAVE` state is live in the registers whenever the kernel runs (the kernel is
+/// soft-float and saves a task's state only when it is switched out), so the signal code asks
+/// the CPU for it. Every method that moves state works on the *standard* format of
+/// [`crate::xstate::Config`], which is what the user-space signal frame holds.
 pub trait Cpu {
-    /// FXSAVE image (512 bytes) of the user FPU state, current registers
-    /// included (`fxsave_to_user_sigframe`). Linux uses the 64-bit form
-    /// (`fxsaveq`, REX.W: 64-bit FIP/FDP), so implement it with
-    /// `core::arch::x86_64::_fxsave64`. Bytes 464..512 are overwritten by the
-    /// caller, so their content is irrelevant.
-    fn fxsave(&mut self) -> [u8; 512];
-    /// `mxcsr_feature_mask`: MXCSR bits the CPU accepts.
-    fn mxcsr_mask(&self) -> u32;
-    /// FXRSTOR of a validated image (alignment and MXCSR already checked); the
-    /// 64-bit form (`fxrstorq`, `_fxrstor64`), as Linux.
-    fn fxrstor(&mut self, image: &[u8; 512]);
-    /// `fpu__clear_user_states`: user FPU state back to the init state.
+    /// The enabled extended state: save instruction, component placement, sizes (fixed after
+    /// boot).
+    fn xstate(&self) -> crate::xstate::Config;
+    /// `XSAVE` (all enabled components, standard format) of the live state into `area`, or
+    /// `FXSAVE` into its first 512 bytes without `XSAVE`: the hardware's own writes, so only
+    /// the bytes `XSAVE` writes change. The caller made the header zero (and for `FXSAVE`
+    /// pre-filled nothing): reserved legacy bytes the hardware leaves alone keep their value.
+    fn xsave(&mut self, area: &mut crate::xstate::XsaveArea);
+    /// `XRSTOR` of the standard-format `area` with request mask `rfbm`; `false` when the CPU
+    /// refuses the area (the `#GP` of a bad header or reserved `MXCSR` bit, which the binary
+    /// recovers from). On `false` the registers are indeterminate: the caller resets them.
+    fn xrstor(&mut self, area: &crate::xstate::XsaveArea, rfbm: u64) -> bool;
+    /// `FXRSTOR` of the first 512 bytes of `area` (the legacy restore of a frame with no valid
+    /// `XSAVE` description, and the only restore without `XSAVE`); `false` for a reserved
+    /// `MXCSR` bit (`#GP`). The 64-byte alignment rule of `XRSTOR` does not apply.
+    fn fxrstor(&mut self, area: &crate::xstate::XsaveArea) -> bool;
+    /// `os_xrstor(&init_fpstate, mask)`: put the components in `mask` into their initial
+    /// configuration (including `PKRU` to 0 when it is in `mask`).
+    fn restore_init(&mut self, mask: u64);
+    /// `fpu__clear_user_states`: user FPU state back to the init state, `PKRU` to
+    /// `init_pkru_value`.
     fn fpu_reset(&mut self);
+    /// `read_pkru()`: 0 without `OSPKE`.
+    fn read_pkru(&self) -> u32;
+    /// `write_pkru()`: nothing without `OSPKE`.
+    fn write_pkru(&mut self, pkru: u32);
     /// The `lar` test of `force_valid_ss`. The access rights are masked with
     /// `AR_DPL_MASK | AR_S | AR_P | AR_TYPE_MASK` (`AR_TYPE_MASK` = bits 9-11,
     /// so the accessed bit is ignored) and must equal DPL 3, S, P with type

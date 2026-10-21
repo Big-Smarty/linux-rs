@@ -46,6 +46,7 @@ pub mod proc;
 pub mod signal;
 pub mod smoke;
 pub mod time;
+pub mod xstate;
 
 pub type R = Result<usize, Errno>;
 
@@ -360,6 +361,8 @@ pub fn run_mode(mode: &[u8]) -> bool {
         b"proc" => proc::run(),
         b"jobctl" => jobctl::run(),
         b"pipe" => pipe::run(),
+        // The extended CPU state (needs AVX-512 and PKU: a KVM `-cpu host` group): see `xstate`.
+        b"xstate" => xstate::run(),
         _ => return false,
     };
     conclude(ok);

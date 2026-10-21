@@ -50,6 +50,28 @@ pub const PF_PK: u64 = 1 << 5;
 pub const PF_SHSTK: u64 = 1 << 6;
 pub const PF_SGX: u64 = 1 << 15;
 
+/// `bad_area_access_from_pkeys` for a VMA whose key is 0 (every mapping of this kernel), called
+/// for an access error with protection keys on: the hardware reported a protection-key fault, or
+/// `arch_vma_access_permitted` finds the access denied by the task's `pkru` (instruction fetches
+/// are never affected by it; access-disable also denies writes). `true` is `SEGV_PKUERR`.
+#[must_use]
+pub fn pkru_denies_key0(error_code: u64, pkru: u32) -> bool {
+    const AD: u32 = 1;
+    const WD: u32 = 2;
+    if error_code & PF_PK != 0 {
+        return true;
+    }
+    if error_code & PF_INSTR != 0 {
+        return false;
+    }
+    let denied = if error_code & PF_WRITE != 0 {
+        AD | WD
+    } else {
+        AD
+    };
+    pkru & denied != 0
+}
+
 /// `si_code` of `SIGSEGV`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SegvCode {
@@ -152,7 +174,11 @@ impl Mm {
             _ => return segv(SegvCode::MapErr),
         }
         idx = self.lower(address);
-        if access_error(error_code, self.vmas[idx].flags) {
+        // access_error: PF_PK, then `arch_vma_access_permitted` (the VMA's key is 0), both before
+        // any page is populated; the signal code (SEGV_PKUERR) is the caller's.
+        if access_error(error_code, self.vmas[idx].flags)
+            || (env.ospke && pkru_denies_key0(error_code, env.pkru))
+        {
             return segv(SegvCode::AccErr);
         }
         match self.fault_one(pt, idx, address, write) {

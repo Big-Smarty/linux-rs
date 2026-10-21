@@ -6,7 +6,7 @@
 // builds, see `kalloc`. The task state of `userspace` (fork, init) and the boot
 // proofs use these forms in the binary.
 #![feature(allocator_ext)]
-#![cfg_attr(feature = "boot-proofs", feature(vec_push_within_capacity))]
+#![feature(vec_push_within_capacity)]
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 compile_error!(
@@ -24,6 +24,7 @@ mod apic;
 mod baremetal;
 mod console;
 mod cpu;
+mod fpu;
 mod kalloc;
 mod ktask;
 mod mmio;
@@ -37,6 +38,28 @@ mod userspace;
 use boot::TestMode;
 use core::{panic::PanicInfo, ptr};
 use memory::{Allocator, Virtual};
+
+/// The user FPU and extended state, enabled before `/init` is built because its auxiliary vector
+/// carries `AT_MINSIGSTKSZ`, which follows the XSAVE area size (Linux sets up the FPU in
+/// `arch_cpu_finalize_init` and the frame size in an `early_initcall`, both before `kernel_init`).
+/// Needs the heap (save buffers) and nothing else. Prints the `CHECK xstate ok` record.
+fn enable_user_fpu(boot: &boot::BootInfo) {
+    // SAFETY: BSP, CPL0, IF clear, the heap is installed (the caller runs after the frame
+    // allocator became a service), no ring-3 task exists yet.
+    let summary = unwrap(
+        unsafe { fpu::init(fpu::Options::from_boot(boot)) },
+        "user-fpu",
+    );
+    log!(
+        "CHECK xstate ok mode={:?} features={:#x} user_size={} kernel_size={} pkru={} fallback={}\n",
+        summary.config.mode,
+        summary.config.features,
+        summary.config.user_size,
+        summary.config.kernel_size,
+        summary.config.ospke,
+        summary.fallback.unwrap_or("none")
+    );
+}
 
 fn inspect_boot_images(boot: &boot::BootInfo) {
     for index in 0..boot.module_count() {
@@ -232,6 +255,7 @@ extern "C" fn kernel_main() -> ! {
     // unpacked with the kernel heap before the module payloads disappear. From
     // here on `FRAMES` is locked per use, never across a heap allocation.
     services::FRAMES.install(allocator);
+    enable_user_fpu(boot);
     #[cfg(not(feature = "baremetal-suite"))]
     let user = userspace::load(boot, &mut tables);
     // The suite starts one fresh /init per group after the tables are active,

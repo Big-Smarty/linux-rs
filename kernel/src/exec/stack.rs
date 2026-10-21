@@ -68,21 +68,6 @@ pub const AT_MINSIGSTKSZ: u64 = 51;
 /// `USER_HZ` / `CLOCKS_PER_SEC`.
 pub const CLKTCK: u64 = 100;
 
-/// `get_sigframe_size()` for this kernel: FXSAVE-only FPU (this kernel does not
-/// enable XSAVE, like Linux `noxsave`), `CONFIG_IA32_EMULATION=y`.
-///
-/// `init_sigframe_size`: `sizeof(sigframe_ia32)` + 15 padding +
-/// `fpu__get_fpstate_size()` + 63 xsave padding, rounded up to 16, where the
-/// FP state is `sizeof(fxregs_state)` (512) + `sizeof(fregs_state)` (112; added
-/// for ia32 emulation when FXSR is used), and
-/// `sizeof(sigframe_ia32)` = pretcode 4 + sig 4 + `sigcontext_32` 88 +
-/// `_fpstate_32` 624 + extramask 4 + retcode 8.
-pub const MIN_SIGSTACK_SIZE: u64 = {
-    let frame = 4 + 4 + 88 + 624 + 4 + 8;
-    let fpu = 512 + 112;
-    (frame + 15 + fpu + 63 + 15) & !15
-};
-
 /// Values that vary per boot or per image.
 #[derive(Clone, Copy, Debug)]
 pub struct Aux {
@@ -207,7 +192,7 @@ pub fn build<'w>(
     let random = p;
 
     let auxv: [(u64, u64); 19] = [
-        (AT_MINSIGSTKSZ, MIN_SIGSTACK_SIZE),
+        (AT_MINSIGSTKSZ, crate::xstate::max_frame_size()),
         (AT_HWCAP, u64::from(aux.hwcap)),
         (AT_PAGESZ, PAGE),
         (AT_CLKTCK, CLKTCK),

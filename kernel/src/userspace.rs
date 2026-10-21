@@ -48,7 +48,7 @@
 #[cfg_attr(feature = "baremetal-suite", allow(unused_imports))]
 use crate::{
     boot::{BootError, BootInfo},
-    console, cpu, ktask,
+    console, cpu, fpu, ktask,
     memory::{Error as MemoryError, PAGE, PAGE_BYTES, Physical},
     paging::{self, Tables, UserSpace},
     services::{self, Service, ServiceGuard},
@@ -447,7 +447,8 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
     if !tables.has_zero_page() {
         tables.init_zero_page(&mut services::FRAMES.lock())?;
     }
-    let env = Env::init(total_pages, 0);
+    let mut env = Env::init(total_pages, 0);
+    env.ospke = fpu::config().ospke;
     let mut mm = Mm::new(&env);
     insert_stack(&mut mm, &env, plan.exec_stack)?;
     map_segments(
@@ -896,10 +897,18 @@ impl<'a, 'b> FaultPages<'a, 'b> {
 
     /// `page` by value: the returned borrow lives as long as the view's.
     fn into_page(self, page: u64, write: bool) -> Option<&'a mut [u8; PAGE_BYTES]> {
+        // Present-but-read-only (write) is `X86_PF_PROT`, an absent page is
+        // not; the model's decision does not depend on it for a write.
+        let error = if write { PF_WRITE } else { 0 };
+        // The protection keys apply to the kernel's own accesses on the task's behalf
+        // (`copy_from_user`/`copy_to_user`/`put_user`, the `XSAVE` into a signal frame; Documentation/
+        // core-api/protection-keys.rst: "like with a read()"): the hardware reports a PK fault, and
+        // `access_error` finds it before anything is populated, so it ends in the fixup (a short
+        // copy, `-EFAULT`) whether or not the page is resident. All memory is key 0.
+        if self.env.ospke && mm::pkru_denies_key0(error, fpu::read_pkru()) {
+            return None;
+        }
         if !self.space.resident(page, write) {
-            // Present-but-read-only (write) is `X86_PF_PROT`, an absent page is
-            // not; the model's decision does not depend on it for a write.
-            let error = if write { PF_WRITE } else { 0 };
             match user_fault(
                 self.mm, self.env, self.vfs, self.owner, self.space, page, error,
             ) {
@@ -1033,6 +1042,9 @@ impl Syscall<'_> {
         // loses what it holds to an allocation failure. It comes first, as in
         // Linux (kernel/fork.c:2020): ENOMEM beats the limits' EAGAIN.
         let block = Box::<TaskLocal>::try_new_uninit().map_err(|_| Errno::ENOMEM)?;
+        // ... and the child's FPU state, a copy of ours (`fpu_clone`; Linux's lives inside the
+        // task structure, so it fails there too).
+        let xstate = fpu::XBuf::from_live().map_err(|_| Errno::ENOMEM)?;
         // copy_process: RLIMIT_NPROC and max_threads (fork.c:2059, 2072).
         self.shared.get().tasks.fork_allowed(parent, params)?;
         // copy_mm: the VMA model, then the pages.
@@ -1059,7 +1071,7 @@ impl Syscall<'_> {
         if request.child_sp != 0 {
             regs.sp = request.child_sp;
         }
-        let Ok(sched) = ktask::prepare_fork(regs, tables.root_address()) else {
+        let Ok(sched) = ktask::prepare_fork(regs, tables.root_address(), xstate) else {
             destroy_tables(tables);
             return Err(Errno::EAGAIN);
         };
@@ -1168,7 +1180,7 @@ impl Context for Syscall<'_> {
     }
     fn start_thread(&mut self, ip: u64, sp: u64) {
         // flush_thread: the FPU returns to its initial state, TLS bases to 0.
-        signal::Cpu::fpu_reset(&mut cpu::UserCpu::new());
+        signal::Cpu::fpu_reset(&mut fpu::UserCpu::new());
         cpu::set_user_fs_base(0);
         cpu::set_user_gs_base(0);
         // start_thread: the same initial user state `enter_user` builds (every
@@ -1201,6 +1213,9 @@ impl Context for Syscall<'_> {
     }
     fn cpuid_fault_absent(&self) -> bool {
         cpuid_fault_absent()
+    }
+    fn xstate(&self) -> kernel::xstate::Config {
+        *fpu::config()
     }
     fn machine(&self) -> Machine {
         // `ktime_get_boottime_ns` is the boot clock `do_sysinfo` reads.
@@ -1319,7 +1334,7 @@ impl<'a> signal::Task for Syscall<'a> {
             &mut state,
             self.regs,
             &mut pages,
-            &mut cpu::UserCpu::new(),
+            &mut fpu::UserCpu::new(),
         );
         // `restore_sigcontext`'s first statement: a pending restarted system
         // call now returns -EINTR; a frame refused before it resets nothing.
@@ -1554,7 +1569,7 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
                     &mut state,
                     regs,
                     &mut pages,
-                    &mut cpu::UserCpu::new(),
+                    &mut fpu::UserCpu::new(),
                 )
             };
             match outcome {
@@ -1745,7 +1760,7 @@ fn raise_fault(
         0
     };
     let fpe = match vector8 {
-        info::X86_TRAP_MF | info::X86_TRAP_XF => cpu::fpu_exception_code(vector8),
+        info::X86_TRAP_MF | info::X86_TRAP_XF => fpu::fpu_exception_code(vector8),
         _ => 0,
     };
     let fault = info::exception(vector8, error, regs.ip, dr6, fpe);
@@ -1844,9 +1859,14 @@ fn page_fault(
     let ip = regs.ip;
     let owner = own.owner();
     let mut space = tables.user_space();
+    // `access_error` consults the task's `PKRU` before it populates anything.
+    let env = Env {
+        pkru: fpu::read_pkru(),
+        ..own.env
+    };
     let outcome = user_fault(
         &mut own.space,
-        &own.env,
+        &env,
         &mut process.vfs,
         owner,
         &mut space,
@@ -1859,7 +1879,19 @@ fn page_fault(
             USER_FAULTS_HANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return true;
         }
-        FaultOutcome::Segv { code, address } => (info::PageFault::Segv(code as i32), address),
+        FaultOutcome::Segv { code, address } => {
+            // `bad_area_access_error`: with protection keys, an access error that the PKRU
+            // caused (a hardware PK fault, or an access the PKRU denies for the VMA's key, 0
+            // here) is SEGV_PKUERR with that key; the key is in the zero-filled `_pkey` field.
+            let pkuerr =
+                code == mm::SegvCode::AccErr && env.ospke && mm::pkru_denies_key0(error, env.pkru);
+            let code = if pkuerr {
+                info::SEGV_PKUERR
+            } else {
+                code as i32
+            };
+            (info::PageFault::Segv(code), address)
+        }
         FaultOutcome::Bus { address } => (info::PageFault::Bus, address),
         FaultOutcome::Oom => {
             crate::log!(
@@ -2454,8 +2486,10 @@ fn start(mut init: Loaded) {
     let protection = unsafe { cpu::enable_user_protection() };
     // `nofsgsbase` (AT_HWCAP2 = 0) holds only while CR4.FSGSBASE is clear.
     crate::require(!cpu::fsgsbase_enabled(), "cr4-fsgsbase-clear");
-    // SAFETY: as above; x87/SSE for ring 3 and Linux's initial FP state.
-    crate::unwrap(unsafe { cpu::init_user_fpu() }, "user-fpu");
+    // SAFETY: as above; `kernel_main` enabled the FPU before the loader built `/init`'s stack
+    // (`AT_MINSIGSTKSZ` needs the XSAVE size), so this only reloads the initial registers of
+    // this group.
+    crate::unwrap(unsafe { fpu::init(fpu::Options::default()) }, "user-fpu");
     crate::log!(
         "CHECK userspace exec path=/init entry={:#x} loads={} sp={:#x} smep={} smap={}\n",
         init.entry,

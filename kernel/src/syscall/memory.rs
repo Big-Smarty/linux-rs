@@ -59,7 +59,12 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
         }
         Sysno::mprotect => {
             let AddressSpace { mm, env, pages } = ctx.address_space();
-            status(mm.mprotect(env, pages, args[0], args[1], args[2]))
+            match mm.mprotect(env, pages, args[0], args[1], args[2]) {
+                Ok(None) => Outcome::Return(0),
+                // The execute-only protection key: not ported, Linux serves it.
+                Ok(Some(_)) => Outcome::Unimplemented(Sysno::mprotect as u32),
+                Err(errno) => Outcome::Return(error(errno)),
+            }
         }
         Sysno::madvise => madvise(ctx, args),
         _ => return None,

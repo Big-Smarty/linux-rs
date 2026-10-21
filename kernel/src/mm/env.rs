@@ -33,6 +33,10 @@ pub enum Overcommit {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per fact the rules read (capabilities, boot options, CPU features)"
+)]
 pub struct Env {
     /// `RLIMIT_STACK` soft limit.
     pub rlimit_stack: u64,
@@ -56,6 +60,15 @@ pub struct Env {
     pub cap_sys_rawio: bool,
     /// `ignore_rlimit_data` boot parameter.
     pub ignore_rlimit_data: bool,
+    /// `cpu_feature_enabled(X86_FEATURE_OSPKE)`: protection keys are on, so a `PROT_EXEC`-only
+    /// mapping would get the execute-only key (`execute_only_pkey`), which this model does not
+    /// carry (no `VM_PKEY_BIT*`, no key in the page tables, no `pkey_alloc` state): those
+    /// requests end in [`super::Unsupported::ExecuteOnlyPkey`], a loud stop.
+    pub ospke: bool,
+    /// The faulting task's `PKRU` (`read_pkru()`), meaningful with `ospke`: `access_error` asks
+    /// `arch_vma_access_permitted` before it populates anything. The caller refreshes it for
+    /// each fault; it is not a boot-time constant.
+    pub pkru: u32,
 }
 
 impl Env {
@@ -81,6 +94,8 @@ impl Env {
             cap_ipc_lock: true,
             cap_sys_rawio: true,
             ignore_rlimit_data: false,
+            ospke: false,
+            pkru: 0,
         }
     }
 
