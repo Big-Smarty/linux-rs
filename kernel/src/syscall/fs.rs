@@ -348,10 +348,22 @@ fn put_stat<C: Context>(ctx: &mut C, addr: u64, st: &Kstat) -> Result<(), Errno>
 
 /// `vfs_fstat`: `fd_raw`, so `O_PATH` descriptors work.
 fn kstat_fd<C: Context>(ctx: &mut C, fd: u64) -> Result<Kstat, Errno> {
+    let caller = procfs_caller(ctx);
     let files = ctx.files();
     #[allow(clippy::cast_possible_truncation)]
     let id = files.fdt.get(fd as u32).ok_or(Errno::EBADF)?;
+    if let Some(inode) = files.vfs.files.get(id).inode {
+        files.vfs.fs.getattr_check(&caller, inode)?;
+    }
     Ok(files.vfs.kstat_file(id))
+}
+
+/// The caller as the procfs permission checks see it.
+fn procfs_caller<C: Context>(ctx: &mut C) -> crate::procfs::Caller {
+    crate::procfs::Caller {
+        tgid: i32::try_from(ctx.tgid()).unwrap_or(0),
+        cred: ctx.cred(),
+    }
 }
 
 fn fstat<C: Context>(ctx: &mut C, fd: u64, buf: u64) -> Sys {
@@ -395,6 +407,13 @@ fn vfs_statx<C: Context>(ctx: &mut C, dfd: i32, name: &[u8], flags: u32) -> Resu
     let env = env_for(ctx, dfd, name)?;
     let vfs = ctx.files().vfs;
     let inode = vfs.lookup(&env, name, stat_lookup_flags(flags))?;
+    vfs.fs.getattr_check(
+        &crate::procfs::Caller {
+            tgid: env.tgid,
+            cred: env.cred,
+        },
+        inode,
+    )?;
     Ok(vfs.getattr(inode))
 }
 

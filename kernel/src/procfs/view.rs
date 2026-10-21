@@ -17,7 +17,7 @@
 //!   file table's descriptors in it are validated against the file's serial
 //!   before use ([`crate::vfs::FileTable::get_checked`]).
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 
 use syscalls::Errno;
 
@@ -106,8 +106,10 @@ pub struct TaskView {
     /// (`arg_start..env_end`): what `/proc/<pid>/cmdline` and `environ` show for
     /// another task. shortcut: the caller's own are read live from its memory;
     /// a task that rewrote its `argv` after `execve` (`setproctitle`) shows the
-    /// original to others until it republishes at the next `execve`.
-    pub args: Vec<u8>,
+    /// original to others until it republishes at the next `execve`. Shared
+    /// between the views of one image (a republish keeps it without copying);
+    /// `None` is empty.
+    pub args: Option<Arc<Vec<u8>>>,
 }
 
 /// What [`TaskView::collect`] reads from the owning task.
@@ -128,7 +130,7 @@ pub struct Collect<'a> {
     pub start_boottime_ns: u64,
     pub flags: u32,
     /// The exec-time argument bytes to keep (the previous view's, or fresh).
-    pub args: Vec<u8>,
+    pub args: Option<Arc<Vec<u8>>>,
 }
 
 impl TaskView {
@@ -137,17 +139,7 @@ impl TaskView {
     /// # Errors
     /// `ENOMEM`.
     pub fn collect(input: Collect<'_>) -> KResult<Self> {
-        let mut fds: Vec<FdEntry> = Vec::new();
-        for (fd, file, cloexec) in input.fdt.iter() {
-            fds.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
-            let serial = input.files.try_get(file).map_or(0, |f| f.serial);
-            let _ = fds.push_within_capacity(FdEntry {
-                fd,
-                file,
-                serial,
-                cloexec,
-            });
-        }
+        let fds = collect_fds(input.fdt, input.files)?;
         let mm = match input.mm {
             Some(mm) => Some(MmView::collect(mm, input.rss, input.pgtables_bytes)?),
             None => None,
@@ -178,6 +170,39 @@ impl TaskView {
             policy: 0,
             args: input.args,
         })
+    }
+
+    /// The exec-time argument and environment bytes.
+    #[must_use]
+    pub fn args(&self) -> &[u8] {
+        self.args.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    /// Bring the parts that follow the descriptor table, the filesystem
+    /// context and the executable up to date, leaving the address-space part
+    /// as published (what a syscall that opened, closed or `chdir`ed changed).
+    ///
+    /// # Errors
+    /// `ENOMEM`; the view is unchanged.
+    pub fn refresh_files(
+        &mut self,
+        attrs: &Attributes,
+        fdt: &FdTable,
+        files: &FileTable,
+        exe: FileId,
+    ) -> KResult<()> {
+        let fds = collect_fds(fdt, files)?;
+        self.attrs = *attrs;
+        self.fds = fds;
+        self.fd_gen = fdt.generation();
+        self.max_fds = u32::try_from(fdt.max_fds()).unwrap_or(u32::MAX);
+        self.exe = Some(FdEntry {
+            fd: 0,
+            file: exe,
+            serial: files.try_get(exe).map_or(0, |f| f.serial),
+            cloexec: false,
+        });
+        Ok(())
     }
 
     /// The descriptor `fd`, if open.
@@ -219,6 +244,22 @@ impl TaskView {
     pub fn pwd(&self) -> Option<InodeId> {
         self.has_fs.then_some(self.attrs.fs.pwd)
     }
+}
+
+/// The open descriptors in ascending order.
+fn collect_fds(fdt: &FdTable, files: &FileTable) -> KResult<Vec<FdEntry>> {
+    let mut fds: Vec<FdEntry> = Vec::new();
+    for (fd, file, cloexec) in fdt.iter() {
+        fds.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        let serial = files.try_get(file).map_or(0, |f| f.serial);
+        let _ = fds.push_within_capacity(FdEntry {
+            fd,
+            file,
+            serial,
+            cloexec,
+        });
+    }
+    Ok(fds)
 }
 
 impl MmView {

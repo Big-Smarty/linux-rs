@@ -93,9 +93,9 @@ pub struct File {
     /// The name the file was opened by (`f_path.dentry`): the directory it was
     /// found in and the name there, for `d_path`.
     pub dentry: Option<Dentry>,
-    /// The text of a procfs file as last generated and the position after the
-    /// last read (`seq_file`'s buffer and `read_pos`).
-    pub seq: Option<(alloc::vec::Vec<u8>, i64)>,
+    /// The `seq_file` state of a procfs file: the text as last generated, the
+    /// buffer and `read_pos`. Taken out while a read or seek uses it.
+    pub seq: Option<crate::seq::SeqFile>,
     /// `seq_file.poll_event`: the mount namespace event `/proc/<pid>/mounts` and
     /// `mountinfo` last reported to `poll` (taken when the file is opened).
     pub poll_event: u64,
@@ -458,12 +458,20 @@ impl FdTable {
         Ok(new)
     }
 
-    /// Every populated descriptor with its close-on-exec flag.
+    /// Every populated descriptor with its close-on-exec flag; words of the
+    /// open bitmap without a set bit are skipped, so a sparse table costs
+    /// its words, not its slots.
     pub fn iter(&self) -> impl Iterator<Item = (Fd, FileId, bool)> + '_ {
-        (0..self.fds.len()).filter_map(move |fd| {
-            let fd = u32::try_from(fd).ok()?;
-            Some((fd, self.get(fd)?, self.cloexec(fd)))
-        })
+        self.open
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| **word != 0)
+            .flat_map(move |(index, _)| {
+                (index * BITS_PER_WORD..(index + 1) * BITS_PER_WORD).filter_map(move |fd| {
+                    let fd = u32::try_from(fd).ok()?;
+                    Some((fd, self.get(fd)?, self.cloexec(fd)))
+                })
+            })
     }
 }
 

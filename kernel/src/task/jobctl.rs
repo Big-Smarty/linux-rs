@@ -154,6 +154,10 @@ impl Tasklist {
             t.self_exec_id = t.self_exec_id.wrapping_add(1);
         }
         self.publish_cred(task, cred);
+        // begin_new_exec: without a set-id image or an unreadable binary (neither
+        // exists here: the credentials do not change at exec and root reads
+        // everything) the new mm is SUID_DUMP_USER.
+        self.set_dumpable(task, true);
     }
 
     /// `do_signal_stop(signr)` for the running task `task`, up to the sleep:

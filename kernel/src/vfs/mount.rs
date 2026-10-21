@@ -62,7 +62,9 @@ pub const MS_RELATIME: u64 = 1 << 21;
 pub const MS_I_VERSION: u64 = 1 << 23;
 pub const MS_STRICTATIME: u64 = 1 << 24;
 pub const MS_LAZYTIME: u64 = 1 << 25;
-pub const MS_NOUSER: u64 = 1 << 31;
+/// `MS_NOUSER` is the C `int` `(1<<31)`: widened to `unsigned long` it
+/// sign-extends, so a `flags & MS_NOUSER` test covers bits 31..63.
+pub const MS_NOUSER: u64 = 0xffff_ffff_8000_0000;
 pub const MS_MGC_VAL: u64 = 0xC0ED_0000;
 pub const MS_MGC_MSK: u64 = 0xffff_0000;
 /// `MS_RMT_MASK`: the superblock flags a remount may alter.
@@ -306,9 +308,10 @@ fn memparse(text: &[u8]) -> (u64, &[u8]) {
 }
 
 /// `kstrtouint(s, base, &out)`: the whole string must be a number (one
-/// trailing newline allowed), no sign, and fit 32 bits.
+/// trailing newline allowed, one leading `+` skipped, `-` refused), and fit 32 bits.
 fn kstrtouint(text: &[u8], base: u32) -> Option<u32> {
     let text = text.strip_suffix(b"\n").unwrap_or(text);
+    let text = text.strip_prefix(b"+").unwrap_or(text);
     if text.is_empty() || text[0] == b'-' || text[0] == b'+' {
         return None;
     }
@@ -475,8 +478,18 @@ pub fn parse_tmpfs(data: Option<&[u8]>, ram_pages: u64, sb_flags: u32) -> Parsed
                 let mode = kstrtouint(string(param.value)?, 8).ok_or(Errno::EINVAL)?;
                 opts.mode = Some(mode & 0o7777);
             }
-            b"uid" => opts.uid = Some(kstrtouint(string(param.value)?, 0).ok_or(Errno::EINVAL)?),
-            b"gid" => opts.gid = Some(kstrtouint(string(param.value)?, 0).ok_or(Errno::EINVAL)?),
+            // `fs_param_is_uid`/`gid`: `make_kuid`/`make_kgid` of (uid_t)-1 is
+            // not `uid_valid`.
+            b"uid" | b"gid" => {
+                let id = kstrtouint(string(param.value)?, 0)
+                    .filter(|&id| id != u32::MAX)
+                    .ok_or(Errno::EINVAL)?;
+                if param.key == b"uid" {
+                    opts.uid = Some(id);
+                } else {
+                    opts.gid = Some(id);
+                }
+            }
             b"huge" => {
                 // CONFIG_TRANSPARENT_HUGEPAGE=n: only `never` is accepted.
                 let value = string(param.value)?;
@@ -600,7 +613,7 @@ pub fn parse_proc(data: Option<&[u8]>, sb_flags: u32) -> KResult<ProcOptSet<'_>>
                 );
             }
             b"hidepid" => {
-                let text = value.ok_or(Errno::EINVAL)?;
+                let text = string(value)?;
                 hide = Some(match kstrtouint(text, 0) {
                     Some(0) => HidePid::Off,
                     Some(1) => HidePid::NoAccess,
@@ -617,7 +630,10 @@ pub fn parse_proc(data: Option<&[u8]>, sb_flags: u32) -> KResult<ProcOptSet<'_>>
                 });
             }
             b"subset" => {
-                for item in value.ok_or(Errno::EINVAL)?.split(|&b| b == b',') {
+                // `fsparam_string` without `fs_param_can_be_empty`: `subset=`
+                // is `fs_param_is_string`'s bad value.
+                let list = string(value)?;
+                for item in list.split(|&b| b == b',') {
                     if item.is_empty() {
                         continue;
                     }
@@ -769,6 +785,16 @@ impl Namespace {
             },
         )?;
         Ok(ns)
+    }
+
+    /// Whether any procfs superblock exists (mounted, or held by an open file
+    /// or working directory): otherwise no pid mirror or task view can be read.
+    #[must_use]
+    pub fn has_proc(&self) -> bool {
+        self.sbs
+            .iter()
+            .flatten()
+            .any(|sb| sb.fstype == FsType::Proc)
     }
 
     /// Record that a not-yet-ported Linux behaviour was reached.

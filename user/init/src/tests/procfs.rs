@@ -406,12 +406,15 @@ pub fn run() -> bool {
     tmpfs_mounts(&mut t);
     tmpfs_options(&mut t);
     remounts(&mut t);
+    proc_options(&mut t);
     propagation(&mut t);
     stacking_and_detach(&mut t);
     proc_tree(&mut t);
     global_files(&mut t);
     pid_files(&mut t);
     seq_files(&mut t);
+    seq_records(&mut t);
+    wchan(&mut t);
     mounts_poll(&mut t);
     root_umount(&mut t);
     t.finish()
@@ -445,6 +448,32 @@ fn mount_errors(t: &mut T) {
         mount(Some("x"), "/mnt/a", Some("nosuchfs"), MS_NOUSER, None),
         Err(Errno::EINVAL),
     );
+    // MS_NOUSER is the C `int` (1<<31), which sign-extends: every bit from 31 to 63 is MS_NOUSER.
+    // The magic MS_MGC_VAL in the top half of the low word is discarded with `~MS_MGC_MSK`, an
+    // `unsigned int` that clears bits 16 to 63.
+    const MS_MGC_VAL: usize = 0xC0ED_0000;
+    for (name, flags, want) in [
+        ("nouser-bit32", 1 << 32, Errno::EINVAL),
+        ("nouser-bit47", 1 << 47, Errno::EINVAL),
+        ("nouser-bit63", 1 << 63, Errno::EINVAL),
+        ("nouser-bit31-and-32", MS_NOUSER | 1 << 32, Errno::EINVAL),
+        ("magic-alone", MS_MGC_VAL, Errno::ENODEV),
+        ("magic-clears-nouser", MS_MGC_VAL | MS_NOUSER, Errno::ENODEV),
+        ("magic-clears-bit32", MS_MGC_VAL | 1 << 32, Errno::ENODEV),
+        ("magic-clears-bit63", MS_MGC_VAL | 1 << 63, Errno::ENODEV),
+        (
+            "magic-clears-high-word",
+            MS_MGC_VAL | 0xffff_ffff_0000_0000,
+            Errno::ENODEV,
+        ),
+        ("not-the-magic", 0xC0EC_0000, Errno::EINVAL),
+    ] {
+        t.eq(
+            format_args!("err-flags-{name}"),
+            mount(Some("x"), "/mnt/a", Some("nosuchfs"), flags, None),
+            Err(want),
+        );
+    }
     // do_new_mount: no type is EINVAL, an unregistered one ENODEV.
     t.eq(
         "err-type-null",
@@ -515,6 +544,10 @@ fn mount_errors(t: &mut T) {
         ("size-missing", "size"),
         ("nr-inodes-junk", "nr_inodes=1q"),
         ("uid-junk", "uid=x"),
+        ("uid-max", "uid=4294967295"),
+        ("gid-max", "gid=4294967295"),
+        ("gid-empty", "gid="),
+        ("uid-too-big", "uid=4294967296"),
         ("flag-with-value", "noswap=1"),
         ("huge", "huge=always"),
         ("quota", "quota"),
@@ -531,7 +564,20 @@ fn mount_errors(t: &mut T) {
         ("hidepid-value", "hidepid=3"),
         ("hidepid-word", "hidepid=bogus"),
         ("subset", "subset=net"),
+        ("subset-empty", "subset="),
+        ("subset-missing", "subset"),
+        ("subset-list", "subset=pid,net"),
+        ("hidepid-empty", "hidepid="),
+        ("hidepid-missing", "hidepid"),
+        ("hidepid-sign", "hidepid=-1"),
+        ("hidepid-big", "hidepid=4294967297"),
         ("gid-missing", "gid"),
+        ("gid-empty", "gid="),
+        ("gid-big", "gid=4294967296"),
+        ("gid-negative", "gid=-1"),
+        ("gid-junk", "gid=1x"),
+        ("pidns-empty", "pidns="),
+        ("pidns-missing", "pidns"),
         ("tmpfs-option", "size=1"),
     ] {
         t.eq(
@@ -4321,4 +4367,631 @@ fn root_umount(t: &mut T) {
     let _ = close(again.unwrap_or(99));
     let _ = sys(Sysno::unlink, &[addr(&c("/rootwriter2"))]);
     let _ = sys(Sysno::unlink, &[addr(&c("/rootwriter"))]);
+}
+
+// ---- proc options: display, parsing and the order of a remount -------------------------------
+
+/// The superblock options of the mountinfo line of `point` (`- fstype source options`).
+fn sb_opts<'a>(buf: &'a mut Page, point: &str) -> &'a [u8] {
+    let n = mountinfo(buf);
+    let line = mi_line(&buf[..n], point);
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let at = line
+        .windows(3)
+        .position(|w| w == b" - ")
+        .map_or(0, |at| at + 3);
+    field(&line[at..], b' ', 2)
+}
+
+fn proc_options(t: &mut T) {
+    let mut buf: Page = [0; 16384];
+    // `proc_show_options`: gid, hidepid, subset, in that order after the generic flags.
+    for (name, fs, data, want) in [
+        ("gid-hex", "proc", "gid=0x10", "rw,gid=16"),
+        ("gid-octal", "proc", "gid=010", "rw,gid=8"),
+        ("gid-plus", "proc", "gid=+5", "rw,gid=5"),
+        ("gid-newline", "proc", "gid=5\n", "rw,gid=5"),
+        ("gid-zero", "proc", "gid=0", "rw"),
+        ("gid-last-wins", "proc", "gid=3,gid=4", "rw,gid=4"),
+        ("gid-max", "proc", "gid=4294967295", "rw,gid=65534"),
+        ("hidepid-plus", "proc", "hidepid=+1", "rw,hidepid=noaccess"),
+        ("hidepid-hex", "proc", "hidepid=0x2", "rw,hidepid=invisible"),
+        (
+            "hidepid-octal",
+            "proc",
+            "hidepid=04",
+            "rw,hidepid=ptraceable",
+        ),
+        ("hidepid-zero", "proc", "hidepid=0", "rw"),
+        ("hidepid-off", "proc", "hidepid=off", "rw"),
+        (
+            "hidepid-name",
+            "proc",
+            "hidepid=invisible",
+            "rw,hidepid=invisible",
+        ),
+        (
+            "hidepid-last-wins",
+            "proc",
+            "hidepid=2,hidepid=1",
+            "rw,hidepid=noaccess",
+        ),
+        (
+            "hidepid-newline",
+            "proc",
+            "hidepid=1\n",
+            "rw,hidepid=noaccess",
+        ),
+        ("subset-pid", "proc", "subset=pid", "rw,subset=pid"),
+        (
+            "all-three",
+            "proc",
+            "subset=pid,hidepid=1,gid=3",
+            "rw,gid=3,hidepid=noaccess,subset=pid",
+        ),
+        ("flag-ro", "proc", "ro,gid=2", "ro,gid=2"),
+        (
+            "flags",
+            "proc",
+            "sync,mand,lazytime",
+            "rw,sync,mand,lazytime",
+        ),
+        (
+            "tmpfs-uid-edge",
+            "tmpfs",
+            "uid=4294967294",
+            "rw,uid=4294967294",
+        ),
+        (
+            "tmpfs-gid-edge",
+            "tmpfs",
+            "gid=4294967294",
+            "rw,gid=4294967294",
+        ),
+        ("tmpfs-uid-plus", "tmpfs", "uid=+7", "rw,uid=7"),
+    ] {
+        let mounted = mount(Some("x"), "/mnt/g", Some(fs), 0, Some(data));
+        t.eq(format_args!("po-{name}-mount"), mounted, Ok(0));
+        if mounted.is_ok() {
+            t.eq(
+                format_args!("po-{name}-options"),
+                Txt(sb_opts(&mut buf, "/mnt/g")),
+                Txt(want.as_bytes()),
+            );
+            let _ = umount("/mnt/g", 0);
+        }
+    }
+
+    // A remount applies the options only after reconfigure_super's checks: a flag it refuses
+    // (EINVAL) or a writer it finds (EBUSY) leave the options as they were.
+    t.eq(
+        "po-mount",
+        mount(
+            Some("x"),
+            "/mnt/g",
+            Some("proc"),
+            0,
+            Some("gid=5,hidepid=2,subset=pid"),
+        ),
+        Ok(0),
+    );
+    let opts = |buf: &mut Page| -> [u8; 96] {
+        let mut out = [0u8; 96];
+        let text = sb_opts(buf, "/mnt/g");
+        out[..text.len().min(96)].copy_from_slice(&text[..text.len().min(96)]);
+        out
+    };
+    let trim = |raw: &[u8; 96]| -> usize { raw.iter().position(|&b| b == 0).unwrap_or(96) };
+    let first = opts(&mut buf);
+    t.eq(
+        "po-options",
+        Txt(&first[..trim(&first)]),
+        Txt(b"rw,gid=5,hidepid=invisible,subset=pid"),
+    );
+    t.eq(
+        "po-remount-hidepid",
+        mount(None, "/mnt/g", None, MS_REMOUNT, Some("hidepid=1")),
+        Ok(0),
+    );
+    let now = opts(&mut buf);
+    t.eq(
+        "po-remount-keeps-the-rest",
+        Txt(&now[..trim(&now)]),
+        Txt(b"rw,gid=5,hidepid=noaccess,subset=pid"),
+    );
+    t.eq(
+        "po-remount-dirsync",
+        mount(None, "/mnt/g", None, MS_REMOUNT, Some("gid=7,dirsync")),
+        Err(Errno::EINVAL),
+    );
+    let after = opts(&mut buf);
+    t.eq(
+        "po-remount-dirsync-changes-nothing",
+        Txt(&after[..trim(&after)]),
+        Txt(b"rw,gid=5,hidepid=noaccess,subset=pid"),
+    );
+    let writer = open("/mnt/g/self/comm", O_WRONLY).unwrap_or(99);
+    t.eq(
+        "po-remount-busy",
+        mount(
+            None,
+            "/mnt/g",
+            None,
+            MS_REMOUNT | MS_RDONLY,
+            Some("hidepid=2,gid=9"),
+        ),
+        Err(Errno::EBUSY),
+    );
+    let after = opts(&mut buf);
+    t.eq(
+        "po-remount-busy-changes-nothing",
+        Txt(&after[..trim(&after)]),
+        Txt(b"rw,gid=5,hidepid=noaccess,subset=pid"),
+    );
+    let _ = close(writer);
+    t.eq(
+        "po-remount-ro",
+        mount(
+            None,
+            "/mnt/g",
+            None,
+            MS_REMOUNT | MS_RDONLY,
+            Some("hidepid=2,gid=9"),
+        ),
+        Ok(0),
+    );
+    let after = opts(&mut buf);
+    t.eq(
+        "po-options-after-ro",
+        Txt(&after[..trim(&after)]),
+        Txt(b"ro,gid=9,hidepid=invisible,subset=pid"),
+    );
+    t.eq(
+        "po-remount-pidns",
+        mount(None, "/mnt/g", None, MS_REMOUNT, Some("pidns=/nonexistent")),
+        Err(Errno::EBUSY),
+    );
+    t.eq(
+        "po-remount-unknown",
+        mount(None, "/mnt/g", None, MS_REMOUNT, Some("bogus")),
+        Err(Errno::EINVAL),
+    );
+    t.eq(
+        "po-remount-rw",
+        mount(None, "/mnt/g", None, MS_REMOUNT, Some("hidepid=ptraceable")),
+        Ok(0),
+    );
+    let after = opts(&mut buf);
+    t.eq(
+        "po-options-after-rw",
+        Txt(&after[..trim(&after)]),
+        Txt(b"rw,gid=9,hidepid=ptraceable,subset=pid"),
+    );
+    t.eq("po-umount", umount("/mnt/g", 0), Ok(0));
+}
+
+// ---- seq_file reads over many records, vanished tasks, wchan ----------------------------------
+
+/// The length of the line that starts at `from` in `text` (through its newline), 0 at the end.
+fn line_len(text: &[u8], from: usize) -> usize {
+    match text.get(from..) {
+        Some(rest) if !rest.is_empty() => rest
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(rest.len(), |at| at + 1),
+        _ => 0,
+    }
+}
+
+/// Whether `got` bytes taken from the record boundary `from` of `text` are what `seq_read_iter`
+/// fills: whole lines, less than the 4096-byte buffer (it is doubled only for a bigger record),
+/// and no more could have been added without reaching it.
+fn fill_ok(text: &[u8], from: usize, got: usize) -> bool {
+    let end = from + got;
+    got < 4096
+        && (end == text.len() || (end > from && text[end - 1] == b'\n'))
+        && (end == text.len() || got + line_len(text, end) >= 4096)
+}
+
+/// The reads of a many-record `seq_file` (`maps`, `mounts`, `mountinfo`): a big read returns whole
+/// records that fit the buffer, the rest of a buffer is served first, and a seek into a record
+/// serves its tail before the next records.
+fn seq_chunks(t: &mut T, name: &str, path: &str) {
+    let mut whole: Page = [0; 16384];
+    // The flat text, by small reads (a read smaller than the buffered records is a plain slice).
+    let fd = open(path, O_RDONLY).unwrap_or(99);
+    let mut total = 0;
+    let mut small = [0u8; 97];
+    while let Ok(n) = read(fd, &mut small) {
+        if n == 0 || total + n > whole.len() {
+            break;
+        }
+        whole[total..total + n].copy_from_slice(&small[..n]);
+        total += n;
+    }
+    let _ = close(fd);
+    let text = &whole[..total];
+    t.holds(
+        format_args!("{name}-is-long"),
+        total > 8192,
+        total,
+        "more than two buffers of text",
+    );
+
+    // Big reads: every chunk is whole records filling the buffer.
+    let fd = open(path, O_RDONLY).unwrap_or(99);
+    let mut big: Page = [0; 16384];
+    let (mut pos, mut chunks, mut all_ok, mut same) = (0usize, 0, true, true);
+    let mut first = 0;
+    loop {
+        let n = read(fd, &mut big).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        all_ok &= fill_ok(text, pos, n);
+        same &= text.get(pos..pos + n) == Some(&big[..n]);
+        if chunks == 0 {
+            first = n;
+        }
+        pos += n;
+        chunks += 1;
+    }
+    let _ = close(fd);
+    t.holds(
+        format_args!("{name}-big-reads-fill-whole-records"),
+        all_ok && same && pos == total,
+        (chunks, pos, total),
+        "whole records, each chunk the longest that fits 4096 bytes",
+    );
+    t.holds(
+        format_args!("{name}-big-reads-take-several-calls"),
+        chunks >= 3,
+        chunks,
+        "at least three reads",
+    );
+
+    // A short read, then a big one. The first read buffers whole records until it has as many
+    // bytes as the caller asked for (`m->count >= iov_iter_count`); the second serves the rest of
+    // that buffer, then fills a fresh one.
+    let fd = open(path, O_RDONLY).unwrap_or(99);
+    let n1 = read(fd, &mut big[..100]).unwrap_or(0);
+    let n2 = read(fd, &mut big).unwrap_or(0);
+    let mut buffered = 0;
+    while buffered < 100 {
+        buffered += line_len(text, buffered);
+    }
+    let rest = buffered - 100;
+    t.holds(
+        format_args!("{name}-rest-of-the-buffer-then-a-fill"),
+        n1 == 100
+            && n2 >= rest
+            && text.get(100..100 + n2) == Some(&big[..n2])
+            && fill_ok(text, buffered, n2 - rest),
+        (n1, n2, rest, first),
+        "the rest of the buffered records, then the next records that fit",
+    );
+    let _ = close(fd);
+
+    // pread into the middle of the third line: its tail, then the records that fit.
+    let third = line_len(text, 0) + line_len(text, line_len(text, 0));
+    let off = third + 5;
+    let tail = line_len(text, third) - 5;
+    let fd = open(path, O_RDONLY).unwrap_or(99);
+    let n = pread(fd, &mut big, off).unwrap_or(0);
+    t.holds(
+        format_args!("{name}-pread-into-a-record"),
+        n >= tail
+            && text.get(off..off + n) == Some(&big[..n])
+            && fill_ok(text, off + tail, n - tail),
+        (n, tail),
+        "the tail of the record, then the records that fit",
+    );
+    // lseek into a record, then read: the same.
+    t.eq(
+        format_args!("{name}-seek-into-a-record"),
+        lseek(fd, off as isize, SEEK_SET),
+        Ok(off),
+    );
+    let n = read(fd, &mut big).unwrap_or(0);
+    t.holds(
+        format_args!("{name}-read-after-seek"),
+        n >= tail
+            && text.get(off..off + n) == Some(&big[..n])
+            && fill_ok(text, off + tail, n - tail),
+        (n, tail),
+        "the tail of the record, then the records that fit",
+    );
+    // A seek to a record boundary, and to the end.
+    let second = line_len(text, 0);
+    t.eq(
+        format_args!("{name}-seek-to-a-boundary"),
+        lseek(fd, second as isize, SEEK_SET),
+        Ok(second),
+    );
+    let n = read(fd, &mut big).unwrap_or(0);
+    t.holds(
+        format_args!("{name}-read-from-a-boundary"),
+        text.get(second..second + n) == Some(&big[..n]) && fill_ok(text, second, n),
+        n,
+        "whole records that fit",
+    );
+    t.eq(
+        format_args!("{name}-seek-to-the-end"),
+        lseek(fd, total as isize, SEEK_SET),
+        Ok(total),
+    );
+    t.eq(
+        format_args!("{name}-read-at-the-end"),
+        read(fd, &mut big),
+        Ok(0),
+    );
+    // A zero-length read shows nothing and is 0 wherever the file is.
+    t.eq(
+        format_args!("{name}-zero-length"),
+        read(fd, &mut big[..0]),
+        Ok(0),
+    );
+    let _ = close(fd);
+}
+
+fn seq_records(t: &mut T) {
+    use super::proc::{nap, spawn, wait4};
+    // Enough VMAs for `maps` to be several buffers long: single pages with a gap between them.
+    const MAP_PRIVATE_ANON_FIXED_NOREPLACE: usize = 0x2 | 0x20 | 0x10_0000;
+    let mut made = 0;
+    for i in 0..220usize {
+        let at = 0x6000_0000 + i * 0x2000;
+        if super::mmap(at, 4096, 1, MAP_PRIVATE_ANON_FIXED_NOREPLACE, usize::MAX, 0) == Ok(at) {
+            made += 1;
+        }
+    }
+    t.eq("seq-vmas-made", made, 220);
+    seq_chunks(t, "seq-maps", "/proc/self/maps");
+    for i in 0..220usize {
+        let _ = sys(Sysno::munmap, &[0x6000_0000 + i * 0x2000, 4096]);
+    }
+
+    // The mount tables: stacked tmpfs mounts.
+    let mut stacked = 0;
+    for _ in 0..300 {
+        if mount(Some("x"), "/mnt/h", Some("tmpfs"), 0, None).is_ok() {
+            stacked += 1;
+        }
+    }
+    t.eq("seq-mounts-made", stacked, 300);
+    seq_chunks(t, "seq-mountinfo", "/proc/self/mountinfo");
+    seq_chunks(t, "seq-mounts", "/proc/self/mounts");
+    let mut gone = 0;
+    for _ in 0..stacked {
+        if umount("/mnt/h", 0).is_ok() {
+            gone += 1;
+        }
+    }
+    t.eq("seq-mounts-removed", gone, stacked);
+
+    // A task that exits under an open `maps`: the opened file keeps the address space it was
+    // opened on, so a zombie reads as empty; once reaped, a read or a seek finds no task (ESRCH)
+    // and a seek that fails puts the position back to 0.
+    let child = spawn(|| {
+        nap(20);
+        0
+    });
+    let path = text!(32, "/proc/{child}/maps");
+    let fd = open(path.str(), O_RDONLY).unwrap_or(99);
+    let mut buf = [0u8; 64];
+    let _ = wait4(-1, 1 /* WNOHANG */);
+    // Let it exit without reaping: poll its state.
+    for _ in 0..100 {
+        let mut page: Page = [0; 16384];
+        let state = pid_text(child, "stat", &mut page)
+            .ok()
+            .and_then(parse_stat)
+            .map_or(b'?', |s| s.state()[0]);
+        if state == b'Z' {
+            break;
+        }
+        nap(5);
+    }
+    t.eq("seq-zombie-maps-read", read(fd, &mut buf), Ok(0));
+    t.eq("seq-reaped", wait4(child as isize, 0).0, Ok(child));
+    t.eq("seq-gone-zero-length", read(fd, &mut buf[..0]), Ok(0));
+    t.eq("seq-gone-read", read(fd, &mut buf), Err(Errno::ESRCH));
+    t.eq("seq-gone-seek", lseek(fd, 100, SEEK_SET), Err(Errno::ESRCH));
+    t.eq("seq-gone-position-reset", lseek(fd, 0, SEEK_CUR), Ok(0));
+    t.eq("seq-gone-seek-zero", lseek(fd, 0, SEEK_SET), Ok(0));
+    let _ = close(fd);
+}
+
+fn wchan(t: &mut T) {
+    use super::proc::{nap, spawn, wait4};
+    let mut page: Page = [0; 16384];
+    // `proc_pid_wchan` prints the symbol a sleeping task waits in, else `0`: the task reading its
+    // own file, and a zombie (its stack is gone), print `0`.
+    t.eq(
+        "wchan-self",
+        Txt(pid_text(getpid(), "wchan", &mut page).unwrap_or_default()),
+        Txt(b"0"),
+    );
+    let child = spawn(|| 0);
+    for _ in 0..100 {
+        let mut stat: Page = [0; 16384];
+        let state = pid_text(child, "stat", &mut stat)
+            .ok()
+            .and_then(parse_stat)
+            .map_or(b'?', |s| s.state()[0]);
+        if state == b'Z' {
+            break;
+        }
+        nap(5);
+    }
+    t.eq(
+        "wchan-zombie",
+        Txt(pid_text(child, "wchan", &mut page).unwrap_or_default()),
+        Txt(b"0"),
+    );
+    let _ = wait4(child as isize, 0);
+    t.eq(
+        "wchan-reaped",
+        pid_text(child, "wchan", &mut page).map(<[u8]>::len),
+        Err(Errno::ENOENT),
+    );
+}
+
+// ---- the permission matrix of /proc (reference-only mode `procperm`) ---------------------------
+
+/// Reference-only mode `procperm`: records, on the pinned Linux, what `hidepid`, `gid=`,
+/// `subset=pid`, ownership, the dumpable rules and `ptrace_may_access` make of `/proc/<pid>` for
+/// observers with other credentials. It prints `init: info procperm.<observer>.<mount>.<victim>
+/// <probes>` rows and no checks: this kernel has no credential-changing system call (the
+/// `setuid` family stops it loudly), so the matrix cannot run on it; it is the table the host
+/// tests of `kernel/src/procfs/permtests.rs` compare the permission functions with.
+pub fn perm_probe() {
+    use super::proc::{nap, spawn, wait4};
+    const PR_SET_DUMPABLE: usize = 4;
+    let mut pair = [0i32; 2];
+    let _ = sys(Sysno::pipe2, &[addr_mut(&mut pair), 0]);
+    let (pr, pw) = (pair[0] as usize, pair[1] as usize);
+    let set_ids = |uid: usize, gid: usize| {
+        let _ = sys(Sysno::setresgid, &[gid, gid, gid]);
+        let _ = sys(Sysno::setresuid, &[uid, uid, uid]);
+    };
+    // Victims: a dumpable and a non-dumpable user task asleep, a root task asleep, a zombie.
+    let sleeper = |uid: usize, gid: usize, dumpable: bool| {
+        spawn(move || {
+            if uid != 0 {
+                set_ids(uid, gid);
+            }
+            if dumpable {
+                let _ = sys(Sysno::prctl, &[PR_SET_DUMPABLE, 1]);
+            }
+            let _ = close(pw);
+            let mut b = [0u8; 1];
+            let _ = read(pr, &mut b);
+            0
+        })
+    };
+    let v_user = sleeper(1000, 100, true);
+    let v_undump = sleeper(1000, 100, false);
+    let v_root = sleeper(0, 0, true);
+    let v_zombie = spawn(move || {
+        set_ids(1000, 100);
+        let _ = sys(Sysno::prctl, &[PR_SET_DUMPABLE, 1]);
+        0
+    });
+    nap(300);
+    let victims = [
+        ("user", v_user),
+        ("undumpable", v_undump),
+        ("root", v_root),
+        ("zombie", v_zombie),
+    ];
+    let mounts = [
+        ("plain", "/mnt/a", None),
+        ("hide1", "/mnt/b", Some("hidepid=1")),
+        ("hide2", "/mnt/c", Some("hidepid=2")),
+        ("hide4", "/mnt/d", Some("hidepid=4")),
+        ("gid100hide2", "/mnt/e", Some("gid=100,hidepid=2")),
+        ("subsetpid", "/mnt/f", Some("subset=pid")),
+    ];
+    let observers: [(&str, usize, usize); 4] = [
+        ("root", 0, 0),
+        ("other", 2000, 200),
+        ("owner", 1000, 100),
+        ("group", 2000, 100),
+    ];
+    for (who, uid, gid) in observers {
+        // Fresh superblocks for every observer: Linux keeps the dentries a lookup
+        // instantiated, and a later observer would find them without the checks of the lookup.
+        for (_, point, data) in mounts {
+            let _ = mount(Some("proc"), point, Some("proc"), 0, data);
+        }
+        let probe = move || {
+            if uid != 0 {
+                set_ids(uid, gid);
+            }
+            let me = getpid();
+            for (mname, point, _) in mounts {
+                let mut rows: [Buf<400>; 4] = [Buf::new(), Buf::new(), Buf::new(), Buf::new()];
+                for (row, (_, v)) in rows.iter_mut().zip(victims) {
+                    let dir = text!(64, "{point}/{v}");
+                    let (r, st) = stat(dir.str());
+                    let head = match r {
+                        Ok(_) => text!(48, "ok:{}:{}:{:o}", st.uid, st.gid, st.mode & 0o7777),
+                        Err(e) => text!(48, "{e:?}"),
+                    };
+                    let try_open = |name: &str, flags: usize| -> Buf<24> {
+                        let path = text!(96, "{point}/{v}/{name}");
+                        match open(path.str(), flags) {
+                            Ok(fd) => {
+                                let _ = close(fd);
+                                text!(24, "ok")
+                            }
+                            Err(e) => text!(24, "{e:?}"),
+                        }
+                    };
+                    let link = |name: &str| -> Buf<24> {
+                        let path = text!(96, "{point}/{v}/{name}");
+                        let mut out = [0u8; 256];
+                        match readlink(path.str(), &mut out) {
+                            Ok(_) => text!(24, "ok"),
+                            Err(e) => text!(24, "{e:?}"),
+                        }
+                    };
+                    let fdinfo = text!(24, "fdinfo/{pr}");
+                    let _ = write!(
+                        row,
+                        "dir={} stat={} environ={} maps={} comm={} cmdline={} exe={} cwd={} fd={} fdinfo={} fdinfofile={}",
+                        head.str(),
+                        try_open("stat", O_RDONLY).str(),
+                        try_open("environ", O_RDONLY).str(),
+                        try_open("maps", O_RDONLY).str(),
+                        try_open("comm", O_RDONLY).str(),
+                        try_open("cmdline", O_RDONLY).str(),
+                        link("exe").str(),
+                        link("cwd").str(),
+                        try_open("fd", O_RDONLY | O_DIRECTORY).str(),
+                        try_open("fdinfo", O_RDONLY | O_DIRECTORY).str(),
+                        try_open(fdinfo.str(), O_RDONLY).str(),
+                    );
+                }
+                // The listing last: it would instantiate the entries it shows.
+                let listing = Dir::list(point);
+                for (row, (vname, v)) in rows.iter().zip(victims) {
+                    let listed = match &listing {
+                        Ok(d) => {
+                            let want = text!(16, "{v}");
+                            if d.entries()
+                                .any(|e| e.strip_suffix(b":d") == Some(want.bytes()))
+                            {
+                                "in"
+                            } else {
+                                "out"
+                            }
+                        }
+                        Err(_) => "err",
+                    };
+                    pl!(
+                        "init: info procperm.{who}.{mname}.{vname} {} list={listed}",
+                        row.str()
+                    );
+                }
+            }
+            let _ = me;
+            0
+        };
+        if uid == 0 {
+            probe();
+        } else {
+            let child = spawn(probe);
+            let _ = wait4(child as isize, 0);
+        }
+        for (_, point, _) in mounts {
+            let _ = umount(point, MNT_DETACH);
+        }
+    }
+    let _ = close(pw);
+    let _ = close(pr);
+    for (_, v) in victims {
+        let _ = wait4(v as isize, 0);
+    }
 }

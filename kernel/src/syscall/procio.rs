@@ -5,18 +5,19 @@
 // (`proc_pid_cmdline_read`, `get_mm_cmdline`, `get_mm_proctitle`,
 // `environ_read`, `proc_pid_readlink`), fs/proc/generic.c (`proc_reg_read`),
 // fs/read_write.c (`generic_file_llseek`, `default_llseek`). All GPL-2.0.
-// Transformation: the buffer of a `seq_file` is `File::seq`; the text is
-// produced whole by `procfs::show` and handed out in pieces.
+// Transformation: the state of a `seq_file` is `File::seq` ([`crate::seq::SeqFile`]);
+// the text is produced whole by `procfs::show` with its record ends marked, and
+// handed out as `seq_read_iter` would fill its buffer.
 #![forbid(unsafe_code)]
 //! Reading and seeking the files of `/proc`.
 //!
 //! Context: task context. A `seq_file` text is generated when the file is read
-//! at a position other than the one the last read ended at (the first read, or
-//! after `lseek`), and then served from the buffer, as `seq_read_iter` does.
-//! The files with their own `read` (`cmdline`, `environ`) are generated on
-//! every call.
+//! from the start or at a position other than the one the last read ended at
+//! (the first read, or after `lseek`), and then served record by record as
+//! `seq_read_iter` fills its buffer (see [`crate::seq::SeqFile`]). The files
+//! with their own `read` (`cmdline`, `environ`) are generated on every call.
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use syscalls::Errno;
 
 use super::{
@@ -24,8 +25,11 @@ use super::{
     fd::{Dest, View},
 };
 use crate::{
-    procfs::{self, Kind, ProcNode, show},
-    seq::Seq,
+    procfs::{
+        self, Kind, ProcNode,
+        show::{self, ShowScope},
+    },
+    seq::{Seq, Snapshot},
     usercopy::copy_from_user,
     vfs::{FMODE_LSEEK, MAX_LFS_FILESIZE},
 };
@@ -51,58 +55,74 @@ pub(super) fn read<C: Context>(
     let Some(pos) = pos else {
         return Err(Errno::EINVAL.into());
     };
+    if own_read(node.kind) {
+        return read_own(ctx, node, dest, pos);
+    }
+    // seq_read_iter: nothing is shown for an empty buffer.
+    let count = usize::try_from(dest.remaining()).unwrap_or(usize::MAX);
+    if count == 0 {
+        return Ok(0);
+    }
     let at = *pos;
-    let data: Vec<u8> = if own_read(node.kind) {
-        own_text(ctx, node)?
-    } else {
-        // The buffered text, if the read continues where the last one ended.
-        let kept = ctx
-            .files()
-            .vfs
-            .files
-            .get(view.id)
-            .seq
-            .as_ref()
-            .filter(|(_, ended)| *ended == at)
-            .map(|(text, _)| text.clone_fallible());
-        match kept {
-            Some(Some(text)) => text,
-            Some(None) => return Err(Errno::ENOMEM.into()),
-            None => generate(ctx, node)?,
+    let mut state = ctx
+        .files()
+        .vfs
+        .files
+        .get_mut(view.id)
+        .seq
+        .take()
+        .unwrap_or_default();
+    if state.wants_snapshot(at) {
+        // `->start` from the beginning, or `traverse` after a position change.
+        match generate(ctx, node) {
+            Ok(snap) => state.load(snap),
+            Err(stop) => {
+                state.reset(); // "with prejudice"
+                ctx.files().vfs.files.get_mut(view.id).seq = Some(state);
+                return Err(stop);
+            }
         }
-    };
+    }
+    // `m_start` of `maps` asks for the task again at every refill.
+    let gone = node.kind == Kind::Maps && ctx.tasks().list.find_task_by_vpid(node.tgid).is_none();
+    let result = state.read(at, count, gone.then_some(Errno::ESRCH), &mut |bytes| {
+        dest.copy_out(ctx, bytes)
+    });
+    ctx.files().vfs.files.get_mut(view.id).seq = Some(state);
+    let copied = result?;
+    *pos = at + i64::try_from(copied).unwrap_or(0);
+    Ok(i64::try_from(copied).unwrap_or(0))
+}
+
+/// The files with their own `read` (`proc_pid_cmdline_read`, `environ_read`):
+/// generated at every call and sliced at the position.
+fn read_own<C: Context>(ctx: &mut C, node: ProcNode, dest: &mut Dest, pos: &mut i64) -> Sys {
+    let at = *pos;
+    let data = own_text(ctx, node)?;
     let start = usize::try_from(at).unwrap_or(usize::MAX).min(data.len());
     let asked = dest.remaining();
     let copied = dest.copy_out(ctx, &data[start..]);
-    let mut result = Ok(i64::try_from(copied).unwrap_or(0));
     if copied == 0 && start < data.len() && asked > 0 {
         // The user buffer was unwritable from the start.
-        result = Err(Errno::EFAULT.into());
+        return Err(Errno::EFAULT.into());
     }
     if copied > 0 {
-        let end = at + i64::try_from(copied).unwrap_or(0);
-        *pos = end;
-        if !own_read(node.kind) {
-            ctx.files().vfs.files.get_mut(view.id).seq = Some((data, end));
-        }
-    } else if !own_read(node.kind) && result.is_ok() {
-        // EOF: keep the buffer so a repeated read at the end stays free.
-        ctx.files().vfs.files.get_mut(view.id).seq = Some((data, at));
+        *pos = at + i64::try_from(copied).unwrap_or(0);
     }
-    result
+    Ok(i64::try_from(copied).unwrap_or(0))
 }
 
-/// Produce the text of a node afresh.
-fn generate<C: Context>(ctx: &mut C, node: ProcNode) -> Result<Vec<u8>, Stop> {
-    let produced = ctx.with_show(|s| {
+/// Show a node afresh: its text and the ends of its records.
+fn generate<C: Context>(ctx: &mut C, node: ProcNode) -> Result<Snapshot, Stop> {
+    let produced = ctx.with_show(ShowScope::of(node), |s| {
         let mut seq = Seq::new();
-        show::read(s, node, &mut seq).map(|()| seq.into_vec())
+        show::read(s, node, &mut seq).and_then(|()| seq.into_snapshot())
     })?;
     Ok(produced?)
 }
 
 /// `(arg_start, arg_end, env_start, env_end, copy)` of a published task.
-type ExecArgs = (u64, u64, u64, u64, Vec<u8>);
+type ExecArgs = (u64, u64, u64, u64, Option<Arc<Vec<u8>>>);
 
 /// The text of `cmdline` and `environ`: the caller's own is read from its
 /// memory (`access_remote_vm` on `current`), another task's is the copy taken
@@ -110,33 +130,31 @@ type ExecArgs = (u64, u64, u64, u64, Vec<u8>);
 fn own_text<C: Context>(ctx: &mut C, node: ProcNode) -> Result<Vec<u8>, Stop> {
     let me = i32::try_from(ctx.tgid()).unwrap_or(0);
     // The task must exist (get_proc_task) and have an address space.
-    let view_args = ctx.with_show(|s| -> Result<Option<ExecArgs>, Errno> {
-        s.tasks.find_task_by_vpid(node.tgid).ok_or(Errno::ESRCH)?;
-        let view = s.vfs.fs.ns.proc.view(node.tgid).ok_or(Errno::ESRCH)?;
-        let Some(mm) = view.mm.as_ref() else {
-            return Ok(None);
-        };
-        let mut args = Vec::new();
-        args.try_reserve_exact(view.args.len())
-            .map_err(|_| Errno::ENOMEM)?;
-        for &byte in &view.args {
-            let _ = args.push_within_capacity(byte);
-        }
-        Ok(Some((
-            mm.arg_start,
-            mm.arg_end,
-            mm.env_start,
-            mm.env_end,
-            args,
-        )))
-    })??;
+    let view_args = ctx.with_show(
+        ShowScope::Pid(node.tgid),
+        |s| -> Result<Option<ExecArgs>, Errno> {
+            s.tasks.find_task_by_vpid(node.tgid).ok_or(Errno::ESRCH)?;
+            let view = s.vfs.fs.ns.proc.view(node.tgid).ok_or(Errno::ESRCH)?;
+            let Some(mm) = view.mm.as_ref() else {
+                return Ok(None);
+            };
+            Ok(Some((
+                mm.arg_start,
+                mm.arg_end,
+                mm.env_start,
+                mm.env_end,
+                view.args.clone(),
+            )))
+        },
+    )??;
     let Some((arg_start, arg_end, env_start, env_end, args)) = view_args else {
         return Ok(Vec::new());
     };
     if node.tgid != me {
         // Another task: the copy taken at exec (`args` = arg_start..env_end).
+        let args = args.as_deref().map_or(&[][..], Vec::as_slice);
         return Ok(slice_args(
-            node.kind, &args, arg_start, arg_end, env_start, env_end,
+            node.kind, args, arg_start, arg_end, env_start, env_end,
         ));
     }
     let (arg_start, arg_end, env_start, env_end) = ctx
@@ -237,30 +255,34 @@ pub(super) fn lseek<C: Context>(ctx: &mut C, view: &View, whence: u32, offset: i
         return Err(Errno::EINVAL.into());
     }
     let file = ctx.files().vfs.files.get_mut(view.id);
-    // seq_lseek drops the buffered text of a different position.
-    file.seq = None;
-    Ok(new)
+    if generic {
+        // generic_file_llseek: the next read shows the text afresh.
+        file.seq = None;
+        return Ok(new);
+    }
+    // seq_lseek: a new position other than the read position runs `traverse`.
+    let mut state = file.seq.take().unwrap_or_default();
+    let moved = if state.seek_wants_snapshot(new) {
+        generate(ctx, node).map(|snap| state.load(snap))
+    } else {
+        Ok(())
+    };
+    let sought = moved.and_then(|()| state.seek(new).map_err(Stop::from));
+    let file = ctx.files().vfs.files.get_mut(view.id);
+    if sought.is_err() {
+        state.reset();
+        file.pos = 0; // "with extreme prejudice"
+    }
+    file.seq = Some(state);
+    sought.map(|()| new)
 }
 
 /// `readlink(2)` on a procfs link: the text `do_proc_readlink` or the
 /// `get_link` of the entry gives.
 pub(super) fn readlink<C: Context>(ctx: &mut C, node: ProcNode) -> Result<Vec<u8>, Stop> {
-    Ok(ctx.with_show(|s| procfs::show::readlink(s, node))??)
-}
-
-trait CloneFallible {
-    fn clone_fallible(&self) -> Option<Vec<u8>>;
-}
-
-impl CloneFallible for Vec<u8> {
-    fn clone_fallible(&self) -> Option<Vec<u8>> {
-        let mut out = Vec::new();
-        out.try_reserve_exact(self.len()).ok()?;
-        for &byte in self {
-            out.push_within_capacity(byte).ok()?;
-        }
-        Some(out)
-    }
+    Ok(ctx.with_show(ShowScope::Pid(node.tgid), |s| {
+        procfs::show::readlink(s, node)
+    })??)
 }
 
 trait ResizeFallible {
@@ -293,7 +315,10 @@ pub fn comm_write<C: Context>(ctx: &mut C, view: &View, buf: u64, count: u64) ->
     if copy_from_user(ctx, &mut name[..take], buf) != 0 {
         return Err(Errno::EFAULT.into());
     }
-    ctx.with_show(|s| s.tasks.find_task_by_vpid(node.tgid).ok_or(Errno::ESRCH))??;
+    ctx.tasks()
+        .list
+        .find_task_by_vpid(node.tgid)
+        .ok_or(Errno::ESRCH)?;
     if i32::try_from(ctx.tgid()).ok() != Some(node.tgid) {
         return Err(Errno::EINVAL.into());
     }

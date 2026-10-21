@@ -41,6 +41,8 @@ mod namei;
 mod poll;
 mod process;
 mod procio;
+#[cfg(test)]
+mod procperm_tests;
 mod random;
 mod reboot;
 mod signal;
@@ -184,13 +186,15 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     /// lookups of the path walk cannot reach the task list themselves).
     fn sync_proc(&mut self);
     /// Run `f` over the system state the files of `/proc` show: the VFS, the
-    /// task list and the machine's counters, with the caller identified. The
-    /// error is the allocator's refusal to build the host snapshot.
+    /// task list and the machine's counters, with the caller identified. Only
+    /// what `scope` names is built. The error is the allocator's refusal to
+    /// build the host snapshot.
     ///
     /// # Errors
     /// `ENOMEM`.
     fn with_show<R>(
         &mut self,
+        scope: crate::procfs::show::ShowScope,
         f: impl FnOnce(&crate::procfs::show::Show<'_>) -> R,
     ) -> Result<R, Errno>;
     /// The user memory facts of the caller's address space that `cmdline` and

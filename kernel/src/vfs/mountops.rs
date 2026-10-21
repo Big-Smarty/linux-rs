@@ -86,6 +86,9 @@ pub struct MountArgs<'a> {
     pub data: Option<&'a [u8]>,
 }
 
+/// `overflowgid`: what an id with no mapping shows as (`/proc/sys/kernel/overflowgid`).
+const OVERFLOWGID: u32 = 65534;
+
 impl Vfs {
     /// The pid mirror of `/proc` follows the task list.
     ///
@@ -127,7 +130,10 @@ impl Vfs {
         let mut flags = args.flags;
         // Discard magic
         if flags & MS_MGC_MSK == MS_MGC_VAL {
-            flags &= !MS_MGC_MSK;
+            // C: `flags &= ~MS_MGC_MSK` with MS_MGC_MSK an `unsigned int`
+            // (0xffff0000): the complement is 0x0000ffff, zero-extended to
+            // `unsigned long`, so bits 16..63 are cleared.
+            flags &= MS_MGC_MSK ^ 0xffff_ffff;
         }
         if flags & MS_NOUSER != 0 {
             return Err(Errno::EINVAL.into());
@@ -389,6 +395,7 @@ impl Vfs {
         let rmt = MS_RMT_MASK as u32;
         let mut mask = rmt;
         let mut want = sb_flags & rmt;
+        let mut proc_set = None;
         let (blocks, inodes) = match kind {
             FsType::Tmpfs | FsType::Rootfs => {
                 let ram = self.fs.ns.ram_pages;
@@ -411,17 +418,8 @@ impl Vfs {
                 }
                 want = (set.sb_flags & set.sb_mask) | (want & !set.sb_mask);
                 mask |= set.sb_mask;
-                // proc_reconfigure applies the options set.
-                let info = self.fs.ns.sb_mut(sb);
-                if let Some(gid) = set.gid {
-                    info.proc.gid = gid;
-                }
-                if let Some(hide) = set.hide_pid {
-                    info.proc.hide_pid = hide;
-                }
-                if let Some(pidonly) = set.pidonly {
-                    info.proc.pidonly = pidonly;
-                }
+                // proc_reconfigure runs after reconfigure_super's checks.
+                proc_set = Some((set.gid, set.hide_pid, set.pidonly));
                 (None, None)
             }
         };
@@ -439,6 +437,18 @@ impl Vfs {
         }
         let _ = env;
         let info = self.fs.ns.sb_mut(sb);
+        if let Some((gid, hide, pidonly)) = proc_set {
+            // proc_apply_options
+            if let Some(gid) = gid {
+                info.proc.gid = gid;
+            }
+            if let Some(hide) = hide {
+                info.proc.hide_pid = hide;
+            }
+            if let Some(pidonly) = pidonly {
+                info.proc.pidonly = pidonly;
+            }
+        }
         info.flags = (info.flags & !mask) | (want & mask);
         if kind != FsType::Proc {
             self.fs.tmp_mut().set_rdonly(sb, ro);
@@ -684,7 +694,13 @@ impl Vfs {
         if info.fstype == FsType::Proc {
             // proc_show_options
             if info.proc.gid != 0 {
-                seq::print(seq, format_args!(",gid={}", info.proc.gid))?;
+                // from_kgid_munged: the invalid id (gid_t)-1 shows as the overflow gid.
+                let gid = if info.proc.gid == u32::MAX {
+                    OVERFLOWGID
+                } else {
+                    info.proc.gid
+                };
+                seq::print(seq, format_args!(",gid={gid}"))?;
             }
             if info.proc.hide_pid != HidePid::Off {
                 seq::print(seq, format_args!(",hidepid={}", info.proc.hide_pid.name()))?;
@@ -762,6 +778,7 @@ impl Vfs {
             Self::show_mnt_options(seq, m.flags)?;
             self.show_fs_options(seq, m)?;
             seq.puts(" 0 0\n")?;
+            seq.end_record()?;
         }
         Ok(())
     }
@@ -805,6 +822,7 @@ impl Vfs {
             Self::show_sb_flags(seq, info)?;
             self.show_fs_options(seq, m)?;
             seq.putc(b'\n')?;
+            seq.end_record()?;
         }
         Ok(())
     }

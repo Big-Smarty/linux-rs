@@ -137,6 +137,10 @@ pub struct TaskStruct {
     /// `PF_*`.
     pub flags: u32,
     pub cred: CredSnapshot,
+    /// `get_dumpable(mm) == SUID_DUMP_USER` (`MMF_DUMPABLE`): copied by `fork`,
+    /// set again by `execve`, cleared by `PR_SET_DUMPABLE` and by a change of
+    /// the effective ids (`commit_creds`).
+    pub dumpable: bool,
     /// `signal->leader`: a session leader.
     pub session_leader: bool,
     /// `signal->tty != NULL`: the console tty is the controlling terminal
@@ -254,6 +258,7 @@ impl Tasklist {
                 parent_exec_id: 0,
                 flags: 0,
                 cred: CredSnapshot::of(cred),
+                dumpable: true,
                 session_leader: false,
                 ctty: false,
                 tty_old_pgrp: None,
@@ -340,8 +345,14 @@ impl Tasklist {
     pub fn fork(&mut self, parent: TaskId, params: ForkParams) -> Result<TaskId, Errno> {
         self.fork_allowed(parent, params)?;
         let p = self.tasks.get(parent).ok_or(Errno::ESRCH)?;
-        let (pgid, sid, cred, exec_id, ctty) =
-            (p.pids[2], p.pids[3], p.cred, p.self_exec_id, p.ctty);
+        let (pgid, sid, cred, exec_id, ctty, dumpable) = (
+            p.pids[2],
+            p.pids[3],
+            p.cred,
+            p.self_exec_id,
+            p.ctty,
+            p.dumpable,
+        );
         // copy_sighand / copy_signal / dup_task_struct: the parent's
         // dispositions, blocked mask and altstack; nothing pending.
         let signals = Box::try_new(
@@ -366,6 +377,8 @@ impl Tasklist {
             parent_exec_id: exec_id,
             flags: PF_FORKNOEXEC,
             cred,
+            // mm_init: the child's mm takes the parent's dumpability.
+            dumpable,
             session_leader: false,
             // copy_signal: `p->signal->tty = tty_kref_get(current->signal->tty)`.
             ctty,
@@ -512,13 +525,23 @@ impl Tasklist {
         self.epoch += 1;
     }
 
-    /// Whether `get_dumpable(mm) == SUID_DUMP_USER` for the task. shortcut:
-    /// always true; `PR_SET_DUMPABLE` and set-id `execve` are not ported
-    /// (`syscall::ids` answers `PR_GET_DUMPABLE` with the constant), so no mm
-    /// can become undumpable. Make it state with the first of them.
+    /// `get_dumpable(mm) == SUID_DUMP_USER` for the task (a task that is gone
+    /// counts as dumpable: nothing reads it). shortcut: `fs.suid_dumpable`
+    /// stays 0 and `SUID_DUMP_ROOT` does not exist, so a task is dumpable or
+    /// not; no set-id `execve` exists to make the new image undumpable.
     #[must_use]
-    pub const fn dumpable(&self, _task: TaskId) -> bool {
-        true
+    pub fn dumpable(&self, task: TaskId) -> bool {
+        self.tasks.get(task).is_none_or(|t| t.dumpable)
+    }
+
+    /// `set_dumpable(mm, value)` (`PR_SET_DUMPABLE`, `commit_creds`, `execve`).
+    pub fn set_dumpable(&mut self, task: TaskId, dumpable: bool) {
+        if let Some(t) = self.tasks.get_mut(task)
+            && t.dumpable != dumpable
+        {
+            t.dumpable = dumpable;
+            self.epoch += 1; // the /proc mirror copies it
+        }
     }
 
     /// Live and zombie tasks, `nr_threads`.
@@ -749,7 +772,14 @@ impl Tasklist {
     /// (`commit_creds`) and after every credential-changing syscall.
     pub fn publish_cred(&mut self, task: TaskId, cred: &Cred) {
         if let Some(t) = self.tasks.get_mut(task) {
-            t.cred = CredSnapshot::of(cred);
+            let new = CredSnapshot::of(cred);
+            // commit_creds: "dumpability changes" when the effective ids move
+            // (fsuid/fsgid follow them; the capabilities are tied to euid 0),
+            // to `suid_dumpable` (0).
+            if t.cred.euid != new.euid || t.cred.egid != new.egid {
+                t.dumpable = false;
+            }
+            t.cred = new;
             self.epoch += 1;
         }
     }

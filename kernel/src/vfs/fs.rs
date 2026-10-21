@@ -220,6 +220,18 @@ impl Fs {
         }
     }
 
+    /// What `->getattr` refuses before `vfs_getattr` fills the stat (see
+    /// [`procfs::getattr_check`]).
+    ///
+    /// # Errors
+    /// `ENOENT` for a process directory `hidepid` hides from the caller.
+    pub fn getattr_check(&self, caller: &procfs::Caller, id: InodeId) -> KResult<()> {
+        match ProcNode::of(id) {
+            Some(node) => procfs::getattr_check(&self.ns.proc, &self.proc_opts(node), caller, node),
+            None => Ok(()),
+        }
+    }
+
     /// `vfs_getattr`.
     #[must_use]
     pub fn getattr(&self, id: InodeId) -> Kstat {

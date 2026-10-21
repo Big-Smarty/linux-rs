@@ -337,6 +337,7 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
     }
     fn with_show<R>(
         &mut self,
+        _scope: crate::procfs::show::ShowScope,
         f: impl FnOnce(&crate::procfs::show::Show<'_>) -> R,
     ) -> Result<R, syscalls::Errno> {
         use crate::procfs::{
@@ -362,7 +363,7 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
             nivcsw: 0,
             start_boottime_ns: 0,
             flags: 0,
-            args: Vec::new(),
+            args: None,
         })?;
         let tgid = i32::try_from(self.tgid).unwrap_or(0);
         self.vfs.fs.ns.proc.publish(tgid, view)?;

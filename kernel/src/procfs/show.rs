@@ -115,6 +115,33 @@ pub struct HostInfo {
     pub compiler: &'static [u8],
 }
 
+/// What a `show` call reads, so that the caller builds no more than that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowScope {
+    /// The files of one thread group: the caller's own view is brought up to
+    /// date first when it is the one shown. The machine-wide sums of
+    /// [`HostInfo`] (`cpustat`, `anon_pages`, `mapped_pages`, `pagetable_kb`)
+    /// are zero.
+    Pid(i32),
+    /// The global files: every task's counters are summed.
+    Machine,
+    /// Nothing about any task (the sysctls, a task-existence check): the
+    /// machine-wide sums are zero.
+    Plain,
+}
+
+impl ShowScope {
+    /// The scope the file of `node` needs.
+    #[must_use]
+    pub fn of(node: ProcNode) -> Self {
+        match node.kind {
+            Kind::Global => Self::Machine,
+            Kind::SysFile => Self::Plain,
+            _ => Self::Pid(node.tgid),
+        }
+    }
+}
+
 /// The inputs of a `show` function.
 pub struct Show<'a> {
     pub vfs: &'a Vfs,
@@ -164,15 +191,38 @@ pub fn read(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
             seq::print(seq, format_args!("{:08x}\n", view.attrs.personality))
         }
         Kind::Limits => limits(show, node, seq),
-        Kind::Wchan => {
-            // proc_pid_wchan: the flag, not an address.
-            pid_task(show, node)?;
-            seq.putc(b'0')
-        }
+        Kind::Wchan => wchan(show, node, seq),
         Kind::Maps => maps(show, node, seq),
         Kind::FdinfoFile => fdinfo(show, node, seq),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// `proc_pid_wchan`: `0`, or (`CONFIG_KALLSYMS=y`) the name of the function a
+/// sleeping task other than the caller waits in when the caller may ptrace it.
+///
+/// shortcut: this kernel has no symbol table and no stack unwinder, so the
+/// name of a sleeping task's wait function cannot be produced: that case stops
+/// loudly (`Outcome::Unimplemented`) instead of printing `0`. Upgrade with a
+/// symbol table of the kernel image and an unwinder (`__get_wchan`). A
+/// task that is running, the caller itself (`get_wchan` returns 0), a zombie
+/// (its stack is gone) and a caller that may not ptrace it print `0` as Linux
+/// does.
+fn wchan(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
+    let (task, _) = pid_view(show, node)?;
+    let permitted = show
+        .vfs
+        .fs
+        .ns
+        .proc
+        .facts(node.tgid)
+        .is_some_and(|facts| show.caller.ptrace_may_access(facts));
+    let sleeping = matches!(state_text(show, task).as_bytes()[0], b'S' | b'D' | b'T');
+    if permitted && sleeping && node.tgid != show.caller.tgid {
+        show.vfs.fs.ns.note_unimplemented();
+        return Ok(());
+    }
+    seq.putc(b'0')
 }
 
 /// The `fs->root` the mount tables are shown against: the target's, else the
@@ -581,13 +631,15 @@ fn maps(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     };
     for vma in &mm.vmas {
         show_map_vma(show, mm, vma, seq)?;
+        seq.end_record()?;
     }
     // The vsyscall page (`gate_vma`): `--xp` at `VSYSCALL_ADDR`
     // (CONFIG_LEGACY_VSYSCALL_XONLY).
     let start = seq.len();
     seq.puts("ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 ")?;
     pad_to(seq, start, 25 + 8 * 6 - 1)?;
-    seq.puts("[vsyscall]\n")
+    seq.puts("[vsyscall]\n")?;
+    seq.end_record()
 }
 
 fn show_map_vma(show: &Show<'_>, mm: &super::MmView, vma: &Vma, seq: &mut Seq) -> KResult<()> {
@@ -717,6 +769,9 @@ fn global(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
             seq.putc(b'\n')
         }
         Global::Filesystems => {
+            // shortcut: only the two filesystems this kernel implements are registered; the
+            // reference's list has more (`rootfs`, `sysfs`, `devpts`, ...). Upgrade with each
+            // `register_filesystem` of a ported filesystem.
             for (name, nodev) in FILESYSTEMS {
                 seq::print(
                     seq,
@@ -887,7 +942,10 @@ fn devices(show: &Show<'_>, seq: &mut Seq) -> KResult<()> {
         seq::print(seq, format_args!("{major:3} {name}\n"))?;
     }
     seq.puts("\nBlock devices:\n")?;
-    // The reference lists the extended block major; no block layer exists here.
+    // shortcut: the character devices are the five this kernel serves and the block list is
+    // empty (the reference lists its registered majors and the extended block major `blkext`);
+    // the group checks the shape and the lines it can derive. Upgrade with the device
+    // registries (`register_chrdev`, `register_blkdev`).
     Ok(())
 }
 

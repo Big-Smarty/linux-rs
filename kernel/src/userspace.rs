@@ -54,7 +54,7 @@ use crate::{
     services::{self, Service, ServiceGuard},
     timer,
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdseed64_step, _rdtsc},
     cell::UnsafeCell,
@@ -79,7 +79,7 @@ use kernel::{
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     procfs::{
         Caller,
-        show::{HostInfo, Show},
+        show::{HostInfo, Show, ShowScope},
         view::{Collect, TaskView},
     },
     ratelimit::RateLimit,
@@ -998,19 +998,12 @@ fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Res
     let layout = (own.space.arg_start, own.space.env_end);
     let kept = process.vfs.fs.ns.proc.view(tgid).and_then(|view| {
         let mm = view.mm.as_ref()?;
-        ((mm.arg_start, mm.env_end) == layout && !view.args.is_empty())
-            .then(|| {
-                let mut copy = Vec::new();
-                copy.try_reserve_exact(view.args.len()).ok()?;
-                for &byte in &view.args {
-                    copy.push_within_capacity(byte).ok()?;
-                }
-                Some(copy)
-            })
+        ((mm.arg_start, mm.env_end) == layout && !view.args().is_empty())
+            .then(|| view.args.clone())
             .flatten()
     });
-    let args = if let Some(args) = kept {
-        args
+    let args = if kept.is_some() {
+        kept
     } else {
         let len = layout.1.saturating_sub(layout.0).min(MAX_PUBLISHED_ARGS);
         let mut bytes = Vec::new();
@@ -1023,7 +1016,11 @@ fn publish(process: &mut Process, own: &Owned, space: &mut UserSpace<'_>) -> Res
             let missing = usercopy::copy_from_user(space, &mut bytes, layout.0);
             bytes.truncate(len - missing);
         }
-        bytes
+        if bytes.is_empty() {
+            None
+        } else {
+            Some(Arc::try_new(bytes).map_err(|_| Errno::ENOMEM)?)
+        }
     };
     let rss = space.rss(own.space.vmas());
     let view = TaskView::collect(Collect {
@@ -1057,7 +1054,7 @@ fn publish_current() {
 ///
 /// Context: task; takes `FRAMES` and `LOAD` (leaf locks) while `process` is held.
 #[allow(clippy::too_many_lines)] // one straight list of the counters /proc shows
-fn host_info(process: &Process, own: &Owned) -> Result<HostInfo, Errno> {
+fn host_info(process: &Process, own: &Owned, machine: bool) -> Result<HostInfo, Errno> {
     let up = timer::ktime_get_boottime_ns();
     let now = timer::ktime_get_ns();
     let (total_pages, free_pages) = {
@@ -1082,7 +1079,12 @@ fn host_info(process: &Process, own: &Owned) -> Result<HostInfo, Errno> {
     // The CPU time of all tasks; the idle time is what is left of the uptime.
     let (mut user, mut system) = (0u64, 0u64);
     let (mut anon, mut mapped, mut tables_bytes) = (0u64, 0u64, 0u64);
-    for id in process.tasks.processes() {
+    // Summed only for the global files (`ShowScope::Machine`).
+    for id in process
+        .tasks
+        .processes()
+        .take(if machine { usize::MAX } else { 0 })
+    {
         let Some(task) = process.tasks.task(id) else {
             continue;
         };
@@ -1845,12 +1847,17 @@ impl Context for Syscall<'_> {
     }
     fn sync_proc(&mut self) {
         let process = self.shared.get();
+        // Nothing reads the mirror or a view before a procfs is mounted.
+        if !process.vfs.fs.ns.has_proc() {
+            return;
+        }
         // A refusal keeps the previous mirror: lookups of the newest pids may
         // miss until memory is available.
         let _ = process.vfs.sync_proc(&process.tasks);
         // A walk or a directory read through the caller's own `/proc/<pid>` sees its published
         // view: bring that up to date when a descriptor, the root, the working directory or the
-        // executable changed since it was taken.
+        // executable changed since it was taken. Only those parts are rebuilt: the address space
+        // is published when a file of `/proc` is read, and when the task leaves the CPU.
         let tgid = self.own.tgid.cast_signed();
         let (fs, exe, fd_gen) = (
             self.own.attrs.fs,
@@ -1863,15 +1870,32 @@ impl Context for Syscall<'_> {
                 || v.attrs.fs.pwd != fs.pwd
                 || v.exe.map(|e| e.file) != Some(exe)
         });
-        if stale {
-            let _ = publish(self.shared.get(), self.own, &mut self.space);
+        if !stale {
+            return;
+        }
+        if process.vfs.fs.ns.proc.view(tgid).is_none() {
+            let _ = publish(process, self.own, &mut self.space);
+            return;
+        }
+        let vfs = &mut process.vfs;
+        let files = &vfs.files;
+        if let Some(view) = vfs.fs.ns.proc.view_mut(tgid) {
+            let _ = view.refresh_files(&self.own.attrs, &self.own.fdt, files, exe);
         }
     }
-    fn with_show<R>(&mut self, f: impl FnOnce(&Show<'_>) -> R) -> Result<R, Errno> {
-        // The caller's own view is current before anyone reads it.
-        publish(self.shared.get(), self.own, &mut self.space)?;
+    fn with_show<R>(
+        &mut self,
+        scope: ShowScope,
+        f: impl FnOnce(&Show<'_>) -> R,
+    ) -> Result<R, Errno> {
+        // The caller's own view is current before anyone reads it: when its
+        // own files are shown, or every task's counters are summed.
+        let mine = self.own.tgid.cast_signed();
+        if matches!(scope, ShowScope::Machine) || scope == ShowScope::Pid(mine) {
+            publish(self.shared.get(), self.own, &mut self.space)?;
+        }
         let process = self.shared.get();
-        let host = host_info(process, self.own)?;
+        let host = host_info(process, self.own, scope == ShowScope::Machine)?;
         let caller = Caller {
             tgid: self.own.tgid.cast_signed(),
             cred: vfs::Cred::of_task(&self.own.attrs.cred),

@@ -699,6 +699,12 @@ impl ProcState {
             .map(|at| &self.views[at].1)
     }
 
+    /// The view `tgid` last published, to refresh in place.
+    pub fn view_mut(&mut self, tgid: i32) -> Option<&mut TaskView> {
+        let at = self.views.binary_search_by_key(&tgid, |(t, _)| *t).ok()?;
+        Some(&mut self.views[at].1)
+    }
+
     /// The task `tgid` exited: its view loses the address space, descriptors
     /// and filesystem context (`exit_mm`, `exit_files`, `exit_fs`).
     pub fn exit(&mut self, tgid: i32) {
@@ -709,7 +715,7 @@ impl ProcState {
             view.fds = Vec::new();
             view.has_files = false;
             view.has_fs = false;
-            view.args = Vec::new();
+            view.args = None;
         }
     }
 
@@ -1014,8 +1020,10 @@ fn dump_owner(facts: Option<&PidFacts>, mode: u32) -> (u32, u32) {
     let Some(facts) = facts else {
         return (0, 0);
     };
-    // task_dump_owner: only a non-directory node of a non-dumpable task is root's.
-    if facts.dumpable || mode == S_IFDIR | 0o555 {
+    // task_dump_owner: the owner is the effective ids, except that a per-process node that is
+    // not a world-readable directory belongs to root when the task has no `mm` (a zombie) or
+    // its `mm` is not dumpable.
+    if mode == S_IFDIR | 0o555 || (facts.dumpable && !facts.zombie) {
         (facts.euid, facts.egid)
     } else {
         (0, 0)
@@ -1146,6 +1154,26 @@ pub fn getattr(
             | crate::vfs::STATX_ATTR_MOUNT_ROOT,
         mnt_id: 0,
     }
+}
+
+/// What `->getattr` refuses: `pid_getattr` (the process and thread directories) answers `ENOENT`
+/// for a process `hidepid` hides from the caller, "to make `getattr()` consistent with `readdir()`".
+///
+/// # Errors
+/// `ENOENT`.
+pub fn getattr_check(
+    state: &ProcState,
+    opts: &ProcOpts,
+    caller: &Caller,
+    node: ProcNode,
+) -> KResult<()> {
+    if node.kind == Kind::Pid
+        && let Some(facts) = state.facts(node.tgid)
+        && !caller.has_pid_permissions(opts, facts, HidePid::Invisible)
+    {
+        return Err(Errno::ENOENT);
+    }
+    Ok(())
 }
 
 // ---- readdir ------------------------------------------------------------------------------------
@@ -1453,7 +1481,17 @@ pub fn permission(
             }
             generic()
         }
-        Kind::FdDir | Kind::FdinfoDir => {
+        Kind::FdinfoDir | Kind::FdinfoFile => {
+            // proc_fdinfo_permission: PTRACE_MODE_READ in addition to the mode bits.
+            let Some(facts) = state.facts(node.tgid) else {
+                return Err(Errno::ESRCH);
+            };
+            if !caller.ptrace_may_access(facts) {
+                return Err(Errno::EACCES);
+            }
+            generic()
+        }
+        Kind::FdDir => {
             // proc_fd_permission: the owner's own thread group may always look.
             match generic() {
                 Ok(()) => Ok(()),
@@ -1553,9 +1591,15 @@ pub fn open_check(state: &ProcState, env: &Env, node: ProcNode) -> KResult<()> {
             cred: env.cred,
         };
         let facts = state.facts(node.tgid).ok_or(Errno::ESRCH)?;
-        // `proc_mem_open` finds no mm in a zombie: `environ` answers ESRCH.
-        if facts.zombie && node.kind == Kind::Environ {
-            return Err(Errno::ESRCH);
+        // `proc_mem_open` (`mm_access`) finds no mm in a zombie and returns NULL: `maps` opens
+        // (and reads nothing), `__mem_open` of `environ` turns it into ESRCH. With an mm,
+        // `ptrace_may_access` decides.
+        if facts.zombie {
+            return if node.kind == Kind::Environ {
+                Err(Errno::ESRCH)
+            } else {
+                Ok(())
+            };
         }
         if !caller.ptrace_may_access(facts) {
             return Err(Errno::EACCES);
