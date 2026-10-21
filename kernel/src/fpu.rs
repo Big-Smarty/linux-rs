@@ -54,6 +54,10 @@ const MSR_IA32_XSS: u32 = 0xda0;
 
 /// What the command line asks for.
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per boot option (noxsave, noxsaveopt, noxsaves, nopku)"
+)]
 pub struct Options {
     /// `noxsave`: `X86_FEATURE_XSAVE` cleared, so no AVX, no PKU, `FXSAVE` state only.
     pub noxsave: bool,
