@@ -21,7 +21,10 @@ use super::{
     pid::PidType,
     tasklist::{PF_FORKNOEXEC, TaskId, Tasklist},
 };
-use crate::signal::jobctl::{SIGNAL_CLD_MASK, SignalStop};
+use crate::signal::jobctl::{
+    JOBCTL_STOP_CONSUME, JOBCTL_STOP_PENDING, JOBCTL_STOP_SIGMASK, SIGNAL_CLD_MASK,
+    SIGNAL_STOP_STOPPED,
+};
 use syscalls::Errno;
 
 /// What [`Tasklist::signal_stop`] decided for the running task.
@@ -43,8 +46,9 @@ impl Tasklist {
     /// # Errors
     /// `EINVAL`, `ESRCH`, `EPERM`, `EACCES` (target already exec'd), `ENOMEM`.
     pub fn setpgid(&mut self, current: TaskId, pid: i32, group: i32) -> Result<(), Errno> {
+        let leader = self.group_leader(current);
         let pid = if pid == 0 {
-            self.task_pid_vnr(current)
+            self.task_pid_vnr(leader)
         } else {
             pid
         };
@@ -53,20 +57,25 @@ impl Tasklist {
             return Err(Errno::EINVAL);
         }
         let p = self.find_task_by_vpid(pid).ok_or(Errno::ESRCH)?;
-        // `thread_group_leader(p)` always holds: one thread per group.
+        if !self.thread_group_leader(p) {
+            return Err(Errno::EINVAL);
+        }
         let task = self.task(p).ok_or(Errno::ESRCH)?;
-        if task.real_parent == Some(current) {
-            // A child of the caller.
-            if self.task_pid_type(p, PidType::Sid) != self.task_pid_type(current, PidType::Sid) {
+        if task
+            .real_parent
+            .is_some_and(|parent| self.same_thread_group(parent, leader))
+        {
+            // A child of the caller's group.
+            if self.task_pid_type(p, PidType::Sid) != self.task_pid_type(leader, PidType::Sid) {
                 return Err(Errno::EPERM);
             }
             if task.flags & PF_FORKNOEXEC == 0 {
                 return Err(Errno::EACCES);
             }
-        } else if p != current {
+        } else if p != leader {
             return Err(Errno::ESRCH);
         }
-        if task.session_leader {
+        if self.is_session_leader(p) {
             return Err(Errno::EPERM);
         }
         let own = self.task_pid_type(p, PidType::Pid).ok_or(Errno::ESRCH)?;
@@ -75,7 +84,7 @@ impl Tasklist {
         } else {
             let pgrp = self.find_vpid(group).ok_or(Errno::EPERM)?;
             let member = self.pid_task(pgrp, PidType::Pgid).ok_or(Errno::EPERM)?;
-            if self.task_pid_type(member, PidType::Sid) != self.task_pid_type(current, PidType::Sid)
+            if self.task_pid_type(member, PidType::Sid) != self.task_pid_type(leader, PidType::Sid)
             {
                 return Err(Errno::EPERM);
             }
@@ -120,11 +129,12 @@ impl Tasklist {
     /// `EPERM` if already a session leader or a process group with the
     /// caller's pid number exists; `ENOMEM`.
     pub fn setsid(&mut self, current: TaskId) -> Result<i32, Errno> {
+        let current = self.group_leader(current);
         let sid = self
             .task_pid_type(current, PidType::Pid)
             .ok_or(Errno::ESRCH)?;
         let session = self.pid_vnr(Some(sid));
-        if self.task(current).ok_or(Errno::ESRCH)?.session_leader {
+        if self.is_session_leader(current) {
             return Err(Errno::EPERM);
         }
         // "Fail if a process group id already exists that equals the proposed
@@ -134,8 +144,8 @@ impl Tasklist {
         }
         self.reserve_attach(sid, PidType::Sid)?;
         self.reserve_attach(sid, PidType::Pgid)?;
-        if let Some(t) = self.task_mut(current) {
-            t.session_leader = true;
+        if let Some(g) = self.group_mut(current) {
+            g.session_leader = true;
         }
         // set_special_pids
         self.change_pid(current, PidType::Sid, sid);
@@ -167,18 +177,64 @@ impl Tasklist {
     /// `SA_NOCLDSTOP`, the `wait` sleepers woken either way). The caller then
     /// leaves the CPU in `TASK_STOPPED` unless [`StopPlan::Stop::fatal`].
     pub fn signal_stop(&mut self, task: TaskId, signr: u8, w: &mut dyn Waker) -> StopPlan {
+        let fresh = self
+            .task(task)
+            .is_some_and(|t| t.thread.jobctl & JOBCTL_STOP_PENDING == 0);
+        if fresh {
+            let began = self
+                .signal_state_as(task, true)
+                .is_some_and(|mut state| state.begin_group_stop(signr));
+            if !began {
+                return StopPlan::Carry;
+            }
+            // "for_other_each_thread(current, t) if (!task_is_stopped(t) &&
+            // task_set_jobctl_pending(t, signr | gstop)) { group_stop_count++;
+            // signal_wake_up(t, 0); }"
+            let mut index = 0;
+            while let Some(t) = self.thread_at(task, index) {
+                index += 1;
+                if t == task {
+                    continue;
+                }
+                let joined = self
+                    .signal_state(t)
+                    .is_some_and(|mut state| state.join_group_stop(signr));
+                if joined {
+                    self.signal_wake_up(t, false, w);
+                }
+            }
+        }
         let Some(mut state) = self.signal_state_as(task, true) else {
             return StopPlan::Carry;
         };
-        match state.do_signal_stop(signr) {
-            SignalStop::NotStopped => StopPlan::Carry,
-            SignalStop::Stop { notify } => {
-                let fatal = state.fatal_signal_pending();
-                if notify {
-                    self.do_notify_parent_cldstop(task, CLD_STOPPED, w);
-                }
-                StopPlan::Stop { fatal }
-            }
+        let notify = state.participate_and_stop();
+        let fatal = state.fatal_signal_pending();
+        if notify {
+            self.do_notify_parent_cldstop(task, CLD_STOPPED, w);
+        }
+        StopPlan::Stop { fatal }
+    }
+
+    /// `task_join_group_stop(task)`: a new thread of a group that is stopping (or stopped)
+    /// takes part in the stop its creator saw.
+    pub(super) fn task_join_group_stop(&mut self, creator: TaskId, task: TaskId) {
+        let Some(mut mask) = self
+            .task(creator)
+            .map(|t| t.thread.jobctl & JOBCTL_STOP_SIGMASK)
+        else {
+            return;
+        };
+        let Some(sig) = self.sig_mut(creator) else {
+            return;
+        };
+        if sig.group_stop_count != 0 {
+            sig.group_stop_count += 1;
+            mask |= JOBCTL_STOP_CONSUME;
+        } else if sig.job_flags & SIGNAL_STOP_STOPPED == 0 {
+            return;
+        }
+        if let Some(mut state) = self.signal_state(task) {
+            state.task_set_jobctl_pending(mask | JOBCTL_STOP_PENDING);
         }
     }
 
@@ -189,8 +245,8 @@ impl Tasklist {
     pub fn notify_job_control(&mut self, task: TaskId, w: &mut dyn Waker) {
         // Every return to user mode asks: look at the flags before building a view.
         if self
-            .task(task)
-            .is_none_or(|t| t.signals.signal.job_flags & SIGNAL_CLD_MASK == 0)
+            .sig(task)
+            .is_none_or(|sig| sig.job_flags & SIGNAL_CLD_MASK == 0)
         {
             return;
         }

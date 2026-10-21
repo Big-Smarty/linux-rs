@@ -259,8 +259,9 @@ fn dup_family_and_fcntl() {
 #[test]
 fn descriptor_table_honours_rlimit_nofile() {
     let mut t = t();
-    t.attrs
-        .rlimits
+    t.tasks
+        .rlimits_mut(t.current)
+        .unwrap()
         .prlimit(7, Some(crate::task::Rlimit { cur: 5, max: 5 }))
         .unwrap();
     assert_eq!(open(&mut t, "/dev/console", O_RDWR, 0), ok(3));
@@ -899,8 +900,9 @@ fn unported_behaviour_stops_instead_of_answering() {
 // ---- review round 1 -----------------------------------------------------------------
 
 fn limit_fsize(t: &mut Task, cur: u64) {
-    t.attrs
-        .rlimits
+    t.tasks
+        .rlimits_mut(t.current)
+        .unwrap()
         .prlimit(1, Some(crate::task::Rlimit { cur, max: cur }))
         .unwrap();
 }
@@ -1033,7 +1035,7 @@ fn a_removed_directory_is_dead_for_a_process_still_inside_it() {
         err(Errno::ENOENT)
     );
     let env = crate::vfs::ops::Env {
-        start: t.attrs.fs.pwd,
+        start: t.fs.pwd,
         ..env
     };
     assert_eq!(

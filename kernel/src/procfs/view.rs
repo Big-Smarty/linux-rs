@@ -26,11 +26,13 @@
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
+use crate::vfs::FsStruct;
+
 use syscalls::Errno;
 
 use crate::{
     mm::{Mm, Vma},
-    task::{Attributes, COMM_LEN},
+    task::{Attributes, COMM_LEN, Rlimits},
     vfs::{FdTable, FileId, FileTable, InodeId, KResult},
 };
 
@@ -83,19 +85,16 @@ pub struct MmView {
 /// list).
 #[derive(Debug)]
 pub struct TaskView {
-    /// The identity group's state of the task: credentials, limits, `comm`,
-    /// the filesystem context (`fs->root`, `fs->pwd`, `fs->umask`) and the
-    /// personality.
+    /// The identity group's state of the task: credentials, `comm` and the personality.
     pub attrs: Attributes,
+    /// `signal->rlim` of the task's thread group (`/proc/<pid>/limits`, `stat`'s `rsslim`).
+    pub rlimits: Rlimits,
+    /// The filesystem context (`fs->root`, `fs->pwd`, `fs->umask`).
+    pub fs: FsStruct,
     /// `task->fs` still exists (`exit_fs` has not run).
     pub has_fs: bool,
-    /// `None` for a task without an address space (a zombie), and while a `vfork` child works in
-    /// it (`lent_to`).
+    /// `None` for a task without an address space (a zombie).
     pub mm: Option<MmView>,
-    /// The tgid of the `vfork` child (`CLONE_VM`) that works in this task's `mm_struct`, until it
-    /// execs or exits: `/proc` shows that task's address space ([`ProcState::mm_of`]), which
-    /// is the one `mm_struct` and so always current.
-    pub lent_to: Option<i32>,
     /// `mm->exe_file`.
     pub exe: Option<FdEntry>,
     /// [`crate::vfs::FdTable::stamp`] when the table was read.
@@ -131,11 +130,11 @@ pub struct TaskView {
 /// What [`TaskView::collect`] reads from the owning task.
 pub struct Collect<'a> {
     pub attrs: &'a Attributes,
+    pub rlimits: &'a Rlimits,
+    pub fs: FsStruct,
     pub fdt: &'a FdTable,
     pub files: &'a FileTable,
-    /// The address space, or `None` while a `vfork` child works in it (the task's own slot holds a
-    /// placeholder): the view's `mm` is then `None` too and the child's shows
-    /// ([`TaskView::lent_to`]).
+    /// The address space (`None` keeps what the view has).
     pub mm: Option<&'a Mm>,
     pub exe: Option<FileId>,
     /// `(anon, file, shmem)` resident pages and the page-table bytes of the
@@ -160,9 +159,10 @@ impl TaskView {
     pub fn collect(input: Collect<'_>) -> KResult<Self> {
         let mut view = Self {
             attrs: *input.attrs,
+            rlimits: *input.rlimits,
+            fs: input.fs,
             has_fs: true,
             mm: None,
-            lent_to: None,
             exe: None,
             // No table has this stamp, so the first update copies the table.
             fd_stamp: (0, u64::MAX),
@@ -202,6 +202,8 @@ impl TaskView {
         };
         self.fds.sync(self.fd_stamp, input.fdt, input.files)?;
         self.attrs = *input.attrs;
+        self.rlimits = *input.rlimits;
+        self.fs = input.fs;
         self.has_fs = true;
         self.has_files = true;
         if input.mm.is_some() {
@@ -236,12 +238,16 @@ impl TaskView {
     pub fn refresh_files(
         &mut self,
         attrs: &Attributes,
+        rlimits: &Rlimits,
+        fs: FsStruct,
         fdt: &FdTable,
         files: &FileTable,
         exe: FileId,
     ) -> KResult<()> {
         self.fds.sync(self.fd_stamp, fdt, files)?;
         self.attrs = *attrs;
+        self.rlimits = *rlimits;
+        self.fs = fs;
         self.fd_stamp = fdt.stamp();
         self.max_fds = u32::try_from(fdt.max_fds()).unwrap_or(u32::MAX);
         self.exe = Some(exe_entry(exe, files));
@@ -275,13 +281,13 @@ impl TaskView {
     /// `fs->root`, while the task has a filesystem context.
     #[must_use]
     pub fn root(&self) -> Option<InodeId> {
-        self.has_fs.then_some(self.attrs.fs.root)
+        self.has_fs.then_some(self.fs.root)
     }
 
     /// `fs->pwd`.
     #[must_use]
     pub fn pwd(&self) -> Option<InodeId> {
-        self.has_fs.then_some(self.attrs.fs.pwd)
+        self.has_fs.then_some(self.fs.pwd)
     }
 }
 

@@ -478,7 +478,9 @@ fn release_state(slot: usize) {
 /// `dup_task_struct` + `copy_thread` for a forked child, **not yet runnable**
 /// ([`wake_up_new_task`]): a ring-3 task whose first return to user mode has
 /// `regs`, with a copy of the calling task's live x87/SSE state and segment
-/// registers and bases, and the page tables whose root is `cr3`. `xs` is the copy of the
+/// registers and bases (`tls`, for `CLONE_SETTLS`, replaces the `%fs` base and
+/// selects the null selector, as `ARCH_SET_FS` does), and the page tables whose
+/// root is `cr3`. `xs` is the copy of the
 /// caller's live user state made by [`XBuf::from_live`] (allocated early, as `dup_task_struct`
 /// allocates the task's `fpstate`), and the child starts with the caller's `PKRU`.
 ///
@@ -488,7 +490,12 @@ fn release_state(slot: usize) {
 ///
 /// # Errors
 /// [`NoSlot`] when no scheduler slot or stack is free (fork's `-EAGAIN`).
-pub fn prepare_fork(regs: PtRegs, cr3: u64, xs: XBuf) -> Result<SchedId, NoSlot> {
+pub fn prepare_fork(regs: PtRegs, cr3: u64, xs: XBuf, tls: Option<u64>) -> Result<SchedId, NoSlot> {
+    let mut segments = Segments::save();
+    if let Some(base) = tls {
+        segments.fs = 0;
+        segments.fs_base = base;
+    }
     prepare(
         None,
         0,
@@ -497,7 +504,7 @@ pub fn prepare_fork(regs: PtRegs, cr3: u64, xs: XBuf) -> Result<SchedId, NoSlot>
             user: true,
             xs: Some(xs),
             pkru: fpu::read_pkru(),
-            segments: Segments::save(),
+            segments,
             cr3,
         },
     )
@@ -810,6 +817,8 @@ pub(crate) extern "C" fn ret_from_fork(
         func(arg);
         exit_current();
     }
+    // schedule_tail: `CLONE_CHILD_SETTID` stores the child's tid in the child, first thing.
+    crate::userspace::schedule_tail();
     crate::userspace::exit_to_user(regs);
 }
 

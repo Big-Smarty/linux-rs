@@ -32,7 +32,9 @@ use super::{
 };
 use crate::{
     procfs::view::{Collect, TaskView},
-    task::{Attributes, Cred, TaskId, exit::NoWake, fork::ForkRequest, tasklist::ForkParams},
+    task::{
+        Attributes, Cred, Rlimits, TaskId, exit::NoWake, fork::ForkRequest, tasklist::ForkParams,
+    },
     vfs::{FdTable, O_CREAT, O_DIRECTORY, O_RDONLY},
 };
 use syscalls::{Errno, Sysno};
@@ -116,19 +118,8 @@ fn victim(
     fd: u32,
     exe: crate::vfs::FileId,
 ) -> Victim {
-    let request = ForkRequest {
-        exit_signal: 17,
-        child_sp: 0,
-        clear_sighand: false,
-        clear_child_tid: 0,
-        set_child_tid: 0,
-        share_vm: false,
-        vfork: false,
-    };
-    let id: TaskId = t
-        .tasks
-        .fork(t.current, ForkParams::of(&t.attrs, &request))
-        .unwrap();
+    let request = ForkRequest::plain(17);
+    let id: TaskId = t.tasks.fork(t.current, ForkParams::of(&request)).unwrap();
     let pid = t.tasks.task_pid_vnr(id);
     t.tasks.publish_cred(id, &cred);
     t.tasks.set_dumpable(id, dumpable);
@@ -137,11 +128,13 @@ fn victim(
     let mut fdt = FdTable::default();
     assert_eq!(fdt.alloc_fd(fd, 1024, false).unwrap(), fd);
     fdt.install(fd, read);
-    let mut attrs = Attributes::init(1000);
+    let mut attrs = Attributes::init();
+    let limits = Rlimits::init(1000);
     attrs.cred = cred;
-    attrs.fs = t.attrs.fs;
     let view = TaskView::collect(Collect {
         attrs: &attrs,
+        rlimits: &limits,
+        fs: t.fs,
         fdt: &fdt,
         files: &t.vfs.files,
         mm: Some(&t.mm),
@@ -159,8 +152,8 @@ fn victim(
     .unwrap();
     t.vfs.fs.ns.proc.publish(pid, view).unwrap();
     if zombie {
-        t.tasks.exit_prepare(id, 0, false);
-        t.tasks.exit_notify(id, &mut NoWake).unwrap();
+        t.tasks.exit_prepare(id, 0, false, &mut NoWake);
+        t.tasks.exit_notify(id, true, &mut NoWake).unwrap();
         t.vfs.fs.ns.proc.exit(pid);
     }
     Victim { name, pid }

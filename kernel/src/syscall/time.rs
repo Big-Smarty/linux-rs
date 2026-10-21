@@ -52,8 +52,9 @@ every range is bounded by `timespec64_valid*` or `KTIME_MAX` at the call site"
 //! `rt_sigreturn` resets the block to `do_no_restart_syscall`
 //! (`restore_sigcontext`).
 
-use super::{Context, Outcome, error};
+use super::{Context, Outcome, error, outcome};
 use crate::{
+    task::TaskId,
     time::{HZ, NSEC_PER_SEC, TICK_NSEC},
     usercopy::{copy_from_user, copy_to_user},
 };
@@ -106,6 +107,18 @@ pub enum RestartFn {
     /// `do_restart_poll` (`syscall::poll`): `rmtp` is `ufds`, `clockid` the
     /// bits of `nfds`, `expires_ns` the absolute end (-1: no timeout).
     Poll,
+    /// `futex_wait_restart` (`syscall::futex`): [`RestartBlock::futex`] is the call,
+    /// `expires_ns` the absolute deadline on the clock its flags name.
+    Futex,
+}
+
+/// `restart_block->futex.{uaddr,val,flags,bitset}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FutexRestart {
+    pub uaddr: u64,
+    pub val: u32,
+    pub flags: u32,
+    pub bitset: u32,
 }
 
 /// The `restart_block.nanosleep` fields `nanosleep`/`clock_nanosleep` fill.
@@ -119,6 +132,8 @@ pub struct RestartBlock {
     pub expires_ns: i64,
     /// `rmtp` user pointer, 0 for `TT_NONE`.
     pub rmtp: u64,
+    /// The `futex_wait` call of [`RestartFn::Futex`].
+    pub futex: FutexRestart,
 }
 
 impl RestartBlock {
@@ -128,6 +143,12 @@ impl RestartBlock {
         clockid: 0,
         expires_ns: 0,
         rmtp: 0,
+        futex: FutexRestart {
+            uaddr: 0,
+            val: 0,
+            flags: 0,
+            bitset: 0,
+        },
     };
 }
 
@@ -142,9 +163,22 @@ pub trait Clocks {
     fn set_restart_block(&mut self, block: RestartBlock);
     /// `current->restart_block` as stored by [`Self::set_restart_block`].
     fn restart_block(&self) -> RestartBlock;
-    /// `CPUCLOCK_SCHED`/`VIRT`/`PROF` inputs of the (only) task.
+    /// `CPUCLOCK_SCHED`/`VIRT`/`PROF` inputs of the calling thread.
     fn cpu_sample(&self) -> crate::cputime::CpuSample;
-    /// `thread_group_cputime_adjusted`: `(utime, stime)` in ns for `times(2)`.
+    /// The same inputs summed over the calling thread's group (`thread_group_cputime`: the
+    /// live threads and the finished ones), for `CLOCK_PROCESS_CPUTIME_ID`. A single-thread
+    /// group is the thread's own.
+    fn group_cpu_sample(&mut self) -> crate::cputime::CpuSample {
+        self.cpu_sample()
+    }
+    /// `cpu_clock_sample(clkid, task)`: the inputs of any thread of the caller's group, live or
+    /// finished but not yet released.
+    fn cpu_sample_of(&mut self, task: TaskId) -> crate::cputime::CpuSample;
+    /// `cpu_clock_sample_group(clkid, task, false)`: the group `task` belongs to, which need not
+    /// be the caller's.
+    fn group_cpu_sample_of(&mut self, task: TaskId) -> crate::cputime::CpuSample;
+    /// `thread_group_cputime_adjusted`: `(utime, stime)` in ns of the whole group for
+    /// `times(2)`.
     fn cpu_adjusted(&mut self) -> (u64, u64);
     /// Block until `CLOCK_MONOTONIC` reaches `deadline_ns`. `None` when the
     /// deadline was reached; `Some(remaining_ns)` when a signal interrupted it.
@@ -224,6 +258,9 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
             if block.func == RestartFn::Poll {
                 return Some(super::poll::restart(ctx, block, sysno));
             }
+            if block.func == RestartFn::Futex {
+                return Some(outcome(sysno as u32, Ok(super::futex::restart(ctx, block))));
+            }
             restart_syscall(ctx)
         }
         Sysno::gettimeofday => gettimeofday(ctx, args[0], args[1]),
@@ -289,16 +326,38 @@ fn to_ktime((sec, nsec): Ts) -> i128 {
     }
 }
 
-/// `pid_for_clock` for the only task: pid 0 is "current", otherwise the id must
-/// name this thread group. `which` (`CPUCLOCK_WHICH`) 3 is invalid.
-fn cpu_clock_valid<C: Context>(ctx: &C, id: i32) -> Result<(), Errno> {
-    let upid = !(id >> 3);
-    // shortcut: one single-threaded task, so the thread id equals the tgid.
-    // Replace with a pid/tid lookup when tasks exist.
-    if id & 3 >= 3 || (upid != 0 && i64::from(upid) != i64::from(ctx.tgid())) {
-        return Err(Errno::EINVAL);
+/// `pid_for_clock(clock, gettime)` (kernel/time/posix-cpu-timers.c:57-95), as the task it names:
+/// a per-thread clock names a thread of the caller's group; a process clock names a thread
+/// group leader (any process, not only the caller's) or, for `clock_gettime`, the caller's own
+/// thread id (its group). Pid 0 is the caller (or its group). `CPUCLOCK_WHICH` 3 is invalid.
+fn pid_for_clock<C: Context>(ctx: &mut C, id: i32, gettime: bool) -> Option<TaskId> {
+    if id & 3 >= 3 {
+        return None;
     }
-    Ok(())
+    let thread = id & 4 != 0;
+    let upid = !(id >> 3);
+    let t = ctx.tasks();
+    if upid == 0 {
+        return Some(t.current);
+    }
+    let target = t.list.find_task_by_vpid(upid)?;
+    if thread {
+        return t
+            .list
+            .same_thread_group(target, t.current)
+            .then_some(target);
+    }
+    if gettime && target == t.current {
+        return Some(t.current);
+    }
+    t.list.thread_group_leader(target).then_some(target)
+}
+
+/// `validate_clock_permissions`: the id names something (`EINVAL` else).
+fn cpu_clock_valid<C: Context>(ctx: &mut C, id: i32) -> Result<(), Errno> {
+    pid_for_clock(ctx, id, false)
+        .map(|_| ())
+        .ok_or(Errno::EINVAL)
 }
 
 struct Now {
@@ -331,7 +390,7 @@ impl Now {
 }
 
 /// The `clock_get_timespec` method, as nanoseconds.
-fn clock_get<C: Context>(ctx: &C, kclock: Kclock, id: i32) -> Result<i128, Errno> {
+fn clock_get<C: Context>(ctx: &mut C, kclock: Kclock, id: i32) -> Result<i128, Errno> {
     let now = Now {
         state: ctx.clock_state(),
     };
@@ -351,10 +410,16 @@ fn clock_get<C: Context>(ctx: &C, kclock: Kclock, id: i32) -> Result<i128, Errno
                 now.boot()
             }
         }
-        Kclock::Process | Kclock::Thread => i128::from(ctx.cpu_sample().runtime_ns),
+        Kclock::Process => i128::from(ctx.group_cpu_sample().runtime_ns),
+        Kclock::Thread => i128::from(ctx.cpu_sample().runtime_ns),
         Kclock::PosixCpu(id) => {
-            cpu_clock_valid(ctx, id)?;
-            let sample = ctx.cpu_sample();
+            let task = pid_for_clock(ctx, id, true).ok_or(Errno::EINVAL)?;
+            // The per-thread bit selects that thread's clock, else the group's.
+            let sample = if id & 4 != 0 {
+                ctx.cpu_sample_of(task)
+            } else {
+                ctx.group_cpu_sample_of(task)
+            };
             i128::from(match id & 3 {
                 0 => sample.user_ns + sample.system_ns,
                 1 => sample.user_ns,
@@ -530,6 +595,7 @@ fn sleep_to<C: Context>(
         clockid: resume.clockid,
         expires_ns: i64::try_from(resume.expires_ns.clamp(0, KTIME_MAX)).unwrap_or(i64::MAX),
         rmtp: rem_out.unwrap_or(0),
+        ..RestartBlock::NONE
     });
     -ERESTART_RESTARTBLOCK
 }
@@ -546,7 +612,7 @@ fn restart_syscall<C: Context>(ctx: &mut C) -> i64 {
     // boottime, 11 TAI) or the `alarmtimer_type` (0 realtime, 1 boottime).
     let kclock = match (block.func, block.clockid) {
         // `do_restart_poll` is dispatched before this function.
-        (RestartFn::None | RestartFn::Poll, _) => return error(Errno::EINTR),
+        (RestartFn::None | RestartFn::Poll | RestartFn::Futex, _) => return error(Errno::EINTR),
         (RestartFn::Hrtimer, 1) => Kclock::Monotonic,
         (RestartFn::Hrtimer, 7) => Kclock::Boottime,
         (RestartFn::Hrtimer, _) => Kclock::Tai,
@@ -675,7 +741,7 @@ fn clock_nanosleep<C: Context>(
             if let Kclock::PosixCpu(id) = kclock {
                 if id & 4 != 0 {
                     let upid = !(id >> 3);
-                    if upid == 0 || i64::from(upid) == i64::from(ctx.tgid()) {
+                    if upid == 0 || i64::from(upid) == i64::from(ctx.tid()) {
                         return Ok(error(Errno::EINVAL));
                     }
                 }
@@ -951,6 +1017,88 @@ mod tests {
         ] {
             assert_eq!(gettime(&mut t, clock).0, neg(Errno::EINVAL), "{clock}");
         }
+    }
+
+    #[test]
+    fn cpu_clock_ids_name_threads_of_the_group_and_any_process_leader() {
+        // pid_for_clock (posix-cpu-timers.c:57): a thread clock takes any tid of the caller's
+        // group, a process clock a thread-group leader (any process), and `clock_gettime`
+        // also the caller's own tid.
+        use crate::task::tasklist::{CloneParams, ForkParams};
+        let mut t = user_task();
+        let fork = ForkParams {
+            exit_signal: 17,
+            clear_sighand: false,
+        };
+        let sibling = t
+            .tasks
+            .clone_task(
+                t.current,
+                CloneParams {
+                    fork,
+                    thread: true,
+                    share_sighand: true,
+                    reset_altstack: true,
+                },
+            )
+            .unwrap(); // tid 2 in group 1
+        let child = t.tasks.fork(t.current, fork).unwrap(); // pid 3
+        let _ = child;
+        let main = t.current;
+        // From the leader: the sibling's thread clock, the child's process clock.
+        assert_eq!(
+            gettime(&mut t, cpu_clock(2, 2, true)).0,
+            0,
+            "sibling thread"
+        );
+        assert_eq!(
+            gettime(&mut t, cpu_clock(3, 2, false)).0,
+            0,
+            "another process"
+        );
+        assert_eq!(
+            gettime(&mut t, cpu_clock(2, 2, false)).0,
+            neg(Errno::EINVAL),
+            "a process clock needs a leader"
+        );
+        assert_eq!(
+            gettime(&mut t, cpu_clock(3, 2, true)).0,
+            neg(Errno::EINVAL),
+            "a thread clock needs the caller's group"
+        );
+        assert_eq!(gettime(&mut t, cpu_clock(9, 2, true)).0, neg(Errno::EINVAL));
+        // From the sibling: its own tid names its group's clock for gettime only.
+        t.current = sibling;
+        assert_eq!(gettime(&mut t, cpu_clock(2, 2, false)).0, 0, "own tid");
+        assert_eq!(gettime(&mut t, cpu_clock(1, 2, false)).0, 0, "the leader");
+        put(&mut t, BUF, -1, -1);
+        assert_eq!(
+            ret(
+                &mut t,
+                Sysno::clock_getres,
+                [arg(cpu_clock(2, 2, false)), BUF, 0, 0]
+            ),
+            neg(Errno::EINVAL),
+            "getres validates without the gettime allowance"
+        );
+        assert_eq!(
+            ret(
+                &mut t,
+                Sysno::clock_getres,
+                [arg(cpu_clock(1, 2, false)), BUF, 0, 0]
+            ),
+            0
+        );
+        put(&mut t, BUF, 0, 0);
+        assert_eq!(
+            ret(
+                &mut t,
+                Sysno::clock_settime,
+                [arg(cpu_clock(1, 2, true)), BUF, 0, 0]
+            ),
+            neg(Errno::EPERM)
+        );
+        t.current = main;
     }
 
     #[test]
@@ -1245,6 +1393,7 @@ mod tests {
             clockid,
             expires_ns,
             rmtp,
+            ..RestartBlock::NONE
         };
         let none = |rmtp| block(RestartFn::None, 0, 0, rmtp);
         t.clocks.state.boot_offset_ns = 1_000;
@@ -1350,6 +1499,7 @@ mod tests {
             clockid,
             expires_ns,
             rmtp: BUF + 16,
+            ..RestartBlock::NONE
         };
         // `do_no_restart_syscall`.
         assert_eq!(

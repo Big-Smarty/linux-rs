@@ -68,6 +68,14 @@ pub trait UserPages {
     /// many mappings (the zero page): the caller MUST only read through it and
     /// never write. Only a `write == true` result is exclusively writable.
     fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]>;
+
+    /// Whether [`UserPages::page`] would find the page: it is made resident exactly as `page`
+    /// does (a fault is taken, a private copy made for `write`), and nothing is read or
+    /// written through it. For callers that need the page present and its kind decided, not its
+    /// bytes (`get_futex_key`'s `get_user_pages_fast`).
+    fn resident(&mut self, page: u64, write: bool) -> bool {
+        self.page(page, write).is_some()
+    }
 }
 
 impl<T: UserPages + ?Sized> UserPages for &mut T {

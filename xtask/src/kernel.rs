@@ -979,6 +979,15 @@ const DEBUG_CASES: &[DebugCase] = &[
     // flags, stacking and lazy detach, the layout and files of /proc and /proc/<pid>, sysctls
     // (`user/init` group `procfs`; the last check remounts the root read-only and back).
     oracle_case!(procfs),
+    // Threads: `clone`/`clone3` with `CLONE_THREAD` and the sharing flags, one `mm`/`files`/`fs`/
+    // `sighand` for the group, tids and pids, thread- and process-directed signals, `exit` against
+    // `exit_group`, the zombie leader, `execve` from a thread, per-thread FPU state (`user/init`
+    // group `threads`, recorded on the pinned Linux 6.18.57).
+    oracle_case!(threads),
+    // futex(2) and futex2: wait, wake, bitsets, requeue, wake-op, timeouts and restarts, private
+    // and shared keys, signals, robust lists, the argument checks of the priority-inheritance
+    // operations, `futex_waitv` (`user/init` group `futex`, recorded on the pinned Linux 6.18.57).
+    oracle_case!(futex),
     // 200 fork/exit/wait rounds: nothing is left behind (`user/init` mode `forkleak`).
     // Pool exhaustion and every unwinding path of `copy_process` (this kernel only: Linux's limit
     // is `max_threads`, not a stack pool).
@@ -997,6 +1006,22 @@ const DEBUG_CASES: &[DebugCase] = &[
     DebugCase {
         name: "forkleak",
         cmdline: Some("-- forkleak"),
+        cpu: "qemu64",
+        expected_exit: 33,
+        required: SUCCESS_MARKERS,
+        forbid_success: false,
+        modules: ARCHIVE_ONLY,
+        user: User::ForkLeak,
+        framebuffers: 1,
+        plat: Q35_TCG,
+    },
+    // 202 clones of every shape that shares the address space, descriptors and filesystem
+    // context (a thread, a `CLONE_VM` child, a `vfork`, a thread with `CLONE_CHILD_SETTID`): the
+    // same records as `forkleak`, plus the live address spaces, descriptor tables and filesystem
+    // contexts (`user/init` mode `threadleak`).
+    DebugCase {
+        name: "threadleak",
+        cmdline: Some("-- threadleak"),
         cpu: "qemu64",
         expected_exit: 33,
         required: SUCCESS_MARKERS,
@@ -4981,10 +5006,11 @@ fn forkleak_ram_unchanged(line: &str) -> bool {
     )
 }
 
-/// `CHECK fork-objects forks=202 heap=a/b files=a/b file_refs=a/b pins=a/b root_refs=a/b slots=a/b threads=a/b`
-/// (printed by the self-test kernel when init exits): the 202 forks of `-- forkleak` happened and
-/// every live-object count, sampled before the 3rd fork and at init's exit, is the same, which
-/// the free-RAM line cannot show (a leaked file reference, inode pin, task slot or heap byte).
+/// `CHECK fork-objects forks=202 heap=a/b files=a/b file_refs=a/b pins=a/b root_refs=a/b slots=a/b threads=a/b mms=a/b file_tables=a/b fs_contexts=a/b`
+/// (printed by the self-test kernel when init exits): the 202 forks (or clones) of `-- forkleak`
+/// or `-- threadleak` happened and every live-object count, sampled before the 3rd clone and at
+/// init's exit, is the same, which the free-RAM line cannot show (a leaked file reference, inode
+/// pin, task slot, address space, descriptor table, filesystem context or heap byte).
 fn forkleak_objects_unchanged(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("CHECK fork-objects forks=202 ") else {
         return false;
@@ -5005,6 +5031,9 @@ fn forkleak_objects_unchanged(line: &str) -> bool {
             "root_refs",
             "slots",
             "threads",
+            "mms",
+            "file_tables",
+            "fs_contexts",
         ];
         if want.get(index) != Some(&name)
             || was != now
@@ -5015,7 +5044,7 @@ fn forkleak_objects_unchanged(line: &str) -> bool {
         }
         fields += 1;
     }
-    fields == 7
+    fields == 10
 }
 
 /// `-- forkbomb`: the three records, in order. Each flood forks until `EAGAIN` (at least 100
@@ -8299,7 +8328,7 @@ mod tests {
         };
         let counts = FORKLEAK_MODE_LINE;
         let ram = "init: forkleak free_ram before=453361664 after=453361664";
-        let objects = "CHECK fork-objects forks=202 heap=484795/484795 files=2/2 file_refs=5/5 pins=1/1 root_refs=5/5 slots=1/1 threads=1/1";
+        let objects = "CHECK fork-objects forks=202 heap=484795/484795 files=2/2 file_refs=5/5 pins=1/1 root_refs=5/5 slots=1/1 threads=1/1 mms=1/1 file_tables=1/1 fs_contexts=1/1";
         let with_objects = |lines: &[&str], objects: &str| {
             let serial = oracle_serial(&lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>());
             // The kernel prints the record when init exits, after `init: ok`.
@@ -8327,6 +8356,18 @@ mod tests {
                 objects.replace("slots=1/1", "slots=1/2"),
             ),
             ("too few forks", objects.replace("forks=202", "forks=3")),
+            (
+                "an address space kept",
+                objects.replace("mms=1/1", "mms=1/2"),
+            ),
+            (
+                "a descriptor table kept",
+                objects.replace("file_tables=1/1", "file_tables=1/2"),
+            ),
+            (
+                "a filesystem context kept",
+                objects.replace("fs_contexts=1/1", "fs_contexts=2/1"),
+            ),
             ("a field missing", objects.replace(" threads=1/1", "")),
             ("no record", String::new()),
         ] {
@@ -8663,7 +8704,7 @@ mod tests {
         }
         let groups = [
             "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe", "xstate", "tty",
-            "ttyin", "ttykbd", "names", "busybox", "dynelf", "procfs",
+            "ttyin", "ttykbd", "names", "busybox", "dynelf", "procfs", "threads", "futex",
         ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),

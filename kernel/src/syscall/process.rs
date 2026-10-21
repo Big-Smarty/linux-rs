@@ -112,14 +112,11 @@ fn clone_syscall<C: Context>(ctx: &mut C, sysno: Sysno, args: &CloneArgs) -> Out
     if ctx.state().signal_pending() {
         return Outcome::Return(-ERESTARTNOINTR);
     }
+    // `kernel_clone` stores `CLONE_PARENT_SETTID` before the child is woken, which
+    // `copy_process` of the binary does.
     match ctx.copy_process(&request) {
         Err(errno) => Outcome::Return(error(errno)),
-        Ok(pid) => {
-            if let Some(at) = args.parent_settid() {
-                let _ = put_user(ctx, at, &pid.to_le_bytes());
-            }
-            Outcome::Return(i64::from(pid))
-        }
+        Ok(pid) => Outcome::Return(i64::from(pid)),
     }
 }
 
@@ -136,7 +133,11 @@ pub fn exit_code(status: u64) -> u32 {
 /// signal pending (the return path turns it into `-EINTR` or restarts).
 fn do_wait<C: Context>(ctx: &mut C, wo: &mut WaitOpts) -> i64 {
     let mut result = 0;
-    let key = chldexit_key(ctx.tasks().current);
+    // `current->signal->wait_chldexit`: every thread of the group waits on the leader's.
+    let key = {
+        let t = ctx.tasks();
+        chldexit_key(t.list.group_leader(t.current))
+    };
     let waited = wait_event_interruptible(ctx, key, |c| {
         let t = c.tasks();
         result = t.list.do_wait_once(t.current, wo);
@@ -298,8 +299,6 @@ mod tests {
             .fork(
                 t.current,
                 ForkParams {
-                    rlimit_sigpending: 100,
-                    rlimit_nproc: 1000,
                     exit_signal: crate::signal::SIGCHLD,
                     clear_sighand: false,
                 },
@@ -308,8 +307,8 @@ mod tests {
     }
 
     fn exit(t: &mut Task, child: crate::task::TaskId, code: u32) {
-        t.tasks.exit_prepare(child, code, false);
-        t.tasks.exit_notify(child, &mut NoWake).unwrap();
+        t.tasks.exit_prepare(child, code, false, &mut NoWake);
+        t.tasks.exit_notify(child, true, &mut NoWake).unwrap();
     }
 
     fn read<const N: usize>(t: &mut Task, at: u64) -> [u8; N] {
@@ -605,14 +604,12 @@ mod tests {
             neg(Errno::EINVAL),
             "CLONE_PIDFD and CLONE_PARENT_SETTID on one slot"
         );
-        // Valid but unimplemented requests are loud stops, not errors.
+        // Valid but unimplemented requests are loud stops, not errors: a namespace, a pidfd,
+        // `CLONE_PARENT`.
         for (sysno, args) in [
-            (Sysno::clone, [0x100 | 0x11, 0, 0, 0, 0, 0]),
-            (Sysno::clone, [0x8_0000 | 0x11, 0, 0, 0, 0, 0]),
-            (
-                Sysno::clone,
-                [0x1_0000 | 0x800 | 0x100 | 0x11, 0, 0, 0, 0, 0],
-            ),
+            (Sysno::clone, [0x2_0000 | 0x11, 0, 0, 0, 0, 0]),
+            (Sysno::clone, [0x1000 | 0x11, 0, 0, 0, 0, 0]),
+            (Sysno::clone, [0x8000 | 0x11, 0, 0, 0, 0, 0]),
         ] {
             assert_eq!(
                 dispatch(&mut t, sysno as u64, args),
@@ -621,6 +618,43 @@ mod tests {
             );
         }
         assert_eq!(t.forked.len(), 5, "no stop created a child");
+        // The sharing flags reach the copy as the request: a CLONE_VM child beside its parent,
+        // and a thread as `pthread_create` makes it.
+        assert_eq!(call(&mut t, Sysno::clone, &[0x100 | 0x11, 0, 0, 0, 0]), 7);
+        let thread_flags = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000 | 0x8_0000;
+        assert_eq!(
+            call(
+                &mut t,
+                Sysno::clone,
+                &[
+                    thread_flags | 0x10_0000 | 0x20_0000,
+                    0x9000,
+                    0x1000,
+                    0x1004,
+                    0x55
+                ]
+            ),
+            8
+        );
+        let (vm, thread) = (t.forked[5], t.forked[6]);
+        assert_eq!(
+            (vm.share_vm, vm.thread, vm.share_files),
+            (true, false, false)
+        );
+        assert_eq!(
+            (
+                thread.thread,
+                thread.share_sighand,
+                thread.share_files,
+                thread.share_fs
+            ),
+            (true, true, true, true)
+        );
+        assert_eq!(
+            (thread.clear_child_tid, thread.tls, thread.child_sp),
+            (0x1004, Some(0x55), 0x9000)
+        );
+        t.forked.truncate(5);
         // clone3: size and field errors, then the copy with the stack top.
         assert_eq!(
             call(&mut t, Sysno::clone3, &[0x1000, 63]),
@@ -631,12 +665,12 @@ mod tests {
         args[40..48].copy_from_slice(&0x7000u64.to_le_bytes());
         args[48..56].copy_from_slice(&0x1000u64.to_le_bytes());
         assert_eq!(copy_to_user(&mut t, 0x1000, &args), 0);
-        assert_eq!(call(&mut t, Sysno::clone3, &[0x1000, 88]), 7);
+        assert_eq!(call(&mut t, Sysno::clone3, &[0x1000, 88]), 9);
         assert_eq!(t.forked[5].child_sp, 0x8000);
         // vfork borrows the address space and waits; CLONE_VFORK alone only waits.
-        assert_eq!(call(&mut t, Sysno::vfork, &[]), 8);
+        assert_eq!(call(&mut t, Sysno::vfork, &[]), 10);
         assert_eq!((t.forked[6].share_vm, t.forked[6].vfork), (true, true));
-        assert_eq!(call(&mut t, Sysno::clone, &[0x4000 | 0x11, 0, 0, 0, 0]), 9);
+        assert_eq!(call(&mut t, Sysno::clone, &[0x4000 | 0x11, 0, 0, 0, 0]), 11);
         assert_eq!((t.forked[7].share_vm, t.forked[7].vfork), (false, true));
         // glibc's fork: CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD with the child's
         // tid pointer in the fourth argument; the request carries it for the child's store.
@@ -724,9 +758,13 @@ mod tests {
     fn fork_limits_come_from_the_task_list() {
         let mut t = t();
         // max_threads is 1000 in the fake, RLIMIT_NPROC is not reached by root.
-        t.tasks = crate::task::Tasklist::new(3, &t.attrs.cred, 1000)
-            .unwrap()
-            .0;
+        t.tasks = crate::task::Tasklist::new(
+            3,
+            &t.attrs.cred,
+            crate::task::Rlimits::for_tests(1000, 1000),
+        )
+        .unwrap()
+        .0;
         t.current = t.tasks.child_reaper();
         assert_eq!(call(&mut t, Sysno::fork, &[]), 2);
         assert_eq!(call(&mut t, Sysno::fork, &[]), 3);

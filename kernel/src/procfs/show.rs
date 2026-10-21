@@ -295,7 +295,7 @@ fn status(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     }
     seq.putc(b'\n')?;
     // task_state
-    if let Some(umask) = view.has_fs.then_some(view.attrs.fs.umask) {
+    if let Some(umask) = view.has_fs.then_some(view.fs.umask) {
         seq::print(seq, format_args!("Umask:\t{umask:04o}\n"))?;
     }
     let cred = view.attrs.cred;
@@ -392,8 +392,9 @@ fn status(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     seq::print(
         seq,
         format_args!(
-            "Threads:\t1\nSigQ:\t{queued}/{}\n",
-            view.attrs.rlimits.get(crate::task::RLIMIT_SIGPENDING).cur,
+            "Threads:\t{}\nSigQ:\t{queued}/{}\n",
+            show.tasks.group_thread_count(task),
+            view.rlimits.get(crate::task::RLIMIT_SIGPENDING).cur,
         ),
     )?;
     sigset(seq, "SigPnd:\t", sets.pending)?;
@@ -452,14 +453,23 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
         .is_some_and(|facts| show.caller.ptrace_may_access(facts));
     let state = state_text(show, task).as_bytes()[0];
     let sets = show.tasks.signal_sets(task).ok_or(Errno::ESRCH)?;
-    let (mut utime, mut stime) = (t.utime_ns, t.stime_ns);
-    if t.exit_state == ExitState::Live
-        && let Some(sched) = t.sched
-    {
-        (utime, stime) = (show.host.cpu_time)(sched);
+    // `thread_group_cputime_adjusted` (`whole`): the finished threads' times and every
+    // member's, a live one's from the scheduler.
+    let (mut utime, mut stime) = show.tasks.dead_cputime(task);
+    for member in show.tasks.threads(task) {
+        let Some(m) = show.tasks.task(member) else {
+            continue;
+        };
+        let (u, s) = match m.sched {
+            Some(sched) if m.exit_state == ExitState::Live => (show.host.cpu_time)(sched),
+            _ => (m.utime_ns, m.stime_ns),
+        };
+        utime += u;
+        stime += s;
     }
+    let (waited_user, waited_system) = show.tasks.children_cputime(task);
     let mm = show.vfs.fs.ns.proc.mm_of(node.tgid);
-    let (tty_nr, tty_pgrp): (i64, i64) = if t.ctty {
+    let (tty_nr, tty_pgrp): (i64, i64) = if show.tasks.has_ctty(task) {
         // new_encode_dev(ttyS0 = 4:64)
         (4 << 8 | 64, i64::from(show.host.tty_pgrp))
     } else {
@@ -467,7 +477,7 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     };
     let rss = mm.map_or(0, |m| m.rss_anon + m.rss_file + m.rss_shmem);
     let wchan = u64::from(permitted && state != b'R');
-    let rsslim = view.attrs.rlimits.get(5).cur;
+    let rsslim = view.rlimits.get(5).cur;
     seq::print(seq, format_args!("{} (", show.tasks.task_pid_vnr(task)))?;
     let comm = view.comm_bytes();
     seq.put(&comm[..comm.len().min(64)])?;
@@ -493,11 +503,11 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     field(0)?; // cmaj_flt
     field(i128::from(nsec_to_clock_t(utime)))?;
     field(i128::from(nsec_to_clock_t(stime)))?;
-    field(i128::from(nsec_to_clock_t(t.cutime_ns)))?;
-    field(i128::from(nsec_to_clock_t(t.cstime_ns)))?;
+    field(i128::from(nsec_to_clock_t(waited_user)))?;
+    field(i128::from(nsec_to_clock_t(waited_system)))?;
     field(i128::from(20 + view.nice))?; // priority
     field(i128::from(view.nice))?;
-    field(1)?; // num_threads
+    field(i128::from(show.tasks.group_thread_count(task)))?; // num_threads
     field(0)?; // itrealvalue
     field(i128::from(nsec_to_clock_t(view.start_boottime_ns)))?;
     field(i128::from(mm.map_or(0, |m| m.total_vm * PAGE)))?; // vsize
@@ -595,7 +605,7 @@ fn limits(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     let (_, view) = pid_view(show, node)?;
     seq.puts("Limit                     Soft Limit           Hard Limit           Units     \n")?;
     for (index, (name, unit)) in NAMES.iter().enumerate() {
-        let limit = view.attrs.rlimits.get(index);
+        let limit = view.rlimits.get(index);
         let fmt = |seq: &mut Seq, value: u64, last: bool| -> KResult<()> {
             if value == RLIM_INFINITY {
                 seq::print(seq, format_args!("{:<20}", "unlimited"))?;

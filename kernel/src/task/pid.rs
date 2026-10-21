@@ -117,6 +117,14 @@ impl Pid {
         );
     }
 
+    /// `hlist_replace_rcu`: `new` takes the place of `old` in the list of `ty`, which needs no
+    /// room and cannot fail. A no-op when `old` is not attached.
+    pub fn replace(&mut self, ty: PidType, old: TaskId, new: TaskId) {
+        if let Some(entry) = self.tasks[ty as usize].iter_mut().find(|t| **t == old) {
+            *entry = new;
+        }
+    }
+
     /// `hlist_del_rcu` of the task's link.
     pub fn detach(&mut self, ty: PidType, task: TaskId) {
         let list = &mut self.tasks[ty as usize];

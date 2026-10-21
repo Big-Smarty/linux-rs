@@ -8,21 +8,19 @@
 // kernel/fork.c (`set_max_threads`, `fork_init`), fs/fs_struct.c
 // (`init_fs.umask`), kernel/user.c (`root_user`), kernel/groups.c
 // (`init_groups`). All GPL-2.0-only.
-// Transformation: the `task_struct`/`signal_struct`/`cred`/`fs_struct` fields
-// the identity group reads are plain typed state of the one task; there is no
-// reference counting, locking or sharing because nothing shares them yet.
+// Transformation: the `task_struct`/`cred` fields the identity group reads are plain typed
+// state of the one task (`cred` is a per-task copy, not shared copy-on-write); the resource
+// limits are `signal_struct::rlim` and live with the thread group's other shared state
+// ([`crate::signal::SignalStruct::rlimits`]), so threads see each other's `setrlimit`.
 #![forbid(unsafe_code)]
 //! Per-task attributes of the identity and process-attribute syscalls
-//! (`syscall::ids`): credentials, resource limits, the filesystem context,
-//! personality and the user pointers `set_tid_address`/`set_robust_list` store.
-//! The process tree (parent, process group, session) is not here: it is the
-//! [`super::tasklist::Tasklist`]'s.
+//! (`syscall::ids`): credentials, `comm`, personality and the user pointers
+//! `set_tid_address`/`set_robust_list` store, and the resource-limit table type
+//! ([`Rlimits`]) the thread group keeps. The process tree (parent, process group, session)
+//! is not here: it is the [`super::tasklist::Tasklist`]'s.
 //!
-//! Context: task context of the one user task; the owner (`userspace::Process`)
-//! is only reachable under the `PROCESS` lock, so no field needs a lock of its
-//! own. When more than one task exists these move into the `task_struct`
-//! analogue, `cred` (shared, copy-on-write), `signal_struct` (`rlim`) and
-//! `fs_struct` (shared with `CLONE_FS`) exactly where Linux keeps them.
+//! Context: task context; the owner (`userspace::Process`) is only reachable under the
+//! `PROCESS` lock, so no field needs a lock of its own.
 
 /// `RLIM_NLIMITS`.
 pub const RLIM_NLIMITS: usize = 16;
@@ -104,6 +102,16 @@ impl Rlimits {
             limit(0, 0),                             // RTPRIO
             limit(INF, INF),                         // RTTIME
         ])
+    }
+
+    /// Limits for host tests, where only `RLIMIT_SIGPENDING` and `RLIMIT_NPROC` matter.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_tests(sigpending: u64, nproc: u64) -> Self {
+        let mut limits = Self::init(0);
+        limits.0[RLIMIT_SIGPENDING] = limit(sigpending, sigpending);
+        limits.0[RLIMIT_NPROC] = limit(nproc, nproc);
+        limits
     }
 
     /// `task_rlimit(current, resource)`.
@@ -189,52 +197,41 @@ impl Cred {
     }
 }
 
-/// `current->fs`: the root, the working directory and the file-creation mask.
-/// The VFS spine owns the type ([`crate::vfs::FsStruct`]); `umask(2)` edits
-/// `umask`, `chdir`/`fchdir`/`getcwd` use the directory handles.
-pub use crate::vfs::FsStruct;
-
 /// `TASK_COMM_LEN`.
 pub const COMM_LEN: usize = 16;
 
-/// Everything the identity group keeps per task.
+/// Everything the identity group keeps per task. The resource limits are the thread group's
+/// ([`Rlimits`], in `signal_struct`). The filesystem context (`current->fs`) is
+/// shared between the tasks that cloned with `CLONE_FS` and so lives apart
+/// ([`crate::vfs::FsStruct`], `userspace::FsShared`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attributes {
     pub cred: Cred,
-    pub rlimits: Rlimits,
-    pub fs: FsStruct,
     /// `task_struct::comm`, NUL-padded. A task started by `execve("/init")`
     /// is named after the file: `init`.
     pub comm: [u8; COMM_LEN],
     /// `task_struct::personality` (`PER_LINUX = 0`).
     pub personality: u32,
     /// `task_struct::clear_child_tid` (`set_tid_address`, `CLONE_CHILD_CLEARTID`).
-    /// Exit does not process it (`mm_release` writes 0 and wakes the futex
-    /// only when `mm_users > 1`; every mm here is private, so it is
-    /// unobservable until `CLONE_VM` exists).
+    /// `mm_release` (at `execve` and at exit, `syscall::futex::mm_release`) writes 0 there and
+    /// wakes one futex waiter only when `mm_users > 1`.
     pub clear_child_tid: u64,
-    /// `task_struct::robust_list` (`set_robust_list`), walked at exit only.
-    pub robust_list: u64,
     /// `PFA_NO_NEW_PRIVS` (`PR_SET_NO_NEW_PRIVS`): set once, inherited by `fork`, kept by
     /// `execve`, never cleared.
     pub no_new_privs: bool,
 }
 
 impl Attributes {
-    /// The init task's attributes; `max_threads` is [`max_threads`] of the
-    /// free pages when `fork_init` runs.
+    /// The init task's attributes.
     #[must_use]
-    pub fn init(max_threads: u64) -> Self {
+    pub fn init() -> Self {
         let mut comm = [0; COMM_LEN];
         comm[..4].copy_from_slice(b"init");
         Self {
             cred: Cred::root(),
-            rlimits: Rlimits::init(max_threads),
-            fs: FsStruct::INIT,
             comm,
             personality: 0,
             clear_child_tid: 0,
-            robust_list: 0,
             no_new_privs: false,
         }
     }
@@ -243,7 +240,7 @@ impl Attributes {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attributes, LimitError, MAX_THREADS, MIN_THREADS, RLIM_INFINITY, Rlimit, max_threads,
+        LimitError, MAX_THREADS, MIN_THREADS, RLIM_INFINITY, Rlimit, Rlimits, max_threads,
     };
 
     #[test]
@@ -254,7 +251,7 @@ mod tests {
         assert_eq!(max_threads(128 * 1024), 128 * 1024 * 4096 / (16384 * 8));
         // 512 MiB of 4 KiB pages: 4096 threads, RLIMIT_NPROC/SIGPENDING 2048.
         assert_eq!(max_threads(131_072), 4096);
-        let limits = Attributes::init(max_threads(131_072)).rlimits;
+        let limits = Rlimits::init(max_threads(131_072));
         assert_eq!(limits.0[6], limits.0[11]);
         assert_eq!(
             limits.0[6],
@@ -271,7 +268,7 @@ mod tests {
 
     #[test]
     fn init_rlimits_are_init_rlimits() {
-        let mut attrs = Attributes::init(20_000);
+        let mut limits = Rlimits::init(20_000);
         let want = |cur, max| Ok(Rlimit { cur, max });
         let table = [
             (3, want(8 << 20, RLIM_INFINITY)),
@@ -285,17 +282,13 @@ mod tests {
             (15, want(RLIM_INFINITY, RLIM_INFINITY)),
         ];
         for (resource, expected) in table {
-            assert_eq!(
-                attrs.rlimits.prlimit(resource, None),
-                expected,
-                "{resource}"
-            );
+            assert_eq!(limits.prlimit(resource, None), expected, "{resource}");
         }
     }
 
     #[test]
     fn prlimit_validates_before_storing_and_returns_the_old_value() {
-        let mut limits = Attributes::init(100).rlimits;
+        let mut limits = Rlimits::init(100);
         let set = |limits: &mut super::Rlimits, resource, cur, max| {
             limits.prlimit(resource, Some(Rlimit { cur, max }))
         };

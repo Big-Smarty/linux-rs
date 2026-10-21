@@ -24,7 +24,7 @@
 
 use super::{Context, Outcome, Tasks};
 use crate::task::pid::PidType;
-use crate::task::{Attributes, COMM_LEN, LimitError, RLIM_INFINITY, RLIMIT_CPU, Rlimit};
+use crate::task::{COMM_LEN, LimitError, RLIM_INFINITY, RLIMIT_CPU, Rlimit};
 use crate::usercopy::{TASK_SIZE_MAX, copy_from_user, copy_to_user, put_user, strncpy_from_user};
 use syscalls::{Errno, Sysno};
 
@@ -97,8 +97,8 @@ pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) ->
         Sysno::setrlimit => setrlimit(ctx, uint(a0), a1),
         Sysno::prlimit64 => prlimit64(ctx, int(a0), uint(a1), a2, a3),
         Sysno::umask => {
-            let fs = &mut ctx.attrs().fs;
-            let old = core::mem::replace(&mut fs.umask, uint(a0) & 0o777);
+            let files = ctx.files();
+            let old = core::mem::replace(&mut files.fs.umask, uint(a0) & 0o777);
             Ok(i64::from(old))
         }
         Sysno::uname => uname(ctx, a0),
@@ -209,7 +209,10 @@ fn set_robust_list<C: Context>(ctx: &mut C, head: u64, len: u64) -> Res {
     if len != 24 {
         return Err(Errno::EINVAL.into());
     }
-    ctx.attrs().robust_list = head;
+    let tasks = ctx.tasks();
+    if let Some(task) = tasks.list.task_mut(tasks.current) {
+        task.robust_list = head;
+    }
     Ok(0)
 }
 
@@ -287,6 +290,22 @@ fn rlimit_bytes(limit: Rlimit) -> [u8; 16] {
     bytes
 }
 
+/// [`find_task`] for state that belongs to the thread group (the resource limits): any thread of
+/// the caller's group answers with the caller's, which is the group's. Another process's
+/// limits are reachable through the task list but not through here yet (the permission rules
+/// of `check_prlimit_permission`), so that stops the kernel loudly.
+fn find_group_task<C: Context>(ctx: &mut C, pid: i32) -> Result<(), Stop> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let tasks = ctx.tasks();
+    match tasks.list.find_task_by_vpid(pid) {
+        None => Err(Errno::ESRCH.into()),
+        Some(task) if tasks.list.same_thread_group(task, tasks.current) => Ok(()),
+        Some(_) => Err(Stop::Unimplemented),
+    }
+}
+
 fn get_rlimit_arg<C: Context>(ctx: &mut C, pointer: u64) -> Result<Rlimit, Stop> {
     let mut bytes = [0u8; 16];
     if copy_from_user(ctx, &mut bytes, pointer) != 0 {
@@ -304,8 +323,8 @@ fn get_rlimit_arg<C: Context>(ctx: &mut C, pointer: u64) -> Result<Rlimit, Stop>
 /// ordinary validation it stops the kernel instead of storing a limit nothing
 /// would enforce (nothing is stored in that case).
 fn do_prlimit<C: Context>(ctx: &mut C, resource: u32, new: Option<Rlimit>) -> Result<Rlimit, Stop> {
-    let attrs: &mut Attributes = ctx.attrs();
-    let mut trial = attrs.rlimits;
+    let limits = ctx.rlimits();
+    let mut trial = *limits;
     let old = trial.prlimit(resource, new)?;
     if let Some(new) = new
         && resource as usize == RLIMIT_CPU
@@ -313,7 +332,7 @@ fn do_prlimit<C: Context>(ctx: &mut C, resource: u32, new: Option<Rlimit>) -> Re
     {
         return Err(Stop::Unimplemented);
     }
-    attrs.rlimits = trial;
+    *limits = trial;
     Ok(old)
 }
 
@@ -336,7 +355,7 @@ fn prlimit64<C: Context>(ctx: &mut C, pid: i32, resource: u32, new: u64, old: u6
     } else {
         Some(get_rlimit_arg(ctx, new)?)
     };
-    find_task(ctx, pid)?;
+    find_group_task(ctx, pid)?;
     let previous = do_prlimit(ctx, resource, new)?;
     // The old value is written after the new one took effect, as in Linux.
     if old != 0 && copy_to_user(ctx, old, &rlimit_bytes(previous)) != 0 {
@@ -780,12 +799,12 @@ mod tests {
         assert_eq!(t.attrs.clear_child_tid, BUF);
         assert_eq!(call(&mut t, Sysno::set_tid_address, &[0]), ok(1));
         assert_eq!(call(&mut t, Sysno::set_robust_list, &[0x1000, 24]), ok(0));
-        assert_eq!(t.attrs.robust_list, 0x1000);
+        assert_eq!(t.tasks.task(t.current).unwrap().robust_list, 0x1000);
         assert_eq!(
             call(&mut t, Sysno::set_robust_list, &[0x2000, 16]),
             err(Errno::EINVAL)
         );
-        assert_eq!(t.attrs.robust_list, 0x1000);
+        assert_eq!(t.tasks.task(t.current).unwrap().robust_list, 0x1000);
 
         assert_eq!(call(&mut t, Sysno::personality, &[0xffff_ffff]), ok(0));
         assert_eq!(call(&mut t, Sysno::personality, &[0x1_ffff_ffff]), ok(0));
@@ -1170,7 +1189,7 @@ mod tests {
     fn rlimits_default_set_and_read_back() {
         let mut t = user_task();
         const INF: u64 = u64::MAX;
-        t.attrs = crate::task::Attributes::init(2000);
+        *t.tasks.rlimits_mut(t.current).unwrap() = crate::task::Rlimits::init(2000);
         let defaults = [
             (INF, INF),
             (INF, INF),
@@ -1299,6 +1318,45 @@ mod tests {
         assert_eq!(call(&mut t, Sysno::prlimit64, &[0, 7, 0, 0]), ok(0));
         // `pid_t` truncation: 1 << 32 is pid 0.
         assert_eq!(call(&mut t, Sysno::prlimit64, &[1 << 32, 7, 0, 0]), ok(0));
+    }
+
+    #[test]
+    fn prlimit64_of_a_sibling_thread_is_the_groups_and_another_process_stops() {
+        use crate::task::tasklist::{CloneParams, ForkParams};
+        let mut t = user_task();
+        let fork = ForkParams {
+            exit_signal: 17,
+            clear_sighand: false,
+        };
+        let thread = t
+            .tasks
+            .clone_task(
+                t.current,
+                CloneParams {
+                    fork,
+                    thread: true,
+                    share_sighand: true,
+                    reset_altstack: true,
+                },
+            )
+            .unwrap();
+        let tid = u64::try_from(t.tasks.task_pid_vnr(thread)).unwrap();
+        put(
+            &mut t,
+            BUF + 32,
+            &[7, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            call(&mut t, Sysno::prlimit64, &[tid, 4, BUF + 32, BUF + 48]),
+            ok(0)
+        );
+        assert_eq!(limit(&mut t, 4), (ok(0), Rlimit { cur: 7, max: 9 }));
+        let child = t.tasks.fork(t.current, fork).unwrap();
+        let pid = u64::try_from(t.tasks.task_pid_vnr(child)).unwrap();
+        assert!(matches!(
+            dispatch(&mut t, Sysno::prlimit64 as u64, [pid, 4, 0, 0, 0, 0]),
+            Outcome::Unimplemented(_)
+        ));
     }
 
     #[test]

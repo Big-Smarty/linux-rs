@@ -41,9 +41,8 @@ fn err(errno: Errno) -> i64 {
 /// Bring the timers up to date and borrow the state.
 fn synced<T: Task>(task: &mut T) -> State<'_> {
     let now = task.now_ns();
-    let mut state = task.state();
-    state.sync_timers(now);
-    state
+    task.sync_timers(now);
+    task.state()
 }
 
 /// `signal_pending(current)` after the timers are brought up to date: an
@@ -192,12 +191,12 @@ pub fn sys_rt_sigtimedwait<T: Task>(
         };
         (these, timeout)
     };
+    task.sync_timers(now);
     let mut state = task.state();
     // `mask` is the set to skip: everything not awaited, plus KILL and STOP.
     let awaited =
         SigSet(u64::from_le_bytes(these) & !(SigSet::bit(SIGKILL) | SigSet::bit(SIGSTOP)));
     let mask = SigSet(!awaited.0);
-    state.sync_timers(now);
     let mut found = state.dequeue_signal_masked(mask);
     // `ret` of `schedule_hrtimeout_range`: -EINTR unless the timer ran out.
     let mut interrupted = false;
@@ -207,6 +206,7 @@ pub fn sys_rt_sigtimedwait<T: Task>(
         let real_blocked = state.me.blocked;
         state.me.real_blocked = real_blocked;
         state.me.blocked = SigSet(real_blocked.0 & mask.0);
+        state.recalc_sigpending();
         let deadline = timeout.map(|ns| now.saturating_add(ns));
         loop {
             if synced(task).signal_pending() {
@@ -222,6 +222,7 @@ pub fn sys_rt_sigtimedwait<T: Task>(
         // __set_task_blocked(real_blocked), then collect.
         state.me.blocked = real_blocked;
         state.me.real_blocked = SigSet::EMPTY;
+        state.recalc_sigpending();
         found = state.dequeue_signal_masked(mask);
     }
     match found {

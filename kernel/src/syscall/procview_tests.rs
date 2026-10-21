@@ -26,10 +26,18 @@ use crate::{
         ProcState,
         view::{Collect, TaskView},
     },
-    task::{Attributes, Cred, TaskId, exit::NoWake, fork::ForkRequest, tasklist::ForkParams},
+    task::{
+        Attributes, Cred, Rlimits, TaskId, exit::NoWake, fork::ForkRequest, tasklist::ForkParams,
+    },
     vfs::{FdTable, FileId},
 };
 use syscalls::Sysno;
+
+/// The thread group's limits a published view carries.
+fn limits() -> &'static Rlimits {
+    extern crate std;
+    std::boxed::Box::leak(std::boxed::Box::new(Rlimits::init(1000)))
+}
 
 fn collect<'a>(
     attrs: &'a Attributes,
@@ -40,6 +48,8 @@ fn collect<'a>(
 ) -> Collect<'a> {
     Collect {
         attrs,
+        rlimits: limits(),
+        fs: t.fs,
         fdt,
         files: &t.vfs.files,
         mm: Some(&t.mm),
@@ -95,7 +105,7 @@ fn assert_view_matches(view: &TaskView, fdt: &FdTable, t: &Task, what: &str) {
 fn a_view_follows_the_descriptor_table_by_replaying_its_log() {
     let mut t = task();
     let cred = crate::vfs::Cred::root();
-    let attrs = Attributes::init(1000);
+    let attrs = Attributes::init();
     let mut files = Vec::new();
     for _ in 0..40 {
         let (read, write) = t.vfs.pipe_create(0, &cred).unwrap();
@@ -166,7 +176,7 @@ fn a_view_follows_the_descriptor_table_by_replaying_its_log() {
 #[test]
 fn the_vma_vector_is_shared_until_the_address_space_changes() {
     let mut t = task();
-    let attrs = Attributes::init(1000);
+    let attrs = Attributes::init();
     let fdt = FdTable::default();
     let (read, _) = t.vfs.pipe_create(0, &crate::vfs::Cred::root()).unwrap();
     let mut view = TaskView::collect(collect(&attrs, &fdt, &t, read, (1, 0, 0))).unwrap();
@@ -215,19 +225,8 @@ fn the_vma_vector_is_shared_until_the_address_space_changes() {
 }
 
 fn fork_child(t: &mut Task) -> (TaskId, i32) {
-    let request = ForkRequest {
-        exit_signal: 17,
-        child_sp: 0,
-        clear_sighand: false,
-        clear_child_tid: 0,
-        set_child_tid: 0,
-        share_vm: false,
-        vfork: false,
-    };
-    let id = t
-        .tasks
-        .fork(t.current, ForkParams::of(&t.attrs, &request))
-        .unwrap();
+    let request = ForkRequest::plain(17);
+    let id = t.tasks.fork(t.current, ForkParams::of(&request)).unwrap();
     let pid = t.tasks.task_pid_vnr(id);
     (id, pid)
 }
@@ -274,12 +273,12 @@ fn the_pid_mirror_follows_the_task_list_through_its_log() {
     ps.sync(&t.tasks).unwrap();
     assert!(ps.facts(pa).unwrap().dumpable);
     assert_mirror(&ps, &t, "dumpable");
-    t.tasks.exit_prepare(a, 0, false);
-    t.tasks.exit_notify(a, &mut NoWake).unwrap();
+    t.tasks.exit_prepare(a, 0, false, &mut NoWake);
+    t.tasks.exit_notify(a, true, &mut NoWake).unwrap();
     ps.sync(&t.tasks).unwrap();
     assert!(ps.facts(pa).unwrap().zombie);
     assert_mirror(&ps, &t, "zombie");
-    t.tasks.release_task(a);
+    t.tasks.release_task(a, &mut NoWake);
     ps.sync(&t.tasks).unwrap();
     assert!(ps.facts(pa).is_none());
     assert_mirror(&ps, &t, "released");
@@ -289,9 +288,9 @@ fn the_pid_mirror_follows_the_task_list_through_its_log() {
     for _ in 0..5 {
         kids.push(fork_child(&mut t));
     }
-    t.tasks.exit_prepare(kids[1].0, 0, false);
-    t.tasks.exit_notify(kids[1].0, &mut NoWake).unwrap();
-    t.tasks.release_task(kids[1].0);
+    t.tasks.exit_prepare(kids[1].0, 0, false, &mut NoWake);
+    t.tasks.exit_notify(kids[1].0, true, &mut NoWake).unwrap();
+    t.tasks.release_task(kids[1].0, &mut NoWake);
     kids.push(fork_child(&mut t));
     ps.sync(&t.tasks).unwrap();
     assert_mirror(&ps, &t, "several between syncs");
@@ -304,9 +303,9 @@ fn the_pid_mirror_follows_the_task_list_through_its_log() {
     assert_mirror(&ps, &t, "burst of forks");
     for &(id, _) in kids.iter().skip(10) {
         if t.tasks.task(id).is_some() {
-            t.tasks.exit_prepare(id, 0, false);
-            t.tasks.exit_notify(id, &mut NoWake).unwrap();
-            t.tasks.release_task(id);
+            t.tasks.exit_prepare(id, 0, false, &mut NoWake);
+            t.tasks.exit_notify(id, true, &mut NoWake).unwrap();
+            t.tasks.release_task(id, &mut NoWake);
         }
     }
     ps.sync(&t.tasks).unwrap();
@@ -324,7 +323,7 @@ fn the_pid_mirror_follows_the_task_list_through_its_log() {
 #[test]
 fn views_and_totals_go_with_their_tasks() {
     let mut t = task();
-    let attrs = Attributes::init(1000);
+    let attrs = Attributes::init();
     let fdt = FdTable::default();
     let (exe, _) = t.vfs.pipe_create(0, &crate::vfs::Cred::root()).unwrap();
     let mut ps = ProcState::default();
@@ -369,18 +368,18 @@ fn views_and_totals_go_with_their_tasks() {
     // ... and a release takes the view away.
     let id = t.tasks.find_task_by_vpid(pids[2].0).unwrap();
     ps.exit(pids[2].0);
-    t.tasks.exit_prepare(id, 0, false);
-    t.tasks.exit_notify(id, &mut NoWake).unwrap();
-    t.tasks.release_task(id);
+    t.tasks.exit_prepare(id, 0, false, &mut NoWake);
+    t.tasks.exit_notify(id, true, &mut NoWake).unwrap();
+    t.tasks.release_task(id, &mut NoWake);
     ps.sync(&t.tasks).unwrap();
     assert!(ps.view(pids[2].0).is_none(), "view of a released group");
     live.retain(|&(p, _)| p != pids[2].0);
     expect(&ps, &live);
     // Pruning (no procfs) keeps the totals right too.
     let id = t.tasks.find_task_by_vpid(pids[4].0).unwrap();
-    t.tasks.exit_prepare(id, 0, false);
-    t.tasks.exit_notify(id, &mut NoWake).unwrap();
-    t.tasks.release_task(id);
+    t.tasks.exit_prepare(id, 0, false, &mut NoWake);
+    t.tasks.exit_notify(id, true, &mut NoWake).unwrap();
+    t.tasks.release_task(id, &mut NoWake);
     ps.prune(&t.tasks);
     live.retain(|&(p, _)| p != pids[4].0);
     expect(&ps, &live);
@@ -391,7 +390,7 @@ fn a_view_never_replays_another_tables_log() {
     // A table that happens to be at the generation the view last read, but is
     // not the table it read, must be copied, not patched.
     let mut t = task();
-    let attrs = Attributes::init(1000);
+    let attrs = Attributes::init();
     let (read, write) = t.vfs.pipe_create(0, &crate::vfs::Cred::root()).unwrap();
     let mut first = FdTable::default();
     let fd = first.alloc_fd(0, 64, false).unwrap();
@@ -406,69 +405,4 @@ fn a_view_never_replays_another_tables_log() {
         .unwrap();
     assert_view_matches(&view, &second, &t, "swapped table");
     assert!(view.fd(0).is_none(), "nothing of the first table is left");
-}
-
-#[test]
-fn a_view_follows_the_vfork_child_that_works_in_its_address_space() {
-    let mut t = task();
-    let attrs = Attributes::init(1000);
-    let fdt = FdTable::default();
-    let (exe, _) = t.vfs.pipe_create(0, &crate::vfs::Cred::root()).unwrap();
-    let mut ps = ProcState::default();
-    ps.sync(&t.tasks).unwrap();
-    let (_, parent) = fork_child(&mut t);
-    let (_, kid) = fork_child(&mut t);
-    let (_, grand) = fork_child(&mut t);
-    ps.sync(&t.tasks).unwrap();
-    // The parent's address space has 3 anonymous pages, the kid's (the same one, later) 5.
-    for (pid, anon) in [(parent, 3), (kid, 0), (grand, 0)] {
-        ps.publish_update(pid, collect(&attrs, &fdt, &t, exe, (anon, 0, 0)))
-            .unwrap();
-    }
-    assert_eq!(ps.totals().anon_pages, 3);
-    // vfork: the parent follows the child; the sums count the address space once.
-    ps.lend_mm(parent, kid);
-    assert_eq!(ps.view(parent).unwrap().mm, None);
-    assert_eq!(ps.mm_of(parent), ps.view(kid).unwrap().mm.as_ref());
-    ps.publish_update(kid, collect(&attrs, &fdt, &t, exe, (5, 0, 0)))
-        .unwrap();
-    assert_eq!(
-        ps.mm_of(parent).unwrap().rss_anon,
-        5,
-        "what the child maps shows"
-    );
-    assert_eq!(ps.totals().anon_pages, 5, "counted once");
-    // The lent task republishing without an address space changes nothing.
-    let mut again = collect(&attrs, &fdt, &t, exe, (0, 0, 0));
-    again.mm = None;
-    ps.publish_update(parent, again).unwrap();
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 5);
-    assert_eq!(ps.totals().anon_pages, 5);
-    // A second level: the kid vforks the grandchild.
-    ps.lend_mm(kid, grand);
-    ps.publish_update(grand, collect(&attrs, &fdt, &t, exe, (7, 0, 0)))
-        .unwrap();
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 7);
-    assert_eq!(ps.mm_of(kid).unwrap().rss_anon, 7);
-    assert_eq!(ps.totals().anon_pages, 7);
-    // The kid dies borrowing: the parent waits for the grandchild now.
-    ps.skip_lent(parent, kid);
-    ps.exit(kid);
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 7);
-    // The grandchild lets go: the parent shows what the grandchild's view showed, and a
-    // republication by the parent replaces it with its own.
-    ps.return_mm(parent, grand);
-    ps.exit(grand);
-    assert_eq!(ps.view(parent).unwrap().lent_to, None);
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 7);
-    assert_eq!(ps.totals().anon_pages, 7);
-    ps.publish_update(parent, collect(&attrs, &fdt, &t, exe, (6, 0, 0)))
-        .unwrap();
-    assert_eq!(ps.mm_of(parent).unwrap().rss_anon, 6);
-    assert_eq!(ps.totals().anon_pages, 6);
-    // A lender that died while lent shows no address space.
-    ps.lend_mm(parent, kid);
-    ps.exit(parent);
-    assert!(ps.mm_of(parent).is_none());
-    assert_eq!(ps.totals().anon_pages, 0);
 }

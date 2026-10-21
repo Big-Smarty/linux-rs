@@ -297,6 +297,23 @@ impl Vfs {
         }
     }
 
+    /// The inode behind the mapped description `id` (`FileInfo::id`) as a futex key names it
+    /// (`get_inode_sequence_number`): the superblock and the inode number.
+    ///
+    /// # Panics
+    /// If `id` is not an open description with an inode (a kernel bug: the VMA set and the pin
+    /// list are reconciled after every mapping change).
+    #[must_use]
+    pub fn mapped_inode(&self, id: u64) -> (super::SbId, u64) {
+        let inode = self
+            .files
+            .get(file_of(id))
+            .inode
+            .expect("mapped file has an inode");
+        let inode = self.fs.inode(inode);
+        (inode.sb, inode.ino)
+    }
+
     /// A private `/dev/zero` mapping now exists (`mmap_zero`).
     pub fn note_zero_mapping(&mut self) {
         self.zero_mapped = true;

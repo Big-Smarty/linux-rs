@@ -1444,6 +1444,17 @@ impl Backing for UserSpace<'_> {
     }
 }
 
+impl Backing for Tables {
+    fn tables(&self) -> &Tables {
+        self
+    }
+    fn parts<R>(&mut self, f: impl FnOnce(&mut Tables, &mut Allocator<'_>) -> R) -> R {
+        // As `UserSpace`'s: the tables are a task's own address space and `FRAMES` a leaf.
+        let mut frames = crate::services::FRAMES.lock();
+        f(self, &mut frames)
+    }
+}
+
 fn out_of_memory(error: Error) -> kernel::mm::OutOfMemory {
     // Only exhaustion is a legitimate failure. Anything else means the model
     // asked for a page it had not checked, a kernel bug: stop loudly.
@@ -1497,6 +1508,20 @@ macro_rules! mm_pages {
     };
 }
 mm_pages!(['a] UserSpace<'a>);
+mm_pages!([] Tables);
+
+impl kernel::exec::load::Pager for Tables {
+    fn install(
+        &mut self,
+        page: u64,
+        prot: kernel::mm::PageProt,
+        file: bool,
+        bytes: &[u8; PAGE_BYTES],
+    ) -> Result<(), kernel::mm::OutOfMemory> {
+        self.parts(|tables, frames| tables.mm_install_page(frames, page, prot, file, bytes))
+            .map_err(out_of_memory)
+    }
+}
 
 impl kernel::exec::load::Pager for UserSpace<'_> {
     fn install(
@@ -1521,12 +1546,6 @@ pub struct UserSpace<'a> {
 }
 
 impl UserSpace<'_> {
-    /// The physical address of the PML4 this view borrows (what CR3 holds when it is active).
-    #[must_use]
-    pub fn root_address(&self) -> u64 {
-        self.tables.root_address()
-    }
-
     /// `pgd_alloc` ([`Tables::fork_template`]): a new tree with an empty user half and this
     /// tree's kernel half, for a task that has no address space of its own (yet).
     ///
@@ -1534,13 +1553,6 @@ impl UserSpace<'_> {
     /// Frame exhaustion.
     pub fn empty_tree(&mut self) -> Result<Tables, Error> {
         self.parts(|tables, frames| tables.fork_template(frames))
-    }
-
-    /// Exchange the tree this view borrows for `tables` and hand back the old one: the task's
-    /// address space changes owner (a `vfork` child borrowing its parent's, or giving it back).
-    /// The old tree is not freed; whoever receives it owns it.
-    pub fn replace_tables(&mut self, tables: Tables) -> Tables {
-        core::mem::replace(self.tables, tables)
     }
 
     /// The page-table half of a fork ([`Tables::fork_user`]) with the frame
@@ -1635,14 +1647,22 @@ impl UserSpace<'_> {
     /// The frame of the user page at page-aligned `address`; present, user at
     /// every level, and writable at every level when `write`.
     fn translate(&self, address: u64, write: bool) -> Option<Physical> {
+        self.tables.translate_user(address, write)
+    }
+}
+
+impl Tables {
+    /// The frame of the user page at page-aligned `address`; present, user at
+    /// every level, and writable at every level when `write`.
+    fn translate_user(&self, address: u64, write: bool) -> Option<Physical> {
         if address >= TASK_SIZE_MAX {
             return None;
         }
         let required = PRESENT | USER | if write { WRITE } else { 0 };
-        let mut table = self.tables.root;
+        let mut table = self.root;
         for shift in [39, 30, 21, 12] {
             let index = usize::try_from((address >> shift) & 511).ok()?;
-            let entry = read_entry(self.tables.direct_map, table, index).ok()?;
+            let entry = read_entry(self.direct_map, table, index).ok()?;
             if entry & required != required {
                 return None;
             }
@@ -1655,6 +1675,17 @@ impl UserSpace<'_> {
             table = Physical(entry & ADDRESS);
         }
         None
+    }
+
+    /// The direct-map address of the frame backing the user page at `page`, for
+    /// [`UserPages::page`]'s two implementations (which carry the proof for turning it into
+    /// a reference). No access happens here.
+    fn user_page_pointer(&self, page: u64, write: bool) -> Option<*mut [u8; PAGE_BYTES]> {
+        let physical = self.translate_user(page, write)?;
+        let address = usize::try_from(self.direct_map.checked_add(physical.0)?).ok()?;
+        Some(ptr::with_exposed_provenance_mut::<[u8; PAGE_BYTES]>(
+            address,
+        ))
     }
 }
 
@@ -1764,28 +1795,33 @@ impl UserSpace<'_> {
     }
 }
 
+/// SAFETY argument shared by the two `UserPages` implementations below.
+///
+/// `user_page_pointer` found a present user leaf. Its frame is one of two kinds. (1) A private
+/// frame: an order-zero allocator reservation that exactly one leaf owns (`map_user`,
+/// `mm_map_anon`, `mm_install_page`) and only `mm_unmap` frees, after clearing and invalidating
+/// that leaf. (2) The shared zero frame (`Tables::init_zero_page`): mapped by any number of
+/// leaves, never freed, and hardware-read-only in every leaf, so `translate(write)` never
+/// returns it. The frame is live, initialized (allocator zeroing, then plain bytes) and 4 KiB
+/// aligned. The direct map covers all usable RAM read-write (checked by `Allocator::new`).
+/// The caller holds `&mut Tables` (directly or through the view) for as long as the returned
+/// borrow lives, so nothing can free, remap or hand out another reference to the frame, and
+/// user code does not run (one CPU) while the kernel holds it. Any byte pattern is a valid
+/// `[u8; N]`. The zero frame stays zero only because every caller obeys the `UserPages::page`
+/// contract: a page requested with `write == false` is only read. The callers that request one
+/// are `usercopy::walk`, whose read visitor is `copy_from_user`, and `UserPages::resident`,
+/// which drops the reference without using it (`get_futex_key` asks whether a read-only file
+/// page is present).
+impl UserPages for Tables {
+    fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
+        let pointer = self.user_page_pointer(page, write)?;
+        // SAFETY: see the argument above; the borrow is tied to `&mut self`.
+        Some(unsafe { &mut *pointer })
+    }
+}
+
 impl UserPages for UserSpace<'_> {
     fn page(&mut self, page: u64, write: bool) -> Option<&mut [u8; PAGE_BYTES]> {
-        let physical = self.translate(page, write)?;
-        let address = usize::try_from(self.tables.direct_map.checked_add(physical.0)?).ok()?;
-        let pointer = ptr::with_exposed_provenance_mut::<[u8; PAGE_BYTES]>(address);
-        // SAFETY: `translate` found a present user leaf. Its frame is one of
-        // two kinds. (1) A private frame: an order-zero allocator reservation
-        // that exactly one leaf owns (`map_user`, `mm_map_anon`,
-        // `mm_install_page`) and only `mm_unmap` frees, after clearing and
-        // invalidating that leaf. (2) The shared zero frame
-        // (`Tables::init_zero_page`): mapped by any number of leaves, never
-        // freed, and hardware-read-only in every leaf, so `translate(write)`
-        // never returns it. The frame is live, initialized (allocator zeroing,
-        // then plain bytes) and 4 KiB aligned. The direct map covers all usable
-        // RAM read-write (checked by `Allocator::new`). The view holds
-        // `&mut Tables`, so nothing can free, remap or hand out another
-        // reference to the frame while the returned borrow (tied to `&mut
-        // self`) lives, and user code does not run (one CPU) while the kernel
-        // holds it. Any byte pattern is a valid `[u8; N]`. The zero frame stays
-        // zero only because every caller obeys the `UserPages::page` contract:
-        // a page requested with `write == false` is only read (the sole caller
-        // is `usercopy::walk`, whose read visitor is `copy_from_user`).
-        Some(unsafe { &mut *pointer })
+        self.tables.page(page, write)
     }
 }

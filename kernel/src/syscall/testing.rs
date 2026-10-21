@@ -5,18 +5,19 @@
 //! descriptors 0-2 on the console, as `console_on_rootfs` leaves init.
 
 use super::{
-    AddressSpace, Console, Context, ExecAux, Files, Machine, Tasks, TtyParts,
+    AddressSpace, Console, Context, ExecAux, Files, FutexParts, Machine, Tasks, TtyParts,
     time::{ClockState, Clocks, RestartBlock},
 };
 use crate::{
     cputime::CpuSample,
+    futex::{FutexWaker, Futexes},
     mm::{Env, Mm, VmFlags, tests::Fake},
     signal::{
         self, SIGALRM, SIGUSR1, SIGUSR2, State, frame::Sigreturn, info::SigInfo, state::Target,
     },
-    task::{Attributes, TaskId, Tasklist, exit::NoWake, fork::ForkRequest, tasklist::ForkParams},
+    task::{Attributes, TaskId, Tasklist, exit::NoWake, fork::ForkRequest},
     usercopy::{UserPages, fake::Space},
-    vfs::{FdTable, FileId, Timespec, Vfs},
+    vfs::{FdTable, FileId, FsStruct, Timespec, Vfs},
 };
 extern crate std;
 use crate::sched::WaitKey;
@@ -76,6 +77,15 @@ impl Default for FakeClocks {
     }
 }
 
+/// The wake-ups the futex code asked for.
+#[derive(Default)]
+pub struct FakeWaker(pub Vec<u32>);
+impl FutexWaker for FakeWaker {
+    fn wake(&mut self, owner: u32) {
+        self.0.push(owner);
+    }
+}
+
 /// What another task does to the shared state while this one sleeps.
 pub type WaitHook = Box<dyn FnOnce(&mut Vfs, &mut FdTable)>;
 
@@ -110,6 +120,12 @@ pub struct Task<P = Space, C = Sink> {
     pub tables: Fake,
     pub vfs: Vfs,
     pub fdt: FdTable,
+    pub fs: FsStruct,
+    /// The futex queues, and the owners the fake wake-up named.
+    pub futexes: Futexes,
+    pub futex_wakes: FakeWaker,
+    /// `mm->mm_users` as the futex code reads it.
+    pub mm_users: u32,
     /// The console tty (`tty::Tty`), as the binary keeps it beside the VFS.
     pub tty: crate::tty::Tty,
     /// Private copies of file pages a kernel access faulted in (the binary's
@@ -169,9 +185,10 @@ impl<P, C> Task<P, C> {
         vfs.default_rootfs().expect("default rootfs");
         let mut fdt = FdTable::default();
         vfs.console_on_rootfs(&mut fdt).expect("console");
-        let mut attrs = Attributes::init(1000);
-        attrs.fs = vfs.new_fs_struct(0o022);
-        let (tasks, current) = Tasklist::new(1000, &attrs.cred, 1000).expect("task list");
+        let attrs = Attributes::init();
+        let fs = vfs.new_fs_struct(0o022);
+        let (tasks, current) =
+            Tasklist::new(1000, &attrs.cred, crate::task::Rlimits::init(1000)).expect("task list");
         let state = State::standalone(1, 0, 1000);
         for sig in [SIGUSR1, SIGUSR2, SIGALRM] {
             state.hand.actions[usize::from(sig) - 1].handler = 0x4000;
@@ -197,6 +214,10 @@ impl<P, C> Task<P, C> {
             tables: Fake::default(),
             vfs,
             fdt,
+            fs,
+            futexes: Futexes::new(8).expect("futex queues"),
+            futex_wakes: FakeWaker::default(),
+            mm_users: 1,
             tty: crate::tty::Tty::new().expect("console tty"),
             file_pages: BTreeMap::new(),
             tasks,
@@ -299,6 +320,16 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
             wake: &mut self.wake,
         }
     }
+    fn futex(&mut self) -> FutexParts<'_> {
+        FutexParts {
+            queue: &mut self.futexes,
+            waker: &mut self.futex_wakes,
+            owner: 1,
+            mm: 1,
+            mm_users: self.mm_users,
+            tid: self.tgid,
+        }
+    }
     fn replace_exe_file(&mut self, file: FileId) -> Option<FileId> {
         self.exe.replace(file)
     }
@@ -328,7 +359,7 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
         Files {
             vfs: &mut self.vfs,
             fdt: &mut self.fdt,
-            fs: &mut self.attrs.fs,
+            fs: &mut self.fs,
             owner: 0,
         }
     }
@@ -349,8 +380,11 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
         // reads its own /proc entries and when it leaves the CPU).
         self.vfs.sync_proc(&self.tasks)?;
         let exe = self.exe;
+        let rlimits = *self.tasks.rlimits(self.current).expect("the current task");
         let view = TaskView::collect(Collect {
             attrs: &self.attrs,
+            rlimits: &rlimits,
+            fs: self.fs,
             fdt: &self.fdt,
             files: &self.vfs.files,
             mm: Some(&self.mm),
@@ -376,7 +410,7 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
                 tgid,
                 cred: crate::vfs::Cred::of_task(&self.attrs.cred),
             },
-            root: self.attrs.fs.root,
+            root: self.fs.root,
         };
         Ok(f(&show))
     }
@@ -389,10 +423,16 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
         ))
     }
     fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, syscalls::Errno> {
-        let params = ForkParams::of(&self.attrs, request);
-        let child = self.tasks.fork(self.current, params)?;
+        let child = self.tasks.clone_task(
+            self.current,
+            crate::task::tasklist::CloneParams::of(request),
+        )?;
         self.forked.push(*request);
-        Ok(self.tasks.task_pid_vnr(child))
+        let pid = self.tasks.task_pid_vnr(child);
+        if request.parent_settid != 0 {
+            let _ = crate::usercopy::put_user(self, request.parent_settid, &pid.to_le_bytes());
+        }
+        Ok(pid)
     }
 }
 
@@ -416,6 +456,13 @@ impl<P: UserPages, C> Clocks for Task<P, C> {
             .unwrap_or(RestartBlock::NONE)
     }
     fn cpu_sample(&self) -> CpuSample {
+        self.clocks.sample
+    }
+    fn cpu_sample_of(&mut self, _task: crate::task::TaskId) -> CpuSample {
+        // One thread per group in the fake: every task has the scripted sample.
+        self.clocks.sample
+    }
+    fn group_cpu_sample_of(&mut self, _task: crate::task::TaskId) -> CpuSample {
         self.clocks.sample
     }
     fn cpu_adjusted(&mut self) -> (u64, u64) {

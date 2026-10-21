@@ -735,8 +735,9 @@ fn truncate_fsync_syncfs_and_statfs() {
     );
     t.attrs.cred.euid = 0;
     // The size limit: growing past RLIMIT_FSIZE raises SIGXFSZ and fails with EFBIG.
-    t.attrs
-        .rlimits
+    t.tasks
+        .rlimits_mut(t.current)
+        .unwrap()
         .prlimit(1, Some(crate::task::Rlimit { cur: 150, max: 150 }))
         .unwrap();
     assert_eq!(

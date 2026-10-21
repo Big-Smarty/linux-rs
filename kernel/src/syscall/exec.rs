@@ -26,9 +26,7 @@
 //!   descriptor) is `Unimplemented`: the name `comm` and `/dev/fd/N` take from
 //!   the dentry is not resolved yet.
 //! * shortcut: user page-table pages of the replaced image are not freed
-//!   (only the frames of its mappings), and the robust-futex list of the old
-//!   image is dropped without the `exit_robust_list` walk. Upgrade with
-//!   per-task page-table roots and the futex lane.
+//!   (only the frames of its mappings). Upgrade with per-task page-table roots.
 
 use super::{
     AddressSpace, Context, Files, Outcome, error,
@@ -194,7 +192,7 @@ fn prepare<C: Context>(
     let fatal = |c: &mut C| c.state().sig.group_exit.is_some();
     let arg_count = count(ctx, argv, fatal)?;
     let env_count = count(ctx, envp, fatal)?;
-    let rlim_stack = ctx.attrs().rlimits.get(RLIMIT_STACK).cur;
+    let rlim_stack = ctx.rlimits().get(RLIMIT_STACK).cur;
     let budget = string_budget(rlim_stack, arg_count, env_count)?;
     let mut used = 0u64;
     let mut name = Strings::new();
@@ -285,7 +283,7 @@ fn prepare<C: Context>(
     ctx.files()
         .vfs
         .reserve_pins(1 + usize::from(interp_file.is_some()))?;
-    ctx.exec_prepare_mm()?;
+    ctx.exec_prepare()?;
     Ok(Some(Prepared {
         file: *file,
         bytes: core::mem::take(bytes),
@@ -324,29 +322,64 @@ fn dev_fd_name(fd: i32, path: &[u8]) -> Result<Vec<u8>, Errno> {
     Ok(name)
 }
 
+/// `bprm_execve`'s `out:` past the point of no return: the errno is stored, the task ends with
+/// SIGSEGV unless it is being killed already, and `free_bprm` releases `bprm->interpreter`
+/// always and `bprm->file` unless it already became `mm->exe_file` (`own_file`).
+fn die<C: Context>(ctx: &mut C, p: &mut Prepared, own_file: bool, errno: Errno) -> Outcome {
+    if own_file {
+        ctx.files().vfs.fput(p.file);
+    }
+    if let Some(interp) = p.interp.take() {
+        ctx.files().vfs.fput(interp.file);
+    }
+    if !ctx.state().fatal_signal_pending() {
+        ctx.state().force_fatal_sig(SIGSEGV);
+    }
+    fail(errno)
+}
+
 /// `begin_new_exec` and the tail of `load_elf_binary`: the point of no return.
 /// The old image is gone when the first step runs; every failure from here on
 /// is fatal to the task.
 fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
+    // bprm->point_of_no_return: from here an error is fatal to the task (`die`).
+    // de_thread: every other thread of the group is killed and gone, and a thread that is not
+    // the leader takes the leader's pid.
+    if let Err(errno) = de_thread(ctx) {
+        return die(ctx, p, true, errno);
+    }
+    // unshare_files: the descriptor table is not shared with another process any more.
+    if let Err(errno) = ctx.exec_unshare_files() {
+        return die(ctx, p, true, errno);
+    }
     // Close-on-exec descriptors (`do_close_on_exec`).
     {
         let Files { vfs, fdt, .. } = ctx.files();
         vfs.do_close_on_exec(fdt);
-    }
-    // exec_mm_release: the old mm's `clear_child_tid` and robust list.
-    {
-        let attrs = ctx.attrs();
-        attrs.clear_child_tid = 0;
-        attrs.robust_list = 0;
     }
     // set_mm_exe_file: the new file is `mm->exe_file`.
     let id = u64::from(p.file.index());
     if let Some(old) = ctx.replace_exe_file(p.file) {
         ctx.files().vfs.fput(old);
     }
-    // exec_mmap: a caller that borrows its address space (`vfork`) leaves it for its
-    // owner and takes the fresh one; any other task's old image is unmapped below.
-    ctx.exec_switch_mm();
+    // exec_mmap -> exec_mm_release: the old mm's robust list is walked and `clear_child_tid`
+    // written and its waiters woken (`futex_exec_release`, `mm_release`).
+    super::futex::mm_release(ctx);
+    // ... then the address space is switched when it is shared with another process (a
+    // `vfork` parent wakes: `complete_vfork_done`), and the dispositions made private
+    // (`unshare_sighand`); any other task's old image is unmapped below.
+    if let Err(errno) = ctx.exec_switch_mm() {
+        return die(ctx, p, false, errno);
+    }
+    // `de_thread` slept, so the pins reserved by `prepare` may be spent by now: reserve them
+    // again here; nothing between this and `Vfs::pin` gives up the CPU.
+    if let Err(errno) = ctx
+        .files()
+        .vfs
+        .reserve_pins(1 + usize::from(p.interp.is_some()))
+    {
+        return die(ctx, p, false, errno);
+    }
     // The old image's mappings go, a fresh address space replaces
     // the VMA set; then `setup_arg_pages` and `elf_load`.
     let mapped = {
@@ -396,27 +429,24 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
         })
     };
     super::memory::unpin_unmapped(ctx);
-    let interp_id = p.interp.as_ref().map(|interp| interp.file);
     let layout = match mapped {
         Ok(layout) => layout,
         Err(error) => {
-            if let Some(file) = interp_id {
-                ctx.files().vfs.fput(file);
-            }
-            // bprm_execve: "ensure the code never returns to the userspace process".
-            ctx.state().force_fatal_sig(SIGSEGV);
             return match error {
-                LoadError::Errno(errno) => fail(errno),
-                LoadError::Unsupported(_) => Outcome::Unimplemented(sysno as u32),
+                LoadError::Errno(errno) => die(ctx, p, false, errno),
+                LoadError::Unsupported(_) => {
+                    let _ = die(ctx, p, false, Errno::EINVAL);
+                    Outcome::Unimplemented(sysno as u32)
+                }
             };
         }
     };
     // The VMAs hold the files (`vm_file`); `bprm->interpreter` is released (`fput`).
     let Files { vfs, owner, .. } = ctx.files();
     vfs.pin(owner, id);
-    if let Some(file) = interp_id {
-        vfs.pin(owner, u64::from(file.index()));
-        vfs.fput(file);
+    if let Some(interp) = p.interp.take() {
+        vfs.pin(owner, u64::from(interp.file.index()));
+        vfs.fput(interp.file);
     }
     // flush_signal_handlers(me, 0) and the new name.
     ctx.state().flush_on_exec();
@@ -427,6 +457,53 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
     // flush_thread + start_thread.
     ctx.start_thread(layout.entry, p.built.sp);
     Outcome::Return(0)
+}
+
+/// `de_thread(current)`: kill the other threads of the group and wait (killable) until they
+/// are gone; a thread that is not the leader then waits for the leader to be a zombie and takes
+/// over its pid, process group, session and place in the tree.
+///
+/// # Errors
+/// `EAGAIN` when a group exit or another `execve` of the group is under way, or a fatal signal
+/// arrived while waiting.
+fn de_thread<C: Context>(ctx: &mut C) -> Result<(), Errno> {
+    use crate::task::dethread::DeThread;
+    let me = ctx.tasks().current;
+    let key = crate::task::exit::de_thread_key(me);
+    let started = {
+        let t = ctx.tasks();
+        t.list.de_thread_start(me, t.wake)?
+    };
+    if started == DeThread::Wait {
+        // "sig->notify_count": every other thread released.
+        while !ctx.tasks().list.de_thread_others_gone(me) {
+            if killed(ctx) {
+                ctx.tasks().list.de_thread_abort(me);
+                return Err(Errno::EAGAIN);
+            }
+            ctx.wait(key, None);
+        }
+        // The non-leader waits for the old leader to exit as well.
+        while !ctx.tasks().list.de_thread_leader_exited(me) {
+            if killed(ctx) {
+                ctx.tasks().list.de_thread_abort(me);
+                return Err(Errno::EAGAIN);
+            }
+            ctx.wait(key, None);
+        }
+    }
+    {
+        let t = ctx.tasks();
+        t.list.de_thread_finish(me, t.wake);
+    }
+    ctx.thread_ids_changed();
+    Ok(())
+}
+
+/// `__fatal_signal_pending(current)` after the timers are brought up to date.
+fn killed<C: Context>(ctx: &mut C) -> bool {
+    crate::signal::wait::signal_pending_synced(ctx);
+    ctx.state().fatal_signal_pending()
 }
 
 /// The argument pages: private frames holding the prepared block, writable
@@ -760,8 +837,8 @@ mod tests {
         t.state.me.altstack.sp = 0x7000;
         t.state.me.altstack.size = 0x2000;
         t.attrs.clear_child_tid = 0x1111;
-        t.attrs.robust_list = 0x2222;
-        t.attrs.fs.umask = 0o77;
+        t.tasks.task_mut(t.current).unwrap().robust_list = 0x2222;
+        t.fs.umask = 0o77;
         // A previous image: one mapping that must disappear.
         {
             let crate::syscall::AddressSpace { mm, env, pages } = Context::address_space(&mut t);
@@ -794,8 +871,14 @@ mod tests {
         assert_eq!((t.state.me.altstack.sp, t.state.me.altstack.size), (0, 0));
         // Attributes: name, cleared user pointers; umask and cwd are kept.
         assert_eq!(&t.attrs.comm[..9], b"bin-init\0");
-        assert_eq!((t.attrs.clear_child_tid, t.attrs.robust_list), (0, 0));
-        assert_eq!(t.attrs.fs.umask, 0o77);
+        assert_eq!(
+            (
+                t.attrs.clear_child_tid,
+                t.tasks.task(t.current).unwrap().robust_list
+            ),
+            (0, 0)
+        );
+        assert_eq!(t.fs.umask, 0o77);
         // The address space is the new image's: the old mapping is gone, the
         // stack VMA and the program's segments are in.
         let vmas = t.mm.vmas();
@@ -814,6 +897,39 @@ mod tests {
         let first = t.exe;
         assert_eq!(execve(&mut t, "/bin-init", &["x"], &[]), Outcome::Return(0));
         assert_ne!(t.exe, first);
+    }
+
+    #[test]
+    fn a_failing_de_thread_releases_the_executable_and_its_script_interpreter() {
+        use crate::task::tasklist::{CloneParams, ForkParams};
+        let mut t = t();
+        install(&mut t, "/interp", 0o755, &oracle());
+        install(&mut t, "/s", 0o755, b"#!/interp\nbody");
+        let fork = ForkParams {
+            exit_signal: 17,
+            clear_sighand: false,
+        };
+        let sibling = t
+            .tasks
+            .clone_task(
+                t.current,
+                CloneParams {
+                    fork,
+                    thread: true,
+                    share_sighand: true,
+                    reset_altstack: true,
+                },
+            )
+            .unwrap();
+        // The sibling's own `execve` is under way: this one finds the group busy (`EAGAIN`).
+        t.tasks.de_thread_start(sibling, &mut t.wake).unwrap();
+        let (open, refs) = (t.vfs.files.open_count(), t.vfs.files.total_refs());
+        assert_eq!(execve(&mut t, "/s", &["/s"], &[]), neg(Errno::EAGAIN));
+        // free_bprm: neither the script's, nor the interpreter's description stays open.
+        assert_eq!(
+            (t.vfs.files.open_count(), t.vfs.files.total_refs()),
+            (open, refs)
+        );
     }
 
     /// `execveat` up to the point of no return: the `argv` strings the new image would start

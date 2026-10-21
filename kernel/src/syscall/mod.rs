@@ -35,6 +35,7 @@ mod dynelf_tests;
 mod exec;
 mod fd;
 mod fs;
+mod futex;
 mod ids;
 mod io;
 mod memory;
@@ -63,13 +64,15 @@ use crate::{
     exec::load::Pager,
     mm::{Env, Mm},
     task::{
-        Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE, TaskId, Tasklist, exit::Waker, fork::ForkRequest,
+        Attributes, RLIMIT_FSIZE, RLIMIT_NOFILE, Rlimits, TaskId, Tasklist, exit::Waker,
+        fork::ForkRequest,
     },
     usercopy::UserPages,
     vfs::{Cred, FdTable, FileId, FsStruct, Vfs, mapping::Mappable},
 };
 use syscalls::{Errno, Sysno};
 
+pub use futex::mm_release;
 pub use ids::{UTS_RELEASE, UTS_VERSION};
 pub use io::{MAX_RW_COUNT, TTY_CHUNK};
 pub use process::exit_code;
@@ -138,8 +141,8 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     fn tgid(&self) -> u32;
     /// `task_pid_vnr(current)`: what `gettid` returns.
     fn tid(&self) -> u32;
-    /// The identity, limits, filesystem context and small per-task state of the
-    /// caller (`task`); see [`Attributes`].
+    /// The identity and small per-task state of the caller (`task`); see [`Attributes`]. The
+    /// limits are the group's ([`Context::rlimits`]).
     fn attrs(&mut self) -> &mut Attributes;
     /// The user `%fs` base as the CPU holds it (`x86_fsbase_read_cpu`).
     fn fs_base(&self) -> u64;
@@ -170,6 +173,8 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     }
     /// The task list, `current` and the wake-up path.
     fn tasks(&mut self) -> Tasks<'_>;
+    /// The futex queues and the caller's place in them.
+    fn futex(&mut self) -> FutexParts<'_>;
     /// `set_mm_exe_file`: the open description the new image was loaded from
     /// becomes `mm->exe_file`; the previous one is returned for `fput`. The
     /// binary also keeps the id the fault report names the program by.
@@ -216,33 +221,76 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     /// `EAGAIN` (`max_threads`, `RLIMIT_NPROC`, pid space, no task slot or
     /// kernel stack), `ENOMEM`, as `copy_process`.
     fn copy_process(&mut self, request: &ForkRequest) -> Result<i32, Errno>;
-    /// `bprm_mm_init` for a caller that works in an address space it borrows (a `vfork`
-    /// child): the fresh address space its `execve` will move to, made before the point of no
-    /// return so that a lack of memory is an `ENOMEM` of the call. Nothing for every other
-    /// task.
+    /// `bprm_mm_init` for a caller whose address space is shared (with a `vfork` parent, a
+    /// `CLONE_VM` child or its own other threads): the fresh address space its `execve` will
+    /// move to, made before the point of no return so that a lack of memory is an `ENOMEM` of
+    /// the call. If only the caller's own threads shared it, the exec finds it private again
+    /// after `de_thread` and drops the fresh one. Nothing for every other task.
     ///
     /// # Errors
     /// `ENOMEM`.
-    fn exec_prepare_mm(&mut self) -> Result<(), Errno> {
+    fn exec_prepare(&mut self) -> Result<(), Errno> {
         Ok(())
     }
-    /// `exec_mmap` for a caller that borrows its address space: move to the one
-    /// [`Context::exec_prepare_mm`] made and give the borrowed one back to its owner, who
-    /// wakes (`mm_release` -> `complete_vfork_done`). Nothing for every other task, whose
-    /// address space the exec replaces in place.
-    fn exec_switch_mm(&mut self) {}
+    /// `unshare_files`: a descriptor table another process still shares (`CLONE_FILES`) is
+    /// replaced by a private copy, which the close-on-exec step then edits. A lack of memory is
+    /// fatal to the task (past the point of no return).
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    fn exec_unshare_files(&mut self) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// `exec_mmap` and `unshare_sighand`: move to what [`Context::exec_prepare`] made and
+    /// leave the shared address space and dispositions to the other process; a `vfork` parent
+    /// wakes (`mm_release` -> `complete_vfork_done`). Nothing else for a task whose address
+    /// space the exec replaces in place.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    fn exec_switch_mm(&mut self) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// The task's pid and tid changed (`de_thread` made a non-leader thread the leader with the
+    /// old leader's pid): refresh what is cached.
+    fn thread_ids_changed(&mut self) {}
     /// `current_cred()` as the VFS needs it.
     fn cred(&mut self) -> Cred {
         Cred::of_task(&self.attrs().cred)
     }
+    /// `current->signal->rlim`: the resource limits of the caller's thread group, which all its
+    /// threads share.
+    ///
+    /// # Panics
+    /// If the running task is not in the task list, which is a kernel bug.
+    fn rlimits(&mut self) -> &mut Rlimits {
+        let Tasks { list, current, .. } = self.tasks();
+        list.rlimits_mut(current)
+            .expect("the running task is in the task list")
+    }
     /// `rlimit(RLIMIT_FSIZE)`: the soft limit (`RLIM_INFINITY` when unlimited).
     fn rlimit_fsize(&mut self) -> u64 {
-        self.attrs().rlimits.get(RLIMIT_FSIZE).cur
+        self.rlimits().get(RLIMIT_FSIZE).cur
     }
     /// `rlimit(RLIMIT_NOFILE)`: the soft limit.
     fn rlimit_nofile(&mut self) -> u64 {
-        self.attrs().rlimits.get(RLIMIT_NOFILE).cur
+        self.rlimits().get(RLIMIT_NOFILE).cur
     }
+}
+
+/// The futex queues with the identity of the caller in them (`current->mm`, `task_pid_vnr`, the
+/// scheduling slot a waker names to wake it) and the way to wake a sleeper.
+pub struct FutexParts<'a> {
+    pub queue: &'a mut crate::futex::Futexes,
+    pub waker: &'a mut dyn crate::futex::FutexWaker,
+    /// The scheduler slot of the caller: its waiters' owner.
+    pub owner: u32,
+    /// The identity of `current->mm` for private keys.
+    pub mm: u64,
+    /// `mm->mm_users`: tasks that share the address space (the caller included).
+    pub mm_users: u32,
+    /// `task_pid_vnr(current)`.
+    pub tid: u32,
 }
 
 /// What `sysinfo` reads from the machine rather than from the task.
@@ -342,6 +390,7 @@ pub fn dispatch<C: Context>(ctx: &mut C, number: u64, args: [u64; 6]) -> Outcome
         .or_else(|| memory::dispatch(ctx, sysno, args))
         .or_else(|| process::dispatch(ctx, sysno, args))
         .or_else(|| exec::dispatch(ctx, sysno, args))
+        .or_else(|| futex::dispatch(ctx, sysno, args))
         .or_else(|| ids::dispatch(ctx, sysno, args))
         .or_else(|| time::dispatch(ctx, sysno, args))
         .or_else(|| signal::dispatch(ctx, sysno, args));
