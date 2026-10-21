@@ -24,7 +24,7 @@ pub struct Declared {
     pub enosys: &'static [u32],
 }
 
-pub const DECLARED: [Declared; 12] = [
+pub const DECLARED: [Declared; 14] = [
     Declared {
         symbol: "boot: console=ttyS0",
         value: "the console tty is the 8250 serial line at its default 9600n8: TCGETS reports tty_std_termios with c_cflag B9600|CS8|CREAD|HUPCL|CLOCAL (a vt console would differ: vt.c sets IUTF8 in UTF-8 mode)",
@@ -95,6 +95,18 @@ pub const DECLARED: [Declared; 12] = [
         symbol: "CONFIG_PREEMPT_VOLUNTARY",
         value: "y, with the reference config's CONFIG_PREEMPT_DYNAMIC=y (so CONFIG_PREEMPTION=y and CONFIG_PREEMPT_RCU=y) whose boot default is the voluntary mode (core.c:7768-7778; `preempt=` could select another, the candidate has no such parameter): code in ring 0 is never preempted; a task in the kernel gives up the CPU only in schedule() (sleeps, yields), and a running task is rescheduled at the tick only on its way back to ring 3. Not modelled: the reference's CONFIG_NO_HZ_IDLE=y stops the tick in idle, the candidate's tick keeps running",
         source: "kernel/Kconfig.preempt:36-52 and :126-131 (PREEMPT_DYNAMIC), kernel/sched/core.c:5597 (sched_tick sets need_resched), 7025 (schedule) and 7640-7780 (preempt_dynamic_mode), kernel/entry/common.c:19 (exit_to_user_mode_loop)",
+        enosys: &[],
+    },
+    Declared {
+        symbol: "CONFIG_SERIAL_8250 console input and CONFIG_KEYBOARD_ATKBD/CONFIG_SERIO_I8042 keyboard",
+        value: "the console tty is fed by the 8250 (COM1, receive interrupt, QEMU self-test builds only: a physical build assumes no serial port) and by the i8042 PS/2 keyboard port with the default US keymap (CONFIG_VT keyboard.c semantics; atkbd translated/raw set 2, scancode set 1 after translation); the controller's auxiliary (mouse) port stays disabled and there is no VT console, no USB HID (xHCI) and no virtual terminals: a machine without a PS/2 port or USB legacy emulation has no keyboard input",
+        source: "drivers/tty/serial/8250/8250_port.c:1740-1800, drivers/input/serio/i8042.c, drivers/input/keyboard/atkbd.c, drivers/tty/vt/keyboard.c, drivers/tty/vt/defkeymap.c_shipped",
+        enosys: &[],
+    },
+    Declared {
+        symbol: "CONFIG_LEGACY_TIOCSTI=y, CONFIG_LDISC_AUTOLOAD=y",
+        value: "y (as the reference config): TIOCSTI is permitted for the caller's own controlling terminal (CAP_SYS_ADMIN otherwise); only N_TTY is ported, so TIOCSETD of another valid line discipline number is a loud Unimplemented stop (out-of-range numbers are -EINVAL as in Linux)",
+        source: "drivers/tty/Kconfig, drivers/tty/tty_io.c:2199-2223 (tiocsti) and tty_ldisc.c:tty_register_ldisc",
         enosys: &[],
     },
 ];

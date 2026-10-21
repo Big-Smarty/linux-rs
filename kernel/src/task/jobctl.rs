@@ -7,8 +7,8 @@
 // cleared by `begin_new_exec`), kernel/signal.c (`do_signal_stop` 2636-2722 and
 // the `SIGNAL_CLD_MASK` step of `get_signal` 2913-2940, whose state half is
 // `crate::signal::jobctl`). All GPL-2.0-only.
-// Transformation: no LSM hook (`security_task_*` allow); no `proc_clear_tty`
-// (no controlling terminal: `signal->tty` does not exist), no
+// Transformation: no LSM hook (`security_task_*` allow); `proc_clear_tty` is
+// [`Tasklist::proc_clear_tty`] (`signal->tty` is a flag, `task::ctty`), no
 // `sched_autogroup_create_attach`, no connector event; the pid re-linking
 // reserves its capacity first, so `ENOMEM` can replace success only when the
 // heap is exhausted.
@@ -140,6 +140,8 @@ impl Tasklist {
         // set_special_pids
         self.change_pid(current, PidType::Sid, sid);
         self.change_pid(current, PidType::Pgid, sid);
+        // `proc_clear_tty(group_leader)`: the new session has no terminal.
+        self.proc_clear_tty(current);
         Ok(session)
     }
 

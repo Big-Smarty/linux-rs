@@ -5,7 +5,7 @@
 //! descriptors 0-2 on the console, as `console_on_rootfs` leaves init.
 
 use super::{
-    AddressSpace, Console, Context, ExecAux, Files, Machine, Tasks,
+    AddressSpace, Console, Context, ExecAux, Files, Machine, Tasks, TtyParts,
     time::{ClockState, Clocks, RestartBlock},
 };
 use crate::{
@@ -110,6 +110,8 @@ pub struct Task<P = Space, C = Sink> {
     pub tables: Fake,
     pub vfs: Vfs,
     pub fdt: FdTable,
+    /// The console tty (`tty::Tty`), as the binary keeps it beside the VFS.
+    pub tty: crate::tty::Tty,
     /// Private copies of file pages a kernel access faulted in (the binary's
     /// `user_fault` for `NeedsFile`: `Vfs::fault_page`, then a private frame).
     pub file_pages: BTreeMap<u64, Box<[u8; 4096]>>,
@@ -191,6 +193,7 @@ impl<P, C> Task<P, C> {
             tables: Fake::default(),
             vfs,
             fdt,
+            tty: crate::tty::Tty::new().expect("console tty"),
             file_pages: BTreeMap::new(),
             tasks,
             current,
@@ -242,8 +245,16 @@ impl<P: UserPages, C> UserPages for Task<P, C> {
 }
 
 impl<P: UserPages, C: Console> Context for Task<P, C> {
-    fn console(&mut self) -> &mut dyn Console {
-        &mut self.sink
+    fn tty_parts(&mut self) -> TtyParts<'_> {
+        TtyParts {
+            tty: &mut self.tty,
+            tasks: Tasks {
+                list: &mut self.tasks,
+                current: self.current,
+                wake: &mut self.wake,
+            },
+            console: &mut self.sink,
+        }
     }
     fn tgid(&self) -> u32 {
         self.tgid

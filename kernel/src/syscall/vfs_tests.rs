@@ -879,7 +879,7 @@ fn unported_behaviour_stops_instead_of_answering() {
         err(Errno::ENOTTY)
     );
     assert_eq!(
-        call(&mut t, Sysno::ioctl, &[0, 0x5402, 0]),
+        call(&mut t, Sysno::ioctl, &[0, 0x5415, 0]),
         Outcome::Unimplemented(16)
     );
     // FASYNC: a regular file has no ->fasync, so the bit is ignored; the

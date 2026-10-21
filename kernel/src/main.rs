@@ -25,6 +25,8 @@ mod baremetal;
 mod console;
 mod cpu;
 mod fpu;
+#[cfg(not(feature = "baremetal-suite"))]
+mod i8042;
 mod kalloc;
 mod ktask;
 mod mmio;
@@ -33,6 +35,7 @@ mod paging;
 mod pci;
 mod services;
 mod timer;
+mod ttyin;
 mod userspace;
 
 use boot::TestMode;

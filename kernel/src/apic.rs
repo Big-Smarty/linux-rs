@@ -556,17 +556,48 @@ pub fn pic_init_masked() {
     cpu::io_wait();
     cpu::out_byte(PIC_MASTER + 1, 0xff);
     cpu::out_byte(PIC_SLAVE + 1, 0xff);
+    PIC_MASK.store(0xff, Ordering::Relaxed);
 }
-/// Unmask only ISA IRQ0 (the PIT) on the master.
+/// The master 8259's interrupt mask (bit n masks ISA IRQ n): the PIT tick and
+/// the device interrupts share the register, so each keeps the others' bits.
+static PIC_MASK: AtomicU8 = AtomicU8::new(0xff);
+
+fn pic_write_master_mask() {
+    cpu::out_byte(PIC_MASTER + 1, PIC_MASK.load(Ordering::Relaxed));
+}
+
+/// Unmask ISA IRQ0 (the PIT) on the master.
 pub fn pic_unmask_irq0() {
-    cpu::out_byte(PIC_MASTER + 1, 0xfe);
+    PIC_MASK.fetch_and(!1, Ordering::Relaxed);
+    pic_write_master_mask();
 }
-pub fn pic_mask_all() {
-    cpu::out_byte(PIC_MASTER + 1, 0xff);
-    cpu::out_byte(PIC_SLAVE + 1, 0xff);
+/// Mask the PIT again (its IRQ line only: device lines keep their state).
+pub fn pic_mask_irq0() {
+    PIC_MASK.fetch_or(1, Ordering::Relaxed);
+    pic_write_master_mask();
+}
+/// Unmask a device's ISA IRQ (0..8, master only) after its handler is ready.
+#[cfg_attr(
+    feature = "baremetal-suite",
+    allow(dead_code, reason = "only the console tty's input devices are routed")
+)]
+pub fn pic_unmask_irq(irq: u8) {
+    PIC_MASK.fetch_and(!(1u8 << (irq & 7)), Ordering::Relaxed);
+    pic_write_master_mask();
 }
 /// Non-specific EOI of the master for IRQ0.
 pub fn pic_eoi_irq0() {
+    cpu::out_byte(PIC_MASTER, 0x20);
+}
+/// Non-specific EOI for ISA IRQ `irq` (a slave line also acknowledges the cascade).
+#[cfg_attr(
+    feature = "baremetal-suite",
+    allow(dead_code, reason = "only the console tty's input interrupts use it")
+)]
+pub fn pic_eoi(irq: u8) {
+    if irq >= 8 {
+        cpu::out_byte(PIC_SLAVE, 0x20);
+    }
     cpu::out_byte(PIC_MASTER, 0x20);
 }
 

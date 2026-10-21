@@ -39,6 +39,7 @@ mod signal;
 #[cfg(test)]
 mod testing;
 mod time;
+pub mod tty;
 #[cfg(test)]
 mod vfs_tests;
 
@@ -70,6 +71,14 @@ const NOT_IMPLEMENTED_BY_LINUX: [u32; 17] = [
 /// Byte sink for the console tty (serial and framebuffer in the kernel).
 pub trait Console {
     fn write(&mut self, bytes: &[u8]);
+}
+
+/// The console tty with what its operations touch: the task list (job control,
+/// signals), the wake-up path and the byte sink of the UART.
+pub struct TtyParts<'a> {
+    pub tty: &'a mut crate::tty::Tty,
+    pub tasks: Tasks<'a>,
+    pub console: &'a mut dyn Console,
 }
 
 /// The file-system state of the calling task: the system-wide VFS, the task's
@@ -105,8 +114,10 @@ pub struct ExecAux {
 /// ([`crate::signal::Task`]) and its identity, devices and files. The binary
 /// implements it for its `Process`; host tests for a fake.
 pub trait Context: UserPages + Clocks + crate::signal::Task {
-    /// The console tty's byte sink (what `/dev/console` writes reach).
-    fn console(&mut self) -> &mut dyn Console;
+    /// The console tty with the task list and the UART's byte sink. The binary
+    /// feeds the input that arrived since the last call into the line discipline
+    /// first (the flip buffer's flush), so every look at the tty is current.
+    fn tty_parts(&mut self) -> TtyParts<'_>;
     /// `task_tgid_vnr(current)`: what `getpid` returns.
     fn tgid(&self) -> u32;
     /// `task_pid_vnr(current)`: what `gettid` returns.

@@ -26,14 +26,33 @@ use crate::bitmap::{BITS_PER_WORD, Bitmap};
 /// A character device the VFS can open (`chrdev_open` results).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CharDev {
-    /// `/dev/console` (5:1) on the console tty.
+    /// `/dev/console` (5:1) on the console tty (`console_fops`: writes follow
+    /// `redirected_tty_write`, so neither job control nor a hangup touches it).
     Console,
+    /// `/dev/tty` (5:0): the caller's controlling terminal, which is the console
+    /// tty (`tty_fops`).
+    TtyAux,
+    /// `/dev/ttyS0` (4:64): the console tty's own device (`tty_fops`).
+    TtyS0,
+    /// A `tty_fops` file after the tty was hung up (`hung_up_tty_fops`).
+    HungUp,
     /// 1:3, `null_fops`.
     Null,
     /// 1:5, `zero_fops`.
     Zero,
     /// 1:7, `full_fops`.
     Full,
+}
+
+impl CharDev {
+    /// Whether the file is on the console tty (any of its device nodes).
+    #[must_use]
+    pub const fn is_tty(self) -> bool {
+        matches!(
+            self,
+            Self::Console | Self::TtyAux | Self::TtyS0 | Self::HungUp
+        )
+    }
 }
 
 /// What an open file is (the role of `file->f_op`).
@@ -145,6 +164,11 @@ impl FileTable {
         // Losing the free-list slot on ENOMEM only wastes an arena entry.
         let _ = try_push(&mut self.free, id.0);
         file
+    }
+
+    /// Every open description (the tty hangup walks them).
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut File> {
+        self.files.iter_mut().flatten()
     }
 
     /// Descriptions in use (tests).

@@ -2,61 +2,13 @@
 // Selected semantics from Linux 6.18.57, commit
 // 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: fs/read_write.c (`vfs_write`),
 // include/linux/fs.h (`MAX_RW_COUNT`), drivers/tty/tty_io.c
-// (`iterate_tty_write`), drivers/tty/n_tty.c (`do_output_char`). GPL-2.0-only.
-// Transformation: the VFS/tty stack is reduced to the one open file the init
-// process owns (/dev/console on fds 0-2) with its default termios.
-//! The console tty's write path (the `->write` of `/dev/console`).
-
-use super::Context;
-use crate::usercopy::copy_from_user;
-use syscalls::Errno;
+// (`iterate_tty_write`). GPL-2.0-only.
+//! The sizes of the read/write paths (the console tty's own are in `tty`).
 
 /// `MAX_RW_COUNT = INT_MAX & PAGE_MASK`.
 pub const MAX_RW_COUNT: u32 = 0x7fff_f000;
 /// `iterate_tty_write`'s default chunk (no `TTY_NO_WRITE_SPLIT`).
 pub const TTY_CHUNK: u32 = 2048;
-
-/// `tty_write` on `/dev/console`, called by `vfs_write` after the descriptor,
-/// access and clamp checks: `count` is already at most `MAX_RW_COUNT` and
-/// `[buffer, buffer + count)` passed `access_ok` on the unclamped count.
-///
-/// The tty copies at most 2048 bytes at a time (`iterate_tty_write`). A chunk
-/// that cannot be fully copied from user memory is not written at all: the
-/// call returns the bytes of the earlier chunks, or `-EFAULT` when there are
-/// none.
-///
-/// Output processing is the default `tty_std_termios` (`OPOST | ONLCR`):
-/// `\n` becomes `\r\n`, nothing else changes, and the return value counts
-/// input bytes. (The pinned oracle's serial log shows the same `\r\n`.)
-pub(super) fn tty_write<C: Context>(ctx: &mut C, buffer: u64, count: u64) -> Result<i64, Errno> {
-    // The clamp is below 2^31, so everything below fits u32/i64 exactly.
-    let mut remaining = u32::try_from(count.min(u64::from(MAX_RW_COUNT))).unwrap_or(MAX_RW_COUNT);
-    let mut at = buffer;
-    let mut written = 0u32;
-    let mut chunk = [0u8; TTY_CHUNK as usize];
-    while remaining > 0 {
-        let step = remaining.min(TTY_CHUNK);
-        let bytes = &mut chunk[..step as usize];
-        if copy_from_user(ctx, bytes, at) != 0 {
-            return if written > 0 {
-                Ok(i64::from(written))
-            } else {
-                Err(Errno::EFAULT)
-            };
-        }
-        let console = ctx.console();
-        for (index, line) in bytes.split(|&byte| byte == b'\n').enumerate() {
-            if index > 0 {
-                console.write(b"\r\n");
-            }
-            console.write(line);
-        }
-        written += step;
-        at += u64::from(step);
-        remaining -= step;
-    }
-    Ok(i64::from(written))
-}
 
 #[cfg(test)]
 mod tests {
@@ -171,6 +123,8 @@ mod tests {
             }
         }
         let mut task = Task::new(Everywhere([b'z'; 4096]), Counter(0));
+        // No output processing: the 2 GiB are not scanned byte by byte.
+        task.tty.termios.oflag = 0;
         let outcome = write_call(&mut task, 1, 0, u64::from(MAX_RW_COUNT) + 12345);
         assert_eq!(outcome, Outcome::Return(i64::from(MAX_RW_COUNT)));
         assert_eq!(task.sink.0, u64::from(MAX_RW_COUNT));

@@ -78,6 +78,15 @@ pub const CLASS_PIPE: u32 = 2;
 /// The key every pipe sleeper uses ([`CLASS_PIPE`]).
 pub const PIPE_KEY: WaitKey = WaitKey::new(CLASS_PIPE, 0);
 
+/// Wait-key class of the console tty's wait queues (`tty->read_wait`,
+/// `tty->write_wait`, the read/write mutexes): one key, [`TTY_KEY`]. A change of
+/// the tty wakes every sleeper on it (and the `poll` sleepers, which share
+/// [`PIPE_KEY`]); each re-checks its condition.
+pub const CLASS_TTY: u32 = 3;
+
+/// The key every tty sleeper uses ([`CLASS_TTY`]).
+pub const TTY_KEY: WaitKey = WaitKey::new(CLASS_TTY, 0);
+
 /// A task handle: slot index plus the slot's generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedId {

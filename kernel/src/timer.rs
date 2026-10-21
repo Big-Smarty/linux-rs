@@ -77,7 +77,7 @@ pub fn rdtsc() -> u64 {
 }
 
 /// Busy-wait `us` microseconds on the calibrated TSC.
-fn udelay(us: u64) {
+pub(crate) fn udelay(us: u64) {
     let cycles = TSC_KHZ.load(Ordering::Relaxed) * us / 1000;
     let start = rdtsc();
     while rdtsc().wrapping_sub(start) < cycles {
@@ -345,7 +345,95 @@ fn pit_rearm(now_ns: u64) {
         apic::pic_unmask_irq0();
     } else if !wanted && PIT_RUNNING.swap(false, Ordering::Relaxed) {
         pit_stop();
-        apic::pic_mask_all();
+        apic::pic_mask_irq0();
+    }
+}
+
+/// Where the ISA device interrupts of the console tty (the 8250 on IRQ4, the
+/// i8042 keyboard on IRQ1) are delivered: the IOAPICs left by [`init`], the
+/// MADT's ISA routes and the boot CPU's APIC id, or the 8259 pair.
+#[cfg_attr(
+    feature = "baremetal-suite",
+    allow(dead_code, reason = "only the console tty's input devices are routed")
+)]
+struct DeviceIrq {
+    ioapics: Option<apic::Ioapics>,
+    routes: [Option<kernel::firmware::IsaRoute>; 16],
+    destination: u8,
+    pic: bool,
+}
+
+static DEVICE_IRQ: crate::services::IrqMutex<Option<DeviceIrq>> =
+    crate::services::IrqMutex::new(None);
+
+/// Why [`route_isa_irq`] could not deliver an interrupt line.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "baremetal-suite",
+    allow(dead_code, reason = "only the console tty's input devices are routed")
+)]
+pub enum RouteError {
+    /// [`init`] did not finish: no controller state to route with.
+    NotReady,
+    /// The MADT does not route this ISA line (an override moved it away).
+    NoRoute,
+    /// The IOAPIC that carries the line is absent or unmapped.
+    NoIoapic,
+    /// A line above 7 on the 8259 path (the cascade is not driven).
+    Unsupported,
+}
+
+/// Route ISA interrupt `irq` to its vector (`ISA_IRQ_VECTOR(irq)`) on the boot CPU
+/// and unmask it: the IOAPIC redirection entry in APIC mode (`mp_config_acpi_
+/// legacy_irqs`/`setup_IO_APIC_irq` as the MADT routes it), the 8259 mask bit on
+/// the legacy path.
+///
+/// # Errors
+/// [`RouteError`].
+///
+/// # Safety
+/// BSP at CPL0 with IF clear, after [`init`]; the handler for the vector is
+/// installed in the IDT (`cpu::install_descriptors`).
+#[cfg_attr(
+    feature = "baremetal-suite",
+    allow(dead_code, reason = "only the console tty's input devices are routed")
+)]
+pub unsafe fn route_isa_irq(irq: u8) -> Result<(), RouteError> {
+    let guard = DEVICE_IRQ.lock();
+    let Some(state) = guard.as_ref() else {
+        return Err(RouteError::NotReady);
+    };
+    if apic::mode() == ApicMode::Disabled {
+        if !state.pic || irq > 7 {
+            return Err(RouteError::Unsupported);
+        }
+        apic::pic_unmask_irq(irq);
+        return Ok(());
+    }
+    let route = state
+        .routes
+        .get(usize::from(irq))
+        .copied()
+        .flatten()
+        .ok_or(RouteError::NoRoute)?;
+    let ioapics = state.ioapics.as_ref().ok_or(RouteError::NoIoapic)?;
+    // SAFETY: the caller's contract (BSP, IF clear, after `init`); the IOAPIC
+    // pages are the ones `init` mapped.
+    unsafe { ioapics.route(route, ISA_IRQ_VECTOR_BASE + irq, state.destination) }
+        .map(|_| ())
+        .ok_or(RouteError::NoIoapic)
+}
+
+/// End of interrupt for ISA line `irq`'s handler (LAPIC EOI, or the 8259's).
+#[cfg_attr(
+    feature = "baremetal-suite",
+    allow(dead_code, reason = "only the console tty's input interrupts use it")
+)]
+pub fn eoi_isa(irq: u8) {
+    if apic::mode() == ApicMode::Disabled {
+        apic::pic_eoi(irq);
+    } else {
+        apic::eoi();
     }
 }
 
@@ -1151,6 +1239,17 @@ pub unsafe fn init(
     // SAFETY: this function's contract.
     unsafe { init_clock(mmio, acpi.fadt.unwrap_or_default(), has_pic) }?;
 
+    // Device interrupts (the console tty's UART and keyboard) are routed later
+    // from these; the IOAPIC state survives `init`.
+    let destination = lapic
+        .as_ref()
+        .map_or(0, |l| u8::try_from(l.id).unwrap_or(0));
+    let mut routes = [None; 16];
+    if let Some(madt) = acpi.madt.as_ref() {
+        for (irq, route) in routes.iter_mut().enumerate() {
+            *route = madt.isa_route(u8::try_from(irq).unwrap_or(0));
+        }
+    }
     // Tick source.
     let mut ioapic_timer = None;
     let kind = if apic_mode == ApicMode::Disabled {
@@ -1198,6 +1297,12 @@ pub unsafe fn init(
     if !delivered {
         return Err(Error::TickStalled);
     }
+    *DEVICE_IRQ.lock() = Some(DeviceIrq {
+        ioapics,
+        routes,
+        destination,
+        pic: has_pic,
+    });
     Ok(Report {
         apic_mode,
         event: event_name(),

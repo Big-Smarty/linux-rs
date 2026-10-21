@@ -540,10 +540,72 @@ impl Waker for SchedWaker {
 /// before a task sleeps itself (what it just wrote may be what the others wait
 /// for), when a system call ends, and when a task exits. Takes `RQ` under the
 /// caller's `PROCESS` lock, which the lock order allows.
-fn wake_pipe_sleepers(vfs: &mut Vfs) {
+fn wake_sleepers(process: &mut Process) {
+    let Process {
+        tasks, vfs, tty, ..
+    } = process;
+    // The count of files on the console tty (`tty->count`) and its last close.
+    syscall::tty::housekeeping(vfs, tty, tasks);
     if vfs.take_pipe_events() {
         ktask::wake_up_key(PIPE_KEY, WakeMode::Interruptible, 0);
     }
+    // A change of the tty (input, output drained, termios) wakes its readers
+    // and writers, and the `poll` sleepers, who share the pipes' key.
+    if tty.take_events() {
+        ktask::wake_up_key(kernel::sched::TTY_KEY, WakeMode::Interruptible, 0);
+        ktask::wake_up_key(PIPE_KEY, WakeMode::Interruptible, 0);
+    }
+}
+
+/// The tty's view of the machine for the input path: the task list (the
+/// foreground group gets `SIGINT` & co.), the wake-up path and the UART's sink.
+struct TtyHost<'a> {
+    tasks: &'a mut Tasklist,
+    wake: &'a mut SchedWaker,
+    sink: &'a mut ConsoleSink,
+}
+
+impl kernel::tty::Host for TtyHost<'_> {
+    fn kill_pgrp(&mut self, pgrp: task::pid::PidRef, sig: u8) {
+        // `kill_pgrp(pgrp, sig, 1)`; an empty group is `ESRCH`, ignored.
+        let _ = self.tasks.kill_pgrp_ref(pgrp, sig, self.wake);
+    }
+    fn transmit(&mut self, bytes: &[u8]) {
+        self.sink.write(bytes);
+    }
+}
+
+/// The input interrupts' entry into the process state: run `f` with the console
+/// tty and a host that can signal and transmit, then wake the sleepers it woke.
+///
+/// Context: hardirq (IF=0), the interrupted code is ring 3 or the idle halt, so the
+/// lock is free (`services`); a lock that is held anyway (not expected) leaves the
+/// input in the flip buffer for the next `tty_parts`.
+#[cfg_attr(
+    feature = "baremetal-suite",
+    allow(dead_code, reason = "only the console tty's input interrupts use it")
+)]
+pub(crate) fn with_tty<R>(
+    f: impl FnOnce(&mut kernel::tty::Tty, &mut dyn kernel::tty::Host) -> R,
+) -> Option<R> {
+    if !PROCESS.is_installed() {
+        return None;
+    }
+    let mut guard = PROCESS.try_lock()?;
+    let process = &mut *guard;
+    let result = {
+        let Process {
+            tasks, wake, tty, ..
+        } = &mut *process;
+        let mut host = TtyHost {
+            tasks,
+            wake,
+            sink: &mut ConsoleSink,
+        };
+        f(tty, &mut host)
+    };
+    wake_sleepers(process);
+    Some(result)
 }
 
 /// What every task shares: the task list (parentage, pids, groups, sessions,
@@ -564,6 +626,11 @@ pub struct Process {
     wake: SchedWaker,
     /// The mounted rootfs, open files and pipes.
     pub vfs: Vfs,
+    /// The console tty (`ttyS0`): termios, line discipline, controlling
+    /// terminal state. Under the same lock as the task list and the VFS: job
+    /// control reads both, and the input interrupt takes this lock to run the
+    /// line discipline (`ttyin`).
+    pub tty: kernel::tty::Tty,
     /// `printk_ratelimit_state`: the limiter of the `show_unhandled_signals`
     /// lines (global in Linux).
     printk_ratelimit: RateLimit,
@@ -795,7 +862,7 @@ struct Syscall<'a> {
     space: UserSpace<'a>,
     shared: Shared,
     regs: &'a mut cpu::PtRegs,
-    tty: Tty,
+    sink: ConsoleSink,
 }
 
 /// `handle_mm_fault` for one user address: the model's decision, and for a
@@ -1151,8 +1218,30 @@ fn destroy_tables(tables: Tables) {
 }
 
 impl Context for Syscall<'_> {
-    fn console(&mut self) -> &mut dyn Console {
-        &mut self.tty
+    fn tty_parts(&mut self) -> syscall::TtyParts<'_> {
+        let me = self.own.me;
+        let process = self.shared.get();
+        let Process {
+            tasks, wake, tty, ..
+        } = process;
+        // The flip buffer's flush: input that arrived since the last look.
+        crate::ttyin::flush(
+            tty,
+            &mut TtyHost {
+                tasks,
+                wake,
+                sink: &mut self.sink,
+            },
+        );
+        syscall::TtyParts {
+            tty,
+            tasks: Tasks {
+                list: tasks,
+                current: me,
+                wake,
+            },
+            console: &mut self.sink,
+        }
     }
     fn tgid(&self) -> u32 {
         self.own.tgid
@@ -1316,7 +1405,7 @@ impl<'a> signal::Task for Syscall<'a> {
             .min();
         // What this call changed in a pipe may be what the sleepers wait for.
         if let Some(process) = self.shared.guard.as_mut() {
-            wake_pipe_sleepers(&mut process.vfs);
+            wake_sleepers(process);
         }
         // No lock is held while the task is off the CPU: another task runs
         // system calls meanwhile. The time until it is chosen again is not
@@ -1360,9 +1449,9 @@ impl<'a> signal::Task for Syscall<'a> {
     }
 }
 
-/// init's `/dev/console`: the same sinks as `log!`.
-struct Tty;
-impl Console for Tty {
+/// The UART of the console tty: the same sinks as `log!`.
+pub(crate) struct ConsoleSink;
+impl Console for ConsoleSink {
     fn write(&mut self, bytes: &[u8]) {
         console::write_bytes(bytes);
     }
@@ -1425,8 +1514,33 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
     shared.vfs.fput(own.exe_file);
     shared.vfs.close_files(&mut own.fdt);
     shared.vfs.put_fs(&own.attrs.fs);
+    // `disassociate_ctty(1)` of a session leader (after `exit_files`, before
+    // `exit_notify`), and the tty's last close if this exit was it.
+    {
+        let Process {
+            tasks,
+            wake,
+            vfs,
+            tty,
+            ..
+        } = &mut *shared;
+        syscall::tty::housekeeping(vfs, tty, tasks);
+        let console_open = vfs.tty_files().1 > 0;
+        let hung = kernel::tty::jobctl::disassociate_ctty(
+            tty,
+            tasks,
+            own.me,
+            wake,
+            &mut crate::ttyin::Wire(&mut ConsoleSink),
+            true,
+            console_open,
+        );
+        if hung {
+            vfs.tty_hangup_files();
+        }
+    }
     // An end of a pipe closed with the last descriptor wakes the other side.
-    wake_pipe_sleepers(&mut shared.vfs);
+    wake_sleepers(&mut shared);
     // The task's CPU time is what its parent's wait reports (cputime_adjust).
     let (utime, stime) = ktask::cpu_account(own.sched).adjusted(timer::ktime_get_ns());
     if let Some(task) = shared.tasks.task_mut(own.me) {
@@ -1498,11 +1612,11 @@ pub extern "C" fn syscall(regs: &mut cpu::PtRegs) {
             own,
             shared: Shared::default(),
             regs: &mut *regs,
-            tty: Tty,
+            sink: ConsoleSink,
         };
         let outcome = syscall::dispatch(&mut context, number, args);
         if let Some(process) = context.shared.guard.as_mut() {
-            wake_pipe_sleepers(&mut process.vfs);
+            wake_sleepers(process);
         }
         outcome
     };
@@ -2124,7 +2238,7 @@ fn check_mm_usercopy(local: &mut TaskLocal) {
         own,
         shared: Shared::default(),
         regs: &mut regs,
-        tty: Tty,
+        sink: ConsoleSink,
     };
     let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
     let a = call(
@@ -2533,12 +2647,26 @@ fn start(mut init: Loaded) {
         .map_err(|_| "out of memory"),
         "task-list",
     );
+    let tty = crate::unwrap(
+        kernel::tty::Tty::new().map_err(|_| "out of memory"),
+        "console-tty",
+    );
     PROCESS.install(Process {
         tasks,
         wake: SchedWaker,
         vfs: init.vfs,
+        tty,
         printk_ratelimit: RateLimit::printk(kernel::time::HZ),
     });
+    // The console tty's input devices raise interrupts that take the process
+    // state installed above. Not in the bare-metal suite: its groups run on a
+    // machine whose keyboard and serial line are not assumed.
+    #[cfg(not(feature = "baremetal-suite"))]
+    // SAFETY: BSP, IF clear (see the SAFETY comment above `enable_syscalls`),
+    // the timer and the IDT are initialised, `PROCESS` is installed.
+    unsafe {
+        crate::ttyin::init();
+    }
     // init's own state. Its scheduling handle is known only when the task is
     // created (`bound` below), the placeholder is the idle slot.
     let mut local = crate::unwrap(

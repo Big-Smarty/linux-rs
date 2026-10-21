@@ -43,13 +43,10 @@
 use alloc::vec::Vec;
 use syscalls::{Errno, Sysno};
 
-use super::{Context, MAX_RW_COUNT, Outcome, Stop, Sys, io, outcome};
+use super::{Context, MAX_RW_COUNT, Outcome, Stop, Sys, outcome, tty};
 use crate::{
-    sched::{PIPE_KEY, WaitKey},
-    signal::{
-        SIGPIPE, SIGXFSZ,
-        wait::{ERESTARTSYS, wait_event_interruptible},
-    },
+    sched::PIPE_KEY,
+    signal::{SIGPIPE, SIGXFSZ, wait::wait_event_interruptible},
     task::RLIM_INFINITY,
     usercopy::{access_ok, copy_from_user, copy_to_user},
     vfs::{
@@ -132,11 +129,11 @@ fn set_pos<C: Context>(ctx: &mut C, view: &View, pos: i64) {
 // ---- user-space iterators ---------------------------------------------------
 
 /// `iov_iter` over user buffers for a read: sequential segments.
-struct Dest {
+pub(super) struct Dest {
     segs: Vec<(u64, u64)>,
     seg: usize,
     used: u64,
-    remaining: u64,
+    pub(super) remaining: u64,
 }
 
 impl Dest {
@@ -153,7 +150,7 @@ impl Dest {
 
     /// Copy `data` to the next user bytes; returns the bytes copied (short on
     /// a fault). The cursor advances by what was copied.
-    fn copy_out<C: Context>(&mut self, ctx: &mut C, data: &[u8]) -> usize {
+    pub(super) fn copy_out<C: Context>(&mut self, ctx: &mut C, data: &[u8]) -> usize {
         let mut done = 0;
         while done < data.len() && self.seg < self.segs.len() {
             let (base, len) = self.segs[self.seg];
@@ -329,16 +326,8 @@ fn read_kind<C: Context>(ctx: &mut C, view: &View, dest: &mut Dest, pos: Option<
         FileKind::Directory => Err(Errno::EISDIR.into()), // generic_read_dir
         FileKind::Char(CharDev::Null) => Ok(0),           // read_null
         FileKind::Char(CharDev::Zero | CharDev::Full) => Ok(read_zero(ctx, dest)?),
-        FileKind::Char(CharDev::Console) => {
-            // n_tty_read with no input pending: sleeps; O_NONBLOCK -> EAGAIN.
-            if view.flags & O_NONBLOCK != 0 {
-                Err(Errno::EAGAIN.into())
-            } else {
-                // `n_tty_read`: `signal_pending` -> `-ERESTARTSYS`. Nothing ever
-                // delivers console input, so only a signal ends the sleep.
-                Ok(wait_event_interruptible(ctx, WaitKey::NONE, |_| false)
-                    .map_or_else(|restart| restart, |()| -ERESTARTSYS))
-            }
+        FileKind::Char(CharDev::Console | CharDev::TtyAux | CharDev::TtyS0 | CharDev::HungUp) => {
+            tty::read(ctx, view, dest)
         }
         FileKind::Pipe {
             pipe,
@@ -517,7 +506,9 @@ fn vfs_write<C: Context>(
             };
             write_regular(ctx, view, inode, buf, count, pos)
         }
-        FileKind::Char(CharDev::Console) => Ok(io::tty_write(ctx, buf, count)?),
+        FileKind::Char(CharDev::Console | CharDev::TtyAux | CharDev::TtyS0 | CharDev::HungUp) => {
+            tty::write(ctx, view, buf, count)
+        }
         // write_null / write_zero: the data is discarded, never read.
         FileKind::Char(CharDev::Null | CharDev::Zero) => Ok(i64::try_from(count).unwrap_or(0)),
         FileKind::Char(CharDev::Full) => Err(Errno::ENOSPC.into()), // write_full
@@ -1007,10 +998,8 @@ fn setfl<C: Context>(ctx: &mut C, view: &View, arg: u32) -> Sys {
     // ->fasync() sets FASYNC; tmpfs files, directories and the memory devices
     // have none, so the bit is ignored there (SETFL_MASK excludes it).
     if arg & FASYNC != view.flags & FASYNC
-        && matches!(
-            view.kind,
-            FileKind::Pipe { .. } | FileKind::Char(CharDev::Console) | FileKind::Unsupported
-        )
+        && (matches!(view.kind, FileKind::Pipe { .. } | FileKind::Unsupported)
+            || matches!(view.kind, FileKind::Char(dev) if dev.is_tty()))
     {
         return Err(Stop::Unimplemented); // fasync_helper / SIGIO
     }
@@ -1028,9 +1017,6 @@ const FIONCLEX: u32 = 0x5450;
 const FIOCLEX: u32 = 0x5451;
 const FIOASYNC: u32 = 0x5452;
 const FIOQSIZE: u32 = 0x5460;
-const TCGETS: u32 = 0x5401;
-const TIOCGPGRP: u32 = 0x540f;
-const TIOCGWINSZ: u32 = 0x5413;
 const FIFREEZE: u32 = 0xc004_5877;
 const FITHAW: u32 = 0xc004_5878;
 const FIGETBSZ: u32 = 2;
@@ -1054,30 +1040,6 @@ const FS_IOC_PREALLOCATE: [u32; 5] = [
     0x4030_582b,
     0x4030_5839,
 ];
-
-/// The tty ioctl numbers `include/uapi/asm-generic/ioctls.h` defines: Linux
-/// routes all of them through `tty_ioctl`, so an unimplemented one stops the
-/// kernel instead of answering `ENOTTY`.
-fn is_tty_ioctl(cmd: u32) -> bool {
-    (0x5401..=0x5470).contains(&cmd) || matches!(cmd, 0x802c_542a | 0x402c_542b | 0x402c_542c)
-}
-
-/// `TCGETS` data of the declared console (`config.rs`: `console=ttyS0`, default 9600n8):
-/// `tty_std_termios` (`drivers/tty/tty_io.c`: iflag ICRNL|IXON, oflag OPOST|ONLCR, lflag
-/// ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN, `INIT_C_CC`) with the serial console's
-/// `c_cflag` (`uart_set_options`, `serial_core.c:2240`: B9600|CS8|CREAD|HUPCL|CLOCAL, applied to
-/// the tty at `serial_core.c:323-327`), as a 36-byte `struct termios`. Verified against the
-/// pinned Linux by the oracle check `fs.console-tcgets-termios`.
-fn console_termios() -> [u8; 36] {
-    let mut out = [0u8; 36];
-    for (at, word) in [0o2400u32, 0o5, 0o6275, 0o105_073].into_iter().enumerate() {
-        out[4 * at..4 * at + 4].copy_from_slice(&word.to_le_bytes());
-    }
-    // c_line = N_TTY (0), then c_cc[19]
-    let cc: [u8; 17] = [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0];
-    out[17..34].copy_from_slice(&cc);
-    out
-}
 
 fn ioctl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
     let view = fdget(ctx, fd, false)?;
@@ -1175,15 +1137,9 @@ fn ioctl<C: Context>(ctx: &mut C, fd: u64, cmd: u64, arg: u64) -> Sys {
             let n = i32::try_from(ctx.files().vfs.pipe_ref(pipe).available()).unwrap_or(i32::MAX);
             put(ctx, arg, &n.to_le_bytes())
         }
-        FileKind::Char(CharDev::Console) => match cmd {
-            TCGETS => put(ctx, arg, &console_termios()),
-            TIOCGWINSZ => put(ctx, arg, &[0u8; 8]),
-            // tiocgpgrp: the console is not init's controlling terminal.
-            TIOCGPGRP => Err(Errno::ENOTTY.into()),
-            FIONREAD => put(ctx, arg, &0i32.to_le_bytes()),
-            c if is_tty_ioctl(c) => Err(Stop::Unimplemented),
-            _ => Err(Errno::ENOTTY.into()),
-        },
+        FileKind::Char(CharDev::Console | CharDev::TtyAux | CharDev::TtyS0 | CharDev::HungUp) => {
+            tty::ioctl(ctx, &view, cmd, arg)
+        }
         FileKind::Unsupported => Err(Stop::Unimplemented),
         _ => Err(Errno::ENOTTY.into()),
     }
