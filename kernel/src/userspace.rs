@@ -1558,6 +1558,9 @@ mod leak {
         root_refs: u32,
         slots: usize,
         threads: u32,
+        mms: usize,
+        file_tables: usize,
+        fs_contexts: usize,
     }
 
     /// The fork whose entry state is the baseline: two warm-up rounds precede it.
@@ -1575,6 +1578,9 @@ mod leak {
             root_refs: process.vfs.fs.inode_refs(process.vfs.fs.root()),
             slots: ktask::tasks_in_use(),
             threads: process.tasks.nr_threads(),
+            mms: process.mms.len(),
+            file_tables: process.files_structs.len(),
+            fs_contexts: process.fs_structs.len(),
         }
     }
 
@@ -1591,7 +1597,7 @@ mod leak {
             return;
         };
         crate::log!(
-            "CHECK fork-objects forks={} heap={}/{} files={}/{} file_refs={}/{} pins={}/{} root_refs={}/{} slots={}/{} threads={}/{}\n",
+            "CHECK fork-objects forks={} heap={}/{} files={}/{} file_refs={}/{} pins={}/{} root_refs={}/{} slots={}/{} threads={}/{} mms={}/{} file_tables={}/{} fs_contexts={}/{}\n",
             FORKS.load(Ordering::Relaxed),
             was.heap,
             now.heap,
@@ -1607,6 +1613,12 @@ mod leak {
             now.slots,
             was.threads,
             now.threads,
+            was.mms,
+            now.mms,
+            was.file_tables,
+            now.file_tables,
+            was.fs_contexts,
+            now.fs_contexts,
         );
     }
 }
@@ -2782,7 +2794,11 @@ pub fn exit_to_user(regs: &mut cpu::PtRegs) {
                     // The default action of a stop signal. "The job control
                     // signals do nothing in an orphaned pgrp, but SIGSTOP always
                     // works": the dequeued signal is dropped (`goto relock`).
-                    if sig != SIGSTOP && process.tasks.is_pgrp_orphaned(own.me) {
+                    // A thread that was told to join a stop in progress stops with the others.
+                    let joined = current_signals(&mut process.tasks, own.me).me.jobctl
+                        & signal::jobctl::JOBCTL_STOP_PENDING
+                        != 0;
+                    if sig != SIGSTOP && !joined && process.tasks.is_pgrp_orphaned(own.me) {
                         after_stop = true;
                         continue;
                     }

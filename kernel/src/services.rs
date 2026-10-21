@@ -28,9 +28,10 @@
 //! `PROCESS`/`heap` -> `RQ`, `PROCESS` -> `TIMERQ` -> `TIMER_HW`, and no edge
 //! leaves `RQ`. [`FRAMES`] is a leaf: it calls nothing that locks. A table
 //! operation takes the frame allocator as an argument, so callers pass the
-//! [`FRAMES`] guard; the tables a task edits are its own (`TaskLocal`, no lock:
-//! nobody else touches them), and a copy of them for a fork is made by the
-//! parent with `FRAMES` held and no heap allocation. `PROCESS` is held across a
+//! [`FRAMES`] guard; the tables a task edits are those of its `mm`
+//! (`userspace::MmStruct`, a counted slot of `Process`, so under `PROCESS`), and a
+//! copy of them for a fork is made by the parent with `FRAMES` held and no heap
+//! allocation. `PROCESS` is held across a
 //! user-memory copy: the copy resolves each page first (`usercopy`), and a
 //! non-resident one is faulted in on the spot (`userspace::Syscall::page` ->
 //! `handle_user_fault`), which reserves heap storage, then takes [`FRAMES`] as
@@ -84,13 +85,13 @@
 //! needs process state (an IRQ that wakes a reader, a VFS completion) must queue
 //! the work and let the waking task take the lock.
 //!
-//! `userspace::VFORK_DONE` (the address space a `vfork` child gives back, by the
-//! sleeping parent's slot) is a leaf under `PROCESS`: nothing is acquired while
-//! it is held, and the wake-up of the parent is made after the guard is dropped
-//! (`PROCESS` -> `VFORK_DONE`, then `PROCESS` -> `RQ`). `userspace::VFORK_FORWARD` (the lender
-//! a dead borrower owes the address space to, by the dead task's slot) is a leaf of the same
-//! kind; `complete_vfork` takes it only after `VFORK_DONE` is released and recurses with
-//! neither held.
+//! `userspace::VFORK_DONE` (the flag a `vfork` child sets for its sleeping parent, by the
+//! parent's slot) is a leaf under `PROCESS`: nothing is acquired while it is held, and the
+//! wake-up of the parent is made after the guard is dropped (`PROCESS` -> `VFORK_DONE`, then
+//! `PROCESS` -> `RQ`). The address spaces, descriptor tables and filesystem contexts that tasks
+//! share by `clone` flag, and the futex queue, are fields of `Process` and so under `PROCESS`
+//! (no lock of their own): `PROCESS` -> heap -> `FRAMES` covers their allocation, which is
+//! reserved before any `FRAMES` guard is taken.
 //!
 //! The bare-metal suite (`baremetal-suite` only) adds `baremetal::ARCHIVES`
 //! in front of the chain: it is held across `userspace::load_group`, so the

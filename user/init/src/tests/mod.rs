@@ -361,6 +361,11 @@ pub fn run_mode(mode: &[u8]) -> bool {
             fork::forkleak();
             return true;
         }
+        // The leak check of the thread lane: see `threads::threadleak`.
+        b"threadleak" => {
+            threads::threadleak();
+            return true;
+        }
         // Candidate-only exhaustion check of the fork lane: see `fork::forkbomb`.
         b"forkbomb" => {
             fork::forkbomb();

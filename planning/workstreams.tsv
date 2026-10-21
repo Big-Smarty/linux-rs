@@ -1885,7 +1885,7 @@ ws-kernel-exec-domain-c	kernel/exec_domain.c	docs/subsystems/process.md	P0	not_s
 ws-kernel-exit-c	kernel/exit.c	docs/subsystems/process.md	P0	in_progress
 ws-kernel-exit-h	kernel/exit.h	docs/subsystems/process.md	P0	not_started
 ws-kernel-fork-c	kernel/fork.c	docs/subsystems/process.md	P0	in_progress
-ws-kernel-futex	kernel/futex	docs/subsystems/ipc.md	P0	not_started
+ws-kernel-futex	kernel/futex	docs/subsystems/ipc.md	P0	in_progress
 ws-kernel-gcov	kernel/gcov	docs/verification.md	P0	not_started
 ws-kernel-groups-c	kernel/groups.c	docs/subsystems/process.md	P0	not_started
 ws-kernel-hung-task-c	kernel/hung_task.c	docs/subsystems/observability.md	P1	not_started

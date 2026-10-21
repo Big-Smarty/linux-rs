@@ -44,6 +44,11 @@ use core::sync::atomic::{
 
 use syscalls::{Errno, Sysno};
 
+const SIGCONT: usize = 18;
+const SIGSTOP: usize = 19;
+const WUNTRACED: usize = 2;
+const WCONTINUED: usize = 8;
+
 use super::proc::{
     BAD, SIGCHLD, SIGKILL, SIGTERM, SIGUSR1, SIGUSR2, WNOHANG, nap, reap_all, wait4,
 };
@@ -62,6 +67,7 @@ pub(super) const CLONE_SETTLS: usize = 0x8_0000;
 pub(super) const CLONE_PARENT_SETTID: usize = 0x10_0000;
 pub(super) const CLONE_CHILD_CLEARTID: usize = 0x20_0000;
 pub(super) const CLONE_CHILD_SETTID: usize = 0x100_0000;
+pub(super) const CLONE_VFORK: usize = 0x4000;
 pub(super) const CLONE_NEWUSER: usize = 0x1000_0000;
 pub(super) const CLONE_NEWPID: usize = 0x2000_0000;
 
@@ -1471,6 +1477,38 @@ fn lifecycle(t: &mut T) {
         (Ok(ADOPTED.load(SeqCst)), 6 << 8),
     );
     let _ = (close(d_r), close(d_w));
+
+    // A group stop covers every thread, the parent hears of it once, and the continue and a
+    // later fatal signal reach all of them.
+    let sub = fork_child(|| {
+        let _ = spawn(sleeper, 0);
+        let _ = spawn(sleeper, 0);
+        sleep_forever()
+    });
+    nap(40);
+    let _ = sys(Sysno::kill, &[sub, SIGSTOP]);
+    t.eq(
+        "group-stop-is-reported",
+        wait4(sub as isize, WUNTRACED),
+        (Ok(sub), 0x137f),
+    );
+    t.eq(
+        "group-stop-is-reported-once",
+        wait4(sub as isize, WUNTRACED | WNOHANG),
+        (Ok(0), -1),
+    );
+    let _ = sys(Sysno::kill, &[sub, SIGCONT]);
+    t.eq(
+        "group-continue-is-reported",
+        wait4(sub as isize, WCONTINUED),
+        (Ok(sub), 0xffff),
+    );
+    let _ = sys(Sysno::kill, &[sub, SIGKILL]);
+    t.eq(
+        "group-is-killed-after-the-continue",
+        wait4(sub as isize, 0),
+        (Ok(sub), 9),
+    );
     reap_all();
 }
 
@@ -1485,6 +1523,52 @@ fn decimal(mut n: usize, out: &mut [u8; 24]) {
     }
     for i in 0..len {
         out[i] = digits[len - 1 - i];
+    }
+}
+
+/// `threadleak` mode: 202 clones that share the address space, one per round, in four shapes
+/// (a thread, a `CLONE_VM` child with its own `SIGCHLD`, a `vfork`, a thread with
+/// `CLONE_CHILD_SETTID`), each joined or waited for. Prints the records of `forkleak`: the counts
+/// and the free RAM `sysinfo` reports before and after (after two warm-up rounds); the kernel
+/// prints its live-object counts when init exits and the harness requires them unchanged.
+pub fn threadleak() {
+    fn free_ram() -> u64 {
+        let mut info = [0u64; 14];
+        let _ = sys(Sysno::sysinfo, &[addr_mut(&mut info)]);
+        info[5]
+    }
+    fn round(n: usize) -> bool {
+        let work: fn(&'static Control) -> usize = |c| c.arg + 1;
+        match n % 4 {
+            0 => spawn_with(THREAD_FLAGS, work, n).is_ok_and(|th| th.join() == n + 1),
+            1 => spawn_with(CLONE_VM | CLONE_FS | CLONE_FILES | SIGCHLD, work, n).is_ok_and(|th| {
+                let (r, status, result) = th.reap();
+                r == Ok(th.tid) && status == 0 && result == n + 1
+            }),
+            2 => spawn_with(CLONE_VM | CLONE_VFORK | SIGCHLD, work, n).is_ok_and(|th| {
+                let (r, status, result) = th.reap();
+                r == Ok(th.tid) && status == 0 && result == n + 1
+            }),
+            _ => spawn_with(THREAD_FLAGS | CLONE_CHILD_SETTID, work, n)
+                .is_ok_and(|th| th.join() == n + 1),
+        }
+    }
+    let warm = round(0) && round(1);
+    let before = free_ram();
+    let mut reaped = 0usize;
+    for n in 2..202 {
+        reaped += usize::from(round(n));
+    }
+    let after = free_ram();
+    let none_left = wait4(-1, WNOHANG).0 == Err(Errno::ECHILD);
+    super::emit(format_args!(
+        "init: forkleak warm={warm} rounds=200 reaped={reaped} none_left={none_left}"
+    ));
+    super::emit(format_args!(
+        "init: forkleak free_ram before={before} after={after}"
+    ));
+    if !(warm && reaped == 200 && none_left) {
+        crate::exit(1);
     }
 }
 

@@ -1008,6 +1008,22 @@ fn get_signal_default_actions() {
     st.me.blocked = SigSet::EMPTY;
     assert_eq!(get_signal(&mut st), GetSignal::Stop(SIGTSTP));
 
+    // A thread told to join a group stop stops with nothing queued for it, and a group whose
+    // `execve` is collapsing it is marked for death with the exit code 0 left to `do_group_exit`.
+    let mut st = State::standalone(5, 0, 100);
+    st.me.jobctl = crate::signal::jobctl::JOBCTL_STOP_PENDING | u32::from(SIGTSTP);
+    assert_eq!(get_signal(&mut st), GetSignal::Stop(SIGTSTP));
+    st.me.jobctl = 0;
+    assert_eq!(get_signal(&mut st), GetSignal::None);
+    st.sig.exec_collapsing = true;
+    assert_eq!(
+        get_signal(&mut st),
+        GetSignal::Fatal {
+            exit_code: u32::from(SIGKILL),
+            core: false
+        }
+    );
+
     // Default-ignore signal that was queued blocked is dropped at delivery.
     let mut st = State::standalone(5, 0, 100);
     st.me.blocked.add(SIGCHLD);

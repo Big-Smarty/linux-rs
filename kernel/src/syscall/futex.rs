@@ -111,7 +111,7 @@ fn get_futex_key<C: Context>(
         return Err(Errno::EINVAL);
     }
     // access_ok(uaddr, size): the pinned Linux accepts an address up to and including
-    // TASK_SIZE_MAX (observed: init-reference-024, `FUTEX_WAKE_PRIVATE` there returns 0).
+    // TASK_SIZE_MAX (observed: init-reference-026, `FUTEX_WAKE_PRIVATE` there returns 0).
     if uaddr > TASK_SIZE_MAX {
         return Err(Errno::EFAULT);
     }

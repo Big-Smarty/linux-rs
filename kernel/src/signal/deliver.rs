@@ -132,6 +132,14 @@ pub fn get_signal(state: &mut State) -> GetSignal {
                 core: false,
             };
         }
+        // "if (unlikely(current->jobctl & JOBCTL_STOP_PENDING) && do_signal_stop(0)) goto
+        // relock;": a thread told to take part in the group stop another thread started (the
+        // stop signal's number is kept in `jobctl`).
+        if state.me.jobctl & super::jobctl::JOBCTL_STOP_PENDING != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let sig = (state.me.jobctl & super::jobctl::JOBCTL_STOP_SIGMASK) as u8;
+            return GetSignal::Stop(sig);
+        }
         // Faults first so the saved ip is the faulting instruction.
         let (sig, info) = if let Some(info) = state.dequeue_synchronous() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
