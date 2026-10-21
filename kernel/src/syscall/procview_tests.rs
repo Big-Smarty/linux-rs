@@ -220,6 +220,8 @@ fn fork_child(t: &mut Task) -> (TaskId, i32) {
         child_sp: 0,
         clear_sighand: false,
         clear_child_tid: 0,
+        share_vm: false,
+        vfork: false,
     };
     let id = t
         .tasks

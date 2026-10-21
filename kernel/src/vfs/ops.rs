@@ -658,8 +658,7 @@ impl Vfs {
             }
         }
         // vfs_rename: `is_local_mountpoint` of either dentry is `EBUSY`.
-        if self.fs.ns.is_mountpoint(source) || target.is_some_and(|t| self.fs.ns.is_mountpoint(t))
-        {
+        if self.fs.ns.is_mountpoint(source) || target.is_some_and(|t| self.fs.ns.is_mountpoint(t)) {
             return Err(Errno::EBUSY);
         }
         if flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {

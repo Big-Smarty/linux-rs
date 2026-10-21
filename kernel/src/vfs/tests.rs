@@ -1116,3 +1116,54 @@ fn the_descriptor_log_replays_recent_changes_and_reports_a_gap() {
     assert_eq!(tail.collect::<Vec<_>>(), (8..40).collect::<Vec<u32>>());
     assert!(fds.changed_since(fds.generation() + 1).is_none());
 }
+
+#[test]
+fn statfs_is_per_filesystem_and_follows_the_mount_flags() {
+    use super::mountops::MountArgs;
+    let (mut vfs, env) = rootfs(1 << 10);
+    vfs.mkdir(&env, b"/p", 0o755).unwrap();
+    vfs.mkdir(&env, b"/t", 0o755).unwrap();
+    let (p, t) = (
+        vfs.lookup(&env, b"/p", 0).unwrap(),
+        vfs.lookup(&env, b"/t", 0).unwrap(),
+    );
+    let mut env = env;
+    env.cred.sys_admin = true;
+    let ms_rdonly = 1;
+    let mount = |vfs: &mut Vfs, point, fstype: &[u8], flags, data: Option<&[u8]>| {
+        let args = MountArgs {
+            source: Some(b"none"),
+            point,
+            fstype: Some(fstype),
+            flags,
+            data,
+        };
+        vfs.do_mount(&env, &args)
+            .unwrap_or_else(|_| panic!("mount"));
+    };
+    mount(&mut vfs, p, b"proc", ms_rdonly, None);
+    mount(&mut vfs, t, b"tmpfs", 0, Some(b"size=8k,nr_inodes=5\0"));
+    let (root, p, t) = (
+        vfs.lookup(&env, b"/", 0).unwrap(),
+        vfs.lookup(&env, b"/p", 0).unwrap(),
+        vfs.lookup(&env, b"/t", 0).unwrap(),
+    );
+    // procfs: `simple_statfs` (no counts); the mount adds `ST_RDONLY` and the default `ST_RELATIME`.
+    let st = vfs.fs.statfs(p);
+    assert_eq!(
+        (st.magic, st.blocks, st.files, st.flags),
+        (0x9fa0, 0, 0, 0x1021)
+    );
+    // A size-limited tmpfs: two pages, five inodes of which the root uses one.
+    let st = vfs.fs.statfs(t);
+    assert_eq!(
+        (st.magic, st.blocks, st.bfree, st.files, st.ffree, st.flags),
+        (0x0102_1994, 2, 2, 5, 4, 0x1020)
+    );
+    // The rootfs: the limits it was made with.
+    let st = vfs.fs.statfs(root);
+    assert_eq!(
+        (st.magic, st.blocks, st.files),
+        (0x0102_1994, 1024, 1 << 16)
+    );
+}

@@ -730,7 +730,9 @@ fn write_kind<C: Context>(ctx: &mut C, view: &View, src: &mut Src, pos: Option<&
                 .and_then(crate::procfs::ProcNode::of)
                 .is_some_and(|node| node.kind == crate::procfs::Kind::Comm) =>
         {
-            write_loop(ctx, src, |ctx, base, len| procio::comm_write(ctx, view, base, len))
+            write_loop(ctx, src, |ctx, base, len| {
+                procio::comm_write(ctx, view, base, len)
+            })
         }
         // The other writers (the writable sysctls) are not ported: the
         // write stops the kernel rather than succeed or fail as Linux does not.

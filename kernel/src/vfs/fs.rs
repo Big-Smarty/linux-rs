@@ -25,7 +25,7 @@ use syscalls::Errno;
 use super::{
     Cred, InodeId, KResult, Kstat, MAY_WRITE, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, SbId, Timespec,
     mount::{
-        FsType, MNT_NODEV, MNT_NODIRATIME, MNT_NOATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW,
+        FsType, MNT_NOATIME, MNT_NODEV, MNT_NODIRATIME, MNT_NOEXEC, MNT_NOSUID, MNT_NOSYMFOLLOW,
         MNT_READONLY, MNT_RELATIME, Mount, Namespace, ProcOpts, SB_MANDLOCK, SB_RDONLY,
         SB_SYNCHRONOUS,
     },
