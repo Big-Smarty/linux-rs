@@ -226,7 +226,7 @@ fn faccessat<C: Context>(ctx: &mut C, dfd: i32, path: u64, mode: u64, flags: u64
         LOOKUP_FOLLOW
     };
     let name = getname(ctx, path, empty_ok)?;
-    let env = env_for(ctx, dfd, &name)?;
+    let env = env_for_at(ctx, dfd, &name)?;
     let vfs = ctx.files().vfs;
     let inode = vfs.lookup(&env, &name, lookup)?;
     vfs.access_check(&env, inode, mode)?;
@@ -287,7 +287,7 @@ fn readlinkat<C: Context>(ctx: &mut C, dfd: i32, path: u64, buf: u64, bufsiz: u6
         return Err(Errno::EINVAL.into());
     }
     let name = getname(ctx, path, true)?;
-    let env = env_for(ctx, dfd, &name)?;
+    let env = env_for_at(ctx, dfd, &name)?;
     let vfs = ctx.files().vfs;
     let inode = vfs.lookup(&env, &name, 0)?;
     if !vfs.fs.inode(inode).is_symlink() {

@@ -2,7 +2,7 @@
 # Linux 6.18.57 reference kernel: QEMU q35, -cpu qemu64 (TCG), -smp 1 -m 512M, "console=ttyS0 panic=-1 vdso=0 norandmaps -- <mode>",
 # the harness-built /init and generated initramfs (target/linux-reference/init-reference-006 for mm ids time signal fs proc, -009/-010 for fork, -011 for jobctl and pipe, -014 for tty, ttyin and ttykbd (ttyin/ttykbd are driven through the serial port / QMP send-key by `xtask tty-oracle`; ttykbd runs with "console=ttyS0 console=tty0" so that /dev/console is the vt; kinds stage and echo are the driver's transcript rows, see docs/kernel-tooling.md); docs/implementation.md#oracle-syscall-test-suite).
 # The `xstate` group is the exception to the machine: it drives AVX-512 and PKRU state, so it was recorded under KVM with -cpu host (AMD Zen 5) and runs only where KVM does (target/linux-reference/init-reference-012; docs/implementation.md#extended-cpu-state-xsave-pkru). Its `info` rows name the machine (XCR0, sizes, offsets) and are not compared by value.
-# The `names` group (mkdir, rmdir, rename, link, symlink, chmod, chown, utimensat, truncate, fsync, statfs, writev, sendfile, getrandom's argument errors, reboot's checks, mknodat, `#!` scripts, vfork including an expiring ITIMER_REAL and a nested vfork killed by its child) is CPU independent: recorded under TCG `-cpu qemu64` like the first groups (target/linux-reference/init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017). The `busybox` group runs the host's BusyBox v1.36.1 (sha256 1097cdef...f0d, static, x86-64-v4) through `user/init` mode `bbrun` and was recorded under KVM `-cpu host` with `initramfs.cpio` followed by the generated `busybox.cpio` as the initrd (init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017: the `getrandom` clamp rows): each row is a command's exit status or signal and its escaped output, and the case is `unavailable` without that exact program, KVM or AVX-512 (docs/implementation.md#busybox-lane).
+# The `names` group (mkdir, rmdir, rename, link, symlink, chmod, chown, utimensat, truncate, fsync, statfs, writev, sendfile, getrandom's argument errors, reboot's checks, mknodat, `#!` scripts, vfork including an expiring ITIMER_REAL a nested vfork killed by its child and a three-deep chain with both middle tasks killed) is CPU independent: recorded under TCG `-cpu qemu64` like the first groups (target/linux-reference/init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017; the `vfork-chain-*` rows and the `names` summary from init-reference-019, fix round 2). The `busybox` group runs the host's BusyBox v1.36.1 (sha256 1097cdef...f0d, static, x86-64-v4) through `user/init` mode `bbrun` and was recorded under KVM `-cpu host` with `initramfs.cpio` followed by the generated `busybox.cpio` as the initrd (init-reference-016, re-recorded with the fix-round-1 /init in init-reference-017: the `getrandom` clamp rows): each row is a command's exit status or signal and its escaped output, and the case is `unavailable` without that exact program, KVM or AVX-512 (docs/implementation.md#busybox-lane).
 # Columns: group, kind (check|info|summary|stage|echo), name, line (the exact stdout line without the newline).
 # A consumer matches "check" and "summary" rows exactly; "info" rows are recorded observations (tmpfs d_off cookies), not requirements.
 # Kernel printk lines may interleave with console output and must be filtered by the consumer (keep lines that start with
@@ -2140,7 +2140,16 @@ names	check	vfork-nested-memory-visible	init: test names.vfork-nested-memory-vis
 names	check	vfork-nested-mmap-after	init: test names.vfork-nested-mmap-after ok
 names	check	vfork-nested-mapping-works	init: test names.vfork-nested-mapping-works ok
 names	check	vfork-nested-munmap-after	init: test names.vfork-nested-munmap-after ok
-names	summary	-	init: tests names passed=337 failed=0
+names	check	vfork-chain-first-status	init: test names.vfork-chain-first-status ok
+names	check	vfork-chain-second-reaped	init: test names.vfork-chain-second-reaped ok
+names	check	vfork-chain-second-status	init: test names.vfork-chain-second-status ok
+names	check	vfork-chain-third-reaped	init: test names.vfork-chain-third-reaped ok
+names	check	vfork-chain-third-status	init: test names.vfork-chain-third-status ok
+names	check	vfork-chain-memory-visible	init: test names.vfork-chain-memory-visible ok
+names	check	vfork-chain-mmap-after	init: test names.vfork-chain-mmap-after ok
+names	check	vfork-chain-mapping-works	init: test names.vfork-chain-mapping-works ok
+names	check	vfork-chain-munmap-after	init: test names.vfork-chain-munmap-after ok
+names	summary	-	init: tests names passed=346 failed=0
 busybox	check	echo	init: test busybox.echo exit=0 out="hello world\n"
 busybox	check	echo-n	init: test busybox.echo-n exit=0 out="no newline"
 busybox	check	echo-e	init: test busybox.echo-e exit=0 out="a\tb\\cA\n"

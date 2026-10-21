@@ -2266,6 +2266,74 @@ fn vfork_nested_killed(value: usize) -> R {
     Errno::from_ret(pid)
 }
 
+/// A chain of three `vfork`s: A (child of the caller) `vfork`s B, B kills A while A waits and
+/// `vfork`s C, C kills B while B waits, sleeps 300 ms, stores `value` in `FLAG` and exits with
+/// status 4. The address space then passes through two dead lenders.
+#[inline(never)]
+fn vfork_chain_killed(value: usize) -> R {
+    let pid: usize;
+    // SAFETY: as `vfork_nested_killed`, one level deeper: A, B and C run only register-based
+    // system calls on the caller's stack without pushing or calling, A and B leave through
+    // `exit_group` if they are ever resumed, and the only memory C touches is `FLAG` and the
+    // read-only `NAP`.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 3f",
+            // A: vfork again.
+            "mov eax, 58",
+            "syscall",
+            "test rax, rax",
+            "jnz 5f",
+            // B: getppid -> kill(ppid, SIGKILL) -> vfork again.
+            "mov eax, 110",
+            "syscall",
+            "mov rdi, rax",
+            "mov esi, 9",
+            "mov eax, 62",
+            "syscall",
+            "mov eax, 58",
+            "syscall",
+            "test rax, rax",
+            "jnz 4f",
+            // C: getppid -> kill(ppid, SIGKILL) -> nanosleep(NAP) -> FLAG = value -> exit_group(4).
+            "mov eax, 110",
+            "syscall",
+            "mov rdi, rax",
+            "mov esi, 9",
+            "mov eax, 62",
+            "syscall",
+            "mov rdi, {nap}",
+            "xor esi, esi",
+            "mov eax, 35",
+            "syscall",
+            "mov qword ptr [{flag}], {value}",
+            "mov edi, 4",
+            "mov eax, 231",
+            "syscall",
+            "ud2",
+            // B and A, back from their vforks (not reached once killed).
+            "4:",
+            "5:",
+            "xor edi, edi",
+            "mov eax, 231",
+            "syscall",
+            "ud2",
+            "3:",
+            nap = in(reg) core::ptr::addr_of!(NAP),
+            flag = in(reg) core::ptr::addr_of!(FLAG),
+            value = in(reg) value,
+            inlateout("rax") 58usize => pid,
+            out("rcx") _,
+            out("r11") _,
+            out("rdi") _,
+            out("rsi") _,
+        );
+    }
+    Errno::from_ret(pid)
+}
+
 fn vfork(t: &mut T) {
     FLAG.store(0, Relaxed);
     let pid = vfork_exit(0x1234, 7);
@@ -2395,6 +2463,44 @@ fn vfork(t: &mut T) {
     t.eq("vfork-nested-mapping-works", super::peek(at), 0x3c);
     t.eq(
         "vfork-nested-munmap-after",
+        sys(Sysno::munmap, &[at, 4096]),
+        Ok(0),
+    );
+    super::proc::reap_all();
+    // Three levels: A and B are both killed while they wait, so C's completion crosses two dead
+    // lenders. The caller resumes (Linux: when A dies), A is reaped with SIGKILL, B and C are
+    // reparented and reaped with their own statuses once C is done.
+    FLAG.store(0, Relaxed);
+    let pid = vfork_chain_killed(0x55).unwrap_or(usize::MAX);
+    t.eq(
+        "vfork-chain-first-status",
+        super::proc::wait4(pid as isize, 0).1,
+        9,
+    );
+    let (b, status) = super::proc::wait4(-1, 0);
+    t.holds(
+        "vfork-chain-second-reaped",
+        b.is_ok_and(|b| b != pid),
+        &b,
+        "the second child's pid",
+    );
+    t.eq("vfork-chain-second-status", status, 9);
+    let (c, status) = super::proc::wait4(-1, 0);
+    t.holds(
+        "vfork-chain-third-reaped",
+        c.is_ok_and(|c| c != pid && c != b.unwrap_or(0)),
+        &c,
+        "the third child's pid",
+    );
+    t.eq("vfork-chain-third-status", status, 4 << 8);
+    t.eq("vfork-chain-memory-visible", FLAG.load(Relaxed), 0x55);
+    let at = 0x6000_0000_0000usize;
+    let page = super::mmap(at, 4096, 3, 0x22 | 0x10, usize::MAX, 0);
+    t.eq("vfork-chain-mmap-after", page, Ok(at));
+    super::poke(at, 0x3c);
+    t.eq("vfork-chain-mapping-works", super::peek(at), 0x3c);
+    t.eq(
+        "vfork-chain-munmap-after",
         sys(Sysno::munmap, &[at, 4096]),
         Ok(0),
     );

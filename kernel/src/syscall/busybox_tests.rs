@@ -1052,6 +1052,8 @@ fn at_empty_path_on_a_pipe_stops_instead_of_using_the_working_directory() {
         (Sysno::fchownat, vec![r, empty, 0, 0, 0x1000]),
         (Sysno::utimensat, vec![r, empty, 0, 0x1000]),
         (Sysno::linkat, vec![r, empty, AT_FDCWD as u64, new, 0x1000]),
+        (Sysno::faccessat2, vec![r, empty, 0, 0x1000]),
+        (Sysno::readlinkat, vec![r, empty, OUT + 64, 16]),
     ] {
         assert_eq!(call(&mut t, sysno, &args), stop(sysno), "{sysno:?}");
     }

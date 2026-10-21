@@ -830,10 +830,17 @@ fn vfork_done_key(parent: SchedId) -> WaitKey {
 /// waited) cannot take it: the address space is freed here, with the mappings' pins it left.
 fn complete_vfork(lender: Lender, key: u32, lent: Option<Lent>, vfs: &mut Vfs) {
     let alive = matches!(ktask::state(lender.sched), Some(state) if state != TaskState::Dead);
+    // Taken as its own statement: an `if let` scrutinee guard lives through the whole branch
+    // (edition 2024), and the recursion below must run with `VFORK_FORWARD` released.
+    let next = if alive {
+        None
+    } else {
+        VFORK_FORWARD.lock()[lender.sched.index()].take()
+    };
     if alive {
         VFORK_DONE.lock()[lender.sched.index()] = Some(Done { lent });
         ktask::wake_up_key(vfork_done_key(lender.sched), WakeMode::Normal, 0);
-    } else if let Some(next) = VFORK_FORWARD.lock()[lender.sched.index()].take() {
+    } else if let Some(next) = next {
         // The lender died borrowing: the address space goes to whom it borrowed it from.
         complete_vfork(next, key, lent, vfs);
     } else if let Some(lent) = lent {
