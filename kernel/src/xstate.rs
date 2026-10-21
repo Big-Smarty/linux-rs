@@ -266,17 +266,16 @@ impl Config {
         if max & MASK_APX != 0 && max & (MASK_BNDREGS | MASK_BNDCSR) != 0 {
             return Err(Disabled::ApxAndMpx);
         }
-        // `xsave_cpuid_features`: a component needs the CPU feature that owns it. AVX-512 also
-        // needs AVX (`cpuid-deps.c:54`: clearing AVX clears AVX512F), or `XSETBV` would get
-        // XCR0[7:5] without XCR0[2:1] and raise #GP (SDM Vol. 1 13.3) on an inconsistent
-        // hypervisor CPUID.
+        // `xsave_cpuid_features`: a component needs the CPU feature that owns it. AVX-512 is
+        // not made to depend on AVX here, as in Linux: `cpuid-deps.c:54` applies only when a
+        // feature is force-cleared, not when the CPUID leaves are inconsistent (AVX hidden,
+        // AVX-512F listed). Then `XSETBV` gets XCR0[7:5] without XCR0[2:1] and raises #GP: the
+        // pinned Linux panics in `fpu__init_system_xstate` (`-cpu host,-avx`, KVM; evidence
+        // `init-reference-013/linux-xstate-host_avx.log`) and this kernel stops loudly too.
         for (mask, present) in [
             (MASK_YMM, cpu.avx),
             (MASK_BNDREGS | MASK_BNDCSR, cpu.mpx),
-            (
-                MASK_OPMASK | MASK_ZMM_HI256 | MASK_HI16_ZMM,
-                cpu.avx512f && cpu.avx,
-            ),
+            (MASK_OPMASK | MASK_ZMM_HI256 | MASK_HI16_ZMM, cpu.avx512f),
             (MASK_PKRU, cpu.ospke),
             (MASK_APX, cpu.apx),
         ] {
@@ -643,13 +642,6 @@ mod tests {
             ..ALL
         };
         assert_eq!(Config::features(zen5(0xd, 0), no_pku), Ok(0xe7));
-        // AVX-512 without AVX (`-cpu host,-avx`): the opmask and ZMM groups go with it, so XCR0
-        // never has bits 7:5 without bit 2.
-        let no_avx = Cpu { avx: false, ..ALL };
-        assert_eq!(
-            Config::features(zen5(0xd, 0), no_avx),
-            Ok(0x2e7 & !(MASK_YMM | MASK_OPMASK | MASK_ZMM_HI256 | MASK_HI16_ZMM))
-        );
     }
 
     #[test]
