@@ -86,7 +86,24 @@ impl<T> Single<T> {
 struct Aligned<const N: usize>([u8; N]);
 
 static SNAP: Single<Aligned<SNAP_MAX>> = Single::new(Aligned([0; SNAP_MAX]));
-static ALT: Single<Aligned<ALT_SIZE>> = Single::new(Aligned([0xa5; ALT_SIZE]));
+/// Mapped bytes below the alternate stack.
+const ALT_BELOW: usize = 4096;
+
+/// The alternate signal stack with mapped memory below it. The size checks give the stack exactly
+/// the frame, and the handler running on it then needs a few bytes more *below* the start of
+/// the array: when the array is the first thing of the data segment, those bytes are an unmapped
+/// page and the child dies of `SIGSEGV` on Linux and on the candidate alike, which depends on
+/// what the rest of the program links before it.
+#[repr(C, align(64))]
+struct AltArea {
+    _below: [u8; ALT_BELOW],
+    stack: [u8; ALT_SIZE],
+}
+
+static ALT: Single<AltArea> = Single::new(AltArea {
+    _below: [0xa5; ALT_BELOW],
+    stack: [0xa5; ALT_SIZE],
+});
 /// Start and end of a mapped 8 KiB region with unmapped memory right behind it (the buffers of the
 /// refused and short frames live at its tail).
 static REGION: AtomicUsize = AtomicUsize::new(0);
@@ -1021,7 +1038,7 @@ fn install(on_stack: bool) {
     let _ = sigaction(SIGUSR2, fn_addr(nested as *const ()), flags);
     if on_stack {
         let ss = StackT {
-            sp: ALT.with(|alt| alt.0.as_ptr().expose_provenance() as u64),
+            sp: ALT.with(|alt| alt.stack.as_ptr().expose_provenance() as u64),
             flags: 0,
             pad: 0,
             size: ALT_SIZE as u64,
@@ -1087,7 +1104,7 @@ fn frame_layout(t: &mut T, lay: &Layout) {
         let tag = if on_stack { "altstack" } else { "stack" };
         install(on_stack);
         if on_stack {
-            ALT.with(|alt| alt.0.fill(0xa5));
+            ALT.with(|alt| alt.stack.fill(0xa5));
         }
         let got = deliver(mode::PLAIN, &a);
         let rec = REC.with(|rec| *rec);
@@ -1100,7 +1117,7 @@ fn frame_layout(t: &mut T, lay: &Layout) {
             0,
         );
         let top = if on_stack {
-            ALT.with(|alt| alt.0.as_ptr().expose_provenance() as u64) + ALT_SIZE as u64
+            ALT.with(|alt| alt.stack.as_ptr().expose_provenance() as u64) + ALT_SIZE as u64
         } else {
             rec.sp_at_signal - 128
         };
@@ -1155,7 +1172,7 @@ fn frame_layout(t: &mut T, lay: &Layout) {
                 .map(|(at, _)| at);
             let untouched = first_bad.is_none();
             // The bytes past the magic word are not part of the frame (as far as the array goes).
-            let alt_end = ALT.with(|alt| alt.0.as_ptr().expose_provenance()) + ALT_SIZE;
+            let alt_end = ALT.with(|alt| alt.stack.as_ptr().expose_provenance()) + ALT_SIZE;
             let frame_end = rec.fpstate as usize + lay.size + 4;
             let tail = (alt_end - frame_end).min(64);
             let tail_untouched = tail > 0
@@ -1505,7 +1522,7 @@ fn outcome_of(child: usize, want: i32) -> &'static str {
 /// arithmetic of `get_sigframe`; a task whose stack is one byte smaller dies, as does none at the
 /// computed size and at `AT_MINSIGSTKSZ`.
 fn altstack_sizes(t: &mut T, lay: &Layout) {
-    let base = ALT.with(|alt| alt.0.as_ptr().expose_provenance());
+    let base = ALT.with(|alt| alt.stack.as_ptr().expose_provenance());
     let fits = |size: usize| {
         let top = base + size;
         let fpstate = (top - (lay.size + 4)) & !63;
@@ -1709,7 +1726,7 @@ fn pkru_fault(t: &mut T) {
     }
     let child = spawn(|| {
         let ss = StackT {
-            sp: ALT.with(|alt| alt.0.as_ptr().expose_provenance() as u64),
+            sp: ALT.with(|alt| alt.stack.as_ptr().expose_provenance() as u64),
             flags: 0,
             pad: 0,
             size: ALT_SIZE as u64,
