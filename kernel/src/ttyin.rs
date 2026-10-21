@@ -43,7 +43,7 @@ impl Host for Wire<'_> {
 }
 
 /// Linux bounds the flip buffers by `TTYB_DEFAULT_MEM_LIMIT` (640 KiB of buffers,
-/// tty_buffer.c:31); this ring holds 4096 two-byte entries (8 KiB).
+/// `tty_buffer.c:31`); this ring holds 4096 two-byte entries (8 KiB).
 /// shortcut: input beyond the ring is dropped much earlier than on Linux, grow
 /// the ring (or make it dynamic) if a workload pastes more than ~8 KiB at once.
 const RX_CAP: usize = 4096;
