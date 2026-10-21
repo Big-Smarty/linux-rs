@@ -95,15 +95,46 @@ pub struct ForkRequest {
     /// `CLONE_CHILD_CLEARTID`'s pointer (the child's `clear_child_tid`), 0 if
     /// the flag is clear.
     pub clear_child_tid: u64,
-    /// `CLONE_CHILD_SETTID`'s pointer (`set_child_tid`: the child stores its own id there before
-    /// it runs in user mode, `schedule_tail`), 0 if the flag is clear.
+    /// `CLONE_CHILD_SETTID`'s pointer (the child's `set_child_tid`: its tid is stored there
+    /// when it first runs), 0 if the flag is clear.
     pub set_child_tid: u64,
-    /// `CLONE_VM` (always with `CLONE_VFORK`): the child runs in the caller's address space,
-    /// which it borrows until its `execve` or exit.
+    /// `CLONE_VM`: the child runs in the caller's address space (`mmget`): shared, counted, until
+    /// the child's `execve` or exit.
     pub share_vm: bool,
     /// `CLONE_VFORK`: the caller sleeps until the child has released its address space
     /// (`wait_for_vfork_done`).
     pub vfork: bool,
+    /// `CLONE_THREAD`: the child is a thread of the caller's group.
+    pub thread: bool,
+    /// `CLONE_SIGHAND`: the child shares the caller's signal dispositions.
+    pub share_sighand: bool,
+    /// `CLONE_FILES`: the child shares the caller's descriptor table.
+    pub share_files: bool,
+    /// `CLONE_FS`: the child shares the caller's root, working directory and umask.
+    pub share_fs: bool,
+    /// `CLONE_SETTLS`: the child's `%fs` base (`tls`), else `None`.
+    pub tls: Option<u64>,
+}
+
+impl ForkRequest {
+    /// A plain `fork` with `exit_signal`: nothing shared, no thread-id words.
+    #[must_use]
+    pub const fn plain(exit_signal: u8) -> Self {
+        Self {
+            exit_signal,
+            child_sp: 0,
+            clear_sighand: false,
+            clear_child_tid: 0,
+            set_child_tid: 0,
+            share_vm: false,
+            vfork: false,
+            thread: false,
+            share_sighand: false,
+            share_files: false,
+            share_fs: false,
+            tls: None,
+        }
+    }
 }
 
 /// A request that passed Linux's checks but asks for something this kernel
@@ -111,10 +142,14 @@ pub struct ForkRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unsupported;
 
-/// Flags that change nothing observable for a plain process copy: tracing
-/// flags (the caller is never traced), the ignored `CLONE_DETACHED`, and the
-/// three `*_TID` flags handled by the caller or by [`ForkRequest`].
-const PLAIN_FLAGS: u64 = CLONE_PTRACE
+/// The flags `copy_process` is implemented for: tracing flags (the caller is never traced),
+/// the ignored `CLONE_DETACHED`, the three `*_TID` flags handled by the caller or by
+/// [`ForkRequest`], the sharing flags (`CLONE_VM`, `FS`, `FILES`, `SIGHAND`, `THREAD`), `SETTLS`
+/// and `VFORK`. `CLONE_SYSVSEM` shares `sysvsem.undo_list`, which only a System V semaphore
+/// operation can observe; those system calls stop the kernel loudly, so accepting the flag
+/// cannot be told from sharing the list (shortcut: the first of `semop`, `semtimedop` or `semget`
+/// to be ported MUST implement the shared undo list and `exit_sem`).
+const SUPPORTED_FLAGS: u64 = CLONE_PTRACE
     | CLONE_UNTRACED
     | CLONE_DETACHED
     | CLONE_PARENT_SETTID
@@ -122,7 +157,13 @@ const PLAIN_FLAGS: u64 = CLONE_PTRACE
     | CLONE_CHILD_CLEARTID
     | CLONE_CLEAR_SIGHAND
     | CLONE_VFORK
-    | CLONE_VM;
+    | CLONE_VM
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SIGHAND
+    | CLONE_THREAD
+    | CLONE_SYSVSEM
+    | CLONE_SETTLS;
 
 impl CloneArgs {
     /// `SYSCALL_DEFINE0(fork)`.
@@ -299,38 +340,31 @@ impl CloneArgs {
         if invalid { Err(Errno::EINVAL) } else { Ok(()) }
     }
 
-    /// Whether the (validated) request is a plain copy of the process, or a `vfork`
-    /// (`CLONE_VM | CLONE_VFORK`, the caller asleep until the child execs or exits;
-    /// `CLONE_VFORK` alone is the same wait on an ordinary copy).
+    /// Whether the (validated) request is one this kernel implements: a copy of the process,
+    /// a `vfork`, a child that shares its parent's address space, descriptor table, filesystem
+    /// context or dispositions, or a thread of its group.
     ///
     /// # Errors
-    /// [`Unsupported`] for anything else: threads, shared tables, namespaces,
-    /// `CLONE_VM` without `CLONE_VFORK` (a child that runs beside its parent in one
-    /// address space), `CLONE_SETTLS`, `CLONE_PIDFD`, a
-    /// requested thread id, a cgroup, `CLONE_IO`, `CLONE_SYSVSEM`.
+    /// [`Unsupported`] for anything else: namespaces, `CLONE_PARENT`, `CLONE_PIDFD`, a
+    /// requested thread id, a cgroup, `CLONE_IO`.
     pub fn request(&self) -> Result<ForkRequest, Unsupported> {
-        if self.flags & !PLAIN_FLAGS != 0
-            || self.set_tid_size != 0
-            || (self.flags & CLONE_VM != 0 && self.flags & CLONE_VFORK == 0)
-        {
+        if self.flags & !SUPPORTED_FLAGS != 0 || self.set_tid_size != 0 {
             return Err(Unsupported);
         }
+        let flag = |bit: u64, pointer: u64| if self.flags & bit != 0 { pointer } else { 0 };
         Ok(ForkRequest {
             exit_signal: u8::try_from(self.exit_signal).map_err(|_| Unsupported)?,
             child_sp: self.stack,
             clear_sighand: self.flags & CLONE_CLEAR_SIGHAND != 0,
-            clear_child_tid: if self.flags & CLONE_CHILD_CLEARTID != 0 {
-                self.child_tid
-            } else {
-                0
-            },
-            set_child_tid: if self.flags & CLONE_CHILD_SETTID != 0 {
-                self.child_tid
-            } else {
-                0
-            },
+            clear_child_tid: flag(CLONE_CHILD_CLEARTID, self.child_tid),
+            set_child_tid: flag(CLONE_CHILD_SETTID, self.child_tid),
             share_vm: self.flags & CLONE_VM != 0,
             vfork: self.flags & CLONE_VFORK != 0,
+            thread: self.flags & CLONE_THREAD != 0,
+            share_sighand: self.flags & CLONE_SIGHAND != 0,
+            share_files: self.flags & CLONE_FILES != 0,
+            share_fs: self.flags & CLONE_FS != 0,
+            tls: (self.flags & CLONE_SETTLS != 0).then_some(self.tls),
         })
     }
 
@@ -427,14 +461,14 @@ mod tests {
         // CLONE_PARENT is refused for global init only.
         assert_eq!(args(CLONE_PARENT).validate(true), Err(Errno::EINVAL));
         assert_eq!(args(CLONE_PARENT).validate(false), Ok(()));
-        // A thread with its dependencies passes the checks (and is unsupported).
+        // A thread with its dependencies passes the checks (and is a request).
         let thread = args(CLONE_THREAD | CLONE_SIGHAND | CLONE_VM);
         assert_eq!(thread.validate(false), Ok(()));
-        assert_eq!(thread.request(), Err(Unsupported));
+        assert!(thread.request().is_ok());
     }
 
     #[test]
-    fn only_a_plain_copy_is_a_request() {
+    fn the_requests_the_kernel_implements() {
         let r = args(0).request().unwrap();
         assert_eq!(
             (
@@ -467,14 +501,36 @@ mod tests {
             let r = args(flags).request().unwrap();
             assert_eq!((r.share_vm, r.vfork), (share_vm, vfork), "{flags:#x}");
         }
+        // The sharing flags, alone and as `pthread_create` passes them.
+        let r = args(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SETTLS | CLONE_CHILD_SETTID)
+            .request()
+            .unwrap();
+        assert_eq!(
+            (r.share_vm, r.share_fs, r.share_files, r.tls, r.set_child_tid),
+            (true, true, true, Some(0), 0)
+        );
+        let pthread = CLONE_VM
+            | CLONE_FS
+            | CLONE_FILES
+            | CLONE_SIGHAND
+            | CLONE_THREAD
+            | CLONE_SYSVSEM
+            | CLONE_SETTLS
+            | CLONE_PARENT_SETTID
+            | CLONE_CHILD_CLEARTID;
+        let mut a = args(pthread);
+        a.child_tid = 0x30;
+        a.tls = 0x77;
+        let r = a.request().unwrap();
+        assert_eq!(
+            (r.thread, r.share_sighand, r.clear_child_tid, r.tls),
+            (true, true, 0x30, Some(0x77))
+        );
         for flags in [
-            CLONE_VM,
-            CLONE_FS,
-            CLONE_FILES,
-            CLONE_SETTLS,
             CLONE_PIDFD,
-            CLONE_SYSVSEM,
             CLONE_INTO_CGROUP,
+            CLONE_NEWNS,
+            CLONE_PARENT,
             0x8000_0000,
         ] {
             assert_eq!(args(flags).request(), Err(Unsupported), "{flags:#x}");

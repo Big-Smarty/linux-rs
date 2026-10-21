@@ -5,7 +5,7 @@
 // `signal->tty` accesses), include/linux/sched/signal.h (`task_pgrp`,
 // `task_session`), include/linux/pid.h (`get_pid`), kernel/pid.c (`pid_task`).
 // All GPL-2.0.
-// Transformation: `signal->tty` is the flag [`TaskStruct::ctty`] (there is one
+// Transformation: `signal->tty` is the flag [`super::tasklist::Group`]`::ctty` (there is one
 // terminal); a counted `struct pid *` is a [`PidRef`].
 #![forbid(unsafe_code)]
 //! The task list's side of controlling terminals.
@@ -44,20 +44,20 @@ impl Tasklist {
     /// `current->signal->tty != NULL`.
     #[must_use]
     pub fn has_ctty(&self, task: TaskId) -> bool {
-        self.task(task).is_some_and(|t| t.ctty)
+        self.group_of(task).is_some_and(|g| g.ctty)
     }
 
     /// Store `signal->tty` (set or cleared).
     pub fn set_ctty(&mut self, task: TaskId, on: bool) {
-        if let Some(t) = self.task_mut(task) {
-            t.ctty = on;
+        if let Some(g) = self.group_mut(task) {
+            g.ctty = on;
         }
     }
 
     /// `current->signal->leader`.
     #[must_use]
     pub fn is_session_leader(&self, task: TaskId) -> bool {
-        self.task(task).is_some_and(|t| t.session_leader)
+        self.group_of(task).is_some_and(|g| g.session_leader)
     }
 
     /// `proc_clear_tty`: `signal->tty = NULL`.
@@ -67,13 +67,13 @@ impl Tasklist {
 
     /// `signal->tty_old_pgrp`, read and cleared (`disassociate_ctty`).
     pub fn take_tty_old_pgrp(&mut self, task: TaskId) -> Option<PidRef> {
-        self.task_mut(task)?.tty_old_pgrp.take()
+        self.group_mut(task)?.tty_old_pgrp.take()
     }
 
     /// Store `signal->tty_old_pgrp`.
     pub fn set_tty_old_pgrp(&mut self, task: TaskId, pgrp: Option<PidRef>) {
-        if let Some(t) = self.task_mut(task) {
-            t.tty_old_pgrp = pgrp;
+        if let Some(g) = self.group_mut(task) {
+            g.tty_old_pgrp = pgrp;
         }
     }
 

@@ -392,7 +392,8 @@ fn status(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     seq::print(
         seq,
         format_args!(
-            "Threads:\t1\nSigQ:\t{queued}/{}\n",
+            "Threads:\t{}\nSigQ:\t{queued}/{}\n",
+            show.tasks.group_thread_count(task),
             view.attrs.rlimits.get(crate::task::RLIMIT_SIGPENDING).cur,
         ),
     )?;
@@ -452,14 +453,23 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
         .is_some_and(|facts| show.caller.ptrace_may_access(facts));
     let state = state_text(show, task).as_bytes()[0];
     let sets = show.tasks.signal_sets(task).ok_or(Errno::ESRCH)?;
-    let (mut utime, mut stime) = (t.utime_ns, t.stime_ns);
-    if t.exit_state == ExitState::Live
-        && let Some(sched) = t.sched
-    {
-        (utime, stime) = (show.host.cpu_time)(sched);
+    // `thread_group_cputime_adjusted` (`whole`): the finished threads' times and every
+    // member's, a live one's from the scheduler.
+    let (mut utime, mut stime) = show.tasks.dead_cputime(task);
+    for member in show.tasks.threads(task) {
+        let Some(m) = show.tasks.task(member) else {
+            continue;
+        };
+        let (u, s) = match m.sched {
+            Some(sched) if m.exit_state == ExitState::Live => (show.host.cpu_time)(sched),
+            _ => (m.utime_ns, m.stime_ns),
+        };
+        utime += u;
+        stime += s;
     }
+    let (cutime, cstime) = show.tasks.children_cputime(task);
     let mm = show.vfs.fs.ns.proc.mm_of(node.tgid);
-    let (tty_nr, tty_pgrp): (i64, i64) = if t.ctty {
+    let (tty_nr, tty_pgrp): (i64, i64) = if show.tasks.has_ctty(task) {
         // new_encode_dev(ttyS0 = 4:64)
         (4 << 8 | 64, i64::from(show.host.tty_pgrp))
     } else {
@@ -493,11 +503,11 @@ fn stat(show: &Show<'_>, node: ProcNode, seq: &mut Seq) -> KResult<()> {
     field(0)?; // cmaj_flt
     field(i128::from(nsec_to_clock_t(utime)))?;
     field(i128::from(nsec_to_clock_t(stime)))?;
-    field(i128::from(nsec_to_clock_t(t.cutime_ns)))?;
-    field(i128::from(nsec_to_clock_t(t.cstime_ns)))?;
+    field(i128::from(nsec_to_clock_t(cutime)))?;
+    field(i128::from(nsec_to_clock_t(cstime)))?;
     field(i128::from(20 + view.nice))?; // priority
     field(i128::from(view.nice))?;
-    field(1)?; // num_threads
+    field(i128::from(show.tasks.group_thread_count(task)))?; // num_threads
     field(0)?; // itrealvalue
     field(i128::from(nsec_to_clock_t(view.start_boottime_ns)))?;
     field(i128::from(mm.map_or(0, |m| m.total_vm * PAGE)))?; // vsize

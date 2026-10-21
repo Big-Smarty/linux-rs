@@ -116,15 +116,7 @@ fn victim(
     fd: u32,
     exe: crate::vfs::FileId,
 ) -> Victim {
-    let request = ForkRequest {
-        exit_signal: 17,
-        child_sp: 0,
-        clear_sighand: false,
-        clear_child_tid: 0,
-        set_child_tid: 0,
-        share_vm: false,
-        vfork: false,
-    };
+    let request = ForkRequest::plain(17);
     let id: TaskId = t
         .tasks
         .fork(t.current, ForkParams::of(&t.attrs, &request))
@@ -159,8 +151,8 @@ fn victim(
     .unwrap();
     t.vfs.fs.ns.proc.publish(pid, view).unwrap();
     if zombie {
-        t.tasks.exit_prepare(id, 0, false);
-        t.tasks.exit_notify(id, &mut NoWake).unwrap();
+        t.tasks.exit_prepare(id, 0, false, &mut NoWake);
+        t.tasks.exit_notify(id, true, &mut NoWake).unwrap();
         t.vfs.fs.ns.proc.exit(pid);
     }
     Victim { name, pid }

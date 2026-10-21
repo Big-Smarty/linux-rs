@@ -10,15 +10,16 @@
 // Transformation: the sleep in `do_wait` is the caller's (`__do_wait` returns
 // `-ERESTARTSYS` when a blocking wait found nothing and the caller sleeps on
 // the parent's `wait_chldexit`, here [`super::exit::Waker::child_event`]); no
-// ptrace (`EXIT_TRACE`, `ptrace_do_wait`), no `__WNOTHREAD` effect (one
-// thread), `rusage` is the CPU times only.
+// ptrace (`EXIT_TRACE`, `ptrace_do_wait`); the children of every thread of the
+// caller's group are considered unless `__WNOTHREAD`; `rusage` is the CPU times
+// only.
 #![forbid(unsafe_code)]
 //! `wait4` and `waitid`: argument decoding and one pass over the children.
 
 use super::{
     exit::{
-        CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, SIGNAL_STOP_CONTINUED,
-        SIGNAL_STOP_STOPPED,
+        CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, NoWake,
+        SIGNAL_STOP_CONTINUED, SIGNAL_STOP_STOPPED,
     },
     pid::{PidId, PidType},
     tasklist::{ExitState, TaskId, Tasklist},
@@ -215,6 +216,15 @@ impl Tasklist {
         clone == (wo.flags & WCLONE != 0)
     }
 
+    /// `is_effectively_child`: `target`'s real parent is `current`, or (without
+    /// `__WNOTHREAD`) any thread of its group.
+    fn is_effectively_child(&self, current: TaskId, wo: &WaitOpts, target: TaskId) -> bool {
+        let Some(parent) = self.real_parent(target) else {
+            return false;
+        };
+        current == parent || (wo.flags & WNOTHREAD == 0 && self.same_thread_group(current, parent))
+    }
+
     /// One pass of `__do_wait` for `current`: the pid of the child reported
     /// (> 0, `wo` filled in, a zombie reaped unless `WNOWAIT`), `0` for
     /// `WNOHANG` with nothing ready, `-ECHILD` for nothing to wait for, or
@@ -234,10 +244,11 @@ impl Tasklist {
         });
         if !nothing {
             if wo.wo_type == WaitType::Pid {
-                // do_wait_pid: the target must be a child of `current`.
+                // do_wait_pid: the target must be a child of `current` or of a thread of its
+                // group.
                 let target = wo.wo_pid.and_then(|pid| self.pid_task(pid, PidType::Tgid));
                 if let Some(target) = target
-                    && self.real_parent(target) == Some(current)
+                    && self.is_effectively_child(current, wo, target)
                 {
                     let ret = self.wait_consider_task(current, wo, target);
                     if ret != 0 {
@@ -245,12 +256,23 @@ impl Tasklist {
                     }
                 }
             } else {
-                let mut next = self.task(current).and_then(|t| t.first_child);
-                while let Some(child) = next {
-                    next = self.task(child).and_then(|t| t.next_sibling);
-                    let ret = self.wait_consider_task(current, wo, child);
-                    if ret != 0 {
-                        return ret;
+                // do_wait_thread for `current`, then the other threads of its group in ring order.
+                let mut tsk = current;
+                loop {
+                    let mut next = self.task(tsk).and_then(|t| t.first_child);
+                    while let Some(child) = next {
+                        next = self.task(child).and_then(|t| t.next_sibling);
+                        let ret = self.wait_consider_task(current, wo, child);
+                        if ret != 0 {
+                            return ret;
+                        }
+                    }
+                    if wo.flags & WNOTHREAD != 0 {
+                        break;
+                    }
+                    tsk = self.next_thread(tsk);
+                    if tsk == current {
+                        break;
                     }
                 }
             }
@@ -259,6 +281,11 @@ impl Tasklist {
             return -ERESTARTSYS;
         }
         wo.notask_error
+    }
+
+    /// `delay_group_leader(p)`: a leader with other threads is not reaped.
+    fn delay_group_leader(&self, p: TaskId) -> bool {
+        self.thread_group_leader(p) && !self.thread_group_empty(p)
     }
 
     /// `wait_consider_task` (no ptrace).
@@ -270,11 +297,16 @@ impl Tasklist {
             return 0;
         }
         if state == ExitState::Zombie {
-            // delay_group_leader(p) is false: no sub-threads.
-            return self.wait_task_zombie(current, wo, p);
+            // we don't reap group leaders with subthreads
+            if !self.delay_group_leader(p) {
+                return self.wait_task_zombie(current, wo, p);
+            }
+            // "Allow access to stopped/continued state via zombie by falling through": with
+            // WEXITED the event will come when the threads are gone, otherwise the stopped
+            // state of the live threads is one.
         }
-        // p is alive and it's gonna stop, continue or exit, so there always is
-        // something to wait for.
+        // p is alive (or a leader with live threads) and it's gonna stop, continue or exit, so
+        // there always is something to wait for.
         wo.notask_error = 0;
         let ret = self.wait_task_stopped(wo, p);
         if ret != 0 {
@@ -283,10 +315,39 @@ impl Tasklist {
         self.wait_task_continued(wo, p)
     }
 
+    /// `getrusage(p, RUSAGE_BOTH)`: the CPU time of the group (its threads, the finished ones
+    /// included) and of the children it has reaped.
     fn rusage_of(&self, p: TaskId) -> (u64, u64) {
-        self.task(p).map_or((0, 0), |t| {
-            (t.utime_ns + t.cutime_ns, t.stime_ns + t.cstime_ns)
+        let (own_u, own_s) = self.group_cputime(p);
+        self.group_of(p).map_or((own_u, own_s), |g| {
+            (own_u + g.cutime_ns, own_s + g.cstime_ns)
         })
+    }
+
+    /// `thread_group_cputime(p)`: the live threads' times and those of the finished threads.
+    #[must_use]
+    pub fn group_cputime(&self, p: TaskId) -> (u64, u64) {
+        let Some(g) = self.group_of(p) else {
+            return (0, 0);
+        };
+        g.threads.iter().filter_map(|&t| self.task(t)).fold(
+            (g.dead_utime_ns, g.dead_stime_ns),
+            |(u, s), t| (u + t.utime_ns, s + t.stime_ns),
+        )
+    }
+
+    /// `signal->utime`/`stime`: the times of the group's threads that were released.
+    #[must_use]
+    pub fn dead_cputime(&self, p: TaskId) -> (u64, u64) {
+        self.group_of(p)
+            .map_or((0, 0), |g| (g.dead_utime_ns, g.dead_stime_ns))
+    }
+
+    /// `signal->cutime`/`cstime`: the times of the children the group has reaped.
+    #[must_use]
+    pub fn children_cputime(&self, p: TaskId) -> (u64, u64) {
+        self.group_of(p)
+            .map_or((0, 0), |g| (g.cutime_ns, g.cstime_ns))
     }
 
     /// `wait_task_zombie`.
@@ -298,21 +359,25 @@ impl Tasklist {
         let Some(t) = self.task(p) else { return 0 };
         let uid = t.cred.uid;
         // `SIGNAL_GROUP_EXIT ? group_exit_code : exit_code`
-        let status = t.signals.signal.group_exit.unwrap_or(t.exit_code);
+        let status = self
+            .sig(p)
+            .and_then(|s| s.group_exit)
+            .unwrap_or(t.exit_code);
         wo.rusage = self.rusage_of(p);
         if wo.flags & WNOWAIT == 0 {
-            // Move the task's state to DEAD, then fold its times (and those
-            // of its reaped children) into the reaper's `c*time`.
-            let (ut, st, cut, cst) = (t.utime_ns, t.stime_ns, t.cutime_ns, t.cstime_ns);
+            // Move the task's state to DEAD, then fold the times of the group (and those of
+            // its reaped children) into the reaper's group `c*time`.
+            let (ut, st) = self.group_cputime(p);
+            let (cut, cst) = self.group_of(p).map_or((0, 0), |g| (g.cutime_ns, g.cstime_ns));
             if let Some(t) = self.task_mut(p) {
                 t.exit_state = ExitState::Dead;
             }
-            if let Some(reaper) = self.task_mut(current) {
-                reaper.cutime_ns += ut + cut;
-                reaper.cstime_ns += st + cst;
+            if let Some(psig) = self.group_mut(current) {
+                psig.cutime_ns += ut + cut;
+                psig.cstime_ns += st + cst;
             }
             wo.stat = i32::try_from(status).unwrap_or(0);
-            self.release_task(p);
+            self.release_task(p, &mut NoWake);
         }
         if wo.with_info {
             // `(status & 0x7f) == 0`: exited normally.
@@ -339,21 +404,23 @@ impl Tasklist {
             return 0;
         }
         let pid = self.task_pid_vnr(p);
-        let Some(t) = self.task_mut(p) else { return 0 };
+        let Some(uid) = self.task(p).map(|t| t.cred.uid) else {
+            return 0;
+        };
+        let Some(sig) = self.sig_mut(p) else { return 0 };
         // task_stopped_code (not ptraced): `SIGNAL_STOP_STOPPED`, whatever the
         // task's own state (a stopped child that `SIGKILL` woke is still reported
         // until it exits).
-        if t.signals.signal.job_flags & SIGNAL_STOP_STOPPED == 0 {
+        if sig.job_flags & SIGNAL_STOP_STOPPED == 0 {
             return 0;
         }
-        let exit_code = t.signals.signal.stop_code;
+        let exit_code = sig.stop_code;
         if exit_code == 0 {
             return 0;
         }
         if wo.flags & WNOWAIT == 0 {
-            t.signals.signal.stop_code = 0;
+            sig.stop_code = 0;
         }
-        let uid = t.cred.uid;
         wo.rusage = self.rusage_of(p);
         if wo.flags & WNOWAIT == 0 {
             wo.stat = i32::try_from((exit_code << 8) | 0x7f).unwrap_or(0);
@@ -375,14 +442,16 @@ impl Tasklist {
             return 0;
         }
         let pid = self.task_pid_vnr(p);
-        let Some(t) = self.task_mut(p) else { return 0 };
-        if t.signals.signal.job_flags & SIGNAL_STOP_CONTINUED == 0 {
+        let Some(uid) = self.task(p).map(|t| t.cred.uid) else {
+            return 0;
+        };
+        let Some(sig) = self.sig_mut(p) else { return 0 };
+        if sig.job_flags & SIGNAL_STOP_CONTINUED == 0 {
             return 0;
         }
         if wo.flags & WNOWAIT == 0 {
-            t.signals.signal.job_flags &= !SIGNAL_STOP_CONTINUED;
+            sig.job_flags &= !SIGNAL_STOP_CONTINUED;
         }
-        let uid = t.cred.uid;
         wo.rusage = self.rusage_of(p);
         if wo.with_info {
             wo.info = WaitInfo {

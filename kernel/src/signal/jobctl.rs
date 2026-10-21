@@ -123,29 +123,63 @@ impl State<'_> {
         false
     }
 
-    /// `do_signal_stop(signr)` up to the sleep: start a group stop with `signr`
-    /// when none is in progress, then take part in it. `signr` is the stop
-    /// signal just dequeued (`JOBCTL_STOP_DEQUEUED` is set by the dequeue).
-    pub fn do_signal_stop(&mut self, signr: u8) -> SignalStop {
-        if self.me.jobctl & JOBCTL_STOP_PENDING == 0 {
-            let gstop = JOBCTL_STOP_PENDING | JOBCTL_STOP_CONSUME;
-            // A stop signal whose `SIGCONT`/`SIGKILL` already overruled it.
-            if self.me.jobctl & JOBCTL_STOP_DEQUEUED == 0 || self.sig.group_exit.is_some() {
-                return SignalStop::NotStopped;
-            }
-            // "Don't generate group_exit_code" when a stop is already in effect.
-            if self.sig.job_flags & SIGNAL_STOP_STOPPED == 0 {
-                self.sig.stop_code = u32::from(signr);
-            }
-            self.sig.group_stop_count = 0;
-            if self.task_set_jobctl_pending(u32::from(signr) | gstop) {
-                self.sig.group_stop_count += 1;
-            }
+    /// The start of a fresh group stop (the first half of `do_signal_stop` when
+    /// `JOBCTL_STOP_PENDING` is not yet set): `false` when a `SIGCONT` or `SIGKILL` overruled
+    /// the stop signal between its dequeue and now. Otherwise the stop code is recorded (unless
+    /// a stop is in effect), the count restarts at this task and this task has the stop pending;
+    /// the caller then makes the group's other threads join ([`State::join_group_stop`]).
+    pub fn begin_group_stop(&mut self, signr: u8) -> bool {
+        let gstop = JOBCTL_STOP_PENDING | JOBCTL_STOP_CONSUME;
+        // A stop signal whose `SIGCONT`/`SIGKILL` already overruled it.
+        if self.me.jobctl & JOBCTL_STOP_DEQUEUED == 0 || self.sig.group_exit.is_some() {
+            return false;
         }
-        // No other thread: the only participant is the last to stop.
+        // "Don't generate group_exit_code" when a stop is already in effect.
+        if self.sig.job_flags & SIGNAL_STOP_STOPPED == 0 {
+            self.sig.stop_code = u32::from(signr);
+        }
+        self.sig.group_stop_count = 0;
+        if self.task_set_jobctl_pending(u32::from(signr) | gstop) {
+            self.sig.group_stop_count += 1;
+        }
+        true
+    }
+
+    /// For another thread of the group when a stop starts: unless it is stopped already, the
+    /// stop becomes pending for it and the count includes it. Whether it joined (and must be
+    /// woken, `signal_wake_up(t, 0)`).
+    pub fn join_group_stop(&mut self, signr: u8) -> bool {
+        if self.me.jobctl & JOBCTL_STOPPED != 0 {
+            return false;
+        }
+        let gstop = JOBCTL_STOP_PENDING | JOBCTL_STOP_CONSUME;
+        if self.task_set_jobctl_pending(u32::from(signr) | gstop) {
+            self.sig.group_stop_count += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The end of `do_signal_stop`: take part in the stop in progress and go to the stopped
+    /// state. Whether this task completed a fresh stop (the parent is to be told).
+    pub fn participate_and_stop(&mut self) -> bool {
         let notify = self.task_participate_group_stop();
         self.me.jobctl |= JOBCTL_STOPPED;
-        SignalStop::Stop { notify }
+        notify
+    }
+
+    /// `do_signal_stop(signr)` up to the sleep for a group of one thread: start a group stop
+    /// with `signr` when none is in progress, then take part in it. `signr` is the stop
+    /// signal just dequeued (`JOBCTL_STOP_DEQUEUED` is set by the dequeue). A group with more
+    /// threads uses the pieces ([`crate::task::Tasklist::signal_stop`]).
+    pub fn do_signal_stop(&mut self, signr: u8) -> SignalStop {
+        if self.me.jobctl & JOBCTL_STOP_PENDING == 0 && !self.begin_group_stop(signr) {
+            return SignalStop::NotStopped;
+        }
+        SignalStop::Stop {
+            notify: self.participate_and_stop(),
+        }
     }
 
     /// The `SIGNAL_CLD_MASK` check at the top of `get_signal`: the notification

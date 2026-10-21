@@ -16,7 +16,8 @@ extern crate std;
 use super::{
     attrs::Cred,
     exit::{
-        CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, ExitPrep, Notified, Waker,
+        CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, ExitPrep, NoWake, Notified,
+        Waker,
     },
     pid::PidType,
     tasklist::{CredSnapshot, ExitState, ForkParams, PF_FORKNOEXEC, TaskId, Tasklist},
@@ -49,6 +50,7 @@ struct Rec {
     /// `(task, resume)` of every `signal_wake`.
     resumes: Vec<(TaskId, bool)>,
     stopped_wakes: Vec<TaskId>,
+    de_thread_events: Vec<TaskId>,
 }
 impl Waker for Rec {
     fn child_event(&mut self, parent: TaskId) {
@@ -60,6 +62,9 @@ impl Waker for Rec {
     }
     fn wake_stopped(&mut self, task: TaskId, _sched: Option<crate::sched::SchedId>) {
         self.stopped_wakes.push(task);
+    }
+    fn de_thread_event(&mut self, task: TaskId) {
+        self.de_thread_events.push(task);
     }
 }
 
@@ -79,10 +84,10 @@ fn user_cred(uid: u32) -> CredSnapshot {
 /// `do_exit` up to and including `exit_notify`.
 fn exit(l: &mut Tasklist, t: TaskId, code: u32, w: &mut Rec) -> Notified {
     assert_eq!(
-        l.exit_prepare(t, code, false),
+        l.exit_prepare(t, code, false, &mut NoWake),
         ExitPrep::Proceed { group_dead: true }
     );
-    l.exit_notify(t, w).unwrap()
+    l.exit_notify(t, true, w).unwrap()
 }
 
 fn pending(l: &mut Tasklist, t: TaskId) -> SigSet {
@@ -151,7 +156,7 @@ fn fork_limits_follow_copy_process() {
     assert_eq!(l.fork(init, FORK), Err(Errno::EAGAIN));
     assert_eq!(l.nr_threads(), 3);
     // A failed fork leaves no pid behind: the next number is still 4.
-    l.release_task(a);
+    l.release_task(a, &mut NoWake);
     let again = l.fork(init, FORK).unwrap();
     assert_eq!(pid(&l, again), 4);
 
@@ -178,7 +183,7 @@ fn release_task_frees_slot_pid_and_list_links_and_stale_ids_stop_resolving() {
     let b = l.fork(init, FORK).unwrap();
     let c = l.fork(init, FORK).unwrap();
     let pid_a = l.task_pid_type(a, PidType::Pid).unwrap();
-    l.release_task(b);
+    l.release_task(b, &mut NoWake);
     assert_eq!(l.children(init).collect::<Vec<_>>(), [a, c]);
     assert!(l.task(b).is_none());
     assert_eq!(l.find_task_by_vpid(3), None);
@@ -190,10 +195,10 @@ fn release_task_frees_slot_pid_and_list_links_and_stale_ids_stop_resolving() {
     // Pid numbers are not reused until the cursor wraps.
     assert_eq!(pid(&l, d), 5);
     // pid object of a is gone with a.
-    l.release_task(a);
+    l.release_task(a, &mut NoWake);
     assert!(l.pid(pid_a).is_none());
     assert_eq!(l.children(init).collect::<Vec<_>>(), [c, d]);
-    l.release_task(a); // double release: nothing happens
+    l.release_task(a, &mut NoWake); // double release: nothing happens
 }
 
 #[test]
@@ -240,8 +245,8 @@ fn group_exit_code_wins_over_the_thread_exit_code() {
     // `group_exit_code` while SIGNAL_GROUP_EXIT is set.
     let (mut l, init) = list();
     let child = l.fork(init, FORK).unwrap();
-    assert_eq!(l.do_group_exit(child, 7 << 8), 7 << 8);
-    assert_eq!(l.do_group_exit(child, 1 << 8), 7 << 8, "first code sticks");
+    assert_eq!(l.do_group_exit(child, 7 << 8, &mut NoWake), 7 << 8);
+    assert_eq!(l.do_group_exit(child, 1 << 8, &mut NoWake), 7 << 8, "first code sticks");
     exit(&mut l, child, 1 << 8, &mut Rec::default());
     let (ret, wo) = wait_pid(&mut l, init, 2, 0);
     assert_eq!((ret, wo.stat), (2, 7 << 8));
@@ -253,24 +258,24 @@ fn init_death_is_reported_with_the_group_exit_code() {
     // signal->group_exit_code ?: code).
     let (mut l, init) = list();
     assert_eq!(
-        l.exit_prepare(init, 0x100, false),
+        l.exit_prepare(init, 0x100, false, &mut NoWake),
         ExitPrep::InitDied { exitcode: 0x100 }
     );
     let (mut l, init) = list();
-    l.do_group_exit(init, 0xb);
+    l.do_group_exit(init, 0xb, &mut NoWake);
     assert_eq!(
-        l.exit_prepare(init, 0xb, true),
+        l.exit_prepare(init, 0xb, true, &mut NoWake),
         ExitPrep::InitDied { exitcode: 0xb }
     );
     // A zero group code falls back to the code (`?:`).
     let (mut l, init) = list();
-    l.do_group_exit(init, 0);
+    l.do_group_exit(init, 0, &mut NoWake);
     assert_eq!(
-        l.exit_prepare(init, 0, false),
+        l.exit_prepare(init, 0, false, &mut NoWake),
         ExitPrep::InitDied { exitcode: 0 }
     );
     // The reaper cannot be notified out.
-    assert!(l.exit_notify(init, &mut Rec::default()).is_err());
+    assert!(l.exit_notify(init, true, &mut Rec::default()).is_err());
 }
 
 #[test]
@@ -299,14 +304,14 @@ fn sigchld_carries_the_exit_status_and_wakes_the_parent() {
     l.signal_state(init).unwrap().hand.actions[usize::from(SIGCHLD) - 1].handler = 0x1000;
     let child = l.fork(init, FORK).unwrap();
     assert_eq!(
-        l.exit_prepare(child, 15, true),
+        l.exit_prepare(child, 15, true, &mut NoWake),
         ExitPrep::Proceed { group_dead: true }
     );
     assert_ne!(
         l.task(child).unwrap().flags & super::tasklist::PF_SIGNALED,
         0
     );
-    l.exit_notify(child, &mut Rec::default()).unwrap();
+    l.exit_notify(child, true, &mut Rec::default()).unwrap();
     let (_, info) = l.signal_state(init).unwrap().dequeue_signal().unwrap();
     assert_eq!(info, SigInfo::chld(CLD_KILLED, 2, 0, 15, 0, 0));
 }
@@ -531,7 +536,7 @@ fn wnowait_leaves_the_zombie_and_reaping_folds_child_times() {
     let child = l.fork(init, FORK).unwrap();
     l.task_mut(child).unwrap().utime_ns = 7_000_000_000;
     l.task_mut(child).unwrap().stime_ns = 1_000_000_000;
-    l.task_mut(child).unwrap().cutime_ns = 2_000_000_000;
+    l.group_mut(child).unwrap().cutime_ns = 2_000_000_000;
     exit(&mut l, child, 5 << 8, &mut Rec::default());
     let mut wo = l
         .prepare_waitid(init, P_PID, 2, WEXITED | WNOWAIT, |_| unreachable!())
@@ -540,18 +545,12 @@ fn wnowait_leaves_the_zombie_and_reaping_folds_child_times() {
     assert_eq!(wo.info.status, 5);
     assert_eq!(wo.rusage, (9_000_000_000, 1_000_000_000));
     assert_eq!(l.task(child).unwrap().exit_state, ExitState::Zombie);
-    assert_eq!(l.task(init).unwrap().cutime_ns, 0, "not folded yet");
+    assert_eq!(l.children_cputime(init).0, 0, "not folded yet");
     // Again, without WNOWAIT: reaped, times folded into `cutime`.
     let (ret, _) = wait_pid(&mut l, init, 2, 0);
     assert_eq!(ret, 2);
     assert!(l.task(child).is_none());
-    assert_eq!(
-        (
-            l.task(init).unwrap().cutime_ns,
-            l.task(init).unwrap().cstime_ns
-        ),
-        (9_000_000_000, 1_000_000_000)
-    );
+    assert_eq!(l.children_cputime(init), (9_000_000_000, 1_000_000_000));
 }
 
 #[test]
@@ -563,10 +562,10 @@ fn stop_and_continue_are_reported_once() {
     // blocking wait would sleep.
     assert_eq!(wait_pid(&mut l, init, 2, WUNTRACED | WNOHANG).0, 0);
     {
-        let t = l.task_mut(child).unwrap();
-        t.signals.thread.jobctl |= JOBCTL_STOPPED;
-        t.signals.signal.job_flags = super::exit::SIGNAL_STOP_STOPPED;
-        t.signals.signal.stop_code = u32::from(SIGSTOP);
+        l.task_mut(child).unwrap().thread.jobctl |= JOBCTL_STOPPED;
+        let sig = l.sig_mut(child).unwrap();
+        sig.job_flags = super::exit::SIGNAL_STOP_STOPPED;
+        sig.stop_code = u32::from(SIGSTOP);
     }
     // Without WUNTRACED a stopped child is invisible (but still "something
     // to wait for").
@@ -587,9 +586,8 @@ fn stop_and_continue_are_reported_once() {
     assert_eq!(wait_pid(&mut l, init, 2, WUNTRACED | WNOHANG).0, 0);
     // Continue: the task runs again, SIGNAL_STOP_CONTINUED is pending.
     {
-        let t = l.task_mut(child).unwrap();
-        t.signals.thread.jobctl &= !JOBCTL_STOPPED;
-        t.signals.signal.job_flags = super::exit::SIGNAL_STOP_CONTINUED;
+        l.task_mut(child).unwrap().thread.jobctl &= !JOBCTL_STOPPED;
+        l.sig_mut(child).unwrap().job_flags = super::exit::SIGNAL_STOP_CONTINUED;
     }
     assert_eq!(wait_pid(&mut l, init, 2, WNOHANG).0, 0, "needs WCONTINUED");
     let mut wo = l
@@ -602,7 +600,7 @@ fn stop_and_continue_are_reported_once() {
     );
     assert_eq!(wait_pid(&mut l, init, 2, WCONTINUED | WNOHANG).0, 0, "once");
     // wait4 form: status 0xffff.
-    l.task_mut(child).unwrap().signals.signal.job_flags = super::exit::SIGNAL_STOP_CONTINUED;
+    l.sig_mut(child).unwrap().job_flags = super::exit::SIGNAL_STOP_CONTINUED;
     let (ret, wo) = wait_pid(&mut l, init, 2, WCONTINUED);
     assert_eq!((ret, wo.stat), (2, 0xffff));
 }
@@ -612,7 +610,7 @@ fn cldstop_notification_honours_nocldstop_and_always_wakes() {
     // do_notify_parent_cldstop.
     let (mut l, init) = list();
     let child = l.fork(init, FORK).unwrap();
-    l.task_mut(child).unwrap().signals.signal.stop_code = u32::from(SIGSTOP);
+    l.sig_mut(child).unwrap().stop_code = u32::from(SIGSTOP);
     let chld = usize::from(SIGCHLD) - 1;
     // SIG_DFL: SIGCHLD is generated (and dropped as ignored by default, so
     // block it to see it), the waiters are woken.
@@ -702,7 +700,7 @@ fn setsid_and_session_rules() {
     let child = l.fork(a, FORK).unwrap(); // 4, child of a
     assert_eq!(l.setsid(a), Ok(2));
     assert_eq!((l.getsid(a, 0), l.getpgid(a, 0)), (Ok(2), Ok(2)));
-    assert!(l.task(a).unwrap().session_leader);
+    assert!(l.is_session_leader(a));
     // Already a leader: EPERM, also for setpgid on itself.
     assert_eq!(l.setsid(a), Err(Errno::EPERM));
     assert_eq!(l.setpgid(a, 0, 0), Err(Errno::EPERM));
@@ -769,7 +767,7 @@ fn orphaned_process_groups() {
     assert!(!l.will_become_orphaned_pgrp(pgrp, None));
     assert!(!l.is_pgrp_orphaned(job_member));
     // Stop the group (SIGNAL_STOP_STOPPED on the member).
-    l.task_mut(job_member).unwrap().signals.signal.job_flags = super::exit::SIGNAL_STOP_STOPPED;
+    l.sig_mut(job_member).unwrap().job_flags = super::exit::SIGNAL_STOP_STOPPED;
     assert!(l.has_stopped_jobs(pgrp));
     for t in [job_leader, job_member] {
         // Handlers so SIGHUP/SIGCONT are queued and visible.
@@ -825,13 +823,13 @@ fn a_group_exit_drops_the_stop_state() {
     let (mut l, init) = list();
     let child = l.fork(init, FORK).unwrap();
     let mark = |l: &mut Tasklist| {
-        let sig = &mut l.task_mut(child).unwrap().signals.signal;
+        let sig = l.sig_mut(child).unwrap();
         sig.job_flags = super::exit::SIGNAL_STOP_STOPPED;
         sig.stop_code = 19;
     };
     mark(&mut l);
-    l.do_group_exit(child, 3);
-    let sig = &l.task(child).unwrap().signals.signal;
+    l.do_group_exit(child, 3, &mut NoWake);
+    let sig = l.sig(child).unwrap();
     assert_eq!(
         (sig.job_flags, sig.stop_code, sig.group_exit),
         (0, 0, Some(3))
@@ -848,7 +846,7 @@ fn a_group_exit_drops_the_stop_state() {
             crate::signal::state::Target::Process,
         )
         .unwrap();
-    let sig = &l.task(child).unwrap().signals.signal;
+    let sig = l.sig(child).unwrap();
     assert_eq!((sig.job_flags, sig.stop_code), (0, 0));
     assert_eq!(sig.group_exit, Some(u32::from(SIGTERM)));
 }
@@ -1050,7 +1048,7 @@ fn signal_state_view_derives_ids_from_the_task() {
     assert_eq!((s.pid, s.tgid, s.uid, s.global_init), (2, 2, 1234, false));
     assert!(!s.sig.unkillable);
     assert_eq!(s.sig.rlimit_sigpending, 100);
-    l.release_task(child);
+    l.release_task(child, &mut NoWake);
     assert!(l.signal_state(child).is_none(), "stale id");
     let _ = SIGKILL;
     let _ = SIGTERM;
@@ -1105,6 +1103,7 @@ impl Waker for RqWaker<'_> {
             self.rq.signal_wake_up_state(self.init.1, resume);
         }
     }
+    fn de_thread_event(&mut self, _task: TaskId) {}
     fn wake_stopped(&mut self, task: TaskId, sched: Option<crate::sched::SchedId>) {
         if task == self.init.0 {
             self.rq.wake_stopped(sched.unwrap());
@@ -1145,10 +1144,10 @@ fn child_exit_wakes_only_the_parents_wait_chldexit_sleepers() {
         init: (init, sid),
     };
     assert_eq!(
-        l.exit_prepare(child, 0, false),
+        l.exit_prepare(child, 0, false, &mut NoWake),
         ExitPrep::Proceed { group_dead: true }
     );
-    l.exit_notify(child, &mut w).unwrap();
+    l.exit_notify(child, true, &mut w).unwrap();
     assert_eq!(rq.state(sid), Some(TaskState::Running));
 }
 
@@ -1403,19 +1402,20 @@ fn only_a_fatal_signal_resumes_a_stopped_task_besides_sigcont() {
         .unwrap();
         w
     };
-    // SIGTERM would kill a running task; a stopped one keeps it pending and sleeps on.
+    // SIGTERM would kill a running task; a stopped one keeps it pending and sleeps on:
+    // `wants_signal` is false for a stopped task, so `complete_signal` wakes nobody.
     let w = send(&mut l, SIGTERM);
-    assert_eq!(w.resumes, [(child, false)]);
+    assert_eq!(w.resumes, []);
     assert!(pending(&mut l, child).contains(SIGTERM));
-    assert_eq!(l.task(child).unwrap().signals.signal.group_exit, None);
+    assert_eq!(l.sig(child).unwrap().group_exit, None);
     // A signal with a handler is queued the same way.
     l.signal_state(child).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
     let w = send(&mut l, SIGUSR1);
-    assert_eq!(w.resumes, [(child, false)]);
+    assert_eq!(w.resumes, []);
     // SIGKILL starts the group exit and asks for a resume.
     let w = send(&mut l, SIGKILL);
     assert_eq!(w.resumes, [(child, true)]);
-    assert_eq!(l.task(child).unwrap().signals.signal.group_exit, Some(9));
+    assert_eq!(l.sig(child).unwrap().group_exit, Some(9));
 }
 
 #[test]
@@ -1440,11 +1440,11 @@ fn a_task_signalling_itself_is_the_current_task() {
     // second is left to the child (not yet a group exit) ...
     send(&mut l, init, SIGUSR1, &mut w);
     send(&mut l, init, SIGTERM, &mut w);
-    assert_eq!(l.task(child).unwrap().signals.signal.group_exit, None);
+    assert_eq!(l.sig(child).unwrap().group_exit, None);
     // ... while the child's own fatal signal, with those pending, starts it.
     send(&mut l, child, SIGHUP, &mut w);
     assert_eq!(
-        l.task(child).unwrap().signals.signal.group_exit,
+        l.sig(child).unwrap().group_exit,
         Some(u32::from(SIGHUP))
     );
 }
@@ -1466,12 +1466,12 @@ fn a_stopped_member_of_a_newly_orphaned_group_is_hung_up_then_continued() {
     assert_eq!(w.stopped_wakes, [job], "SIGCONT woke the stopped member");
     assert!(pending(&mut l, job).contains(SIGHUP));
     assert_eq!(
-        l.task(job).unwrap().signals.signal.group_exit,
+        l.sig(job).unwrap().group_exit,
         None,
         "stopped when SIGHUP arrived"
     );
     assert_ne!(
-        l.task(job).unwrap().signals.signal.job_flags & super::exit::SIGNAL_CLD_CONTINUED,
+        l.sig(job).unwrap().job_flags & super::exit::SIGNAL_CLD_CONTINUED,
         0
     );
 }
@@ -1496,7 +1496,7 @@ fn the_change_log_replays_recent_pids_and_reports_a_gap() {
     assert_eq!(l.epoch(), now);
     // A release is recorded under the number the task had.
     exit(&mut l, b, 0, &mut Rec::default());
-    l.release_task(b);
+    l.release_task(b, &mut NoWake);
     assert_eq!(l.changed_since(now).unwrap().collect::<Vec<_>>(), [3, 3]);
     // A reader from the future or from before the ring gets `None`.
     assert!(l.changed_since(l.epoch() + 1).is_none());
@@ -1507,4 +1507,379 @@ fn the_change_log_replays_recent_pids_and_reports_a_gap() {
     assert!(l.changed_since(seen).is_none());
     assert_eq!(l.changed_since(l.epoch() - 64).unwrap().count(), 64);
     assert!(l.changed_since(l.epoch() - 65).is_none());
+}
+
+// ---- threads -------------------------------------------------------------------------------
+
+use super::tasklist::CloneParams;
+
+const THREAD: CloneParams = CloneParams {
+    fork: FORK,
+    thread: true,
+    share_sighand: true,
+    reset_altstack: true,
+};
+
+/// A process `c` (pid 2) with `n` threads (pids 3...).
+fn group(n: usize) -> (Tasklist, TaskId, TaskId, Vec<TaskId>) {
+    let (mut l, init) = list();
+    let c = l.fork(init, FORK).unwrap();
+    let threads = (0..n).map(|_| l.clone_task(c, THREAD).unwrap()).collect();
+    (l, init, c, threads)
+}
+
+fn thread_exit(l: &mut Tasklist, t: TaskId, code: u32, w: &mut Rec) -> Notified {
+    let ExitPrep::Proceed { group_dead } = l.exit_prepare(t, code, false, w) else {
+        panic!("init died");
+    };
+    l.exit_notify(t, group_dead, w).unwrap()
+}
+
+#[test]
+fn a_thread_has_its_own_tid_and_shares_the_group() {
+    let (mut l, init, c, th) = group(2);
+    let (t1, t2) = (th[0], th[1]);
+    assert_eq!((pid(&l, c), pid(&l, t1), pid(&l, t2)), (2, 3, 4));
+    assert_eq!((l.task_tgid_vnr(t1), l.task_tgid_vnr(t2)), (2, 2));
+    assert_eq!(l.group_leader(t1), c);
+    assert!(l.thread_group_leader(c) && !l.thread_group_leader(t1));
+    assert!(l.same_thread_group(t1, t2) && !l.same_thread_group(t1, init));
+    assert_eq!(l.group_thread_count(t2), 3);
+    assert_eq!(l.nr_threads(), 4);
+    // for_each_process and children see the leader only; threads answer for the group.
+    assert_eq!(l.processes().collect::<Vec<_>>(), [init, c]);
+    assert_eq!(l.children(init).collect::<Vec<_>>(), [c]);
+    assert_eq!(l.children(t1).count(), 0);
+    assert_eq!(l.real_parent(t1), Some(init));
+    assert_eq!(l.task_ppid_vnr(t1), 1);
+    assert_eq!(
+        (l.task_pgrp_vnr(t1), l.task_session_vnr(t1)),
+        (l.task_pgrp_vnr(c), l.task_session_vnr(c))
+    );
+    // Lookup by tid finds a thread; by pid for the group links finds the leader.
+    assert_eq!(l.find_task_by_vpid(4), Some(t2));
+    let tgid = l.find_vpid(2).unwrap();
+    assert_eq!(l.pid_task(tgid, PidType::Tgid), Some(c));
+    assert_eq!(l.pid_task(l.find_vpid(3).unwrap(), PidType::Tgid), None);
+    assert_eq!(l.threads(t2).collect::<Vec<_>>(), [c, t1, t2]);
+    assert_eq!((l.next_thread(c), l.next_thread(t2)), (t1, c));
+    // One sighand: an action set by a thread is the group's.
+    l.signal_state(t1).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler = 0x4000;
+    assert_eq!(
+        l.signal_state(c).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler,
+        0x4000
+    );
+    // Blocked masks and pending queues are per task, the shared queue is the group's.
+    l.signal_state(t1).unwrap().me.blocked.add(SIGUSR1);
+    assert!(!l.signal_state(c).unwrap().me.blocked.contains(SIGUSR1));
+    assert!(!l.thread_group_empty(c));
+}
+
+#[test]
+fn a_thread_that_exits_is_released_at_once_and_tells_nobody() {
+    let (mut l, init, c, th) = group(1);
+    let t1 = th[0];
+    l.signal_state(init).unwrap().me.blocked.add(SIGCHLD);
+    let mut w = Rec::default();
+    assert_eq!(thread_exit(&mut l, t1, 3 << 8, &mut w), Notified::Reaped);
+    assert!(l.task(t1).is_none());
+    assert_eq!(l.find_task_by_vpid(3), None, "the tid is free again");
+    assert_eq!(l.group_thread_count(c), 1);
+    assert_eq!(l.nr_threads(), 2);
+    assert!(w.child_events.is_empty());
+    assert_eq!(pending(&mut l, init), SigSet::EMPTY, "no SIGCHLD for a thread");
+    assert_eq!(l.task(c).unwrap().exit_state, ExitState::Live);
+}
+
+#[test]
+fn a_zombie_leader_waits_for_its_threads_and_the_last_exit_sets_the_status() {
+    let (mut l, init, c, th) = group(1);
+    let t1 = th[0];
+    l.signal_state(init).unwrap().me.blocked.add(SIGCHLD);
+    let mut w = Rec::default();
+    // The leader exits first: a zombie that nobody is told about and wait cannot reap.
+    assert_eq!(thread_exit(&mut l, c, 7 << 8, &mut w), Notified::Zombie);
+    assert!(w.child_events.is_empty());
+    assert_eq!(pending(&mut l, init), SigSet::EMPTY);
+    assert_eq!(wait_pid(&mut l, init, 2, WNOHANG).0, 0, "delay_group_leader");
+    // The last thread's code is the group's (`synchronize_group_exit`), and its release tells
+    // the leader's parent.
+    assert_eq!(thread_exit(&mut l, t1, 3 << 8, &mut w), Notified::Reaped);
+    assert_eq!(w.child_events, [init]);
+    assert!(pending(&mut l, init).contains(SIGCHLD));
+    let (ret, wo) = wait_pid(&mut l, init, 2, 0);
+    assert_eq!((ret, wo.stat), (2, 3 << 8));
+    assert!(l.task(c).is_none() && l.task(t1).is_none());
+    assert_eq!(l.nr_threads(), 1);
+}
+
+#[test]
+fn the_leader_as_the_last_to_exit_keeps_its_own_code() {
+    let (mut l, init, c, th) = group(1);
+    let mut w = Rec::default();
+    thread_exit(&mut l, th[0], 5 << 8, &mut w);
+    assert_eq!(thread_exit(&mut l, c, 7 << 8, &mut w), Notified::Zombie);
+    let (ret, wo) = wait_pid(&mut l, init, 2, 0);
+    assert_eq!((ret, wo.stat), (2, 7 << 8));
+}
+
+#[test]
+fn a_zombie_leader_is_released_by_its_last_thread_when_the_parent_ignores_sigchld() {
+    let (mut l, init, c, th) = group(1);
+    l.signal_state(init).unwrap().hand.actions[usize::from(SIGCHLD) - 1].handler = SIG_IGN;
+    let mut w = Rec::default();
+    thread_exit(&mut l, c, 0, &mut w);
+    assert!(l.task(c).is_some());
+    thread_exit(&mut l, th[0], 0, &mut w);
+    assert!(l.task(c).is_none(), "zap_leader");
+    assert_eq!(l.nr_threads(), 1);
+}
+
+#[test]
+fn exit_group_from_a_thread_kills_the_others() {
+    let (mut l, _init, c, th) = group(2);
+    let mut w = Rec::default();
+    assert_eq!(l.do_group_exit(th[0], 9 << 8, &mut w), 9 << 8);
+    assert_eq!(l.sig(c).unwrap().group_exit, Some(9 << 8));
+    for t in [c, th[1]] {
+        assert!(pending(&mut l, t).contains(SIGKILL), "{t:?}");
+    }
+    assert!(
+        !pending(&mut l, th[0]).contains(SIGKILL),
+        "the caller exits by itself"
+    );
+    assert_eq!(w.resumes.len(), 2);
+    assert!(w.resumes.iter().all(|&(_, resume)| resume));
+    // A second exit_group keeps the first code.
+    assert_eq!(l.do_group_exit(th[1], 1 << 8, &mut w), 9 << 8);
+}
+
+#[test]
+fn a_process_signal_goes_to_the_target_thread_first_then_to_one_that_does_not_block_it() {
+    let (mut l, init, c, th) = group(2);
+    let (t1, t2) = (th[0], th[1]);
+    l.signal_state(c).unwrap().hand.actions[usize::from(SIGUSR1) - 1].handler = 0x1000;
+    let send = |l: &mut Tasklist, target: TaskId, to: SendTo| {
+        let mut w = Rec::default();
+        l.group_send_sig_info(
+            Some(init),
+            i32::from(SIGUSR1),
+            info_of(SIGUSR1),
+            target,
+            to,
+            &mut w,
+        )
+        .unwrap();
+        w.resumes
+    };
+    // Nobody blocks it: the suggested task (here the leader, from the pid) takes it.
+    assert_eq!(send(&mut l, c, SendTo::Group), [(c, false)]);
+    assert!(l.sig(c).unwrap().shared_pending().contains(SIGUSR1));
+    let _ = l.signal_state(c).unwrap().dequeue_signal();
+    // The leader and the first thread block it: the second thread is woken.
+    for t in [c, t1] {
+        l.signal_state(t).unwrap().me.blocked.add(SIGUSR1);
+    }
+    assert_eq!(send(&mut l, c, SendTo::Group), [(t2, false)]);
+    // curr_target moved to the thread that took it.
+    assert_eq!(l.group_of(c).unwrap().curr_target, t2);
+    let _ = l.signal_state(t2).unwrap().dequeue_signal();
+    // A thread-directed signal wakes only that thread, and only if it wants it.
+    assert_eq!(send(&mut l, t1, SendTo::Thread), []);
+    assert!(
+        l.signal_state(t1)
+            .unwrap()
+            .me
+            .private_pending()
+            .contains(SIGUSR1)
+    );
+    let _ = l.signal_state(t1).unwrap().me.private_pending();
+    l.signal_state(t1).unwrap().me.blocked = SigSet::EMPTY;
+    let _ = l.signal_state(t1).unwrap().dequeue_signal();
+    assert_eq!(send(&mut l, t1, SendTo::Thread), [(t1, false)]);
+}
+
+#[test]
+fn a_fatal_signal_starts_the_group_exit_for_every_thread() {
+    let (mut l, init, c, th) = group(2);
+    let mut w = Rec::default();
+    l.group_send_sig_info(
+        Some(init),
+        i32::from(SIGTERM),
+        info_of(SIGTERM),
+        c,
+        SendTo::Group,
+        &mut w,
+    )
+    .unwrap();
+    assert_eq!(l.sig(c).unwrap().group_exit, Some(u32::from(SIGTERM)));
+    for t in [c, th[0], th[1]] {
+        assert!(pending(&mut l, t).contains(SIGKILL));
+    }
+    assert_eq!(w.resumes.len(), 3);
+    assert!(w.resumes.iter().all(|&(_, resume)| resume));
+    // The exit status the leader's parent finally sees is the signal.
+    let mut w = Rec::default();
+    for t in th {
+        thread_exit(&mut l, t, u32::from(SIGTERM), &mut w);
+    }
+    thread_exit(&mut l, c, u32::from(SIGTERM), &mut w);
+    let (ret, wo) = wait_pid(&mut l, init, 2, 0);
+    assert_eq!((ret, wo.stat), (2, i32::from(SIGTERM)));
+}
+
+#[test]
+fn children_of_an_exiting_thread_move_to_a_sibling_not_to_init() {
+    let (mut l, init, c, th) = group(1);
+    let t1 = th[0];
+    let kid = l.fork(t1, FORK).unwrap();
+    assert_eq!(l.real_parent(kid), Some(t1));
+    assert_eq!(l.task_ppid_vnr(kid), 2, "getppid is the parent's tgid");
+    // The leader's own wait sees the thread's child (no __WNOTHREAD) but not with it.
+    assert_eq!(wait_pid(&mut l, c, 4, WNOHANG).0, 0);
+    assert_eq!(
+        wait_pid(&mut l, c, 4, WNOHANG | super::wait::WNOTHREAD).0,
+        ECHILD
+    );
+    let mut w = Rec::default();
+    thread_exit(&mut l, t1, 0, &mut w);
+    assert_eq!(l.real_parent(kid), Some(c));
+    assert!(l.children(c).any(|k| k == kid));
+    assert_eq!(l.children(init).collect::<Vec<_>>(), [c]);
+    // The child exits and its group's leader reaps it.
+    thread_exit(&mut l, kid, 4 << 8, &mut w);
+    let (ret, wo) = wait_pid(&mut l, c, 4, 0);
+    assert_eq!((ret, wo.stat), (4, 4 << 8));
+}
+
+#[test]
+fn a_thread_waits_for_the_children_of_its_group() {
+    let (mut l, _init, c, th) = group(1);
+    let kid = l.fork(c, FORK).unwrap();
+    let mut w = Rec::default();
+    thread_exit(&mut l, kid, 2 << 8, &mut w);
+    // A child of the leader is waited for by the thread; the wake-up key is the leader's.
+    assert_eq!(w.child_events, [c]);
+    let (ret, wo) = wait_pid(&mut l, th[0], 4, 0);
+    assert_eq!((ret, wo.stat), (4, 2 << 8));
+}
+
+#[test]
+fn exec_from_a_non_leader_takes_the_leaders_pid() {
+    let (mut l, init, c, th) = group(2);
+    let (t1, t2) = (th[0], th[1]);
+    let mut w = Rec::default();
+    // The thread that execs starts the collapse: the others are marked for death.
+    assert_eq!(
+        l.de_thread_start(t1, &mut w),
+        Ok(super::dethread::DeThread::Wait)
+    );
+    assert_eq!(
+        l.de_thread_start(t2, &mut w),
+        Err(Errno::EAGAIN),
+        "one exec at a time"
+    );
+    assert!(pending(&mut l, c).contains(SIGKILL) && pending(&mut l, t2).contains(SIGKILL));
+    assert!(!pending(&mut l, t1).contains(SIGKILL));
+    assert!(!l.de_thread_others_gone(t1));
+    // t2 exits and is released; the old leader is not counted.
+    thread_exit(&mut l, t2, 0, &mut w);
+    assert!(l.de_thread_others_gone(t1));
+    assert_eq!(w.de_thread_events, [t1], "the last other thread woke the exec");
+    // The leader has not exited yet: wait, and be woken when it does.
+    assert!(!l.de_thread_leader_exited(t1));
+    thread_exit(&mut l, c, 0, &mut w);
+    assert_eq!(w.de_thread_events, [t1, t1], "and the old leader's exit woke it again");
+    assert!(l.de_thread_leader_exited(t1));
+    l.de_thread_finish(t1, &mut w);
+    // t1 is the leader now, with the old leader's pid, group and place.
+    assert_eq!((pid(&l, t1), l.task_tgid_vnr(t1)), (2, 2));
+    assert!(l.thread_group_leader(t1) && l.thread_group_empty(t1));
+    assert_eq!(l.find_task_by_vpid(2), Some(t1));
+    assert_eq!(l.find_task_by_vpid(3), None, "the thread's old tid is gone");
+    assert!(l.task(c).is_none());
+    assert_eq!(l.processes().collect::<Vec<_>>(), [init, t1]);
+    assert_eq!(l.children(init).collect::<Vec<_>>(), [t1]);
+    assert_eq!(l.task(t1).unwrap().exit_signal, SIGCHLD);
+    assert_eq!(l.nr_threads(), 2);
+    // The parent now waits for pid 2 and gets the new image's exit.
+    thread_exit(&mut l, t1, 1 << 8, &mut w);
+    let (ret, wo) = wait_pid(&mut l, init, 2, 0);
+    assert_eq!((ret, wo.stat), (2, 1 << 8));
+}
+
+#[test]
+fn exec_from_the_leader_just_kills_the_threads() {
+    let (mut l, _init, c, th) = group(1);
+    let mut w = Rec::default();
+    assert_eq!(
+        l.de_thread_start(c, &mut w),
+        Ok(super::dethread::DeThread::Wait)
+    );
+    assert!(pending(&mut l, th[0]).contains(SIGKILL));
+    assert!(!l.de_thread_others_gone(c));
+    thread_exit(&mut l, th[0], 0, &mut w);
+    assert!(l.de_thread_others_gone(c));
+    l.de_thread_finish(c, &mut w);
+    assert!(l.thread_group_empty(c));
+    assert_eq!(pid(&l, c), 2);
+    // An aborted exec leaves the group as it was.
+    let (mut l, _i, c, th) = group(1);
+    let mut w = Rec::default();
+    l.de_thread_start(th[0], &mut w).unwrap();
+    l.de_thread_abort(th[0]);
+    assert_eq!(
+        l.de_thread_start(c, &mut w),
+        Ok(super::dethread::DeThread::Wait)
+    );
+}
+
+#[test]
+fn a_group_stop_waits_for_every_thread_before_the_parent_is_told() {
+    let (mut l, init, c, th) = group(1);
+    let t1 = th[0];
+    l.signal_state(init).unwrap().me.blocked.add(SIGCHLD);
+    dequeue_stop(&mut l, t1, SIGSTOP);
+    let mut w = Rec::default();
+    // The thread that dequeued the stop signal stops; the leader is to join.
+    assert_eq!(
+        l.signal_stop(t1, SIGSTOP, &mut w),
+        StopPlan::Stop { fatal: false }
+    );
+    assert_eq!(l.sig(c).unwrap().group_stop_count, 1);
+    assert!(
+        l.signal_state(c).unwrap().me.jobctl & crate::signal::jobctl::JOBCTL_STOP_PENDING != 0
+    );
+    assert!(
+        l.signal_state(c).unwrap().signal_pending(),
+        "the stop is a pending event"
+    );
+    assert_eq!(w.signal_wakes, [c]);
+    assert_eq!(
+        pending(&mut l, init),
+        SigSet::EMPTY,
+        "not stopped as a group yet"
+    );
+    // The leader takes part when it next returns to user mode; it is the last one.
+    assert_eq!(
+        l.signal_stop(c, 0, &mut w),
+        StopPlan::Stop { fatal: false }
+    );
+    assert!(pending(&mut l, init).contains(SIGCHLD));
+    assert_eq!(
+        l.sig(c).unwrap().job_flags & super::exit::SIGNAL_STOP_STOPPED,
+        1
+    );
+    // SIGCONT wakes both.
+    let mut w = Rec::default();
+    l.group_send_sig_info(
+        Some(init),
+        i32::from(SIGCONT),
+        info_of(SIGCONT),
+        c,
+        SendTo::Group,
+        &mut w,
+    )
+    .unwrap();
+    assert_eq!(w.stopped_wakes.len(), 2);
 }

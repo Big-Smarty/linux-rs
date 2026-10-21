@@ -102,6 +102,14 @@ pub const CLASS_POLL: u32 = 5;
 /// The key every `poll` sleeper uses ([`CLASS_POLL`]).
 pub const POLL_KEY: WaitKey = WaitKey::new(CLASS_POLL, 0);
 
+/// Wait-key class of `de_thread`'s sleep (`TASK_KILLABLE` in `schedule()` until the other threads of the group, and for a
+/// non-leader the old leader, are gone): the id is the slot of the group leader.
+pub const CLASS_DETHREAD: u32 = 6;
+
+/// Wait-key class of a sleeping `futex_q`: the id is the slot of the waiting task, which the
+/// waker names after taking the waiter out of the futex queue (`futex_wake` -> `wake_up_q`).
+pub const CLASS_FUTEX: u32 = 7;
+
 /// A task handle: slot index plus the slot's generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedId {

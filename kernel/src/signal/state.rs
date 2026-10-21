@@ -31,8 +31,8 @@
 //!   nothing pending already. Stop and continue are `super::jobctl`'s.
 
 use super::{
-    AltStack, KERNEL_IGNORE, KERNEL_STOP, NSIG, SA_IMMUTABLE, SIG_DFL, SIG_IGN, SIGALRM, SIGKILL,
-    SIGRTMIN, SYNCHRONOUS, SigAction, SigSet, in_mask,
+    AltStack, KERNEL_IGNORE, KERNEL_STOP, NSIG, SA_IMMUTABLE, SIG_DFL, SIG_IGN, SIGALRM, SIGCONT,
+    SIGKILL, SIGRTMIN, SYNCHRONOUS, SigAction, SigSet, in_mask,
     info::{Fault, Layout, SI_KERNEL, SI_USER, SigInfo},
     itimer::RealTimer,
     sig_kernel_coredump, sig_kernel_only, sig_kernel_stop,
@@ -158,6 +158,14 @@ pub struct SigHand {
 }
 
 impl SigHand {
+    /// A `sighand_struct` with every action `SIG_DFL` (`init_sighand`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            actions: [SigAction::default(); NSIG as usize],
+        }
+    }
+
     /// `flush_signal_handlers(t, 0)` (kernel/signal.c:544): every handler goes
     /// back to `SIG_DFL` except `SIG_IGN`, which is kept; flags, restorer and
     /// `sa_mask` are cleared. `execve` and `CLONE_CLEAR_SIGHAND` use it.
@@ -170,6 +178,12 @@ impl SigHand {
             action.restorer = 0;
             action.mask = SigSet::EMPTY;
         }
+    }
+}
+
+impl Default for SigHand {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -203,6 +217,29 @@ pub struct SignalStruct {
 }
 
 impl SignalStruct {
+    /// The `signal_struct` `copy_signal` gives a new thread group: nothing pending, no group
+    /// exit or stop, the real interval timer unarmed, `RLIMIT_SIGPENDING` as given.
+    #[must_use]
+    pub fn new(rlimit_sigpending: u64) -> Self {
+        Self {
+            group_exit: None,
+            unkillable: false,
+            rlimit_sigpending,
+            job_flags: 0,
+            group_stop_count: 0,
+            stop_code: 0,
+            itimer: RealTimer::default(),
+            now_ns: 0,
+            shared: Pending::new(),
+        }
+    }
+
+    /// The signals pending for the whole group, for `/proc` and tests.
+    #[must_use]
+    pub const fn shared_pending(&self) -> SigSet {
+        self.shared.signal
+    }
+
     /// `signal->flags = SIGNAL_GROUP_EXIT; signal->group_exit_code = code;
     /// signal->group_stop_count = 0` (`do_group_exit`, `complete_signal`,
     /// `synchronize_group_exit`): the assignment replaces the other flag bits,
@@ -236,6 +273,52 @@ pub struct ThreadSignal {
     private: Pending,
 }
 
+impl ThreadSignal {
+    /// The signal fields of a task nobody has signalled: nothing blocked or pending, the
+    /// alternate stack disabled (`init_sigpending`, `sas_ss_reset`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            blocked: SigSet::EMPTY,
+            real_blocked: SigSet::EMPTY,
+            saved_sigmask: None,
+            altstack: AltStack::RESET,
+            arch: ArchInfo::default(),
+            jobctl: 0,
+            private: Pending::new(),
+        }
+    }
+
+    /// What `dup_task_struct` + `copy_process` give a new task of `self`'s creator: the blocked
+    /// masks and the alternate stack are copied (`sas_ss_reset` when `reset_altstack`, i.e.
+    /// `CLONE_VM` without `CLONE_VFORK`), the private pending queue is empty
+    /// (`init_sigpending`) and a mask saved for `TIF_RESTORE_SIGMASK` is not carried (no
+    /// clone happens while one is armed: it is set only on the way out of the syscall that
+    /// set it).
+    #[must_use]
+    pub fn fork_child(&self, reset_altstack: bool) -> Self {
+        let mut child = Self::new();
+        child.blocked = self.blocked;
+        child.real_blocked = self.real_blocked;
+        if !reset_altstack {
+            child.altstack = self.altstack;
+        }
+        child
+    }
+
+    /// The signals pending for this task alone.
+    #[must_use]
+    pub const fn private_pending(&self) -> SigSet {
+        self.private.signal
+    }
+}
+
+impl Default for ThreadSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The three signal objects of one task, owned together. shortcut: a task has
 /// exactly one thread, so `sighand` and `signal_struct` are 1:1 with it and
 /// live inline; with `CLONE_SIGHAND`/`CLONE_THREAD` they become counted shared
@@ -262,18 +345,18 @@ pub struct SigSets {
     pub queued: usize,
 }
 
-impl TaskSignals {
-    /// A read-only summary for `/proc`.
+impl SigSets {
+    /// The summary of one task's signal objects (`task_sig`, `collect_sigign_sigcatch`).
     #[must_use]
-    pub fn sets(&self) -> SigSets {
-        let mut sets = SigSets {
-            pending: self.thread.private.signal.0,
-            shared_pending: self.signal.shared.signal.0,
-            blocked: self.thread.blocked.0,
-            queued: self.thread.private.len + self.signal.shared.len,
-            ..SigSets::default()
+    pub fn of(hand: &SigHand, sig: &SignalStruct, thread: &ThreadSignal) -> Self {
+        let mut sets = Self {
+            pending: thread.private.signal.0,
+            shared_pending: sig.shared.signal.0,
+            blocked: thread.blocked.0,
+            queued: thread.private.len + sig.shared.len,
+            ..Self::default()
         };
-        for (index, action) in self.hand.actions.iter().enumerate() {
+        for (index, action) in hand.actions.iter().enumerate() {
             let bit = 1u64 << index;
             if action.handler == SIG_IGN {
                 sets.ignored |= bit;
@@ -283,6 +366,14 @@ impl TaskSignals {
         }
         sets
     }
+}
+
+impl TaskSignals {
+    /// A read-only summary for `/proc`.
+    #[must_use]
+    pub fn sets(&self) -> SigSets {
+        SigSets::of(&self.hand, &self.signal, &self.thread)
+    }
 
     /// The signal state of a newly created process (a forked child before it
     /// inherits, init at boot): default actions, nothing blocked or pending,
@@ -291,29 +382,9 @@ impl TaskSignals {
     #[must_use]
     pub fn new(rlimit_sigpending: u64) -> Self {
         Self {
-            hand: SigHand {
-                actions: [SigAction::default(); NSIG as usize],
-            },
-            signal: SignalStruct {
-                group_exit: None,
-                unkillable: false,
-                rlimit_sigpending,
-                job_flags: 0,
-                group_stop_count: 0,
-                stop_code: 0,
-                itimer: RealTimer::default(),
-                now_ns: 0,
-                shared: Pending::new(),
-            },
-            thread: ThreadSignal {
-                blocked: SigSet::EMPTY,
-                real_blocked: SigSet::EMPTY,
-                saved_sigmask: None,
-                altstack: AltStack::RESET,
-                arch: ArchInfo::default(),
-                jobctl: 0,
-                private: Pending::new(),
-            },
+            hand: SigHand::new(),
+            signal: SignalStruct::new(rlimit_sigpending),
+            thread: ThreadSignal::new(),
         }
     }
 
@@ -341,6 +412,12 @@ impl TaskSignals {
         child.thread.real_blocked = self.thread.real_blocked;
         child.thread.altstack = self.thread.altstack;
         child
+    }
+
+    /// The three objects, for an owner that shares them separately (the task list).
+    #[must_use]
+    pub fn into_parts(self) -> (SigHand, SignalStruct, ThreadSignal) {
+        (self.hand, self.signal, self.thread)
     }
 
     /// The global init's: `SIGNAL_UNKILLABLE` (`copy_process`, child reaper).
@@ -498,10 +575,30 @@ impl State<'_> {
     }
 
     /// `task_sigpending()` after `recalc_sigpending`: is there anything
-    /// `get_signal` would act on?
+    /// `get_signal` would act on? A group stop this task is to join counts
+    /// (`JOBCTL_PENDING_MASK`).
     #[must_use]
     pub fn signal_pending(&self) -> bool {
-        self.sig.group_exit.is_some() || self.pending_set().0 & !self.me.blocked.0 != 0
+        self.sig.group_exit.is_some()
+            || self.pending_set().0 & !self.me.blocked.0 != 0
+            || self.me.jobctl & super::jobctl::JOBCTL_PENDING_MASK != 0
+    }
+
+    /// [`State::signal_pending`] as it was before `sig` was queued: what `wants_signal` reads
+    /// as `task_sigpending(t)` for a candidate thread (`TIF_SIGPENDING` is set by the wake-up
+    /// that follows the queueing, not by the queueing).
+    #[must_use]
+    pub(crate) fn pending_without(&self, sig: u8) -> bool {
+        self.sig.group_exit.is_some()
+            || self.pending_set().0 & !self.me.blocked.0 & !SigSet::bit(sig) != 0
+            || self.me.jobctl & super::jobctl::JOBCTL_PENDING_MASK != 0
+    }
+
+    /// `sigqueue_dequeue_pending(&tsk->pending, ...)` + `flush_sigqueue_list`: the task is
+    /// exiting and its private queue is dropped.
+    pub fn flush_private(&mut self) {
+        self.me.private.flush(u64::MAX);
+        self.me.private.signal = SigSet::EMPTY;
     }
 
     /// `fatal_signal_pending`: `SIGKILL` is queued, or the group is already
@@ -576,8 +673,46 @@ impl State<'_> {
         self.task_clear_jobctl_pending(super::jobctl::JOBCTL_PENDING_MASK);
     }
 
-    /// `sig_fatal`.
-    fn sig_fatal(&self, sig: u8) -> bool {
+    /// The per-thread half of the fatal branch of `complete_signal` and of
+    /// `zap_other_threads`: the thread's pending group stop is dropped and `SIGKILL` is
+    /// pending for it. The caller wakes the thread (`signal_wake_up(t, 1)`).
+    pub fn mark_killed(&mut self) {
+        self.task_clear_jobctl_pending(super::jobctl::JOBCTL_PENDING_MASK);
+        self.me.private.signal.add(SIGKILL);
+    }
+
+    /// The conditions of `complete_signal` under which the signal `sig`, addressed to this
+    /// (chosen) thread, takes the whole group down at once: it is fatal by default, no group
+    /// exit has started, the thread is not in `rt_sigtimedwait` for it, and it is not a core
+    /// dump signal (which the thread that dequeues it ends the group for).
+    #[must_use]
+    pub(crate) fn fatal_to_group(&self, sig: u8, dest_real_blocked: bool) -> bool {
+        self.sig_fatal(sig)
+            && self.sig.group_exit.is_none()
+            && !dest_real_blocked
+            && !sig_kernel_coredump(sig)
+    }
+
+    /// The per-thread part of `prepare_signal` for a thread that is not the target: the
+    /// stop and continue effects on its private queue and job-control bits. Returns whether
+    /// the thread was in a job-control stop that `SIGCONT` ended (it must be woken).
+    pub(crate) fn job_control_other_thread(&mut self, sig: u8) -> bool {
+        if sig_kernel_stop(sig) {
+            self.me.private.flush(SigSet::bit(SIGCONT));
+            return false;
+        }
+        if sig != SIGCONT {
+            return false;
+        }
+        self.me.private.flush(super::KERNEL_STOP);
+        self.task_clear_jobctl_pending(super::jobctl::JOBCTL_STOP_PENDING);
+        let was_stopped = self.me.jobctl & super::jobctl::JOBCTL_STOPPED != 0;
+        self.me.jobctl &= !super::jobctl::JOBCTL_STOPPED;
+        was_stopped
+    }
+
+    /// `sig_fatal` for the task `sig` was addressed to.
+    pub(crate) fn sig_fatal(&self, sig: u8) -> bool {
         // `siginmask` is false for real-time signals: a default RT signal is fatal.
         !in_mask(sig, KERNEL_IGNORE | KERNEL_STOP)
             && self.hand.actions[usize::from(sig) - 1].handler == SIG_DFL
@@ -606,27 +741,30 @@ impl State<'_> {
         }
     }
 
-    /// `send_signal_locked` / `__send_signal_locked`. `sig` is `1..=64`.
-    /// Kernel-internal senders (`SEND_SIG_NOINFO`, `SEND_SIG_PRIV`) pass the
-    /// equivalent concrete `info` (`SI_USER` from the sender, `SI_KERNEL`); both
-    /// have `si_code >= 0`, so they take the same rlimit-exempt path as in Linux.
+    /// Whether `send_signal_locked` forces the signal: `SI_KERNEL` signals with a pid/uid
+    /// layout do (`force` of `sig_ignored`).
+    #[must_use]
+    pub fn forces(info: &SigInfo) -> bool {
+        matches!(info.layout(), Layout::Kill | Layout::Chld | Layout::Rt) && info.code == SI_KERNEL
+    }
+
+    /// `prepare_signal` for this task as the target (see [`State::prepare_signal`]): the
+    /// caller is [`crate::task::Tasklist`], which applies the per-thread half of the job-control
+    /// effects to the group's other threads itself.
+    pub(crate) fn prepare(&mut self, sig: u8, force: bool) -> bool {
+        self.prepare_signal(sig, force)
+    }
+
+    /// `__send_signal_locked` after `prepare_signal`: `legacy_queue`, the pending-signal
+    /// accounting and the queueing of the `siginfo`, then the pending bit. `Ok(false)` when
+    /// a classic signal was already pending (nothing more happens: no `complete_signal`).
     ///
     /// # Errors
-    /// `EAGAIN` when a real-time signal sent with `si_code != SI_USER` cannot
-    /// be queued (limit reached).
-    pub fn send_signal(&mut self, sig: u8, info: SigInfo, target: Target) -> Result<(), Errno> {
-        // send_signal_locked: SI_KERNEL signals with pid/uid layouts force.
-        let force = matches!(info.layout(), Layout::Kill | Layout::Chld | Layout::Rt)
-            && info.code == SI_KERNEL;
-        if !self.prepare_signal(sig, force) {
-            return Ok(());
-        }
-        // `task_sigpending(t)` as `wants_signal` will read it: before this
-        // signal is queued.
-        let pending_before = self.signal_pending();
+    /// `EAGAIN` when a real-time signal sent with `si_code != SI_USER` cannot be queued.
+    pub(crate) fn enqueue(&mut self, sig: u8, info: SigInfo, target: Target) -> Result<bool, Errno> {
         // legacy_queue: at most one classic signal pending.
         if sig < SIGRTMIN && self.pending(target).signal.contains(sig) {
-            return Ok(());
+            return Ok(false);
         }
         if sig != SIGKILL {
             let override_rlimit = sig < SIGRTMIN && info.code >= 0;
@@ -651,7 +789,33 @@ impl State<'_> {
             // else: silent loss of the siginfo, the signal is still sent.
         }
         self.pending_mut(target).signal.add(sig);
-        self.complete_signal(sig, pending_before);
+        Ok(true)
+    }
+
+    /// `send_signal_locked` / `__send_signal_locked`. `sig` is `1..=64`.
+    /// Kernel-internal senders (`SEND_SIG_NOINFO`, `SEND_SIG_PRIV`) pass the
+    /// equivalent concrete `info` (`SI_USER` from the sender, `SI_KERNEL`); both
+    /// have `si_code >= 0`, so they take the same rlimit-exempt path as in Linux.
+    ///
+    /// For this one task: the thread selection of `complete_signal` among the other threads
+    /// of a group is [`crate::task::Tasklist`]'s (`deliver`); a signal generated from here
+    /// (`send_sig`, a forced fault, an interval timer) wakes this task or leaves the signal
+    /// in the queue for whichever thread dequeues it first.
+    ///
+    /// # Errors
+    /// `EAGAIN` when a real-time signal sent with `si_code != SI_USER` cannot
+    /// be queued (limit reached).
+    pub fn send_signal(&mut self, sig: u8, info: SigInfo, target: Target) -> Result<(), Errno> {
+        // send_signal_locked: SI_KERNEL signals with pid/uid layouts force.
+        if !self.prepare_signal(sig, Self::forces(&info)) {
+            return Ok(());
+        }
+        // `task_sigpending(t)` as `wants_signal` will read it: before this
+        // signal is queued.
+        let pending_before = self.signal_pending();
+        if self.enqueue(sig, info, target)? {
+            self.complete_signal(sig, pending_before);
+        }
         Ok(())
     }
 

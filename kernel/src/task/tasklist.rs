@@ -13,11 +13,13 @@
 // GPL-2.0-only.
 // Transformation: `tasklist_lock`, `siglock` and `pidmap_lock` collapse into
 // the caller's exclusion (`&mut Tasklist`); tasks and pids are arena slots
-// addressed by generation-checked ids, not RCU pointers; one thread per thread
-// group, so `signal_struct`, `sighand_struct` and the task's signal fields are
-// the [`TaskSignals`] owned inline; no ptrace, no subreapers, one PID
-// namespace. `init_task` (the idle task, pid 0, parent of init) is not a
-// task here: init has `real_parent == None` and `getppid` reports 0.
+// addressed by generation-checked ids, not RCU pointers; a task is a thread,
+// `signal_struct` is a [`Group`] and `sighand_struct` a [`Sighand`], each a
+// counted arena slot shared by the tasks that point at it (`CLONE_THREAD`,
+// `CLONE_SIGHAND`); the thread list is a vector, not an intrusive list; no
+// ptrace, no subreapers, one PID namespace. `init_task` (the idle task, pid 0,
+// parent of init) is not a task here: init has `real_parent == None` and
+// `getppid` reports 0.
 #![forbid(unsafe_code)]
 //! The task list: parentage, pids, process groups and sessions, credentials
 //! snapshots and the publish/release protocol.
@@ -36,12 +38,15 @@
 
 use super::{
     attrs::Cred,
-    pid::{PID_MAX_DEFAULT, Pid, PidId, PidTable, PidType},
+    pid::{PID_MAX_DEFAULT, Pid, PidId, PidRef, PidTable, PidType},
 };
 use crate::{
     arena::{Arena, Id},
     sched::SchedId,
-    signal::{Ids, SIGCHLD, State, TaskSignals},
+    signal::{
+        Ids, SIGCHLD, State, TaskSignals,
+        state::{SigHand, SignalStruct, ThreadSignal},
+    },
 };
 use alloc::{boxed::Box, vec::Vec};
 use syscalls::Errno;
@@ -108,16 +113,70 @@ impl CredSnapshot {
     }
 }
 
-/// `struct task_struct` (the thread-group leader of a one-thread group) with
-/// the parts of `signal_struct` that are not signal queues.
+pub type GroupId = Id<Group>;
+pub type SighandId = Id<Sighand>;
+
+/// `struct sighand_struct`: the dispositions, shared by the tasks that point at the slot
+/// (`CLONE_SIGHAND`); `count` is `sighand->count`.
+pub struct Sighand {
+    pub(super) hand: Box<SigHand>,
+    pub(super) count: u32,
+}
+
+/// `struct signal_struct`: what the tasks of one thread group share. `sig` holds the
+/// signal-related fields ([`SignalStruct`]: the shared pending queue, group exit and stop
+/// state, the interval timer); the rest is the thread list, the counters of
+/// `synchronize_group_exit`/`do_exit`, the `exec` rendezvous (`de_thread`), the session and
+/// terminal fields and the CPU times of finished threads and reaped children.
+pub struct Group {
+    pub(super) sig: Box<SignalStruct>,
+    /// `thread_head`: the members in creation order (the leader first).
+    pub(super) threads: Vec<TaskId>,
+    /// `signal->live`: threads that have not gone through `exit_signals`.
+    pub(super) live: u32,
+    /// `signal->quick_threads`: threads that have not reached `synchronize_group_exit`.
+    pub(super) quick_threads: u32,
+    /// `signal->curr_target`: where `complete_signal` starts looking for a thread.
+    pub(super) curr_target: TaskId,
+    /// `signal->notify_count` (`de_thread`).
+    pub(super) notify_count: i32,
+    /// `signal->group_exec_task`.
+    pub(super) group_exec_task: Option<TaskId>,
+    /// `signal->leader`: a session leader.
+    pub(super) session_leader: bool,
+    /// `signal->tty != NULL`: the console tty is the controlling terminal (there is one tty, so
+    /// no pointer). Inherited by `fork`, cleared by `setsid` and by the tty's hangup/release
+    /// ([`Tasklist::session_clear_tty`]).
+    pub(super) ctty: bool,
+    /// `signal->tty_old_pgrp`: the foreground group of a terminal that was hung up under the
+    /// session leader (`tty_signal_session_leader`).
+    pub(super) tty_old_pgrp: Option<PidRef>,
+    /// `signal->cutime`/`cstime`: the times of reaped children.
+    pub(super) cutime_ns: u64,
+    pub(super) cstime_ns: u64,
+    /// `signal->utime`/`stime`: the times of threads that were released.
+    pub(super) dead_utime_ns: u64,
+    pub(super) dead_stime_ns: u64,
+}
+
+/// `struct task_struct` (one thread) with the pointers to the shared `signal_struct` and
+/// `sighand_struct`.
 pub struct TaskStruct {
-    /// `pid_links[]`: `PIDTYPE_PID`, `TGID`, `PGID`, `SID`.
+    /// `pid_links[]`: `PIDTYPE_PID`, `TGID`, `PGID`, `SID`. Only a thread-group leader is
+    /// linked into the last three (and `pid_task(pid, TGID|PGID|SID)` finds leaders only); the
+    /// other threads answer `task_pgrp` and `task_session` through their leader.
     pub(super) pids: [Option<PidId>; 4],
+    /// `group_leader`: the task itself for a leader.
+    pub(super) group_leader: TaskId,
+    /// `signal`.
+    pub(super) group: GroupId,
+    /// `sighand`.
+    pub(super) sighand: SighandId,
     pub(super) real_parent: Option<TaskId>,
     /// `children` (head and tail) and `sibling` (links): the intrusive list
     /// of Linux, in `list_add_tail` order, which is the order `wait`
     /// considers children. Intrusive so that reparenting at exit (a splice)
-    /// cannot fail to allocate.
+    /// cannot fail to allocate. Only thread-group leaders are in a `children` list.
     pub(super) first_child: Option<TaskId>,
     pub(super) last_child: Option<TaskId>,
     pub(super) prev_sibling: Option<TaskId>,
@@ -141,28 +200,17 @@ pub struct TaskStruct {
     /// set again by `execve`, cleared by `PR_SET_DUMPABLE` and by a change of
     /// the effective ids (`commit_creds`).
     pub dumpable: bool,
-    /// `signal->leader`: a session leader.
-    pub session_leader: bool,
-    /// `signal->tty != NULL`: the console tty is the controlling terminal
-    /// (there is one tty, so no pointer). Inherited by `fork`, cleared by
-    /// `setsid` and by the tty's hangup/release ([`Tasklist::session_clear_tty`]).
-    pub ctty: bool,
-    /// `signal->tty_old_pgrp`: the foreground group of a terminal that was
-    /// hung up under the session leader (`tty_signal_session_leader`).
-    pub tty_old_pgrp: Option<super::pid::PidRef>,
     /// Own CPU time in nanoseconds, folded in by the owner before it exits
     /// (`task_cputime`).
     pub utime_ns: u64,
     pub stime_ns: u64,
-    /// `signal->cutime`/`cstime`: the times of reaped children.
-    pub cutime_ns: u64,
-    pub cstime_ns: u64,
     /// The task's scheduling handle (the scheduler owns its state; the model
     /// only needs the handle to name whom to wake). `None` until the owner
     /// binds one with [`Tasklist::set_sched`].
     pub sched: Option<SchedId>,
-    /// `sighand` + `signal_struct` + the task's signal fields.
-    pub(super) signals: Box<TaskSignals>,
+    /// The task's own signal fields (`blocked`, the private pending queue, `jobctl`, the
+    /// alternate stack).
+    pub(super) thread: Box<ThreadSignal>,
 }
 
 /// What [`Tasklist::fork`] needs from the forking owner.
@@ -195,8 +243,48 @@ impl ForkParams {
     }
 }
 
+/// What [`Tasklist::clone_task`] needs beyond [`ForkParams`]: which of the objects `copy_process`
+/// shares instead of copying.
+#[derive(Clone, Copy, Debug)]
+pub struct CloneParams {
+    pub fork: ForkParams,
+    /// `CLONE_THREAD`: the child joins the caller's thread group (and shares its
+    /// `signal_struct` and, necessarily, `sighand_struct`).
+    pub thread: bool,
+    /// `CLONE_SIGHAND`: the child shares the caller's dispositions.
+    pub share_sighand: bool,
+    /// `(clone_flags & (CLONE_VM | CLONE_VFORK)) == CLONE_VM`: `sas_ss_reset(p)`.
+    pub reset_altstack: bool,
+}
+
+impl CloneParams {
+    /// A plain `fork`/`vfork`/`clone` of a separate process.
+    #[must_use]
+    pub const fn process(fork: ForkParams) -> Self {
+        Self {
+            fork,
+            thread: false,
+            share_sighand: false,
+            reset_altstack: false,
+        }
+    }
+
+    /// The request's choices on top of the limits ([`ForkParams::of`]).
+    #[must_use]
+    pub fn of(attrs: &super::attrs::Attributes, request: &super::fork::ForkRequest) -> Self {
+        Self {
+            fork: ForkParams::of(attrs, request),
+            thread: request.thread,
+            share_sighand: request.share_sighand,
+            reset_altstack: request.share_vm && !request.vfork,
+        }
+    }
+}
+
 pub struct Tasklist {
     pub(super) tasks: Arena<TaskStruct>,
+    pub(super) groups: Arena<Group>,
+    pub(super) sighands: Arena<Sighand>,
     pub(super) pids: Arena<Pid>,
     pub(super) table: PidTable,
     /// `init_struct_pid`: number 0, never freed, the group and session of init
@@ -204,8 +292,9 @@ pub struct Tasklist {
     init_pid: PidId,
     /// `pid_ns->child_reaper`.
     pub(super) child_reaper: TaskId,
-    /// `for_each_process` order (`tasks` list order: creation order).
-    order: Vec<TaskId>,
+    /// `for_each_process` order (`tasks` list order: creation order): thread-group leaders.
+    pub(super) order: Vec<TaskId>,
+    /// `nr_threads`: every task, not only leaders.
     nr_threads: u32,
     max_threads: u32,
     /// `total_forks`: tasks created since boot.
@@ -253,6 +342,29 @@ impl ChangeLog {
     }
 }
 
+impl Group {
+    /// A thread group with no member yet; the creator links the first and sets
+    /// `curr_target`.
+    fn new(sig: Box<SignalStruct>) -> Self {
+        Self {
+            sig,
+            threads: Vec::new(),
+            live: 0,
+            quick_threads: 0,
+            curr_target: TaskId::DANGLING,
+            notify_count: 0,
+            group_exec_task: None,
+            session_leader: false,
+            ctty: false,
+            tty_old_pgrp: None,
+            cutime_ns: 0,
+            cstime_ns: 0,
+            dead_utime_ns: 0,
+            dead_stime_ns: 0,
+        }
+    }
+}
+
 impl Tasklist {
     /// The task list at `kernel_init`: pid 1 with `init_struct_pid` as its
     /// group and session, `SIGNAL_UNKILLABLE`, forked from the idle task.
@@ -268,6 +380,8 @@ impl Tasklist {
         let init_pid = pids.try_insert(Pid::new(0)).map_err(|_| Errno::ENOMEM)?;
         let mut list = Self {
             tasks: Arena::new(),
+            groups: Arena::new(),
+            sighands: Arena::new(),
             pids,
             table: PidTable::new(PID_MAX_DEFAULT),
             init_pid,
@@ -281,12 +395,25 @@ impl Tasklist {
                 count: 1,
             },
         };
-        let signals =
-            Box::try_new(TaskSignals::new_init(rlimit_sigpending)).map_err(|_| Errno::ENOMEM)?;
+        let (hand, sig, thread) = TaskSignals::new_init(rlimit_sigpending).into_parts();
+        let hand = Box::try_new(hand).map_err(|_| Errno::ENOMEM)?;
+        let sig = Box::try_new(sig).map_err(|_| Errno::ENOMEM)?;
+        let thread = Box::try_new(thread).map_err(|_| Errno::ENOMEM)?;
+        let sighand = list
+            .sighands
+            .try_insert(Sighand { hand, count: 0 })
+            .map_err(|_| Errno::ENOMEM)?;
+        let group = list
+            .groups
+            .try_insert(Group::new(sig))
+            .map_err(|_| Errno::ENOMEM)?;
         let own = list.alloc_pid()?;
         let init = list.publish(
             TaskStruct {
                 pids: [Some(own), Some(own), Some(init_pid), Some(init_pid)],
+                group_leader: TaskId::DANGLING,
+                group,
+                sighand,
                 real_parent: None,
                 first_child: None,
                 last_child: None,
@@ -300,15 +427,10 @@ impl Tasklist {
                 flags: 0,
                 cred: CredSnapshot::of(cred),
                 dumpable: true,
-                session_leader: false,
-                ctty: false,
-                tty_old_pgrp: None,
                 utime_ns: 0,
                 stime_ns: 0,
-                cutime_ns: 0,
-                cstime_ns: 0,
                 sched: None,
-                signals,
+                thread,
             },
             None,
         )?;
@@ -339,9 +461,9 @@ impl Tasklist {
         }
     }
 
-    /// The `tasklist_lock` block of `copy_process`: link a fully built task
-    /// into the PID/TGID/PGID/SID lists, its parent's `children` and the task
-    /// list. Everything that allocates happens first; the links cannot fail.
+    /// The `tasklist_lock` block of `copy_process` for a new thread-group leader: link a fully
+    /// built task into the PID/TGID/PGID/SID lists, its parent's `children`, the task list and
+    /// its (new, empty) group. Everything that allocates happens first; the links cannot fail.
     fn publish(&mut self, task: TaskStruct, parent: Option<TaskId>) -> Result<TaskId, Errno> {
         // Reserve every vector the links will push into.
         self.order.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
@@ -350,12 +472,32 @@ impl Tasklist {
         {
             return Err(Errno::ESRCH);
         }
+        let group = task.group;
+        self.groups
+            .get_mut(group)
+            .ok_or(Errno::ESRCH)?
+            .threads
+            .try_reserve(1)
+            .map_err(|_| Errno::ENOMEM)?;
         for (ty, pid) in PID_TYPES.into_iter().zip(task.pids) {
             let pid = pid.ok_or(Errno::EINVAL)?;
             self.pids.get_mut(pid).ok_or(Errno::ESRCH)?.reserve(ty)?;
         }
         let links = task.pids;
+        let sighand = task.sighand;
         let id = self.tasks.try_insert(task).map_err(|_| Errno::ENOMEM)?;
+        if let Some(t) = self.tasks.get_mut(id) {
+            t.group_leader = id;
+        }
+        if let Some(g) = self.groups.get_mut(group) {
+            assert!(g.threads.push_within_capacity(id).is_ok());
+            g.live = 1;
+            g.quick_threads = 1;
+            g.curr_target = id;
+        }
+        if let Some(h) = self.sighands.get_mut(sighand) {
+            h.count += 1;
+        }
         for (ty, pid) in PID_TYPES.into_iter().zip(links) {
             if let Some(pid) = pid.and_then(|pid| self.pids.get_mut(pid)) {
                 pid.attach(ty, id);
@@ -371,10 +513,42 @@ impl Tasklist {
         Ok(id)
     }
 
+    /// The `tasklist_lock` block of `copy_process` for a new thread of an existing group: only
+    /// the `PIDTYPE_PID` link and the group's thread list.
+    fn publish_thread(&mut self, task: TaskStruct) -> Result<TaskId, Errno> {
+        let group = task.group;
+        let own = task.pids[PidType::Pid as usize].ok_or(Errno::EINVAL)?;
+        let sighand = task.sighand;
+        let g = self.groups.get_mut(group).ok_or(Errno::ESRCH)?;
+        if g.threads.try_reserve(1).is_err() {
+            return Err(Errno::ENOMEM);
+        }
+        self.pids
+            .get_mut(own)
+            .ok_or(Errno::ESRCH)?
+            .reserve(PidType::Pid)?;
+        let id = self.tasks.try_insert(task).map_err(|_| Errno::ENOMEM)?;
+        if let Some(g) = self.groups.get_mut(group) {
+            assert!(g.threads.push_within_capacity(id).is_ok());
+            g.live += 1;
+            g.quick_threads += 1;
+        }
+        if let Some(h) = self.sighands.get_mut(sighand) {
+            h.count += 1;
+        }
+        if let Some(pid) = self.pids.get_mut(own) {
+            pid.attach(PidType::Pid, id);
+        }
+        self.nr_threads += 1;
+        self.forks += 1;
+        self.note_changed(id);
+        Ok(id)
+    }
+
     /// `copy_process`' publication (`fork`, no `CLONE_*` sharing): a child of
     /// `parent` in its process group and session, `exit_signal` from the
     /// arguments, `PF_FORKNOEXEC`, the parent's credentials and the signal
-    /// state `copy_sighand`/`copy_signal` give it ([`TaskSignals::fork_child`]).
+    /// state `copy_sighand`/`copy_signal` give it.
     ///
     /// Order of failures as in Linux: the `max_threads`/`RLIMIT_NPROC` check
     /// (`EAGAIN`), then pid allocation (`EAGAIN`, `ENOMEM`); a pending fatal
@@ -384,57 +558,157 @@ impl Tasklist {
     /// # Errors
     /// `EAGAIN`, `ENOMEM`, `ESRCH` for a stale or exiting parent.
     pub fn fork(&mut self, parent: TaskId, params: ForkParams) -> Result<TaskId, Errno> {
-        self.fork_allowed(parent, params)?;
+        self.clone_task(parent, CloneParams::process(params))
+    }
+
+    /// `copy_process` for the choices of `clone`/`clone3` that concern the task list: a new
+    /// process (the parent's copy of the dispositions, or the shared ones with `CLONE_SIGHAND`)
+    /// or, with `CLONE_THREAD`, a new thread of the caller's group sharing its `signal_struct`
+    /// and `sighand_struct` (`copy_sighand`, `copy_signal`, the `thread_group_leader` branches
+    /// of the publication block).
+    ///
+    /// # Errors
+    /// `EAGAIN`, `ENOMEM`, `ESRCH` for a stale or exiting parent.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one copy_process, each failure undoing what the steps before it allocated"
+    )]
+    pub fn clone_task(&mut self, parent: TaskId, params: CloneParams) -> Result<TaskId, Errno> {
+        self.fork_allowed(parent, params.fork)?;
         let p = self.tasks.get(parent).ok_or(Errno::ESRCH)?;
-        let (pgid, sid, cred, exec_id, ctty, dumpable) = (
-            p.pids[2],
-            p.pids[3],
+        let (leader, pgid, sid, cred, exec_id, parent_exec_id, dumpable) = (
+            p.group_leader,
+            self.task_pid_type(parent, PidType::Pgid),
+            self.task_pid_type(parent, PidType::Sid),
             p.cred,
             p.self_exec_id,
-            p.ctty,
+            p.parent_exec_id,
             p.dumpable,
         );
-        // copy_sighand / copy_signal / dup_task_struct: the parent's
-        // dispositions, blocked mask and altstack; nothing pending.
-        let signals = Box::try_new(
-            p.signals
-                .fork_child(params.rlimit_sigpending, params.clear_sighand),
-        )
-        .map_err(|_| Errno::ENOMEM)?;
-        let own = self.alloc_pid()?;
+        let ctty = self.has_ctty(parent);
+        let real_parent = if params.thread {
+            p.real_parent
+        } else {
+            Some(parent)
+        };
+        let (group, old_sighand) = (p.group, p.sighand);
+        // dup_task_struct: the task's own signal fields.
+        let thread = Box::try_new(p.thread.fork_child(params.reset_altstack))
+            .map_err(|_| Errno::ENOMEM)?;
+        // copy_sighand: share the parent's, or a copy (with `CLONE_CLEAR_SIGHAND` reset).
+        let new_hand = if params.share_sighand {
+            None
+        } else {
+            let mut hand = self
+                .sighands
+                .get(old_sighand)
+                .map(|h| (*h.hand).clone())
+                .ok_or(Errno::ESRCH)?;
+            if params.fork.clear_sighand {
+                hand.flush();
+            }
+            let hand = Box::try_new(hand).map_err(|_| Errno::ENOMEM)?;
+            Some(
+                self.sighands
+                    .try_insert(Sighand { hand, count: 0 })
+                    .map_err(|_| Errno::ENOMEM)?,
+            )
+        };
+        // copy_signal: a new thread group unless `CLONE_THREAD`.
+        let new_group = if params.thread {
+            None
+        } else {
+            let made = Box::try_new(SignalStruct::new(params.fork.rlimit_sigpending))
+                .map_err(|_| Errno::ENOMEM)
+                .and_then(|sig| {
+                    self.groups
+                        .try_insert(Group::new(sig))
+                        .map_err(|_| Errno::ENOMEM)
+                });
+            match made {
+                Ok(id) => Some(id),
+                Err(errno) => {
+                    if let Some(id) = new_hand {
+                        self.sighands.remove(id);
+                    }
+                    return Err(errno);
+                }
+            }
+        };
+        let own = match self.alloc_pid() {
+            Ok(own) => own,
+            Err(errno) => {
+                if let Some(id) = new_hand {
+                    self.sighands.remove(id);
+                }
+                if let Some(id) = new_group {
+                    self.groups.remove(id);
+                }
+                return Err(errno);
+            }
+        };
         let task = TaskStruct {
-            pids: [Some(own), Some(own), pgid, sid],
-            real_parent: Some(parent),
+            pids: if params.thread {
+                [Some(own), None, None, None]
+            } else {
+                [Some(own), Some(own), pgid, sid]
+            },
+            group_leader: if params.thread { leader } else { TaskId::DANGLING },
+            group: new_group.unwrap_or(group),
+            sighand: new_hand.unwrap_or(old_sighand),
+            real_parent,
             first_child: None,
             last_child: None,
             prev_sibling: None,
             next_sibling: None,
             exit_state: ExitState::Live,
             exit_code: 0,
-            exit_signal: params.exit_signal,
-            // dup_task_struct copies self_exec_id; copy_process: "p->parent_exec_id
-            // = current->self_exec_id" (the real parent is `current`; no CLONE_PARENT).
+            // A thread has no exit signal (`p->exit_signal = -1`).
+            exit_signal: if params.thread {
+                0
+            } else {
+                params.fork.exit_signal
+            },
+            // dup_task_struct copies self_exec_id; copy_process: "p->parent_exec_id =
+            // current->self_exec_id" for a child, the parent's own for a thread.
             self_exec_id: exec_id,
-            parent_exec_id: exec_id,
+            parent_exec_id: if params.thread {
+                parent_exec_id
+            } else {
+                exec_id
+            },
             flags: PF_FORKNOEXEC,
             cred,
             // mm_init: the child's mm takes the parent's dumpability.
             dumpable,
-            session_leader: false,
-            // copy_signal: `p->signal->tty = tty_kref_get(current->signal->tty)`.
-            ctty,
-            tty_old_pgrp: None,
             utime_ns: 0,
             stime_ns: 0,
-            cutime_ns: 0,
-            cstime_ns: 0,
             sched: None,
-            signals,
+            thread,
         };
-        match self.publish(task, Some(parent)) {
-            Ok(id) => Ok(id),
+        let published = if params.thread {
+            self.publish_thread(task)
+        } else {
+            self.publish(task, real_parent)
+        };
+        match published {
+            Ok(id) => {
+                if params.thread {
+                    self.task_join_group_stop(parent, id);
+                } else if let Some(g) = self.group_mut(id) {
+                    // copy_signal: `p->signal->tty = tty_kref_get(current->signal->tty)`.
+                    g.ctty = ctty;
+                }
+                Ok(id)
+            }
             Err(errno) => {
                 self.free_if_unused(own);
+                if let Some(id) = new_hand {
+                    self.sighands.remove(id);
+                }
+                if let Some(id) = new_group {
+                    self.groups.remove(id);
+                }
                 Err(errno)
             }
         }
@@ -476,34 +750,131 @@ impl Tasklist {
         self.tasks.get(task)?.sched
     }
 
-    /// `release_task`: the dead task leaves the lists, its pids are freed when
-    /// nothing else is attached, its slot is freed and its id stops
-    /// resolving. The task has no children left (`forget_original_parent`
-    /// handed them to the reaper at its exit).
+    /// `release_task` (`__exit_signal`, `__unhash_process`): the dead task leaves the lists, its
+    /// pids are freed when nothing else is attached, its slot is freed and its id stops
+    /// resolving. The task has no children left (`forget_original_parent` handed them to the
+    /// reaper at its exit). The last thread of a group frees the group; a thread that leaves a
+    /// zombie leader alone in its group notifies the leader's parent (and releases the leader
+    /// too when that parent wants no zombie): `w` carries those wake-ups.
     ///
     /// # Panics
     /// If the task is the child reaper (init is never released).
-    pub fn release_task(&mut self, id: TaskId) {
-        assert!(id != self.child_reaper, "init released");
+    pub fn release_task(&mut self, id: TaskId, w: &mut dyn super::exit::Waker) {
+        let mut id = id;
+        loop {
+            assert!(id != self.child_reaper, "init released");
+            let Some(next) = self.release_one(id, w) else {
+                return;
+            };
+            id = next;
+        }
+    }
+
+    /// One round of `release_task`; the zombie leader to release next (`zap_leader`).
+    fn release_one(&mut self, id: TaskId, w: &mut dyn super::exit::Waker) -> Option<TaskId> {
         let nr = self.task_tgid_vnr(id);
+        let (leader, group, sighand) = {
+            let t = self.tasks.get(id)?;
+            (t.group_leader, t.group, t.sighand)
+        };
+        let group_dead = leader == id;
         let Some(task) = self.tasks.remove(id) else {
-            return;
+            return None;
         };
         debug_assert!(task.first_child.is_none(), "release_task with children");
-        for (ty, pid) in PID_TYPES.into_iter().zip(task.pids) {
-            if let Some(pid) = pid {
-                if let Some(p) = self.pids.get_mut(pid) {
-                    p.detach(ty, id);
+        // The members: the other threads' view of `curr_target` and `notify_count`.
+        let mut empty_group = false;
+        if let Some(g) = self.groups.get_mut(group) {
+            if !group_dead {
+                // "If there is any task waiting for the group exit then notify it."
+                if g.notify_count > 0 {
+                    g.notify_count -= 1;
+                    if g.notify_count == 0
+                        && let Some(waiting) = g.group_exec_task
+                    {
+                        w.de_thread_event(waiting);
+                    }
                 }
-                self.free_if_unused(pid);
+                if g.curr_target == id {
+                    let at = g.threads.iter().position(|&t| t == id).unwrap_or(0);
+                    g.curr_target = g
+                        .threads
+                        .get(at + 1)
+                        .or_else(|| g.threads.first())
+                        .copied()
+                        .unwrap_or(leader);
+                    if g.curr_target == id {
+                        g.curr_target = leader;
+                    }
+                }
+            }
+            g.dead_utime_ns += task.utime_ns;
+            g.dead_stime_ns += task.stime_ns;
+            g.threads.retain(|&t| t != id);
+            empty_group = g.threads.is_empty();
+        }
+        // __unhash_process: the thread's own pid always, the group's links with the leader.
+        let own = task.pids[PidType::Pid as usize];
+        if let Some(pid) = own {
+            if let Some(p) = self.pids.get_mut(pid) {
+                p.detach(PidType::Pid, id);
+            }
+            self.free_if_unused(pid);
+        }
+        if group_dead {
+            for ty in [PidType::Tgid, PidType::Pgid, PidType::Sid] {
+                if let Some(pid) = task.pids[ty as usize] {
+                    if let Some(p) = self.pids.get_mut(pid) {
+                        p.detach(ty, id);
+                    }
+                    self.free_if_unused(pid);
+                }
+            }
+            if let Some(parent) = task.real_parent {
+                self.list_unlink(parent, id, task.prev_sibling, task.next_sibling);
+            }
+            self.order.retain(|&t| t != id);
+        }
+        // Sub-thread release leaves the sibling position to the leader; a leader may be released
+        // while its group still has zombie-less threads only after `de_thread`.
+        if let Some(h) = self.sighands.get_mut(sighand) {
+            h.count -= 1;
+            if h.count == 0 {
+                self.sighands.remove(sighand);
             }
         }
-        if let Some(parent) = task.real_parent {
-            self.list_unlink(parent, id, task.prev_sibling, task.next_sibling);
-        }
-        self.order.retain(|&t| t != id);
         self.nr_threads -= 1;
         self.changes.note(nr);
+        if empty_group {
+            self.groups.remove(group);
+            return None;
+        }
+        // "If we are the last non-leader member of the thread group, and the leader is zombie,
+        // then notify the group leader's parent process (if it wants notification)."
+        if !group_dead {
+            let alone = self
+                .groups
+                .get(group)
+                .is_some_and(|g| g.threads.len() == 1 && g.threads[0] == leader);
+            if alone && self.tasks.get(leader).is_some_and(|l| l.exit_state == ExitState::Zombie) {
+                if let Some(code) = self
+                    .groups
+                    .get(group)
+                    .and_then(|g| g.sig.group_exit)
+                    && let Some(l) = self.tasks.get_mut(leader)
+                {
+                    l.exit_code = code;
+                }
+                let exit_signal = self.tasks.get(leader).map_or(SIGCHLD, |l| l.exit_signal);
+                if self.do_notify_parent(leader, exit_signal, w) {
+                    if let Some(l) = self.tasks.get_mut(leader) {
+                        l.exit_state = ExitState::Dead;
+                    }
+                    return Some(leader);
+                }
+            }
+        }
+        None
     }
 
     /// `free_pid` once the last link of every type is gone. `init_struct_pid`
@@ -641,10 +1012,15 @@ impl Tasklist {
         self.pid_task(self.find_vpid(nr)?, PidType::Pid)
     }
 
-    /// `task_pid_type(task, ty)`.
+    /// `task_pid_type(task, ty)`: the task's own pid, or (`signal->pids[ty]`) its group's,
+    /// which the leader holds.
     #[must_use]
     pub fn task_pid_type(&self, task: TaskId, ty: PidType) -> Option<PidId> {
-        self.tasks.get(task)?.pids[ty as usize]
+        let t = self.tasks.get(task)?;
+        match ty {
+            PidType::Pid => t.pids[PidType::Pid as usize],
+            _ => self.tasks.get(t.group_leader)?.pids[ty as usize],
+        }
     }
 
     /// `pid_vnr`: the number of a pid, 0 for `init_struct_pid`.
@@ -760,6 +1136,37 @@ impl Tasklist {
         }
     }
 
+    /// `list_replace_init(&old->sibling, &new->sibling)`: `new` takes `old`'s place among the
+    /// children of `parent`.
+    pub(super) fn list_replace(&mut self, parent: TaskId, old: TaskId, new: TaskId) {
+        let (prev, next) = {
+            let Some(o) = self.tasks.get_mut(old) else {
+                return;
+            };
+            (o.prev_sibling.take(), o.next_sibling.take())
+        };
+        if let Some(n) = self.tasks.get_mut(new) {
+            n.prev_sibling = prev;
+            n.next_sibling = next;
+        }
+        match prev.and_then(|p| self.tasks.get_mut(p)) {
+            Some(p) => p.next_sibling = Some(new),
+            None => {
+                if let Some(p) = self.tasks.get_mut(parent) {
+                    p.first_child = Some(new);
+                }
+            }
+        }
+        match next.and_then(|n| self.tasks.get_mut(n)) {
+            Some(n) => n.prev_sibling = Some(new),
+            None => {
+                if let Some(p) = self.tasks.get_mut(parent) {
+                    p.last_child = Some(new);
+                }
+            }
+        }
+    }
+
     /// `list_splice_tail_init(&from->children, &to->children)`: O(1), no
     /// allocation. The `real_parent` of each moved child is the caller's.
     pub(super) fn list_splice_tail(&mut self, from: TaskId, to: TaskId) {
@@ -814,13 +1221,109 @@ impl Tasklist {
     /// sends itself), which `wants_signal` reads.
     pub fn signal_state_as(&mut self, task: TaskId, curr: bool) -> Option<State<'_>> {
         let ids = self.signal_ids(task, curr)?;
-        Some(self.tasks.get_mut(task)?.signals.view(ids))
+        let t = self.tasks.get_mut(task)?;
+        Some(State {
+            hand: &mut *self.sighands.get_mut(t.sighand)?.hand,
+            sig: &mut *self.groups.get_mut(t.group)?.sig,
+            me: &mut *t.thread,
+            pid: ids.pid,
+            tgid: ids.tgid,
+            uid: ids.uid,
+            global_init: ids.global_init,
+            exiting: ids.exiting,
+            curr: ids.curr,
+        })
     }
 
     /// The `/proc` summary of a task's signal sets.
     #[must_use]
     pub fn signal_sets(&self, task: TaskId) -> Option<crate::signal::SigSets> {
-        Some(self.tasks.get(task)?.signals.sets())
+        let t = self.tasks.get(task)?;
+        let hand = &self.sighands.get(t.sighand)?.hand;
+        let sig = &self.groups.get(t.group)?.sig;
+        Some(crate::signal::SigSets::of(hand, sig, &t.thread))
+    }
+
+    // ---- thread groups ------------------------------------------------------------
+
+    pub(super) fn group_of(&self, task: TaskId) -> Option<&Group> {
+        self.groups.get(self.tasks.get(task)?.group)
+    }
+
+    pub(super) fn group_mut(&mut self, task: TaskId) -> Option<&mut Group> {
+        let id = self.tasks.get(task)?.group;
+        self.groups.get_mut(id)
+    }
+
+    /// The `signal_struct` signal fields of `task`'s group.
+    #[must_use]
+    pub fn sig(&self, task: TaskId) -> Option<&SignalStruct> {
+        Some(&*self.group_of(task)?.sig)
+    }
+
+    pub(super) fn sig_mut(&mut self, task: TaskId) -> Option<&mut SignalStruct> {
+        Some(&mut *self.group_mut(task)?.sig)
+    }
+
+    /// `task->group_leader`.
+    #[must_use]
+    pub fn group_leader(&self, task: TaskId) -> TaskId {
+        self.tasks.get(task).map_or(task, |t| t.group_leader)
+    }
+
+    /// `thread_group_leader(task)`.
+    #[must_use]
+    pub fn thread_group_leader(&self, task: TaskId) -> bool {
+        self.group_leader(task) == task
+    }
+
+    /// `same_thread_group(a, b)`.
+    #[must_use]
+    pub fn same_thread_group(&self, a: TaskId, b: TaskId) -> bool {
+        match (self.tasks.get(a), self.tasks.get(b)) {
+            (Some(a), Some(b)) => a.group == b.group,
+            _ => false,
+        }
+    }
+
+    /// `thread_group_empty(task)`: the task is the only thread of its group.
+    #[must_use]
+    pub fn thread_group_empty(&self, task: TaskId) -> bool {
+        self.group_of(task).is_none_or(|g| g.threads.len() <= 1)
+    }
+
+    /// `get_nr_threads(task)`: the threads of the group, the zombie ones included.
+    #[must_use]
+    pub fn group_thread_count(&self, task: TaskId) -> u32 {
+        self.group_of(task)
+            .map_or(0, |g| u32::try_from(g.threads.len()).unwrap_or(u32::MAX))
+    }
+
+    /// `for_each_thread(task, t)`: the group's members in creation order. The collection is
+    /// borrowed from the list, so the caller visits by index when it changes the list.
+    pub fn threads(&self, task: TaskId) -> impl Iterator<Item = TaskId> + '_ {
+        self.group_of(task)
+            .into_iter()
+            .flat_map(|g| g.threads.iter().copied())
+    }
+
+    /// The `index`th member of the group, for loops that change the list as they go.
+    #[must_use]
+    pub fn thread_at(&self, task: TaskId, index: usize) -> Option<TaskId> {
+        self.group_of(task)?.threads.get(index).copied()
+    }
+
+    /// `next_thread(task)`: the next member, wrapping to the group leader.
+    #[must_use]
+    pub fn next_thread(&self, task: TaskId) -> TaskId {
+        let Some(g) = self.group_of(task) else {
+            return task;
+        };
+        let at = g.threads.iter().position(|&t| t == task);
+        match at.and_then(|at| g.threads.get(at + 1)) {
+            Some(&next) => next,
+            None => self.group_leader(task),
+        }
     }
 
     // ---- credentials ------------------------------------------------------------

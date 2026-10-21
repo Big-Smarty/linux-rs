@@ -6,6 +6,7 @@
 
 pub mod attrs;
 pub mod ctty;
+pub mod dethread;
 pub mod exit;
 pub mod fork;
 pub mod jobctl;

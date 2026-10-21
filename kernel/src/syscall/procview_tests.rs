@@ -215,15 +215,7 @@ fn the_vma_vector_is_shared_until_the_address_space_changes() {
 }
 
 fn fork_child(t: &mut Task) -> (TaskId, i32) {
-    let request = ForkRequest {
-        exit_signal: 17,
-        child_sp: 0,
-        clear_sighand: false,
-        clear_child_tid: 0,
-        set_child_tid: 0,
-        share_vm: false,
-        vfork: false,
-    };
+    let request = ForkRequest::plain(17);
     let id = t
         .tasks
         .fork(t.current, ForkParams::of(&t.attrs, &request))
@@ -274,12 +266,12 @@ fn the_pid_mirror_follows_the_task_list_through_its_log() {
     ps.sync(&t.tasks).unwrap();
     assert!(ps.facts(pa).unwrap().dumpable);
     assert_mirror(&ps, &t, "dumpable");
-    t.tasks.exit_prepare(a, 0, false);
-    t.tasks.exit_notify(a, &mut NoWake).unwrap();
+    t.tasks.exit_prepare(a, 0, false, &mut NoWake);
+    t.tasks.exit_notify(a, true, &mut NoWake).unwrap();
     ps.sync(&t.tasks).unwrap();
     assert!(ps.facts(pa).unwrap().zombie);
     assert_mirror(&ps, &t, "zombie");
-    t.tasks.release_task(a);
+    t.tasks.release_task(a, &mut NoWake);
     ps.sync(&t.tasks).unwrap();
     assert!(ps.facts(pa).is_none());
     assert_mirror(&ps, &t, "released");
@@ -289,9 +281,9 @@ fn the_pid_mirror_follows_the_task_list_through_its_log() {
     for _ in 0..5 {
         kids.push(fork_child(&mut t));
     }
-    t.tasks.exit_prepare(kids[1].0, 0, false);
-    t.tasks.exit_notify(kids[1].0, &mut NoWake).unwrap();
-    t.tasks.release_task(kids[1].0);
+    t.tasks.exit_prepare(kids[1].0, 0, false, &mut NoWake);
+    t.tasks.exit_notify(kids[1].0, true, &mut NoWake).unwrap();
+    t.tasks.release_task(kids[1].0, &mut NoWake);
     kids.push(fork_child(&mut t));
     ps.sync(&t.tasks).unwrap();
     assert_mirror(&ps, &t, "several between syncs");
@@ -304,9 +296,9 @@ fn the_pid_mirror_follows_the_task_list_through_its_log() {
     assert_mirror(&ps, &t, "burst of forks");
     for &(id, _) in kids.iter().skip(10) {
         if t.tasks.task(id).is_some() {
-            t.tasks.exit_prepare(id, 0, false);
-            t.tasks.exit_notify(id, &mut NoWake).unwrap();
-            t.tasks.release_task(id);
+            t.tasks.exit_prepare(id, 0, false, &mut NoWake);
+            t.tasks.exit_notify(id, true, &mut NoWake).unwrap();
+            t.tasks.release_task(id, &mut NoWake);
         }
     }
     ps.sync(&t.tasks).unwrap();
@@ -369,18 +361,18 @@ fn views_and_totals_go_with_their_tasks() {
     // ... and a release takes the view away.
     let id = t.tasks.find_task_by_vpid(pids[2].0).unwrap();
     ps.exit(pids[2].0);
-    t.tasks.exit_prepare(id, 0, false);
-    t.tasks.exit_notify(id, &mut NoWake).unwrap();
-    t.tasks.release_task(id);
+    t.tasks.exit_prepare(id, 0, false, &mut NoWake);
+    t.tasks.exit_notify(id, true, &mut NoWake).unwrap();
+    t.tasks.release_task(id, &mut NoWake);
     ps.sync(&t.tasks).unwrap();
     assert!(ps.view(pids[2].0).is_none(), "view of a released group");
     live.retain(|&(p, _)| p != pids[2].0);
     expect(&ps, &live);
     // Pruning (no procfs) keeps the totals right too.
     let id = t.tasks.find_task_by_vpid(pids[4].0).unwrap();
-    t.tasks.exit_prepare(id, 0, false);
-    t.tasks.exit_notify(id, &mut NoWake).unwrap();
-    t.tasks.release_task(id);
+    t.tasks.exit_prepare(id, 0, false, &mut NoWake);
+    t.tasks.exit_notify(id, true, &mut NoWake).unwrap();
+    t.tasks.release_task(id, &mut NoWake);
     ps.prune(&t.tasks);
     live.retain(|&(p, _)| p != pids[4].0);
     expect(&ps, &live);
