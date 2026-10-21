@@ -46,9 +46,9 @@ pub mod proc;
 pub mod signal;
 pub mod smoke;
 pub mod time;
-pub mod xstate;
 pub mod tty;
 pub mod ttyin;
+pub mod xstate;
 
 pub type R = Result<usize, Errno>;
 
