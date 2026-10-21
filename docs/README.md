@@ -28,7 +28,7 @@ The repository is a Rust `no_std` x86_64 kernel for Linux 6.18.57 behaviour that
 | [Maintenance](maintenance.md) | Security response, upstream version drift, release policy, and sustained qualification |
 | [Research](research.md) | Primary-source evidence, source pinning, assumptions, and research method |
 | [Project audit](project-audit.md) | Rust host CLI `check`/`status`, structural planning checks, current counts, negative fixtures, and precisely bounded audit claims |
-| [Bare-metal suite](bare-metal-suite.md) | The user-run kernel suite (13 groups, prepared, never run on hardware) and the bounded nondestructive Rust smoke runner for an existing Linux: commands, outcomes, privacy and qualification limits |
+| [Bare-metal suite](bare-metal-suite.md) | The user-run kernel suite (prepared, never run on hardware; groups in the [current status](implementation.md#current-status)) and the bounded nondestructive Rust smoke runner for an existing Linux: commands, outcomes, privacy and qualification limits |
 | [Skills guide](skills.md) | Index and operating instructions for all sixteen local kernel skills |
 
 ## Subsystem implementation plans
