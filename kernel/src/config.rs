@@ -44,14 +44,14 @@ pub const DECLARED: [Declared; 12] = [
         enosys: &[],
     },
     Declared {
-        symbol: "x86 FPU: XSAVE with the user components of the CPU (boot: `noxsave` selects FXSAVE-only state)",
-        value: "CR4.OSXSAVE=1 and XCR0 = the user components CPUID lists (x87, SSE, AVX, AVX-512, PKRU, MPX, APX; never AMX tile state or supervisor state: no dynamic-state permissions, CONFIG_X86_USER_SHADOW_STACK=n, no PASID), tasks saved with XSAVES > XSAVEC > XSAVEOPT > XSAVE, signal frames and rt_sigreturn in the XSAVE standard format (UC_FP_XSTATE, _fpx_sw_bytes with the real xfeatures and size), AT_MINSIGSTKSZ from the XSAVE area size (0xd30 on the AMD Zen 5 workstation). A CPU without XSAVE, `noxsave`, or an enumeration Linux itself rejects runs FXSAVE-only: _fpx_sw_bytes.xfeatures 0, AT_MINSIGSTKSZ 0x5a0",
+        symbol: "x86 FPU: XSAVE with the user components of the CPU (boot: `noxsave` selects FXSAVE-only state, `noxsaveopt`/`noxsaves` drop XSAVEOPT/XSAVES)",
+        value: "CR4.OSXSAVE=1 and XCR0 = the user components CPUID lists (x87, SSE, AVX, AVX-512, PKRU, MPX, APX; never AMX tile state or supervisor state: no dynamic-state permissions; on a CPU that enumerates AMX, arch_prctl ARCH_GET_XCOMP_SUPP and an XTILE_DATA permission request stop loudly because Linux's answers differ (AT_MINSIGSTKSZ would too, silently: named blocker), CONFIG_X86_USER_SHADOW_STACK=n, no PASID), tasks saved with XSAVES > XSAVEC > XSAVEOPT > XSAVE, signal frames and rt_sigreturn in the XSAVE standard format (UC_FP_XSTATE, _fpx_sw_bytes with the real xfeatures and size), AT_MINSIGSTKSZ from the XSAVE area size (0xd30 on the AMD Zen 5 workstation). A CPU without XSAVE, `noxsave`, or an enumeration Linux itself rejects runs FXSAVE-only: _fpx_sw_bytes.xfeatures 0, AT_MINSIGSTKSZ 0x5a0",
         source: "arch/x86/kernel/fpu/xstate.c:805-1010, arch/x86/kernel/fpu/signal.c:51-531, arch/x86/kernel/fpu/xstate.h, arch/x86/kernel/signal.c:187-210 and 416-438",
         enosys: &[],
     },
     Declared {
         symbol: "CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS=y, boot: nopku",
-        value: "y (as the reference config): with PKU and XSAVE CR4.PKE is set, PKRU starts at init_pkru_value 0x55555554, is switched with the task and saved in signal frames, and a PK fault is SEGV_PKUERR. pkey_alloc/pkey_free/pkey_mprotect stay unimplemented (loud stop), as does a PROT_EXEC-only mmap/mprotect (Linux gives it the execute-only key); kernel copies through the software user-page walk ignore PKRU",
+        value: "y (as the reference config): with PKU and XSAVE CR4.PKE is set, PKRU starts at init_pkru_value 0x55555554, is switched with the task and saved in signal frames, and a PK fault is SEGV_PKUERR. pkey_alloc/pkey_free/pkey_mprotect stay unimplemented (loud stop), as does a PROT_EXEC-only mmap/mprotect (Linux gives it the execute-only key); a kernel access to user memory on the task's behalf (copy_from_user, copy_to_user, the signal frame) honours PKRU as the hardware does (EFAULT, or the usual signal for the frame); a PF_X-only PT_LOAD is a loud stop like the PROT_EXEC mmap",
         source: "arch/x86/kernel/cpu/common.c:523-541, arch/x86/mm/pkeys.c:76-125, arch/x86/include/asm/pkru.h, arch/x86/mm/fault.c:850-905, arch/x86/kernel/process_64.c:375-390",
         enosys: &[],
     },
@@ -87,7 +87,7 @@ pub const DECLARED: [Declared; 12] = [
     },
     Declared {
         symbol: "CONFIG_IA32_EMULATION=y with boot ia32_emulation=0",
-        value: "y (sigframe_ia32 sizing: AT_MINSIGSTKSZ 0x5a0 equals the oracle) but ia32_enabled() is false: no int $0x80 gate (#GP), no SYSENTER/compat SYSCALL entry (CSTAR -> -ENOSYS stub, SYSENTER MSRs zero)",
+        value: "y (get_sigframe_size() counts the ia32 frame too; AT_MINSIGSTKSZ follows the CPU's XSAVE area as the XSAVE entry says, 0x5a0 only without XSAVE) but ia32_enabled() is false: no int $0x80 gate (#GP), no SYSENTER/compat SYSCALL entry (CSTAR -> -ENOSYS stub, SYSENTER MSRs zero)",
         source: "arch/x86/kernel/signal.c:181-185, arch/x86/kernel/idt.c:124-126 and 233-239, arch/x86/kernel/cpu/common.c:2230-2252, arch/x86/include/asm/ia32.h:84",
         enosys: &[],
     },

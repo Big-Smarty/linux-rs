@@ -24,8 +24,8 @@
 //!   loads them when it is switched in, so each task sees only its own.
 //! * `PKRU` is not in the buffer's restore (`XFEATURE_MASK_USER_RESTORE` excludes it): it is
 //!   switched eagerly with the task's saved value ([`pkru_switch`]).
-//! * Lock order: nothing here takes a lock; [`XBuf::try_new`] allocates (heap lock, task
-//!   context only).
+//! * Lock order: nothing here takes a lock; [`XBuf::initial`] and [`XBuf::from_live`] allocate
+//!   (heap lock, task context only).
 //!
 //! Unsafe boundaries: the XSAVE-family intrinsics, `RDPKRU`/`WRPKRU`, the `XRSTOR` whose `#GP`
 //! is recovered at a known address, and the one-time publication of the configuration.
@@ -59,14 +59,21 @@ pub struct Options {
     pub noxsave: bool,
     /// `nopku`: no protection keys (`pku_disabled`).
     pub nopku: bool,
+    /// `noxsaveopt`: `X86_FEATURE_XSAVEOPT` cleared (the task save falls back to `XSAVE`).
+    pub noxsaveopt: bool,
+    /// `noxsaves`: `X86_FEATURE_XSAVES` cleared (the task save falls back to `XSAVEC`).
+    pub noxsaves: bool,
 }
 
 impl Options {
-    /// The kernel part of the loader command line (`noxsave`, `nopku`).
+    /// The kernel part of the loader command line (`noxsave`, `noxsaveopt`, `noxsaves`,
+    /// `nopku`; arch/x86/kernel/cpu/common.c:1719-1727).
     pub fn from_boot(boot: &crate::boot::BootInfo) -> Self {
         Self {
             noxsave: boot.has_option(b"noxsave"),
             nopku: boot.has_option(b"nopku"),
+            noxsaveopt: boot.has_option(b"noxsaveopt"),
+            noxsaves: boot.has_option(b"noxsaves"),
         }
     }
 }
@@ -632,7 +639,20 @@ unsafe fn reset_registers() {
 
 /// The XSAVE half of `init`.
 fn enable_xsave(options: Options, mxcsr_mask: u32) -> Result<Config, &'static str> {
-    let l = leaf;
+    // `setup_clear_cpu_cap(X86_FEATURE_XSAVEOPT/XSAVES)`: the save instructions are chosen from
+    // CPUID.(0xd,1):EAX, so the options clear their bits there (bit 0 XSAVEOPT, bit 3 XSAVES).
+    let l = |leaf_nr: u32, sub: u32| {
+        let mut out = leaf(leaf_nr, sub);
+        if (leaf_nr, sub) == (0xd, 1) {
+            if options.noxsaveopt {
+                out[0] &= !1;
+            }
+            if options.noxsaves {
+                out[0] &= !8;
+            }
+        }
+        out
+    };
     let (l1, l7, l7_1) = (l(1, 0), l(7, 0), l(7, 1));
     // `setup_pku`: protection keys when the CPU has them and `nopku` was not given.
     let pku = !options.nopku && l7[2] >> 3 & 1 == 1;

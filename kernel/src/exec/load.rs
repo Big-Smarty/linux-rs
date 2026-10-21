@@ -37,7 +37,7 @@ use super::{
 use crate::{
     memory::PAGE_BYTES,
     mm::{
-        Env, FileInfo, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, Mm, Mmap, OutOfMemory,
+        self, Env, FileInfo, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, Mm, Mmap, OutOfMemory,
         PROT_EXEC, PROT_READ, PROT_WRITE, PageProt, UserPages, VmFlags, Vma,
     },
     usercopy::TASK_SIZE_MAX,
@@ -119,13 +119,13 @@ fn elf_load(
     mm: &mut Mm,
     env: &Env,
     pt: &mut (impl Pager + ?Sized),
-) -> Result<u64, Errno> {
+) -> Result<u64, LoadError> {
     if segment.filesz != 0 && segment.file_pages != 0 {
         // elf_map -> vm_mmap(file, addr, size, prot, MAP_PRIVATE|FIXED..., off)
         let size = segment.file_pages * crate::memory::PAGE;
         let off = segment.file_offset;
         if off.wrapping_add(size) < off || off & (crate::memory::PAGE - 1) != 0 {
-            return Err(Errno::EINVAL);
+            return Err(failed(Errno::EINVAL));
         }
         let flags = MAP_PRIVATE
             | if first {
@@ -133,21 +133,31 @@ fn elf_load(
             } else {
                 MAP_FIXED
             };
-        match mm.mmap(
-            env,
-            pt,
-            segment.start,
-            size,
-            prot_bits(segment),
-            flags,
-            off >> 12,
-            Some(file),
-        )? {
+        match mm
+            .mmap(
+                env,
+                pt,
+                segment.start,
+                size,
+                prot_bits(segment),
+                flags,
+                off >> 12,
+                Some(file),
+            )
+            .map_err(failed)?
+        {
             Mmap::NeedsFile(m) => {
-                mm.mmap_region(env, pt, Some(m.file.id), m.addr, m.len, m.vm_flags, m.pgoff)?;
+                mm.mmap_region(env, pt, Some(m.file.id), m.addr, m.len, m.vm_flags, m.pgoff)
+                    .map_err(failed)?;
             }
-            // Private regular files never take these branches.
-            Mmap::Mapped(_) | Mmap::Unsupported(_) => return Err(Errno::EINVAL),
+            // `do_mmap`: prot == PROT_EXEC takes `execute_only_pkey()`, so a `PF_X`-only segment
+            // is execute-only with protection keys on (a read of it is SEGV_PKUERR). The model
+            // carries no key: a loud stop, as for the syscalls.
+            Mmap::Unsupported(mm::Unsupported::ExecuteOnlyPkey) => {
+                return Err(LoadError::Unsupported(Unsupported::ExecuteOnlyPkey));
+            }
+            // The other branches are never taken by a private regular file.
+            Mmap::Mapped(_) | Mmap::Unsupported(_) => return Err(failed(Errno::EINVAL)),
         }
     }
     if segment.memsz > segment.filesz {
@@ -157,7 +167,8 @@ fn elf_load(
         } else {
             VmFlags::NONE
         };
-        mm.vm_brk_flags(env, pt, segment.anon_start, segment.anon_len, exec)?;
+        mm.vm_brk_flags(env, pt, segment.anon_start, segment.anon_len, exec)
+            .map_err(failed)?;
     }
     Ok(segment.start)
 }
@@ -181,7 +192,7 @@ pub fn map_segments(
     let mut start_data = 0u64;
     let mut end_data = 0u64;
     for (index, segment) in plan.segments().iter().enumerate() {
-        let map_addr = elf_load(segment, index == 0, info, mm, env, pt).map_err(failed)?;
+        let map_addr = elf_load(segment, index == 0, info, mm, env, pt)?;
         // BAD_ADDR(error)
         if map_addr >= TASK_SIZE_MAX {
             return Err(failed(Errno::EINVAL));

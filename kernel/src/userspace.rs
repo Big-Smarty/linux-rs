@@ -897,10 +897,18 @@ impl<'a, 'b> FaultPages<'a, 'b> {
 
     /// `page` by value: the returned borrow lives as long as the view's.
     fn into_page(self, page: u64, write: bool) -> Option<&'a mut [u8; PAGE_BYTES]> {
+        // Present-but-read-only (write) is `X86_PF_PROT`, an absent page is
+        // not; the model's decision does not depend on it for a write.
+        let error = if write { PF_WRITE } else { 0 };
+        // The protection keys apply to the kernel's own accesses on the task's behalf
+        // (`copy_from_user`/`copy_to_user`/`put_user`, the `XSAVE` into a signal frame; Documentation/
+        // core-api/protection-keys.rst: "like with a read()"): the hardware reports a PK fault, and
+        // `access_error` finds it before anything is populated, so it ends in the fixup (a short
+        // copy, `-EFAULT`) whether or not the page is resident. All memory is key 0.
+        if self.env.ospke && mm::pkru_denies_key0(error, fpu::read_pkru()) {
+            return None;
+        }
         if !self.space.resident(page, write) {
-            // Present-but-read-only (write) is `X86_PF_PROT`, an absent page is
-            // not; the model's decision does not depend on it for a write.
-            let error = if write { PF_WRITE } else { 0 };
             match user_fault(
                 self.mm, self.env, self.vfs, self.owner, self.space, page, error,
             ) {
@@ -1851,9 +1859,14 @@ fn page_fault(
     let ip = regs.ip;
     let owner = own.owner();
     let mut space = tables.user_space();
+    // `access_error` consults the task's `PKRU` before it populates anything.
+    let env = Env {
+        pkru: fpu::read_pkru(),
+        ..own.env
+    };
     let outcome = user_fault(
         &mut own.space,
-        &own.env,
+        &env,
         &mut process.vfs,
         owner,
         &mut space,
@@ -1870,9 +1883,8 @@ fn page_fault(
             // `bad_area_access_error`: with protection keys, an access error that the PKRU
             // caused (a hardware PK fault, or an access the PKRU denies for the VMA's key, 0
             // here) is SEGV_PKUERR with that key; the key is in the zero-filled `_pkey` field.
-            let pkuerr = code == mm::SegvCode::AccErr
-                && fpu::config().ospke
-                && mm::pkru_denies_key0(error, fpu::read_pkru());
+            let pkuerr =
+                code == mm::SegvCode::AccErr && env.ospke && mm::pkru_denies_key0(error, env.pkru);
             let code = if pkuerr {
                 info::SEGV_PKUERR
             } else {

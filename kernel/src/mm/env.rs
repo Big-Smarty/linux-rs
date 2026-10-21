@@ -65,6 +65,10 @@ pub struct Env {
     /// carry (no `VM_PKEY_BIT*`, no key in the page tables, no `pkey_alloc` state): those
     /// requests end in [`super::Unsupported::ExecuteOnlyPkey`], a loud stop.
     pub ospke: bool,
+    /// The faulting task's `PKRU` (`read_pkru()`), meaningful with `ospke`: `access_error` asks
+    /// `arch_vma_access_permitted` before it populates anything. The caller refreshes it for
+    /// each fault; it is not a boot-time constant.
+    pub pkru: u32,
 }
 
 impl Env {
@@ -91,6 +95,7 @@ impl Env {
             cap_sys_rawio: true,
             ignore_rlimit_data: false,
             ospke: false,
+            pkru: 0,
         }
     }
 

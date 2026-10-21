@@ -17,7 +17,7 @@
 //! are enabled, where the standard format puts them, how big a task's save buffer and a signal
 //! frame are.
 //!
-//! Hardware access (`XSETBV`, `XSAVE*`, `XRSTOR*`, `RDPKRU`) is the binary's (`cpu.rs`); this
+//! Hardware access (`XSETBV`, `XSAVE*`, `XRSTOR*`, `RDPKRU`) is the binary's (`fpu.rs`); this
 //! module is the arithmetic both the binary and the signal frame code ([`crate::signal`]) share.
 //!
 //! # Contract
@@ -47,6 +47,8 @@ pub const MASK_FPSSE: u64 = MASK_FP | MASK_SSE;
 
 /// `XFEATURE_MAX`: component numbers are below this.
 pub const XFEATURE_MAX: usize = 20;
+/// `XFEATURE_XTILE_DATA`: the one component with a permission request (`ARCH_REQ_XCOMP_PERM`).
+pub const XFEATURE_XTILE_DATA: u64 = 18;
 pub const XFEATURE_PKRU: usize = 9;
 
 /// `XFEATURE_MASK_USER_SUPPORTED` (arch/x86/include/asm/fpu/xstate.h:26-37).
@@ -191,6 +193,10 @@ pub struct Config {
     pub mxcsr_mask: u32,
     /// `X86_FEATURE_OSPKE`: `PKRU` is switched and saved in signal frames.
     pub ospke: bool,
+    /// `CPUID.(0xd,0)` lists AMX tile data, which this kernel does not enable (a named blocker):
+    /// Linux enables it in `XCR0` with `XFD`, so `ARCH_GET_XCOMP_SUPP` and a tile-data permission
+    /// request differ here, and `arch_prctl` stops loudly for them instead of answering.
+    pub amx: bool,
 }
 
 /// Value of the maximum frame size when no `XSAVE` state exists (the default of every host
@@ -243,6 +249,7 @@ impl Config {
             }; XFEATURE_MAX],
             mxcsr_mask,
             ospke: false,
+            amx: false,
         }
     }
 
@@ -259,11 +266,17 @@ impl Config {
         if max & MASK_APX != 0 && max & (MASK_BNDREGS | MASK_BNDCSR) != 0 {
             return Err(Disabled::ApxAndMpx);
         }
-        // `xsave_cpuid_features`: a component needs the CPU feature that owns it.
+        // `xsave_cpuid_features`: a component needs the CPU feature that owns it. AVX-512 also
+        // needs AVX (`cpuid-deps.c:54`: clearing AVX clears AVX512F), or `XSETBV` would get
+        // XCR0[7:5] without XCR0[2:1] and raise #GP (SDM Vol. 1 13.3) on an inconsistent
+        // hypervisor CPUID.
         for (mask, present) in [
             (MASK_YMM, cpu.avx),
             (MASK_BNDREGS | MASK_BNDCSR, cpu.mpx),
-            (MASK_OPMASK | MASK_ZMM_HI256 | MASK_HI16_ZMM, cpu.avx512f),
+            (
+                MASK_OPMASK | MASK_ZMM_HI256 | MASK_HI16_ZMM,
+                cpu.avx512f && cpu.avx,
+            ),
             (MASK_PKRU, cpu.ospke),
             (MASK_APX, cpu.apx),
         ] {
@@ -326,6 +339,7 @@ impl Config {
             components,
             mxcsr_mask,
             ospke,
+            amx: cpuid(0xd, 0)[0] & 1 << 18 != 0,
         };
         config.user_size = config.calculate_size(features, false);
         config.kernel_size = config.calculate_size(features, config.compacted());
@@ -490,17 +504,17 @@ impl Config {
     /// `ARCH_REQ_XCOMP_PERM`/`ARCH_REQ_XCOMP_GUEST_PERM` (`xstate_request_perm`): the only
     /// facility with a permission request is AMX tile data (component 18), which this
     /// configuration never has; any other index below `XFEATURE_MAX` is `-EOPNOTSUPP`, above it
-    /// `-EINVAL`.
-    ///
-    /// # Errors
-    /// Always: [`XcompError`].
-    pub fn xcomp_request(&self, idx: u64) -> Result<(), XcompError> {
+    /// `-EINVAL`. The request never succeeds here, so the answer is the error itself (the
+    /// success of `xstate_request_perm`, 0 when the permission is already held, exists only with
+    /// a dynamic component; it becomes a `Result` the day AMX does).
+    #[must_use]
+    pub fn xcomp_request(&self, idx: u64) -> XcompError {
         if idx >= XFEATURE_MAX as u64 {
-            return Err(XcompError::Invalid);
+            return XcompError::Invalid;
         }
         // `xstate_prctl_req[idx]` is 0 for everything but XFEATURE_XTILE_DATA, and the CPU
         // (`fpu_user_cfg.max_features`) lacks that one too.
-        Err(XcompError::NotSupported)
+        XcompError::NotSupported
     }
 }
 
@@ -629,6 +643,30 @@ mod tests {
             ..ALL
         };
         assert_eq!(Config::features(zen5(0xd, 0), no_pku), Ok(0xe7));
+        // AVX-512 without AVX (`-cpu host,-avx`): the opmask and ZMM groups go with it, so XCR0
+        // never has bits 7:5 without bit 2.
+        let no_avx = Cpu { avx: false, ..ALL };
+        assert_eq!(
+            Config::features(zen5(0xd, 0), no_avx),
+            Ok(0x2e7 & !(MASK_YMM | MASK_OPMASK | MASK_ZMM_HI256 | MASK_HI16_ZMM))
+        );
+    }
+
+    #[test]
+    fn amx_in_the_enumeration_is_recorded_but_not_enabled() {
+        assert!(!build_zen5().amx);
+        let with_amx = |leaf, sub| {
+            let mut l = zen5(leaf, sub);
+            if (leaf, sub) == (0xd, 0) {
+                l[0] |= low(MASK_XTILE_CFG | MASK_XTILE_DATA);
+            }
+            l
+        };
+        let features = Config::features(with_amx(0xd, 0), ALL).unwrap();
+        assert_eq!(features, 0x2e7, "tile state is never enabled");
+        let config = Config::build(features, with_amx, 0xffff, true).unwrap();
+        assert!(config.amx);
+        assert_eq!((config.user_size, config.xcomp_supported()), (2440, 0x2e7));
     }
 
     #[test]
@@ -710,14 +748,10 @@ mod tests {
     fn xcomp_requests_match_xstate_request_perm() {
         let config = Config::build(0x2e7, zen5, 0xffff, true).unwrap();
         for idx in [0, 2, 9, 17, 18, 19] {
-            assert_eq!(
-                config.xcomp_request(idx),
-                Err(XcompError::NotSupported),
-                "{idx}"
-            );
+            assert_eq!(config.xcomp_request(idx), XcompError::NotSupported, "{idx}");
         }
         for idx in [20, 63, 64, u64::MAX] {
-            assert_eq!(config.xcomp_request(idx), Err(XcompError::Invalid), "{idx}");
+            assert_eq!(config.xcomp_request(idx), XcompError::Invalid, "{idx}");
         }
     }
 }

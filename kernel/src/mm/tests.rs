@@ -1543,3 +1543,50 @@ fn pkru_denies_key0_follows_arch_vma_access_permitted() {
         "unless the hardware said so"
     );
 }
+
+/// src: arch/x86/mm/fault.c `access_error` (:1049-1085): `arch_vma_access_permitted` is asked
+/// before `handle_mm_fault`, so an access the PKRU denies is refused (`Segv(AccErr)`, which the
+/// binary turns into `SEGV_PKUERR`) before any page is populated; an access it allows, and every
+/// access on a CPU without keys, is handled as before.
+#[test]
+fn pkru_denial_refuses_before_a_page_is_populated() {
+    let mut w = W::new();
+    let a = w.map(0, 3 * P, RW, ANON).unwrap();
+    let refused = FaultOutcome::Segv {
+        code: SegvCode::AccErr,
+        address: a,
+    };
+    w.env.ospke = true;
+    // AD: a not-present read and write are refused and nothing is mapped.
+    w.env.pkru = 1;
+    assert_eq!(w.fault(a, 0), refused);
+    assert_eq!(w.fault(a, PF_WRITE), refused);
+    assert!(w.pt.pages.is_empty(), "the denied access populated a page");
+    // WD: the read populates the zero page, the write is refused and does not COW it.
+    w.env.pkru = 2;
+    assert_eq!(w.fault(a, 0), FaultOutcome::Handled);
+    assert_eq!(w.pt.lookup(a), Pte::ZeroPage);
+    assert_eq!(w.fault(a, PF_WRITE | PF_PROT), refused);
+    assert_eq!(
+        w.pt.lookup(a),
+        Pte::ZeroPage,
+        "the denied write copied the page"
+    );
+    // A write to a page never touched is refused with nothing mapped.
+    let b = a + P;
+    assert_eq!(
+        w.fault(b, PF_WRITE),
+        FaultOutcome::Segv {
+            code: SegvCode::AccErr,
+            address: b
+        }
+    );
+    assert_eq!(w.pt.lookup(b), Pte::Absent);
+    // A fetch is never affected by the PKRU.
+    w.env.pkru = 3;
+    let x = w.map(0, P, PROT_READ | PROT_EXEC, ANON).unwrap();
+    assert_eq!(w.fault(x, PF_INSTR), FaultOutcome::Handled);
+    // Keys off: the PKRU value is not looked at.
+    w.env.ospke = false;
+    assert_eq!(w.fault(b, PF_WRITE), FaultOutcome::Handled);
+}

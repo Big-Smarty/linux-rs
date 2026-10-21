@@ -45,8 +45,11 @@ pub(crate) fn env() -> Env {
 }
 
 fn build(file: &[u8]) -> Result<(Mm, Fake), LoadError> {
+    build_in(file, env())
+}
+
+fn build_in(file: &[u8], env: Env) -> Result<(Mm, Fake), LoadError> {
     let plan = LoadPlan::new(file)?;
-    let env = env();
     let mut mm = Mm::new(&env);
     let mut pt = Fake::default();
     insert_stack(&mut mm, &env, plan.exec_stack)?;
@@ -313,4 +316,33 @@ fn segment_limit_and_hostile_headers_never_panic() {
         }
         let _ = build(&bytes);
     }
+}
+
+/// src: mm/mmap.c `do_mmap` (`prot == PROT_EXEC` takes `execute_only_pkey()`), via `elf_map`: with
+/// protection keys on, a `PF_X`-only segment is a loud stop, not a readable mapping and not an
+/// errno; any other protection, and a CPU without keys, load as before.
+#[test]
+fn execute_only_segment_stops_when_protection_keys_are_on() {
+    let image = elf(EXEC, 0x1000, &[load(X, 0, 0x400000, 0x10, 0x10)], 0x1000);
+    assert!(build(&image).is_ok(), "no keys: a readable mapping");
+    let keys = Env {
+        ospke: true,
+        ..env()
+    };
+    assert_eq!(
+        unsupported(build_in(&image, keys)),
+        Unsupported::ExecuteOnlyPkey
+    );
+    for flags in [R | X, R, R | W, W | X] {
+        let image = elf(
+            EXEC,
+            0x1000,
+            &[load(flags, 0, 0x400000, 0x10, 0x10)],
+            0x1000,
+        );
+        assert!(build_in(&image, keys).is_ok(), "{flags}");
+    }
+    // A bss-only segment is an anonymous mapping (`vm_brk_flags`), not execute-only.
+    let bss = elf(EXEC, 0x1000, &[load(X, 0, 0x400000, 0, 0x2000)], 0x1000);
+    assert!(build_in(&bss, keys).is_ok());
 }

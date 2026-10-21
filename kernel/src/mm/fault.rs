@@ -174,7 +174,11 @@ impl Mm {
             _ => return segv(SegvCode::MapErr),
         }
         idx = self.lower(address);
-        if access_error(error_code, self.vmas[idx].flags) {
+        // access_error: PF_PK, then `arch_vma_access_permitted` (the VMA's key is 0), both before
+        // any page is populated; the signal code (SEGV_PKUERR) is the caller's.
+        if access_error(error_code, self.vmas[idx].flags)
+            || (env.ospke && pkru_denies_key0(error_code, env.pkru))
+        {
             return segv(SegvCode::AccErr);
         }
         match self.fault_one(pt, idx, address, write) {

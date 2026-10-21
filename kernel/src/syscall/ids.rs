@@ -458,7 +458,8 @@ const ARCH_REQ_XCOMP_GUEST_PERM: i32 = 0x1025;
 /// determinable, it stops the kernel. The `XCOMP` family is
 /// `fpu_xstate_prctl` (arch/x86/kernel/fpu/xstate.c:1840-1875) over
 /// [`Context::xstate`]: the three `GET`s store a mask, the two `REQ`s are
-/// `-EOPNOTSUPP`/`-EINVAL` because no dynamic (AMX) component is ever enabled.
+/// `-EOPNOTSUPP`/`-EINVAL` because no dynamic (AMX) component is ever enabled; on a CPU that
+/// has AMX, `GET_XCOMP_SUPP` and an `XTILE_DATA` request stop loudly (Linux's answers differ).
 /// `ARCH_MAP_VDSO_*`
 /// (`CONFIG_CHECKPOINT_RESTORE`), the `ADDRESS_MASKING` options and the
 /// `SHSTK` options (`shstk_prctl` is a `-EINVAL` stub without
@@ -472,6 +473,14 @@ fn arch_prctl<C: Context>(ctx: &mut C, option: i32, arg2: u64) -> Res {
         // `set_cpuid_mode`: without CPUID faulting the answer is `-ENODEV`.
         ARCH_SET_CPUID if ctx.cpuid_fault_absent() => Err(Errno::ENODEV.into()),
         ARCH_SET_CPUID => Err(Stop::Unimplemented),
+        // On a CPU with AMX Linux's masks and tile-data permission differ from this kernel's
+        // (named blocker, `xstate::Config::amx`): a loud stop, not a different answer.
+        ARCH_GET_XCOMP_SUPP if ctx.xstate().amx => Err(Stop::Unimplemented),
+        ARCH_REQ_XCOMP_PERM | ARCH_REQ_XCOMP_GUEST_PERM
+            if ctx.xstate().amx && arg2 == crate::xstate::XFEATURE_XTILE_DATA =>
+        {
+            Err(Stop::Unimplemented)
+        }
         // fpu_xstate_prctl: `put_user(mask, uptr)`.
         ARCH_GET_XCOMP_SUPP | ARCH_GET_XCOMP_PERM | ARCH_GET_XCOMP_GUEST_PERM => {
             let xstate = ctx.xstate();
@@ -488,8 +497,8 @@ fn arch_prctl<C: Context>(ctx: &mut C, option: i32, arg2: u64) -> Res {
         }
         ARCH_REQ_XCOMP_PERM | ARCH_REQ_XCOMP_GUEST_PERM => {
             Err(match ctx.xstate().xcomp_request(arg2) {
-                Err(crate::xstate::XcompError::Invalid) | Ok(()) => Errno::EINVAL,
-                Err(crate::xstate::XcompError::NotSupported) => Errno::EOPNOTSUPP,
+                crate::xstate::XcompError::Invalid => Errno::EINVAL,
+                crate::xstate::XcompError::NotSupported => Errno::EOPNOTSUPP,
             }
             .into())
         }
@@ -1094,6 +1103,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn arch_prctl_xcomp_stops_where_amx_would_change_the_answer() {
+        let mut t = user_task();
+        t.xstate = crate::xstate::zen5();
+        t.xstate.amx = true;
+        let nr = Sysno::arch_prctl.id().cast_unsigned();
+        for (code, arg) in [(0x1021, BUF), (0x1023, 18), (0x1025, 18)] {
+            assert_eq!(
+                call(&mut t, Sysno::arch_prctl, &[code, arg]),
+                Outcome::Unimplemented(nr),
+                "{code:#x}"
+            );
+        }
+        // Everything the answer does not depend on is unchanged.
+        assert_eq!(call(&mut t, Sysno::arch_prctl, &[0x1022, BUF]), ok(0));
+        assert_eq!(
+            call(&mut t, Sysno::arch_prctl, &[0x1023, 17]),
+            err(Errno::EOPNOTSUPP)
+        );
     }
 
     fn limit(t: &mut Task, resource: u64) -> (Outcome, Rlimit) {
