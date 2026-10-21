@@ -160,7 +160,9 @@ impl W {
         self.mm.munmap(&self.env, &mut self.pt, a, l)
     }
     fn mprotect(&mut self, a: u64, l: u64, p: u64) -> Result<(), Errno> {
-        self.mm.mprotect(&self.env, &mut self.pt, a, l, p)
+        self.mm
+            .mprotect(&self.env, &mut self.pt, a, l, p)
+            .map(|stop| assert_eq!(stop, None))
     }
     fn brk(&mut self, a: u64) -> u64 {
         self.mm.brk(&self.env, &mut self.pt, a)
@@ -1465,4 +1467,79 @@ fn dup_copies_the_layout_and_counters_for_a_forked_child() {
     // A charge the policy refuses (more pages than RAM) fails the whole dup.
     let tiny = Env::init(16, 0);
     assert_eq!(w.mm.dup(&tiny).err(), Some(Errno::ENOMEM));
+}
+
+/// src: mm/mmap.c `do_mmap` and arch/x86/mm/pkeys.c `execute_only_pkey`/
+/// `__arch_override_mprotect_pkey`: with protection keys on, a `PROT_EXEC`-only request takes the
+/// execute-only key, which this model does not carry, so it stops (nothing changed) at the point
+/// where Linux would pick the key; everything before that point keeps its errno, every other
+/// protection and a CPU without keys are unchanged.
+#[test]
+fn execute_only_requests_stop_when_protection_keys_are_on() {
+    let mut w = W::new();
+    let x = w.map(0, 2 * P, RW, ANON).unwrap();
+    let maps = w.mm.map_count();
+    // Without keys: an ordinary execute-only mapping and mprotect.
+    assert!(w.map(0, P, PROT_EXEC, ANON).is_ok());
+    assert_eq!(w.mprotect(x, P, PROT_EXEC), Ok(()));
+    assert_eq!(w.mprotect(x, P, RW), Ok(()));
+    let maps = maps + 1;
+    w.env.ospke = true;
+    let r = w.mm.mmap(&w.env, &mut w.pt, 0, P, PROT_EXEC, ANON, 0, None);
+    assert!(
+        matches!(r, Ok(Mmap::Unsupported(Unsupported::ExecuteOnlyPkey))),
+        "{r:?}"
+    );
+    assert_eq!(w.mm.map_count(), maps, "nothing was mapped");
+    // The checks before the key lookup answer as before.
+    assert_eq!(
+        w.mm.mmap(&w.env, &mut w.pt, 0, 0, PROT_EXEC, ANON, 0, None)
+            .err(),
+        Some(Errno::EINVAL)
+    );
+    // Other protections are not affected.
+    assert!(w.map(0, P, PROT_READ | PROT_EXEC, ANON).is_ok());
+    assert!(w.map(0, P, RW, ANON).is_ok());
+    // mprotect: the stop comes after the argument and hole checks, per VMA.
+    let before = w.mm.find_vma(x).copied();
+    assert_eq!(
+        w.mm.mprotect(&w.env, &mut w.pt, x, P, PROT_EXEC),
+        Ok(Some(Unsupported::ExecuteOnlyPkey))
+    );
+    assert_eq!(w.mm.find_vma(x).copied(), before, "the VMA is unchanged");
+    assert_eq!(
+        w.mm.mprotect(&w.env, &mut w.pt, x + 1, P, PROT_EXEC),
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(
+        w.mm.mprotect(&w.env, &mut w.pt, x - 8 * P, P, PROT_EXEC),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!(w.mm.mprotect(&w.env, &mut w.pt, x, 0, PROT_EXEC), Ok(None));
+    assert_eq!(w.mm.mprotect(&w.env, &mut w.pt, x, P, PROT_READ), Ok(None));
+}
+
+/// src: arch/x86/mm/fault.c `bad_area_access_from_pkeys` for a VMA with key 0: the hardware's PK
+/// bit, or an access the PKRU denies (AD denies reads and writes, WD writes), never a fetch.
+#[test]
+fn pkru_denies_key0_follows_arch_vma_access_permitted() {
+    assert!(pkru_denies_key0(PF_PK | PF_PROT, 0));
+    assert!(pkru_denies_key0(PF_PK | PF_WRITE, 0));
+    assert!(!pkru_denies_key0(PF_PROT, 0));
+    assert!(
+        !pkru_denies_key0(PF_PROT | PF_WRITE, 0x5555_5554),
+        "keys 1-15 only"
+    );
+    assert!(pkru_denies_key0(PF_PROT, 1), "AD denies a read");
+    assert!(pkru_denies_key0(PF_PROT | PF_WRITE, 1), "AD denies a write");
+    assert!(!pkru_denies_key0(PF_PROT, 2), "WD allows a read");
+    assert!(pkru_denies_key0(PF_PROT | PF_WRITE, 2), "WD denies a write");
+    assert!(
+        !pkru_denies_key0(PF_PROT | PF_INSTR, 3),
+        "pkeys never affect fetches"
+    );
+    assert!(
+        pkru_denies_key0(PF_PK | PF_INSTR, 3),
+        "unless the hardware said so"
+    );
 }

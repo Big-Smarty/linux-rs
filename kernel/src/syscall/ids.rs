@@ -447,13 +447,19 @@ const ARCH_GET_GS: i32 = 0x1004;
 const ARCH_GET_CPUID: i32 = 0x1011;
 const ARCH_SET_CPUID: i32 = 0x1012;
 const ARCH_GET_XCOMP_SUPP: i32 = 0x1021;
+const ARCH_GET_XCOMP_PERM: i32 = 0x1022;
+const ARCH_REQ_XCOMP_PERM: i32 = 0x1023;
+const ARCH_GET_XCOMP_GUEST_PERM: i32 = 0x1024;
 const ARCH_REQ_XCOMP_GUEST_PERM: i32 = 0x1025;
 
 /// `arch_prctl` (arch/x86/kernel/process.c:1063, `do_arch_prctl_64`).
 /// `ARCH_SET_CPUID` is `-ENODEV` on a CPU known to lack CPUID faulting
 /// ([`Context::cpuid_fault_absent`]); with faulting present, or not
-/// determinable, it and the `XCOMP` family (xstate permission model) stop the
-/// kernel. `ARCH_MAP_VDSO_*`
+/// determinable, it stops the kernel. The `XCOMP` family is
+/// `fpu_xstate_prctl` (arch/x86/kernel/fpu/xstate.c:1840-1875) over
+/// [`Context::xstate`]: the three `GET`s store a mask, the two `REQ`s are
+/// `-EOPNOTSUPP`/`-EINVAL` because no dynamic (AMX) component is ever enabled.
+/// `ARCH_MAP_VDSO_*`
 /// (`CONFIG_CHECKPOINT_RESTORE`), the `ADDRESS_MASKING` options and the
 /// `SHSTK` options (`shstk_prctl` is a `-EINVAL` stub without
 /// `X86_USER_SHADOW_STACK`) all fall to the `default: -EINVAL` of the pinned
@@ -465,8 +471,27 @@ fn arch_prctl<C: Context>(ctx: &mut C, option: i32, arg2: u64) -> Res {
         ARCH_GET_CPUID => Ok(1),
         // `set_cpuid_mode`: without CPUID faulting the answer is `-ENODEV`.
         ARCH_SET_CPUID if ctx.cpuid_fault_absent() => Err(Errno::ENODEV.into()),
-        ARCH_SET_CPUID | ARCH_GET_XCOMP_SUPP..=ARCH_REQ_XCOMP_GUEST_PERM => {
-            Err(Stop::Unimplemented)
+        ARCH_SET_CPUID => Err(Stop::Unimplemented),
+        // fpu_xstate_prctl: `put_user(mask, uptr)`.
+        ARCH_GET_XCOMP_SUPP | ARCH_GET_XCOMP_PERM | ARCH_GET_XCOMP_GUEST_PERM => {
+            let xstate = ctx.xstate();
+            let mask = if option == ARCH_GET_XCOMP_SUPP {
+                xstate.xcomp_supported()
+            } else {
+                xstate.xcomp_permitted()
+            };
+            if put_user(ctx, arg2, &mask.to_le_bytes()) {
+                Ok(0)
+            } else {
+                Err(Errno::EFAULT.into())
+            }
+        }
+        ARCH_REQ_XCOMP_PERM | ARCH_REQ_XCOMP_GUEST_PERM => {
+            Err(match ctx.xstate().xcomp_request(arg2) {
+                Err(crate::xstate::XcompError::Invalid) | Ok(()) => Errno::EINVAL,
+                Err(crate::xstate::XcompError::NotSupported) => Errno::EOPNOTSUPP,
+            }
+            .into())
         }
         ARCH_SET_GS | ARCH_SET_FS => {
             if arg2 >= TASK_SIZE_MAX {
@@ -1012,24 +1037,63 @@ mod tests {
             ok(0)
         );
         assert_eq!(call(&mut t, Sysno::arch_prctl, &[0x1011, 0]), ok(1));
-        // CPUID faulting control (when the CPU may have it) and the xstate
-        // permission calls are Linux's, not ours.
-        for code in [0x1012, 0x1021, 0x1022, 0x1023, 0x1024, 0x1025] {
-            assert_eq!(
-                call(&mut t, Sysno::arch_prctl, &[code, 0]),
-                Outcome::Unimplemented(158)
-            );
-        }
+        // CPUID faulting control (when the CPU may have it) is Linux's, not ours.
+        assert_eq!(
+            call(&mut t, Sysno::arch_prctl, &[0x1012, 0]),
+            Outcome::Unimplemented(158)
+        );
         // A CPU without CPUID faulting: `set_cpuid_mode` is `-ENODEV`.
         t.cpuid_fault_absent = true;
         assert_eq!(
             call(&mut t, Sysno::arch_prctl, &[0x1012, 0]),
             err(Errno::ENODEV)
         );
-        assert_eq!(
-            call(&mut t, Sysno::arch_prctl, &[0x1021, 0]),
-            Outcome::Unimplemented(158)
-        );
+    }
+
+    #[test]
+    fn arch_prctl_xcomp_is_fpu_xstate_prctl() {
+        let mut t = user_task();
+        // FXSAVE only (`noxsave`): x87 and SSE are supported, nothing is permitted.
+        let get = |t: &mut Task, code| {
+            put(t, BUF, &[0xff; 8]);
+            (call(t, Sysno::arch_prctl, &[code, BUF]), word(t, BUF))
+        };
+        assert_eq!(get(&mut t, 0x1021), (ok(0), 3));
+        assert_eq!(get(&mut t, 0x1022), (ok(0), 0));
+        assert_eq!(get(&mut t, 0x1024), (ok(0), 0));
+        // The Zen 5 configuration: Linux's 0x2e7 for all three.
+        t.xstate = crate::xstate::zen5();
+        for code in [0x1021, 0x1022, 0x1024] {
+            assert_eq!(get(&mut t, code), (ok(0), 0x2e7), "{code:#x}");
+            assert_eq!(
+                call(&mut t, Sysno::arch_prctl, &[code, 0]),
+                err(Errno::EFAULT),
+                "{code:#x}"
+            );
+            assert_eq!(
+                call(&mut t, Sysno::arch_prctl, &[code, BAD]),
+                err(Errno::EFAULT),
+                "{code:#x}"
+            );
+        }
+        // `xstate_request_perm`: below XFEATURE_MAX no facility exists (EOPNOTSUPP), above it
+        // EINVAL; both request calls.
+        for code in [0x1023, 0x1025] {
+            for idx in [0, 2, 9, 17, 18, 19] {
+                assert_eq!(
+                    call(&mut t, Sysno::arch_prctl, &[code, idx]),
+                    err(Errno::EOPNOTSUPP),
+                    "{code:#x} {idx}"
+                );
+            }
+            for idx in [20, 63, 64, u64::MAX] {
+                assert_eq!(
+                    call(&mut t, Sysno::arch_prctl, &[code, idx]),
+                    err(Errno::EINVAL),
+                    "{code:#x} {idx}"
+                );
+            }
+        }
     }
 
     fn limit(t: &mut Task, resource: u64) -> (Outcome, Rlimit) {

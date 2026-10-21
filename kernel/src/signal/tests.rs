@@ -31,13 +31,14 @@ use super::{
         do_signal_or_restart, get_signal, handle_pending_signals, restart_for_handler,
         restart_without_handler,
     },
-    frame::{FIX_EFLAGS, FRAME_SIZE, INFO, MAX_FRAME_SIZE, rt_sigreturn},
+    frame::{FIX_EFLAGS, FRAME_SIZE, INFO, rt_sigreturn},
     info::{SEGV_MAPERR, SI_QUEUE, SigInfo},
     linux_frames,
     state::{State, Target},
     syscalls::StackT,
 };
 use crate::usercopy::{copy_from_user, copy_to_user, fake::Space};
+use crate::xstate::XsaveArea;
 use core::mem::{offset_of, size_of};
 use std::{vec, vec::Vec};
 
@@ -110,7 +111,10 @@ fn constants_match_the_uapi_layout() {
     assert_eq!(size_of::<MSigaction>(), SigAction::SIZE);
     assert_eq!(FIX_EFLAGS, 0x50DD5); // AC|OF|DF|TF|SF|ZF|AF|PF|CF|RF
     // The worst-case frame equals the AT_MINSIGSTKSZ the oracle reports.
-    assert_eq!(MAX_FRAME_SIZE, 0x5a0);
+    assert_eq!(
+        crate::xstate::Config::fxsave(0xffbf).max_frame_size(),
+        0x5a0
+    );
 }
 
 struct FakeCpu {
@@ -138,44 +142,60 @@ impl FakeCpu {
     }
 }
 impl Cpu for FakeCpu {
-    fn fxsave(&mut self) -> [u8; 512] {
-        self.image
+    fn xstate(&self) -> crate::xstate::Config {
+        crate::xstate::Config::fxsave(self.mask)
     }
-    fn mxcsr_mask(&self) -> u32 {
-        self.mask
+    fn xsave(&mut self, area: &mut XsaveArea) {
+        area.0[..512].copy_from_slice(&self.image);
     }
-    fn fxrstor(&mut self, image: &[u8; 512]) {
-        self.restored.push(*image);
+    fn xrstor(&mut self, _: &XsaveArea, _: u64) -> bool {
+        unreachable!("the FXSAVE-only configuration never uses XRSTOR")
+    }
+    fn fxrstor(&mut self, area: &XsaveArea) -> bool {
+        // FXRSTOR raises #GP for a reserved MXCSR bit.
+        let mxcsr = u32::from_le_bytes([area.0[24], area.0[25], area.0[26], area.0[27]]);
+        if mxcsr & !self.mask != 0 {
+            return false;
+        }
+        self.restored.push(area.0[..512].try_into().unwrap());
+        true
+    }
+    fn restore_init(&mut self, _: u64) {
+        unreachable!("no components beyond the legacy ones");
     }
     fn fpu_reset(&mut self) {
         self.resets += 1;
     }
+    fn read_pkru(&self) -> u32 {
+        0
+    }
+    fn write_pkru(&mut self, _: u32) {}
     fn ss_is_valid_user_data(&self, ss: u16) -> bool {
         self.valid_ss.contains(&ss)
     }
 }
 
-const STACK_LO: u64 = 0x7_0000;
-const STACK_TOP: u64 = 0x7_8000;
+pub(super) const STACK_LO: u64 = 0x7_0000;
+pub(super) const STACK_TOP: u64 = 0x7_8000;
 
-fn user_space() -> Space {
+pub(super) fn user_space() -> Space {
     let mut s = Space::default();
     for page in (STACK_LO..=STACK_TOP + 0x1000).step_by(0x1000) {
         s.map(page, true);
     }
     s
 }
-fn fill(s: &mut Space, lo: u64, hi: u64, byte: u8) {
+pub(super) fn fill(s: &mut Space, lo: u64, hi: u64, byte: u8) {
     let v = vec![byte; (hi - lo) as usize];
     assert_eq!(copy_to_user(s, lo, &v), 0);
 }
-fn read(s: &mut Space, at: u64, n: usize) -> Vec<u8> {
+pub(super) fn read(s: &mut Space, at: u64, n: usize) -> Vec<u8> {
     let mut v = vec![0; n];
     assert_eq!(copy_from_user(s, &mut v, at), 0);
     v
 }
 
-fn regs() -> Regs {
+pub(super) fn regs() -> Regs {
     Regs {
         r15: 0x15,
         r14: 0x14,
@@ -201,7 +221,7 @@ fn regs() -> Regs {
     }
 }
 
-fn handler_state() -> State<'static> {
+pub(super) fn handler_state() -> State<'static> {
     let st = State::standalone(5, 0, 1000);
     st.hand.actions[usize::from(SIGUSR1) - 1] = SigAction {
         handler: 0x40_1000,
@@ -215,7 +235,7 @@ fn handler_state() -> State<'static> {
     st
 }
 
-fn send(st: &mut State, sig: u8) {
+pub(super) fn send(st: &mut State, sig: u8) {
     st.send_signal(sig, SigInfo::from_kill(sig, false, 1, 77), Target::Process)
         .unwrap();
 }

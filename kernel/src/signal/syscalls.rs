@@ -185,17 +185,16 @@ pub fn sys_rt_sigpending<P: UserPages>(
 }
 
 /// `sigaltstack_size_valid`: with `CONFIG_DYNAMIC_SIGFRAME=y`, unless the FPU
-/// state is dynamically sized or `strict_sas_size` is on, any size passes.
-/// The declared configuration (`noxsave`) has neither, so this is `true`;
-/// the strict rule compares against the worst-case frame minus the default FPU
-/// state plus the user FPU state (512 bytes under FXSR-only).
+/// state is dynamically sized (AMX permissions; none here) or `strict_sas_size`
+/// is on, any size passes. The strict rule compares against the worst-case
+/// frame minus the default FPU state plus the user FPU state.
 #[must_use]
-pub const fn sigaltstack_size_valid(size: u64, strict: bool) -> bool {
+pub fn sigaltstack_size_valid(size: u64, strict: bool) -> bool {
     if !strict {
         return true; // !fpu_state_size_dynamic() && !strict_sigaltstack_size
     }
-    size > super::frame::MAX_FRAME_SIZE - super::frame::FPU_DEFAULT_STATE_SIZE
-        + super::frame::FXSAVE_SIZE as u64
+    size > crate::xstate::max_frame_size() - crate::xstate::fpu_default_state_size()
+        + crate::xstate::fpu_user_size()
 }
 
 /// `strict_sigaltstack_size` (`CONFIG_STRICT_SIGALTSTACK_SIZE` is off and no

@@ -10,8 +10,8 @@ extern crate std;
 use super::{
     ARG_PAGES, AT_BASE, AT_CLKTCK, AT_EGID, AT_ENTRY, AT_EUID, AT_EXECFN, AT_FLAGS, AT_GID,
     AT_HWCAP, AT_HWCAP2, AT_MINSIGSTKSZ, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM,
-    AT_PLATFORM, AT_RANDOM, AT_SECURE, AT_UID, Aux, ENVP, MIN_SIGSTACK_SIZE, STACK_PAGES,
-    STACK_START, STACK_TOP, StackError, WINDOW_BYTES, Word, build, weak_random,
+    AT_PLATFORM, AT_RANDOM, AT_SECURE, AT_UID, Aux, ENVP, STACK_PAGES, STACK_START, STACK_TOP,
+    StackError, WINDOW_BYTES, Word, build, weak_random,
 };
 use std::{string::String, vec::Vec};
 
@@ -150,10 +150,11 @@ fn auxv_order_and_values_match_the_pinned_oracle_without_vdso_or_rseq() {
 }
 
 #[test]
-fn min_sigstack_size_is_the_fxsave_only_get_sigframe_size() {
-    // 732 (sigframe_ia32) + 15 + 512 + 112 + 63 = 1434 -> round_up(16).
-    assert_eq!(MIN_SIGSTACK_SIZE, 0x5a0);
-    assert_eq!(MIN_SIGSTACK_SIZE % 16, 0);
+fn min_sigstack_size_defaults_to_the_fxsave_only_get_sigframe_size() {
+    // 732 (sigframe_ia32) + 15 + 512 + 112 + 63 = 1434 -> round_up(16); no test installs another
+    // configuration, so the global is the FXSAVE-only default.
+    assert_eq!(crate::xstate::max_frame_size(), 0x5a0);
+    assert_eq!(crate::xstate::max_frame_size() % 16, 0);
 }
 
 #[test]

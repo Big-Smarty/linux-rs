@@ -101,6 +101,8 @@ pub struct Task<P = Space, C = Sink> {
     pub gs_base: u64,
     pub machine: Machine,
     pub cpuid_fault_absent: bool,
+    /// The user extended state `arch_prctl(ARCH_*_XCOMP_*)` reports.
+    pub xstate: crate::xstate::Config,
     pub clocks: FakeClocks,
     /// The address space the memory syscalls edit, over the model's fake tables.
     pub mm: Mm,
@@ -182,6 +184,7 @@ impl<P, C> Task<P, C> {
                 loads: [0; 3],
             },
             cpuid_fault_absent: false,
+            xstate: crate::xstate::Config::fxsave(0xffbf),
             clocks: FakeClocks::default(),
             mm: Mm::new(&env),
             env,
@@ -268,6 +271,9 @@ impl<P: UserPages, C: Console> Context for Task<P, C> {
     }
     fn cpuid_fault_absent(&self) -> bool {
         self.cpuid_fault_absent
+    }
+    fn xstate(&self) -> crate::xstate::Config {
+        self.xstate
     }
     fn tasks(&mut self) -> Tasks<'_> {
         Tasks {

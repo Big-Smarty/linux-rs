@@ -129,6 +129,9 @@ pub trait Context: UserPages + Clocks + crate::signal::Task {
     /// known to lack CPUID faulting (`set_cpuid_mode` then returns `-ENODEV`).
     /// False means present or not determinable.
     fn cpuid_fault_absent(&self) -> bool;
+    /// The enabled user extended state (`fpu_user_cfg`), for `arch_prctl`'s
+    /// `ARCH_*_XCOMP_*` options.
+    fn xstate(&self) -> crate::xstate::Config;
     /// `current->mm`: the VMA set, the rules' limits and the page tables the
     /// memory syscalls edit.
     fn address_space(&mut self) -> AddressSpace<'_>;

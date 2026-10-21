@@ -32,3 +32,4 @@ pub mod task;
 pub mod time;
 pub mod usercopy;
 pub mod vfs;
+pub mod xstate;
