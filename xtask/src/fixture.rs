@@ -415,6 +415,786 @@ pub(crate) fn busybox_cpu(cpuinfo: &str) -> Result<(), String> {
 /// The AVX-512 subset x86-64-v4 requires.
 const BUSYBOX_CPU_FLAGS: [&str; 5] = ["avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"];
 
+// ---- the `dynelf` group's module ------------------------------------------------------------------
+
+/// Where the host's programs and shared objects are read from (never committed): the `dynelf`
+/// oracle group's inputs. `/usr/bin` and `/usr/lib` are the Arch/CachyOS locations; `/bin`, `/lib`
+/// and `/lib64` are symlinks to them on the host and in the module.
+pub(crate) const DYNAMIC_HOST_BIN: &str = "/usr/bin";
+pub(crate) const DYNAMIC_HOST_LIB: &str = "/usr/lib";
+
+/// The programs (of [`DYNAMIC_HOST_BIN`]) the group executes, directly or from `bash` scripts. Their
+/// shared objects are found from `DT_NEEDED`, transitively, in [`DYNAMIC_HOST_LIB`].
+pub(crate) const DYNAMIC_PROGRAMS: &[&str] = &[
+    "base64",
+    "basename",
+    "bash",
+    "cat",
+    "chmod",
+    "cmp",
+    "comm",
+    "cp",
+    "cut",
+    "date",
+    "dd",
+    "diff",
+    "dirname",
+    "du",
+    "echo",
+    "env",
+    "expr",
+    "factor",
+    "false",
+    "find",
+    "fold",
+    "gawk",
+    "grep",
+    "gzip",
+    "head",
+    "id",
+    "ln",
+    "ls",
+    "mkdir",
+    "mv",
+    "nl",
+    "nproc",
+    "od",
+    "paste",
+    "printenv",
+    "printf",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rev",
+    "rm",
+    "sed",
+    "seq",
+    "sleep",
+    "sort",
+    "stat",
+    "python3.14",
+    "setsid",
+    "stdbuf",
+    "tac",
+    "tail",
+    "tar",
+    "test",
+    "true",
+    "tty",
+    "uname",
+    "uniq",
+    "wc",
+    "whoami",
+    "xargs",
+    "yes",
+];
+
+/// Libraries that are loaded by name or by `LD_PRELOAD` rather than by `DT_NEEDED` (paths below
+/// [`DYNAMIC_HOST_LIB`], stored under `usr/lib`).
+pub(crate) const DYNAMIC_EXTRA_LIBS: &[&str] = &["coreutils/libstdbuf.so"];
+
+/// The part of the Python 3.14 standard library the group's scripts import (paths below
+/// `usr/lib/python3.14`, read from [`DYNAMIC_HOST_LIB`]`/python3.14`): the codec package every
+/// start-up needs and what `re`, `json`, `collections`, `functools`, `struct`, `math` and
+/// `binascii` pull in. Sources only (the group runs `python3 -B`).
+pub(crate) const DYNAMIC_PYTHON_FILES: &[&str] = &[
+    "os.py",
+    "signal.py",
+    "encodings/__init__.py",
+    "encodings/aliases.py",
+    "encodings/utf_8.py",
+    "collections/__init__.py",
+    "copyreg.py",
+    "enum.py",
+    "functools.py",
+    "keyword.py",
+    "linecache.py",
+    "operator.py",
+    "reprlib.py",
+    "struct.py",
+    "types.py",
+    "json/__init__.py",
+    "json/decoder.py",
+    "json/encoder.py",
+    "json/scanner.py",
+    "re/__init__.py",
+    "re/_casefix.py",
+    "re/_compiler.py",
+    "re/_constants.py",
+    "re/_parser.py",
+    "lib-dynload/_json.cpython-314-x86_64-linux-gnu.so",
+    "lib-dynload/_struct.cpython-314-x86_64-linux-gnu.so",
+    "lib-dynload/binascii.cpython-314-x86_64-linux-gnu.so",
+    "lib-dynload/math.cpython-314-x86_64-linux-gnu.so",
+];
+
+/// The loader, which `PT_INTERP` names as `/lib64/ld-linux-x86-64.so.2`.
+const DYNAMIC_LOADER: &str = "ld-linux-x86-64.so.2";
+
+/// SHA-256 of every file of the module as the expected lines of the `dynelf` group were recorded
+/// with on the pinned Linux (module path, digest). Another build of any of them may print other
+/// lines (or lay out other mappings), so the group is `unavailable` on a host that differs.
+pub(crate) const DYNAMIC_PINS: &[(&str, &str)] = &[
+    (
+        "usr/bin/base64",
+        "5ed3f5be081c0c7f3823e8b23ba7f56c3096fdd1a8e948a9be2b1c8765b2185d",
+    ),
+    (
+        "usr/bin/basename",
+        "a0488c233f2cedba5dc2be2505dc731fa0448f1ef75297a938e7e831ced5cfe9",
+    ),
+    (
+        "usr/bin/bash",
+        "c157074818b094c84aaf31b8c80a1e149f234bb1c8c84a25e9a53e96afa30a29",
+    ),
+    (
+        "usr/bin/cat",
+        "364e0574030000b6d924441bef25e153a4aaa1ce07123d7fcaee8fa2e807ce40",
+    ),
+    (
+        "usr/bin/chmod",
+        "8b0e61201872bcc027da6c2090045efccfc3bbb6bb9b9cab65f911559bc09f15",
+    ),
+    (
+        "usr/bin/cmp",
+        "edcc51a8c7e7e85668f77f9a60b64ac9a771f20d0a2474348174c530ccf09abb",
+    ),
+    (
+        "usr/bin/comm",
+        "eb3fd0788950eaa495bf62db0221ec0df6e37d4d19da7b5557e6898aaabdbdfb",
+    ),
+    (
+        "usr/bin/cp",
+        "8ce26f08c86483fc25658a8bcb52a85f3dfe571ba17f2039d4ae84e80d8bcea7",
+    ),
+    (
+        "usr/bin/cut",
+        "66f0c15af9364cd62186aebaf1fb9dd5af66b3e2fae2db041ee1fbe4dffbcd7a",
+    ),
+    (
+        "usr/bin/date",
+        "1b99e1afca2642169fa0cf9a12eff6ea76b24adfa69c23be5bb843f320d77e33",
+    ),
+    (
+        "usr/bin/dd",
+        "97aec913820ba670e0d2e3f67431d518cb215c8cd509b3705022f769a008a9dd",
+    ),
+    (
+        "usr/bin/diff",
+        "6289e2e9460f0ad5b46ebe090baab2ea54a9681d7490cd57317f4ebdd4c9fc5d",
+    ),
+    (
+        "usr/bin/dirname",
+        "8db4d9adbb2b425c3ca1271e3d1f137a533c04a66ece898a804dbf759799c883",
+    ),
+    (
+        "usr/bin/du",
+        "1063eaadb0bc3bf662f0c1c8d8598330a9fbbd1cb91f3f784c832f626742c6bb",
+    ),
+    (
+        "usr/bin/echo",
+        "0d5dcb385d07ae3b4f9a0e464fe7c9c0427a1888b8931a798e920a5f55be37d2",
+    ),
+    (
+        "usr/bin/env",
+        "b91fd720ef6f3c0a69ad78d2ca446049d9a181900b0c0bad5aa0c6e11e18ef7f",
+    ),
+    (
+        "usr/bin/expr",
+        "f2574bba50552755ddbd13053f2468a9ea23a7fd7f53eb65057ab3aa5080644e",
+    ),
+    (
+        "usr/bin/factor",
+        "667d2ed6229e1bc38069c1b44da74ff6ff63de1626c0d0ad887e2ac9e4db64e6",
+    ),
+    (
+        "usr/bin/false",
+        "16ed3c6201c23f5f91bdfb589f2e9d6318d4984c0a423f8fdb5d2448486ed195",
+    ),
+    (
+        "usr/bin/find",
+        "dd7db3e8da1775fd4f196db8a9000d5d31c20bf82f105af567bea7c3db4303d6",
+    ),
+    (
+        "usr/bin/fold",
+        "04dac623d8a926f0a53f201ccb9542fddc341f4288fbaa64ed4cb2b95677ec4c",
+    ),
+    (
+        "usr/bin/gawk",
+        "19deee5f93180e2ffd1ee02c13d29391a2513499661234545c279fd14b360dfe",
+    ),
+    (
+        "usr/bin/grep",
+        "1f000906a29a17f35c3e3563f742533c7e917292c963ccd139d11a82b543c4ea",
+    ),
+    (
+        "usr/bin/gzip",
+        "cc5e7f5c9854ae45a566472d38f86ef816a559a637e6630e392e4885157f237b",
+    ),
+    (
+        "usr/bin/head",
+        "078201badeb023d15cf72db477a794d303132296b27860b55f85bf6f7e7a4133",
+    ),
+    (
+        "usr/bin/id",
+        "9597f365837e84e94d1c35e95fcc05b3db929c4995380c25fa6d4d5016a0e5cf",
+    ),
+    (
+        "usr/bin/ln",
+        "c4928c689e59d7186f957b47313ca1c7af2811552ba38fdcaa39681cd0bd3f48",
+    ),
+    (
+        "usr/bin/ls",
+        "aee98dea6ec77563422f024b81051cc75cd74ac0c4669478d1d922afe22905e0",
+    ),
+    (
+        "usr/bin/mkdir",
+        "32b4cd6a6de33a2d2b384c6fa98a2fffa436d20d2b89fd20c7d26a24f94339c2",
+    ),
+    (
+        "usr/bin/mv",
+        "bb1366f2f314679df9e1eb1ecbd74090386fbc089fc673c6c0eea0edcec41ad0",
+    ),
+    (
+        "usr/bin/nl",
+        "38530a6df1072309251b5be4983ca464e915c60dfa7a6b26f55f6121ea6182ff",
+    ),
+    (
+        "usr/bin/nproc",
+        "dc2f34148061c2194415a56fd837b321c506950e7ae3b168b58b5e617ac3b6c4",
+    ),
+    (
+        "usr/bin/od",
+        "8a138c3b5ae0d28e0e39815375f321c295b36d19b07a61d8d3ac0df9b4b37a50",
+    ),
+    (
+        "usr/bin/paste",
+        "80a46c0f72083918a21c46a4c6dce173c17c3076d68dea2d248cda506cbb28fa",
+    ),
+    (
+        "usr/bin/printenv",
+        "557f0347dffcce6f385d9370d78b63771541763101b4a56416c345e3185ae4cb",
+    ),
+    (
+        "usr/bin/printf",
+        "f946efc457b67ae1e9e251ad82d8cc7b3b1d28abfd65a0b110305899e9c3709e",
+    ),
+    (
+        "usr/bin/pwd",
+        "9fdb014786f7231e509108e9dfc213400de09a3de16ba9506f0d8d5582002ed4",
+    ),
+    (
+        "usr/bin/python3.14",
+        "7579d289e4d95778305acd13fc71be2a3800f7f6a202619505875234659c2c60",
+    ),
+    (
+        "usr/bin/readlink",
+        "6cc46db701fbec2b6a58268d654e46b6d117e62c72ac39255b75de0eeeaa14ac",
+    ),
+    (
+        "usr/bin/realpath",
+        "18ab75f37c2c9317e54fc30370ff0f22f4d40077b45043855e0eccd38ec1dbbf",
+    ),
+    (
+        "usr/bin/rev",
+        "093b67bef11b15dae4c94a1c7f1219001418ae82caae5ae342b3e8a9459bf0fa",
+    ),
+    (
+        "usr/bin/rm",
+        "011c2d0c1af901153e60667924c84ecdbb2052282b3e617aec9fc4b562325804",
+    ),
+    (
+        "usr/bin/sed",
+        "ab0baa3a8f4249be06868d410b494c801631a1cb859754769eee56b8824529e8",
+    ),
+    (
+        "usr/bin/seq",
+        "532ce877efdc430c0aa59c78e1ea3ba43c6bc53722f055b5c01f2c4686b892e9",
+    ),
+    (
+        "usr/bin/setsid",
+        "641d86a5f6e7e212592dec9354b0387dc8a7712582098af42bc99430f90a585f",
+    ),
+    (
+        "usr/bin/sleep",
+        "8f7b42375c8b53f47093509ac66b940698602e8e91d40534b1a7138e6265721a",
+    ),
+    (
+        "usr/bin/sort",
+        "9fac34d6007eb6f2ed5a40aaa362f570dc89eb6758ecfcb89dbffb6b43f6294b",
+    ),
+    (
+        "usr/bin/stat",
+        "2cca92992e6ef110ef1dde788b25995ee61ac107bd76fb02560f5a8ea85548e6",
+    ),
+    (
+        "usr/bin/stdbuf",
+        "4a75ec1dd046c447870cbb1f663f8a09a0c06e9855fd7cd924f2d92277119a78",
+    ),
+    (
+        "usr/bin/tac",
+        "499ec11588c2ec34ce698dfd02ec8bbbdb12f604f4c2c0cc2d34ab1b6271bb3f",
+    ),
+    (
+        "usr/bin/tail",
+        "78be062b99277693de93169118f4fe9c167c4be356109c6c8270ca6f2d169bb8",
+    ),
+    (
+        "usr/bin/tar",
+        "326bb5548b0a17ea3922a928634f141d0ac75d714edf08c096f0659bd90449f7",
+    ),
+    (
+        "usr/bin/test",
+        "666fd8f8ee66cfa880144e2e8881ad1d34773b673c3b43daff762a6c30c28cec",
+    ),
+    (
+        "usr/bin/true",
+        "1573301c316fd6297e2352441a9fb42eca9c32f97b3bb7ae1d45d3362811234d",
+    ),
+    (
+        "usr/bin/tty",
+        "3ba5753c0af8f1a2084e65927d4c9ec96e2e07bc8057288efd2101a9b12b0b89",
+    ),
+    (
+        "usr/bin/uname",
+        "69368312cf5e9db975a2c6ac55d7a372b0baac4f739f5e954a99c9d1bd6477a4",
+    ),
+    (
+        "usr/bin/uniq",
+        "5b1d69526ef4ae32e92d805f7dad50fcea9eda75662575cc3c1a333a9d3b967c",
+    ),
+    (
+        "usr/bin/wc",
+        "89b0a9b3ca913dbd7da9fd7bf01048478827087cf2f88192b1bb9bc215ee76f3",
+    ),
+    (
+        "usr/bin/whoami",
+        "c9169c71a2c9c1386368c363178383518a83269674fdde8d2d302f081090846f",
+    ),
+    (
+        "usr/bin/xargs",
+        "cc7e58da54ad0e016cb4c827cc071ebb656e9408584b1deddfbb6ffd8e56361a",
+    ),
+    (
+        "usr/bin/yes",
+        "5c36362472df1383922c0d8cc466c495b370841d4be77c4c78d4764bdea72326",
+    ),
+    (
+        "usr/lib/coreutils/libstdbuf.so",
+        "777031fafe4156a6b1c898616b428a507218e64dc81d34fe7e9f188c2776c3d7",
+    ),
+    (
+        "usr/lib/ld-linux-x86-64.so.2",
+        "2db4c1e54273a52f75e7124fcfd6fe0d2d8bd7fc87f29780a75ab544b41bd53d",
+    ),
+    (
+        "usr/lib/libacl.so.1",
+        "0b79d488282c0687037344899b46370c9c448fcb03e87a2c1ba784a5fce4317f",
+    ),
+    (
+        "usr/lib/libattr.so.1",
+        "9b763be10a8adf9c40784ecc04419ffab4e8f944eefaf6043da685b8a44908b3",
+    ),
+    (
+        "usr/lib/libc.so.6",
+        "911cf3db7875760dc893b464ae89bddd4f697a377c710ffc13b84f67cbe1237b",
+    ),
+    (
+        "usr/lib/libcap.so.2",
+        "a765c823425ceab77e7c8e2b9e70b0b9dc7844d8cc85bc4a7507e609634ab914",
+    ),
+    (
+        "usr/lib/libgmp.so.10",
+        "69be619014fdf981ed7d0e1148a9c2082f42531ec8736f543b3c8928e11133cf",
+    ),
+    (
+        "usr/lib/libm.so.6",
+        "b42c5cc9e920e2df2038d06dce1124432e874fbe692c7275c866f9c19137b7a7",
+    ),
+    (
+        "usr/lib/libmpfr.so.6",
+        "b84ee11ae1836f14d2f6e04ce0d22d6315a6d90726d4e0a94cd6088bd258ae99",
+    ),
+    (
+        "usr/lib/libncursesw.so.6",
+        "0818af964c5e86421417a877e3b73266eb2dc5e0ce260f44962694c6f639fdc4",
+    ),
+    (
+        "usr/lib/libpcre2-8.so.0",
+        "ea5852c089f1978061189785e918881169d51180d8fdf8634ba9ea76a971585c",
+    ),
+    (
+        "usr/lib/libpython3.14.so.1.0",
+        "3af3675671f40e31c90a22e3ed159b5dfebd32d6719270c40c64bec7e096df3c",
+    ),
+    (
+        "usr/lib/libreadline.so.8",
+        "cf36d61484261364ef2d47ce4e6ecc6297f2fc20ba5ffc0c7358b4f5c2fc8393",
+    ),
+    (
+        "usr/lib/libz.so.1",
+        "2a252a45a28d93ca2e6a7d2662f6cef5cfa666c9da2f8cfbc90bc521c45a03c5",
+    ),
+    (
+        "usr/lib/python3.14/collections/__init__.py",
+        "cb8367b8edd188662143ea2e3942d360c2deae51c72fd779ec898f5076d2c2b9",
+    ),
+    (
+        "usr/lib/python3.14/copyreg.py",
+        "6376eb5722806396f5842997ac18add369ea9ac3ff4fcfe1460c41a088cac425",
+    ),
+    (
+        "usr/lib/python3.14/encodings/__init__.py",
+        "2b708410495acf12a6fad9d2de928dd89e567537c253eaa2b51aaae578e96c59",
+    ),
+    (
+        "usr/lib/python3.14/encodings/aliases.py",
+        "1ee993f8eb4986999b6501381e53947be9a04443626cb48b4190bcff2e87d3b4",
+    ),
+    (
+        "usr/lib/python3.14/encodings/utf_8.py",
+        "ba0cac060269583523ca9506473a755203037c57d466a11aa89a30a5f6756f3d",
+    ),
+    (
+        "usr/lib/python3.14/enum.py",
+        "fd23a7598fa1104ef892abcd4154d3627283e6361eb7a91cd11dc4a7b6fb3a93",
+    ),
+    (
+        "usr/lib/python3.14/functools.py",
+        "9db56d38172c4c9e689b21cc58c8538008b09d86b682faf4dd193b529cdd79d5",
+    ),
+    (
+        "usr/lib/python3.14/json/__init__.py",
+        "2dd10f1bf4c9ea5478e589216805e7f279d0e4bce134a19efa297404fb87407d",
+    ),
+    (
+        "usr/lib/python3.14/json/decoder.py",
+        "dc98d3e677612ea7311303f06a144cec6b91ebadc7ec037d1777501647578a07",
+    ),
+    (
+        "usr/lib/python3.14/json/encoder.py",
+        "d68a4d04d2cfd95897498307f29349058b42c3f48ea6aa6739714a09200a7d01",
+    ),
+    (
+        "usr/lib/python3.14/json/scanner.py",
+        "572958017eae8842eeddd0e3d18d3c56cc0a197348224915e1d87ce937841764",
+    ),
+    (
+        "usr/lib/python3.14/keyword.py",
+        "18c2be738c04ad20ad375f6a71db34b3823c7f40b0340f5294d0e89f3c9b093b",
+    ),
+    (
+        "usr/lib/python3.14/lib-dynload/_json.cpython-314-x86_64-linux-gnu.so",
+        "6ad48ca1bb469b15e32f95d88f2b48e999232a0671c87e8b26908cfaf6887584",
+    ),
+    (
+        "usr/lib/python3.14/lib-dynload/_struct.cpython-314-x86_64-linux-gnu.so",
+        "aaf38adce77a0fd69b300b2d8df664d7752bfeaf41ef90fb5ae09849c0c8f14e",
+    ),
+    (
+        "usr/lib/python3.14/lib-dynload/binascii.cpython-314-x86_64-linux-gnu.so",
+        "11e3ead57dba728f284668171194ef26f74397bc7d2734ba1f71eb78a9e3aec4",
+    ),
+    (
+        "usr/lib/python3.14/lib-dynload/math.cpython-314-x86_64-linux-gnu.so",
+        "e13cabcb991387d795f170476aacf25e07d689efb18ce677009b8cac45b4da4d",
+    ),
+    (
+        "usr/lib/python3.14/linecache.py",
+        "692daec68e2a419adf46bafc0eb2f8a2fb36c482183fa1ac47e00fec440f7d7e",
+    ),
+    (
+        "usr/lib/python3.14/operator.py",
+        "a9f9910965c31f841caad0447ee47299ac539a371422aefe200c86c60f3b4697",
+    ),
+    (
+        "usr/lib/python3.14/os.py",
+        "976bdb3e24925f2fb3ce43a4d788de6dcbb88a7cc8604c60ae690fbdd6507546",
+    ),
+    (
+        "usr/lib/python3.14/re/__init__.py",
+        "741a9de729ed8207bfa19db990f8826f1bf3661f33d0970a80c08cd1338ebc35",
+    ),
+    (
+        "usr/lib/python3.14/re/_casefix.py",
+        "1b12d9136f23db6c3f6f26053fefc15ca964b886838c7b9c1fabf8d2efc1e5c8",
+    ),
+    (
+        "usr/lib/python3.14/re/_compiler.py",
+        "d49f30cf9a1dbae33b200ed8befd9d0ce3ac612783a10ac35196536f98923e91",
+    ),
+    (
+        "usr/lib/python3.14/re/_constants.py",
+        "42253b3181b81aad6c46392f44a0ab26dcfa31feea411296f43ba16616a1ab0b",
+    ),
+    (
+        "usr/lib/python3.14/re/_parser.py",
+        "e57bd194a2d42398355ae7c1ccc2ddfb78421dd431eb81e3809dbe8ca9057dc4",
+    ),
+    (
+        "usr/lib/python3.14/reprlib.py",
+        "b04872e10d76252e44eae50cc785eb0fe478491afc4d7f0825a93f82b2eaba5f",
+    ),
+    (
+        "usr/lib/python3.14/signal.py",
+        "0363c964c90ac0b3e515de5749205e6e6454051a1211058375d84d91eab6071a",
+    ),
+    (
+        "usr/lib/python3.14/struct.py",
+        "50c14e55f94957804c1e45e975fedbe8e86f7e1dbb745b150370ff681155370a",
+    ),
+    (
+        "usr/lib/python3.14/types.py",
+        "8c54d3d5ffc1d1204237e6c69b25c27c7b05b483128f185eeed9ba7ef2229ac2",
+    ),
+];
+
+/// One file of the module: its path in the archive (no leading slash), the bytes and where they
+/// came from.
+#[derive(Debug)]
+pub(crate) struct DynamicFile {
+    pub(crate) module_path: String,
+    pub(crate) host_path: std::path::PathBuf,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// `DT_NEEDED` names of a dynamically linked ELF64 file.
+fn needed_libraries(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let file = ElfBytes::<LittleEndian>::minimal_parse(bytes).map_err(|e| e.to_string())?;
+    let common = file.find_common_data().map_err(|e| e.to_string())?;
+    let (Some(dynamic), Some(strings)) = (common.dynamic, common.dynsyms_strs) else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    for entry in dynamic.iter() {
+        if entry.d_tag == abi::DT_NEEDED {
+            let offset = usize::try_from(entry.d_val()).map_err(|e| e.to_string())?;
+            names.push(strings.get(offset).map_err(|e| e.to_string())?.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// The files of the module, sorted by path: [`DYNAMIC_PROGRAMS`] under `usr/bin`, the loader and
+/// the closure of their `DT_NEEDED` libraries under `usr/lib`. A library file is stored under its
+/// soname (the host's `libc.so.6` is a name of the real file).
+///
+/// # Errors
+/// A missing or unreadable program or library, or one that is not an ELF64 file.
+pub(crate) fn dynamic_files(
+    bin: &std::path::Path,
+    lib: &std::path::Path,
+) -> Result<Vec<DynamicFile>, String> {
+    let read = |path: std::path::PathBuf| -> Result<(std::path::PathBuf, Vec<u8>), String> {
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok((path, bytes))
+    };
+    let mut files: Vec<DynamicFile> = Vec::new();
+    let mut pending: Vec<String> = vec![DYNAMIC_LOADER.to_owned()];
+    for program in DYNAMIC_PROGRAMS {
+        let (host_path, bytes) = read(bin.join(program))?;
+        pending.extend(needed_libraries(&bytes).map_err(|e| format!("{program}: {e}"))?);
+        files.push(DynamicFile {
+            module_path: format!("usr/bin/{program}"),
+            host_path,
+            bytes,
+        });
+    }
+    for relative in DYNAMIC_EXTRA_LIBS {
+        let (host_path, bytes) = read(lib.join(relative))?;
+        pending.extend(needed_libraries(&bytes).map_err(|e| format!("{relative}: {e}"))?);
+        files.push(DynamicFile {
+            module_path: format!("usr/lib/{relative}"),
+            host_path,
+            bytes,
+        });
+    }
+    for relative in DYNAMIC_PYTHON_FILES {
+        let (host_path, bytes) = read(lib.join("python3.14").join(relative))?;
+        if std::path::Path::new(relative)
+            .extension()
+            .is_some_and(|ext| ext == "so")
+        {
+            pending.extend(needed_libraries(&bytes).map_err(|e| format!("{relative}: {e}"))?);
+        }
+        files.push(DynamicFile {
+            module_path: format!("usr/lib/python3.14/{relative}"),
+            host_path,
+            bytes,
+        });
+    }
+    while let Some(name) = pending.pop() {
+        let module_path = format!("usr/lib/{name}");
+        if files.iter().any(|f| f.module_path == module_path) {
+            continue;
+        }
+        let (host_path, bytes) = read(lib.join(&name))?;
+        pending.extend(needed_libraries(&bytes).map_err(|e| format!("{name}: {e}"))?);
+        files.push(DynamicFile {
+            module_path,
+            host_path,
+            bytes,
+        });
+    }
+    files.sort_by(|a, b| a.module_path.cmp(&b.module_path));
+    Ok(files)
+}
+
+/// Directories of the module: (name, mode), parents first. `bb` and below are the data files the
+/// `busybox` group uses too; `proc` is the mount point the group makes itself.
+const DYNAMIC_DIRS: &[(&str, u32)] = &[
+    ("usr", 0o040_755),
+    ("usr/bin", 0o040_755),
+    ("usr/lib", 0o040_755),
+    ("tmp", 0o041_777),
+    ("bb", 0o040_755),
+    ("bb/tree", 0o040_755),
+    ("bb/tree/a", 0o040_755),
+    ("bb/tree/a/b", 0o040_755),
+];
+
+/// [`DYNAMIC_DIRS`] and the directories the files need below `usr/lib/python3.14`, parents first.
+fn dynamic_dirs(files: &[DynamicFile]) -> Vec<(String, u32)> {
+    let mut dirs: Vec<(String, u32)> = DYNAMIC_DIRS
+        .iter()
+        .map(|&(name, mode)| (name.to_owned(), mode))
+        .collect();
+    let mut extra: Vec<String> = Vec::new();
+    for file in files {
+        let mut parent = file
+            .module_path
+            .rsplit_once('/')
+            .map(|(dir, _)| dir.to_owned());
+        while let Some(dir) = parent {
+            if !dirs.iter().any(|d| d.0 == dir) && !extra.contains(&dir) {
+                extra.push(dir.clone());
+            }
+            parent = dir.rsplit_once('/').map(|(up, _)| up.to_owned());
+        }
+    }
+    extra.sort();
+    dirs.extend(extra.into_iter().map(|dir| (dir, 0o040_755)));
+    dirs
+}
+
+/// Symlinks of a merged-`/usr` root (name, target), as on the host.
+const DYNAMIC_LINKS: &[(&str, &str)] = &[
+    ("usr/bin/python3", "python3.14"),
+    ("bin", "usr/bin"),
+    ("lib", "usr/lib"),
+    ("lib64", "usr/lib"),
+    ("usr/lib64", "lib"),
+    ("usr/bin/sh", "bash"),
+];
+
+/// The deterministic second initramfs module of the `dynelf` group: the files from
+/// [`dynamic_files`] (`0755`), the merged-`/usr` links, `/tmp` and the data files of the `busybox`
+/// group, all with the fixed mtime [`BUSYBOX_MTIME`]. Linux unpacks concatenated archives into one
+/// rootfs, so the pinned reference gets `initramfs.cpio` + this one.
+pub(crate) fn dynamic_initramfs(files: &[DynamicFile]) -> io::Result<Vec<u8>> {
+    let bin_dat = busybox_bin_dat();
+    let mut entries: Vec<(NewcBuilder, &[u8])> = Vec::new();
+    let new = |name: &str, mode: u32| NewcBuilder::new(name).mode(mode).mtime(BUSYBOX_MTIME);
+    let dirs = dynamic_dirs(files);
+    for (name, mode) in &dirs {
+        entries.push((new(name, *mode).nlink(2), &[]));
+    }
+    for file in files {
+        if u32::try_from(file.bytes.len()).is_err() {
+            return Err(invalid("a program does not fit a newc file size"));
+        }
+        entries.push((new(&file.module_path, 0o100_755), &file.bytes));
+    }
+    for &(name, target) in DYNAMIC_LINKS {
+        entries.push((new(name, 0o120_777), target.as_bytes()));
+    }
+    for &(name, mode, data) in BUSYBOX_FILES {
+        entries.push((new(name, mode), data));
+    }
+    entries.push((new("bb/bin.dat", 0o100_644), &bin_dat));
+    for &(name, target) in BUSYBOX_LINKS {
+        entries.push((new(name, 0o120_777), target.as_bytes()));
+    }
+    write_cpio(
+        entries
+            .into_iter()
+            .map(|(builder, data)| (builder, Cursor::new(data))),
+        Vec::new(),
+    )
+}
+
+/// The `CHECK image inspected` tail the kernel must print for [`dynamic_initramfs`]: every ELF
+/// file is counted with its own `PT_LOAD` and `PT_INTERP` (an interpreter counts once per file).
+pub(crate) fn dynamic_counts(archive_len: usize, files: &[DynamicFile]) -> io::Result<String> {
+    let reserved = archive_len.next_multiple_of(PAGE).max(PAGE);
+    let (mut loads, mut interpreters, mut elves) = (0u64, 0u64, 0u64);
+    for file in files {
+        // The kernel inspects the files that start with the ELF magic.
+        if !file.bytes.starts_with(b"\x7fELF") {
+            continue;
+        }
+        elves += 1;
+        let elf = ElfBytes::<LittleEndian>::minimal_parse(&file.bytes)
+            .map_err(|error| parse_error(&error))?;
+        let mut interpreter = false;
+        for program in elf.segments().into_iter().flatten() {
+            match program.p_type {
+                abi::PT_LOAD => loads += 1,
+                abi::PT_INTERP => interpreter = true,
+                _ => {}
+            }
+        }
+        interpreters += u64::from(interpreter);
+    }
+    let regular = files.len() + BUSYBOX_FILES.len() + 1;
+    let symlinks = DYNAMIC_LINKS.len() + BUSYBOX_LINKS.len();
+    let entries = dynamic_dirs(files).len() + regular + symlinks;
+    Ok(format!(
+        "reserved={reserved} bytes={archive_len} records={} files={entries} regular={regular} symlinks={symlinks} trailers=1 skipped=0 elf={} loads={loads} interpreters={interpreters} execution=false rootfs=false",
+        entries + 1,
+        elves
+    ))
+}
+
+/// The host files of the `dynelf` group or why this host cannot run the group: a file is
+/// missing or not ELF, the CPU lacks the AVX-512 the x86-64-v4 builds need (`cpuinfo` is
+/// `/proc/cpuinfo`), or a digest differs from the recorded one. `digests` maps each file (same
+/// order as `files`) to its SHA-256.
+pub(crate) fn dynamic_unavailable(
+    cpuinfo: &str,
+    files: &[DynamicFile],
+    digests: &[String],
+) -> Option<String> {
+    if let Err(reason) = busybox_cpu(cpuinfo) {
+        return Some(reason);
+    }
+    for (file, digest) in files.iter().zip(digests) {
+        match DYNAMIC_PINS.iter().find(|pin| pin.0 == file.module_path) {
+            None => {
+                return Some(format!(
+                    "{} is not among the recorded dynelf inputs",
+                    file.module_path
+                ));
+            }
+            Some(pin) if pin.1 != digest => {
+                return Some(format!(
+                    "{} is sha256 {digest}, not the {} the expected lines were recorded with",
+                    file.host_path.display(),
+                    pin.1
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    (files.len() != DYNAMIC_PINS.len()).then(|| {
+        format!(
+            "the module has {} files, {} were recorded",
+            files.len(),
+            DYNAMIC_PINS.len()
+        )
+    })
+}
+
 /// What the `xstate` group needs of the host CPU under KVM `-cpu host`: AVX-512 F/BW/DQ/VL, the
 /// protection keys and `XSAVE`.
 pub(crate) const XSTATE_CPU_FLAGS: [&str; 6] = [
@@ -438,6 +1218,8 @@ pub(crate) struct Expected {
     pub(crate) archive_counts: String,
     /// The `CHECK image inspected` tail of `busybox.cpio`, when the host provides it.
     pub(crate) busybox_counts: Option<String>,
+    /// The `CHECK image inspected` tail of `dynamic.cpio`, when the host provides it.
+    pub(crate) dynamic_counts: Option<String>,
     pub(crate) init: ElfFacts,
 }
 

@@ -22,9 +22,11 @@ use super::{addr, addr_mut, die, emit, sys};
 
 const BUSYBOX: &[u8] = b"/bin/busybox\0";
 /// The environment of every command: `PATH` for `sh`, `HOME` as the kernel gives init.
-const ENVP: [&[u8]; 3] = [b"PATH=/bin\0", b"HOME=/\0", b"LC_ALL=C\0"];
+const ENVP: [&str; 3] = ["PATH=/bin", "HOME=/", "LC_ALL=C"];
 /// Raw output kept per command; the rest is counted and dropped (read, so the child never blocks).
 const KEEP: usize = 700;
+/// The most raw output any group keeps per command (`Exec::keep` chooses below it).
+pub(super) const KEEP_MAX: usize = 2048;
 /// A child that outlives this many seconds dies of `SIGALRM`.
 const GUARD_SECONDS: usize = 20;
 const O_RDWR: usize = 2;
@@ -1220,16 +1222,16 @@ const COMMANDS: &[Cmd] = cmds![
 ];
 
 /// Process output of one command.
-struct Outcome {
+pub(super) struct Outcome {
     /// `exit` status or `signal` number.
-    ended: Ended,
-    kept: [u8; KEEP],
-    len: usize,
-    dropped: usize,
+    pub(super) ended: Ended,
+    pub(super) kept: [u8; KEEP_MAX],
+    pub(super) len: usize,
+    pub(super) dropped: usize,
 }
 
 #[derive(Clone, Copy)]
-enum Ended {
+pub(super) enum Ended {
     Exit(i32),
     Signal(i32),
     Other(i32),
@@ -1248,7 +1250,7 @@ impl core::fmt::Display for Ended {
 }
 
 /// `WIFEXITED` / `WIFSIGNALED` of a wait status.
-fn decode(status: i32) -> Ended {
+pub(super) fn decode(status: i32) -> Ended {
     match (status & 0x7f, (status >> 8) & 0xff) {
         (0, code) => Ended::Exit(code),
         (signal, _) if signal != 0x7f && status & 0x80 == 0 => Ended::Signal(signal),
@@ -1256,31 +1258,50 @@ fn decode(status: i32) -> Ended {
     }
 }
 
-/// `argv`/`envp` pointer arrays for `execve`, built on the child's stack: `buf` holds the NUL
-/// terminated copies. The command list stays far below both bounds (checked by the caller).
+/// `argv`/`envp` pointer arrays for `execve`, built on the child's stack: `strings` holds the NUL
+/// terminated copies. The command lists stay far below both bounds (checked by the caller).
 struct Vector {
-    strings: [u8; 1536],
-    pointers: [usize; 24],
+    strings: [u8; 2048],
+    pointers: [usize; 40],
 }
 
-fn exec_command(cmd: &Cmd, null: usize) -> ! {
+impl Vector {
+    /// Appends `words` to the strings and their addresses to the pointer array (no terminator).
+    fn push<'a>(&mut self, at: &mut usize, n: &mut usize, words: impl Iterator<Item = &'a str>) {
+        for word in words {
+            self.pointers[*n] = self.strings.as_ptr().wrapping_add(*at).expose_provenance();
+            self.strings[*at..*at + word.len()].copy_from_slice(word.as_bytes());
+            *at += word.len() + 1;
+            *n += 1;
+        }
+    }
+}
+
+/// What to `execve` in a forked child: the NUL terminated path of the program, its `argv` and the
+/// environment (the group's fixed words, then `extra`).
+pub(super) struct Exec<'a> {
+    pub(super) program: &'a [u8],
+    pub(super) argv: &'a [&'a str],
+    pub(super) env: &'a [&'a str],
+    pub(super) extra_env: &'a [&'a str],
+    /// Raw output bytes kept (at most [`KEEP_MAX`]); the rest is counted and dropped.
+    pub(super) keep: usize,
+}
+
+fn exec_command(exec: &Exec<'_>, null: usize) -> ! {
     let mut v = Vector {
-        strings: [0; 1536],
-        pointers: [0; 24],
+        strings: [0; 2048],
+        pointers: [0; 40],
     };
     let (mut at, mut n) = (0, 0);
-    for arg in cmd.argv {
-        v.pointers[n] = v.strings.as_ptr().wrapping_add(at).expose_provenance();
-        v.strings[at..at + arg.len()].copy_from_slice(arg.as_bytes());
-        at += arg.len() + 1;
-        n += 1;
-    }
+    v.push(&mut at, &mut n, exec.argv.iter().copied());
     n += 1; // argv terminator
     let envp_at = n;
-    for env in ENVP {
-        v.pointers[n] = env.as_ptr().expose_provenance();
-        n += 1;
-    }
+    v.push(
+        &mut at,
+        &mut n,
+        exec.env.iter().chain(exec.extra_env).copied(),
+    );
     let (argv, envp) = (
         v.pointers.as_ptr().expose_provenance(),
         v.pointers
@@ -1291,13 +1312,13 @@ fn exec_command(cmd: &Cmd, null: usize) -> ! {
     // stdin = /dev/null; the guard against a hang.
     let _ = sys(Sysno::dup2, &[null, 0]);
     let _ = sys(Sysno::alarm, &[GUARD_SECONDS]);
-    let _ = sys(Sysno::execve, &[addr(BUSYBOX), argv, envp]);
+    let _ = sys(Sysno::execve, &[addr(exec.program), argv, envp]);
     // The program of the initramfs is missing: report it as a distinct status.
     die(127)
 }
 
 /// Runs one command, its stdout and stderr on one pipe read to the end.
-fn run_one(cmd: &Cmd, null: usize) -> Outcome {
+pub(super) fn run_one(exec: &Exec<'_>, null: usize) -> Outcome {
     let mut fds = [0u32; 2];
     let _ = sys(Sysno::pipe2, &[addr_mut(&mut fds), 0]);
     let (rd, wr) = (fds[0] as usize, fds[1] as usize);
@@ -1306,12 +1327,12 @@ fn run_one(cmd: &Cmd, null: usize) -> Outcome {
         let _ = sys(Sysno::dup2, &[wr, 2]);
         let _ = sys(Sysno::close, &[rd]);
         let _ = sys(Sysno::close, &[wr]);
-        exec_command(cmd, null)
+        exec_command(exec, null)
     });
     let _ = sys(Sysno::close, &[wr]);
     let mut out = Outcome {
         ended: Ended::Lost,
-        kept: [0; KEEP],
+        kept: [0; KEEP_MAX],
         len: 0,
         dropped: 0,
     };
@@ -1320,7 +1341,7 @@ fn run_one(cmd: &Cmd, null: usize) -> Outcome {
         match sys(Sysno::read, &[rd, addr_mut(&mut scratch), scratch.len()]) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let room = KEEP - out.len;
+                let room = exec.keep - out.len;
                 let take = n.min(room);
                 out.kept[out.len..out.len + take].copy_from_slice(&scratch[..take]);
                 out.len += take;
@@ -1354,7 +1375,7 @@ fn escape(bytes: &[u8], line: &mut impl core::fmt::Write) {
 
 /// A result line, written with one `write(2)`: up to `4 * KEEP` bytes of escapes and the framing.
 struct Wide {
-    buf: [u8; 3072],
+    buf: [u8; 4 * KEEP_MAX + 256],
     len: usize,
 }
 
@@ -1367,6 +1388,23 @@ impl core::fmt::Write for Wide {
     }
 }
 
+/// The result line of one command, written with one `write(2)`:
+/// `init: test <group>.<label> exit=<n>|signal=<n> out="<escaped output>"` (+ ` +<dropped>`).
+pub(super) fn report(group: &str, label: &str, out: &Outcome) {
+    let mut line = Wide {
+        buf: [0; 4 * KEEP_MAX + 256],
+        len: 0,
+    };
+    let _ = write!(line, "init: test {group}.{label} {} out=\"", out.ended);
+    escape(&out.kept[..out.len], &mut line);
+    let _ = line.write_char('"');
+    if out.dropped > 0 {
+        let _ = write!(line, " +{}", out.dropped);
+    }
+    line.buf[line.len] = b'\n';
+    let _ = sys(Sysno::write, &[1, addr(&line.buf), line.len + 1]);
+}
+
 pub fn run() -> bool {
     let (mut passed, mut failed) = (0u32, 0u32);
     // The null device and the sole stdin of the children: /dev holds only /dev/console at boot.
@@ -1376,23 +1414,15 @@ pub fn run() -> bool {
     );
     let null = sys(Sysno::open, &[addr(b"/dev/null\0"), O_RDWR, 0]).unwrap_or(usize::MAX);
     for cmd in COMMANDS {
-        let out = run_one(cmd, null);
-        let mut line = Wide {
-            buf: [0; 3072],
-            len: 0,
+        let exec = Exec {
+            program: BUSYBOX,
+            argv: cmd.argv,
+            env: &ENVP,
+            extra_env: &[],
+            keep: KEEP,
         };
-        let _ = write!(
-            line,
-            "init: test busybox.{} {} out=\"",
-            cmd.label, out.ended
-        );
-        escape(&out.kept[..out.len], &mut line);
-        let _ = line.write_char('"');
-        if out.dropped > 0 {
-            let _ = write!(line, " +{}", out.dropped);
-        }
-        line.buf[line.len] = b'\n';
-        let _ = sys(Sysno::write, &[1, addr(&line.buf), line.len + 1]);
+        let out = run_one(&exec, null);
+        report("busybox", cmd.label, &out);
         // A command whose child could not be reaped is a failure of the runner itself.
         if matches!(out.ended, Ended::Lost) {
             failed += 1;
