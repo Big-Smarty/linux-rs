@@ -192,7 +192,7 @@ Tested: the bootstrap paths above on this CPU, the exact-ABI syscall set behind 
 
 ### Evidence so far (QEMU only, no physical run)
 
-See [the implementation record](implementation.md#kernel-run-bare-metal-suite-a21) for the exact commands, outputs and hashes. In short: the composed build matched four `kernel-test` cases (`baremetal-suite`, `-two-displays`, `-kvm`, `-stops`), and `xtask baremetal-suite` booted the produced tree in QEMU to a summary screen with every group passing; the screendumps are retained under `target/kernel-tooling/`.
+See [the implementation record](implementation.md#kernel-run-bare-metal-suite-a21) for the exact commands, outputs and hashes. In short: the composed build matched five `kernel-test` cases (`baremetal-suite`, `-two-displays`, `-busybox-cpu`, `-kvm`, `-stops`; the KVM case runs all thirteen groups and passes them), and `xtask baremetal-suite` booted the produced tree in QEMU to a summary screen with every runnable group passing (`xstate` and `busybox` `N/A` under TCG `qemu64`); the same tree booted under KVM `-cpu host` passed all thirteen. The screendumps are retained under `target/kernel-tooling/`; the [record of the `procfs` and `busybox` groups](implementation.md#bare-metal-suite-procfs-and-busybox-groups) lists the exact runs, what depends on the machine, and the failures on the way.
 
 ## What remains mandatory outside this smoke
 
