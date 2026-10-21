@@ -4525,6 +4525,11 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
 /// (the XSAVE area, its trailing magic word and `fregs_state`, or 512 + 112 without XSAVE) + 63,
 /// rounded up to 16). The record itself must be self-consistent: without XSAVE the legacy
 /// numbers, with it x87 and SSE enabled and a compacted buffer no larger than the standard area.
+///
+/// This is a consistency check of the kernel's record against what `/init` printed, not an
+/// independent derivation: the independent comparison is the `xstate` oracle group's
+/// `auxv-minsigstksz-from-the-xsave-size`, which recomputes the value from `CPUID` in ring 3 and
+/// is an `expected.tsv` row.
 fn xstate_minsigstksz(lines: &[&str]) -> Result<u64, String> {
     let record = unique_record(lines, "CHECK xstate ok")?;
     let field = |key: &str| record_field(record, key).ok_or(format!("{record}: no {key}"));

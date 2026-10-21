@@ -1458,6 +1458,19 @@ xstate	check	nested-signal-frame-holds-the-first-handlers-registers	init: test x
 xstate	check	nested-signal-return-restores-the-first-handlers-registers	init: test xstate.nested-signal-return-restores-the-first-handlers-registers ok
 xstate	check	nested-signal-both-returns-restore-the-interrupted-registers	init: test xstate.nested-signal-both-returns-restore-the-interrupted-registers ok
 xstate	check	pkru-access-disable-gives-segv-pkuerr	init: test xstate.pkru-access-disable-gives-segv-pkuerr ok
+xstate	check	pkru-ad-makes-write-fail-with-efault	init: test xstate.pkru-ad-makes-write-fail-with-efault ok
+xstate	check	pkru-refused-write-queued-nothing	init: test xstate.pkru-refused-write-queued-nothing ok
+xstate	check	pkru-wd-allows-write-to-read-user-memory	init: test xstate.pkru-wd-allows-write-to-read-user-memory ok
+xstate	check	pkru-ad-makes-read-fail-with-efault	init: test xstate.pkru-ad-makes-read-fail-with-efault ok
+xstate	check	pkru-wd-makes-read-fail-with-efault	init: test xstate.pkru-wd-makes-read-fail-with-efault ok
+xstate	check	pkru-refused-read-consumed-nothing	init: test xstate.pkru-refused-read-consumed-nothing ok
+xstate	check	pkru-ad-makes-clock_gettime-fail-with-efault	init: test xstate.pkru-ad-makes-clock_gettime-fail-with-efault ok
+xstate	check	pkru-wd-makes-clock_gettime-fail-with-efault	init: test xstate.pkru-wd-makes-clock_gettime-fail-with-efault ok
+xstate	check	pkru-clock_gettime-with-the-default-pkru	init: test xstate.pkru-clock_gettime-with-the-default-pkru ok
+xstate	check	pkru-wd-makes-arch_prctl-store-fail-with-efault	init: test xstate.pkru-wd-makes-arch_prctl-store-fail-with-efault ok
+xstate	check	pkru-ad-on-an-untouched-page-is-efault	init: test xstate.pkru-ad-on-an-untouched-page-is-efault ok
+xstate	check	pkru-the-untouched-page-is-usable-afterwards	init: test xstate.pkru-the-untouched-page-is-usable-afterwards ok
+xstate	check	pkru-back-at-the-default	init: test xstate.pkru-back-at-the-default ok
 xstate	check	user-xsave-xstate-bv	init: test xstate.user-xsave-xstate-bv ok
 xstate	check	user-xsave-saves-the-registers	init: test xstate.user-xsave-saves-the-registers ok
 xstate	check	user-xrstor-restores-the-registers	init: test xstate.user-xrstor-restores-the-registers ok
@@ -1466,4 +1479,4 @@ xstate	check	xsaves-in-ring-3-is-sigsegv	init: test xstate.xsaves-in-ring-3-is-s
 xstate	check	wrpkru-with-ecx-not-zero-is-sigsegv	init: test xstate.wrpkru-with-ecx-not-zero-is-sigsegv ok
 xstate	check	xrstor-misaligned-is-sigsegv	init: test xstate.xrstor-misaligned-is-sigsegv ok
 xstate	check	xrstor-reserved-header-bytes-is-sigsegv	init: test xstate.xrstor-reserved-header-bytes-is-sigsegv ok
-xstate	summary	-	init: tests xstate passed=155 failed=0
+xstate	summary	-	init: tests xstate passed=168 failed=0

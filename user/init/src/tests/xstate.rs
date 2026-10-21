@@ -27,7 +27,7 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-use syscalls::Sysno;
+use syscalls::{Errno, Sysno};
 
 use super::proc::{nap, reap_all, sigaction, spawn, wait4};
 use super::signal::{KSigaction, SA_RESTORER, restorer};
@@ -495,6 +495,7 @@ pub fn run() -> bool {
     altstack_sizes(&mut t, &lay);
     nested_signal(&mut t, &lay);
     pkru_fault(&mut t);
+    pkru_kernel_access(&mut t);
     user_instructions(&mut t, &lay);
     reap_all();
     t.finish()
@@ -1454,23 +1455,49 @@ fn sigreturn_refused(t: &mut T, lay: &Layout) {
         }
         1 | flag(1, upper_ok)
     });
-    let (r, status) = wait4(child as isize, 0);
-    let outcome = if status & 0x7f == SIGSEGV as i32 {
-        "killed"
-    } else if r == Ok(child) && status >> 8 & 1 == 1 {
-        "survived"
-    } else {
-        "unexpected"
-    };
+    let outcome = outcome_of(child, 1);
+    // The reference: `rt_sigreturn` first `XRSTOR`s the frame from user memory (the fast path),
+    // so the CPU decides whether a header claiming the compacted format is valid; only when it
+    // faults does the slow path refuse `xcomp_bv != 0` (`validate_user_xstate_header`). The same
+    // header (empty `XSTATE_BV`: no component is read) executed in ring 3 gives that decision
+    // without the kernel's help.
+    reap_all();
+    static HEADER: Single<Aligned<4224>> = Single::new(Aligned([0; 4224]));
+    let reference = spawn(|| {
+        HEADER.with(|area| {
+            area.0.fill(0);
+            area.0[520..528].copy_from_slice(&(1u64 << 63 | lay.xcr0).to_le_bytes());
+            // SAFETY: as `user_instructions`: user mode, a 64-aligned area larger than the
+            // standard format, a header whose only oddity is the compacted bit (the point: the
+            // CPU may raise `#GP`, which is `SIGSEGV` and the answer).
+            unsafe {
+                asm!("xrstor64 [{p}]", p = in(reg) area.0.as_ptr(), in("eax") lay.xcr0 as u32, in("edx") (lay.xcr0 >> 32) as u32, options(nostack, readonly));
+            }
+        });
+        1
+    });
+    let cpu = outcome_of(reference, 1);
     t.info("compacted-header", format_args!("{outcome}"));
-    t.holds(
+    t.eq(
         "sigreturn-compacted-header-is-the-cpus-decision",
-        outcome != "unexpected",
         outcome,
-        "killed by SIGSEGV or restored",
+        cpu,
     );
     let _ = lay;
     uninstall();
+}
+
+/// How a child that exits with `want` in its status byte ended: `"killed"` by `SIGSEGV`,
+/// `"survived"`, or `"unexpected"`.
+fn outcome_of(child: usize, want: i32) -> &'static str {
+    let (r, status) = wait4(child as isize, 0);
+    if status & 0x7f == SIGSEGV as i32 {
+        "killed"
+    } else if r == Ok(child) && status >> 8 & want == want {
+        "survived"
+    } else {
+        "unexpected"
+    }
 }
 
 /// The frame must fit the alternate stack: `get_sigframe` refuses (`SIGSEGV`) when it does not,
@@ -1710,4 +1737,138 @@ fn pkru_fault(t: &mut T) {
         wait4(child as isize, 0),
         (Ok(child), 1 << 8),
     );
+}
+
+/// A system call made with `PKRU = pkru`, and `PKRU` back at `PKRU_INIT` afterwards. Nothing in
+/// ring 3 touches memory between the two `WRPKRU`s (key 0, which every page of this program
+/// has, is disabled meanwhile), so the block is one `asm!`. Returns the raw result.
+fn syscall_with_pkru(pkru: u32, nr: Sysno, a0: usize, a1: usize, a2: usize) -> isize {
+    let ret: isize;
+    // SAFETY: as the module proof; user mode. `WRPKRU` needs ECX = EDX = 0 and sets PKRU from
+    // EAX; the first changes it to `pkru`, the second back to `PKRU_INIT`, which keeps key 0
+    // accessible, so the compiler's own accesses (stack, statics) are never affected: the
+    // block itself reads and writes no memory, and no spill can be placed between the two
+    // instructions that change PKRU because they are in one block. The system call (`SYSCALL`
+    // convention: number in RAX, arguments in RDI/RSI/RDX, RCX and R11 clobbered, the other
+    // registers kept) may write memory through the pointer argument, so the block is not
+    // `nomem`. Flags are changed by `XOR`.
+    unsafe {
+        asm!(
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "mov eax, r8d",
+            "wrpkru",
+            "mov eax, r9d",
+            "mov rdx, r10",
+            "syscall",
+            "mov r12, rax",
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "mov eax, {init}",
+            "wrpkru",
+            init = const PKRU_INIT,
+            in("r8") u64::from(pkru),
+            in("r9") nr.id() as u64,
+            in("r10") a2,
+            in("rdi") a0,
+            in("rsi") a1,
+            out("r12") ret,
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// The protection keys apply to the kernel's own accesses on the task's behalf: with key 0
+/// access-disabled `read(2)`/`write(2)`/`clock_gettime`/`arch_prctl` fail with `EFAULT` (the
+/// hardware checks `copy_from_user`/`copy_to_user` like any user access; Documentation/core-api/
+/// protection-keys.rst), with write-disabled only the calls that store to user memory do, and
+/// nothing is consumed or stored by a refused call.
+fn pkru_kernel_access(t: &mut T) {
+    const AD: u32 = PKRU_INIT | 1;
+    const WD: u32 = PKRU_INIT | 2;
+    const O_NONBLOCK: usize = 0o4000;
+    reap_all();
+    let efault = -(Errno::EFAULT.into_raw() as isize);
+    let eagain = -(Errno::EAGAIN.into_raw() as isize);
+    let mut fds = [0u32; 2];
+    let _ = sys(Sysno::pipe2, &[addr_mut(&mut fds), O_NONBLOCK]);
+    let (r, w) = (fds[0] as usize, fds[1] as usize);
+    let mut buf = [0xa5u8; 16];
+    let p = addr_mut(&mut buf);
+    let io = |pkru, nr, fd| syscall_with_pkru(pkru, nr, fd, p, 4);
+    t.eq(
+        "pkru-ad-makes-write-fail-with-efault",
+        io(AD, Sysno::write, w),
+        efault,
+    );
+    t.eq(
+        "pkru-refused-write-queued-nothing",
+        io(PKRU_INIT, Sysno::read, r),
+        eagain,
+    );
+    t.eq(
+        "pkru-wd-allows-write-to-read-user-memory",
+        io(WD, Sysno::write, w),
+        4,
+    );
+    t.eq(
+        "pkru-ad-makes-read-fail-with-efault",
+        io(AD, Sysno::read, r),
+        efault,
+    );
+    t.eq(
+        "pkru-wd-makes-read-fail-with-efault",
+        io(WD, Sysno::read, r),
+        efault,
+    );
+    t.eq(
+        "pkru-refused-read-consumed-nothing",
+        io(PKRU_INIT, Sysno::read, r),
+        4,
+    );
+    for (name, pkru) in [("ad", AD), ("wd", WD)] {
+        t.eq(
+            format_args!("pkru-{name}-makes-clock_gettime-fail-with-efault"),
+            syscall_with_pkru(pkru, Sysno::clock_gettime, 1, p, 0),
+            efault,
+        );
+    }
+    t.eq(
+        "pkru-clock_gettime-with-the-default-pkru",
+        syscall_with_pkru(PKRU_INIT, Sysno::clock_gettime, 1, p, 0),
+        0,
+    );
+    t.eq(
+        "pkru-wd-makes-arch_prctl-store-fail-with-efault",
+        syscall_with_pkru(WD, Sysno::arch_prctl, 0x1021, p, 0),
+        efault,
+    );
+    // A page nobody touched yet: the denied access is refused whether or not it is resident.
+    if let Ok(page) = mmap(0, 4096, 3, 0x22, usize::MAX, 0) {
+        t.eq(
+            "pkru-ad-on-an-untouched-page-is-efault",
+            syscall_with_pkru(AD, Sysno::write, w, page, 1),
+            efault,
+        );
+        t.eq(
+            "pkru-the-untouched-page-is-usable-afterwards",
+            syscall_with_pkru(PKRU_INIT, Sysno::write, w, page, 1),
+            1,
+        );
+    } else {
+        t.holds(
+            "pkru-mmap-for-the-untouched-page",
+            false,
+            "mmap failed",
+            "a page",
+        );
+    }
+    t.eq("pkru-back-at-the-default", rdpkru(), PKRU_INIT);
+    let _ = sys(Sysno::close, &[r]);
+    let _ = sys(Sysno::close, &[w]);
 }
