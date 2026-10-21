@@ -44,6 +44,8 @@ pub(crate) struct Hw {
 pub(crate) struct Fake {
     pub(crate) pages: BTreeMap<u64, Hw>,
     pub(crate) fail_maps: Option<u32>,
+    /// `move_pages` fails (a destination table could not be allocated).
+    pub(crate) fail_moves: bool,
 }
 
 impl Fake {
@@ -107,6 +109,27 @@ impl UserPages for Fake {
             }
         }
         freed
+    }
+    fn move_pages(
+        &mut self,
+        old_start: u64,
+        new_start: u64,
+        pages: u64,
+    ) -> Result<(), OutOfMemory> {
+        if self.fail_moves {
+            return Err(OutOfMemory);
+        }
+        let end = old_start.saturating_add(pages.saturating_mul(P));
+        let keys: Vec<u64> = self.pages.range(old_start..end).map(|(k, _)| *k).collect();
+        for k in keys {
+            if let Some(h) = self.pages.remove(&k) {
+                assert!(
+                    self.pages.insert(new_start + (k - old_start), h).is_none(),
+                    "move_pages onto a mapped page"
+                );
+            }
+        }
+        Ok(())
     }
     fn protect(&mut self, start: u64, pages: u64, prot: PageProt) {
         let end = start.saturating_add(pages.saturating_mul(P));
@@ -1694,4 +1717,262 @@ fn the_vma_stamp_moves_with_every_change_and_names_the_address_space() {
     // A fork's copy and a new address space are not the same space.
     assert_ne!(w.mm.dup(&w.env).unwrap().vma_stamp().0, w.mm.vma_stamp().0);
     assert_ne!(Mm::new(&w.env).vma_stamp().0, w.mm.vma_stamp().0);
+}
+
+// ---- mremap ----------------------------------------------------------------
+
+impl W {
+    fn mremap(&mut self, a: u64, old: u64, new: u64, flags: u64, to: u64) -> Result<u64, Errno> {
+        self.mm
+            .mremap(&self.env, &mut self.pt, a, old, new, flags, to)
+    }
+    fn resident(&self, a: u64, pages: u64) -> Vec<bool> {
+        (0..pages)
+            .map(|i| self.pt.pages.contains_key(&(a + i * P)))
+            .collect()
+    }
+}
+
+/// src: mm/mremap.c `check_mremap_params`, `check_prep_vma` and `do_mremap`, in order.
+#[test]
+fn mremap_argument_errors_follow_check_order() {
+    let mut w = W::new();
+    let a = w.map(0, 4 * P, RW, ANON).unwrap();
+    let eq = |r: Result<u64, Errno>, e: Errno, what: &str| assert_eq!(r, Err(e), "{what}");
+    eq(w.mremap(a, P, P, 0x8, 0), Errno::EINVAL, "unknown flag");
+    eq(
+        w.mremap(a, P, P, MREMAP_FIXED, a - 8 * P),
+        Errno::EINVAL,
+        "FIXED without MAYMOVE",
+    );
+    eq(
+        w.mremap(a, P, P, MREMAP_DONTUNMAP, 0),
+        Errno::EINVAL,
+        "DONTUNMAP without MAYMOVE",
+    );
+    eq(
+        w.mremap(a, P, 2 * P, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, a - 16 * P),
+        Errno::EINVAL,
+        "DONTUNMAP resizes",
+    );
+    eq(
+        w.mremap(a + 1, P, P, 0, 0),
+        Errno::EINVAL,
+        "unaligned address",
+    );
+    eq(w.mremap(a, P, 0, 0, 0), Errno::EINVAL, "zero new length");
+    eq(
+        w.mremap(a, P, TASK_SIZE + P, MREMAP_MAYMOVE, 0),
+        Errno::EINVAL,
+        "new length too big",
+    );
+    eq(
+        w.mremap(a, P, P, MREMAP_MAYMOVE | MREMAP_FIXED, a - 16 * P + 1),
+        Errno::EINVAL,
+        "unaligned new address",
+    );
+    eq(
+        w.mremap(a, 2 * P, 2 * P, MREMAP_MAYMOVE | MREMAP_FIXED, a + P),
+        Errno::EINVAL,
+        "target overlaps source",
+    );
+    eq(
+        w.mremap(a, 0, P, 0, 0),
+        Errno::EINVAL,
+        "duplicating a private mapping",
+    );
+    eq(
+        w.mremap(a - 64 * P, P, P, 0, 0),
+        Errno::EFAULT,
+        "nothing mapped there",
+    );
+    // Equal lengths are the address itself, whatever the length (no VMA check is made).
+    assert_eq!(w.mremap(a + P, P, P, 0, 0), Ok(a + P));
+    assert_eq!(w.mremap(a, 5 * P, 5 * P, 0, 0), Ok(a));
+    // Growing needs the range to lie within the VMA.
+    eq(
+        w.mremap(a, 5 * P, 6 * P, MREMAP_MAYMOVE, 0),
+        Errno::EFAULT,
+        "beyond the VMA",
+    );
+    // The overflowing offset: a length that wraps PAGE_ALIGN to zero is a zero length.
+    eq(
+        w.mremap(a, P, u64::MAX, 0, 0),
+        Errno::EINVAL,
+        "length wraps to zero",
+    );
+    w.check_invariants();
+}
+
+/// src: mm/mremap.c `shrink_vma`, `expand_vma`, `expand_vma_in_place`, `vma_expandable`.
+#[test]
+fn mremap_shrinks_and_expands_in_place() {
+    let mut w = W::new();
+    let a = w.map(0, 4 * P, RW, ANON).unwrap();
+    for i in 0..4 {
+        assert!(w.writable(a + i * P));
+    }
+    let before = w.mm.total_vm;
+    // Shrink: the tail goes, its pages with it.
+    assert_eq!(w.mremap(a, 4 * P, 2 * P, 0, 0), Ok(a));
+    assert_eq!(w.resident(a, 4), [true, true, false, false]);
+    assert_eq!(w.mm.total_vm, before - 2);
+    assert_eq!(w.mm.find_vma(a).unwrap().end, a + 2 * P);
+    // A shrink of a middle part keeps both ends (`MAYMOVE` is not needed).
+    assert_eq!(w.mremap(a + P, 2 * P, P, 0, 0), Ok(a + P));
+    assert_eq!(w.mm.find_vma(a).unwrap().end, a + 2 * P);
+    // Grow in place: nothing is above the top-most mapping (the stack gap is free).
+    let top = w.mm.find_vma(a).unwrap().end;
+    assert_eq!(top, MMAP_TOP - 2 * P);
+    assert_eq!(w.mremap(a, 2 * P, 6 * P, 0, 0), Ok(a));
+    let v = *w.mm.find_vma(a).unwrap();
+    assert_eq!((v.start, v.end), (a, a + 6 * P));
+    assert_eq!(w.mm.total_vm, before - 2 + 4);
+    // Only a range that ends at the VMA's end can grow in place; otherwise it moves or fails.
+    assert_eq!(w.mremap(a, 2 * P, 3 * P, 0, 0), Err(Errno::ENOMEM));
+    w.check_invariants();
+}
+
+/// src: mm/mremap.c `expand_vma` -> `vrm_set_new_addr` -> `move_vma`: a blocked growth moves
+/// the mapping to the top-down area and takes its pages along.
+#[test]
+fn mremap_moves_a_blocked_mapping_with_its_pages() {
+    let mut w = W::new();
+    let upper = w.map(0, 2 * P, RW, ANON).unwrap();
+    let lower = w.map(0, 2 * P, PROT_READ, ANON).unwrap();
+    assert_eq!(lower + 2 * P, upper);
+    assert!(w.readable(lower));
+    let faulted_before = w.resident(lower, 2);
+    let total = w.mm.total_vm;
+    // Blocked by `upper`, and no MAYMOVE.
+    assert_eq!(w.mremap(lower, 2 * P, 4 * P, 0, 0), Err(Errno::ENOMEM));
+    let moved = w.mremap(lower, 2 * P, 4 * P, MREMAP_MAYMOVE, 0).unwrap();
+    assert!(moved < lower);
+    assert!(
+        w.mm.find_vma(lower)
+            .is_none_or(|v| v.start >= lower + 2 * P)
+    );
+    let v = *w.mm.find_vma(moved).unwrap();
+    assert_eq!((v.start, v.end), (moved, moved + 4 * P));
+    assert_eq!(
+        w.resident(moved, 4),
+        [faulted_before[0], faulted_before[1], false, false]
+    );
+    assert_eq!(w.resident(lower, 2), [false, false]);
+    assert_eq!(w.mm.total_vm, total + 2);
+    // A never-faulted anonymous VMA takes pgoff = start >> 12 again.
+    let fresh = w.map(0, P, RW, ANON | MAP_NORESERVE).unwrap();
+    let moved = w.mremap(fresh, P, 2 * P, MREMAP_MAYMOVE, 0).unwrap();
+    assert_eq!(w.mm.find_vma(moved).unwrap().pgoff, moved >> 12);
+    w.check_invariants();
+}
+
+/// src: mm/mremap.c `mremap_to`, `vrm_overlaps`.
+#[test]
+fn mremap_fixed_replaces_the_target() {
+    let mut w = W::new();
+    let a = w.map(0x2000_0000, 3 * P, RW, ANON | MAP_FIXED).unwrap();
+    let b = w
+        .map(0x3000_0000, 3 * P, PROT_READ, ANON | MAP_FIXED)
+        .unwrap();
+    assert!(w.writable(a));
+    assert!(w.readable(b + P));
+    let flags = MREMAP_MAYMOVE | MREMAP_FIXED;
+    // a -> over b: b is unmapped first; the pages of a arrive, b's go.
+    assert_eq!(w.mremap(a, 3 * P, 3 * P, flags, b), Ok(b));
+    assert!(w.mm.find_vma(a).is_none_or(|v| v.start >= a + 3 * P));
+    let v = *w.mm.find_vma(b).unwrap();
+    assert_eq!(
+        (v.start, v.end, v.flags.contains(VmFlags::WRITE)),
+        (b, b + 3 * P, true)
+    );
+    assert_eq!(w.resident(b, 3), [true, false, false]);
+    // Growing while moving to a fixed address.
+    let c = w.map(0x4000_0000, P, RW, ANON | MAP_FIXED).unwrap();
+    assert_eq!(w.mremap(c, P, 3 * P, flags, 0x5000_0000), Ok(0x5000_0000));
+    assert_eq!(w.mm.find_vma(0x5000_0000).unwrap().end, 0x5000_0000 + 3 * P);
+    // Shrinking while moving: the tail is unmapped, the rest moves.
+    assert_eq!(
+        w.mremap(0x5000_0000, 3 * P, P, flags, 0x6000_0000),
+        Ok(0x6000_0000)
+    );
+    assert_eq!(w.mm.find_vma(0x6000_0000).unwrap().end, 0x6000_0000 + P);
+    assert!(
+        w.mm.find_vma(0x5000_0000)
+            .is_none_or(|v| v.start >= 0x6000_0000)
+    );
+    w.check_invariants();
+}
+
+/// src: mm/mremap.c `move_vma` with `MREMAP_DONTUNMAP`, `dontunmap_complete`.
+#[test]
+fn mremap_dontunmap_leaves_an_empty_mapping_behind() {
+    let mut w = W::new();
+    let a = w.map(0x2000_0000, 2 * P, RW, ANON | MAP_FIXED).unwrap();
+    assert!(w.writable(a));
+    let total = w.mm.total_vm;
+    let to = w
+        .mremap(a, 2 * P, 2 * P, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0)
+        .unwrap();
+    assert_ne!(to, a);
+    assert_eq!(w.mm.total_vm, total + 2, "both mappings count");
+    let old = *w.mm.find_vma(a).unwrap();
+    assert_eq!((old.start, old.end, old.anon), (a, a + 2 * P, None));
+    assert_eq!(old.pgoff, a >> 12, "unfaulted again");
+    assert_eq!(w.resident(a, 2), [false, false]);
+    assert_eq!(w.resident(to, 2), [true, false]);
+    w.check_invariants();
+}
+
+/// src: mm/mremap.c `remap_move`: every VMA of the range moves, the gap between them is kept.
+#[test]
+fn mremap_fixed_moves_several_vmas_keeping_the_gaps() {
+    let mut w = W::new();
+    let base = 0x2000_0000;
+    w.map(base, P, RW, ANON | MAP_FIXED).unwrap();
+    w.map(base + P, P, PROT_READ, ANON | MAP_FIXED).unwrap();
+    w.map(base + 3 * P, P, RW, ANON | MAP_FIXED).unwrap();
+    assert!(w.writable(base));
+    let to = 0x3000_0000;
+    let flags = MREMAP_MAYMOVE | MREMAP_FIXED;
+    assert_eq!(w.mremap(base, 4 * P, 4 * P, flags, to), Ok(to));
+    let vmas: Vec<(u64, u64, u64)> =
+        w.mm.vmas()
+            .iter()
+            .filter(|v| v.start >= to && v.end <= to + 4 * P)
+            .map(|v| (v.start - to, v.end - to, v.flags.0 & VmFlags::ACCESS.0))
+            .collect();
+    assert_eq!(vmas, [(0, P, 3), (P, 2 * P, 1), (3 * P, 4 * P, 3)]);
+    assert!(w.mm.find_vma(base).is_none_or(|v| v.start >= base + 4 * P));
+    assert_eq!(w.resident(to, 1), [true]);
+    // A gap at the very start is EFAULT, nothing mapped at all too.
+    assert_eq!(
+        w.mremap(to - P, 2 * P, 2 * P, flags, 0x4000_0000),
+        Err(Errno::EFAULT)
+    );
+    assert_eq!(
+        w.mremap(0x7000_0000, P, P, flags, 0x4000_0000),
+        Err(Errno::EFAULT)
+    );
+    w.check_invariants();
+}
+
+/// src: mm/mremap.c `copy_vma_and_data`: a page-table move that fails leaves the old mapping
+/// whole and unmaps the copy.
+#[test]
+fn mremap_failing_page_table_move_keeps_the_old_mapping() {
+    let mut w = W::new();
+    let upper = w.map(0, 2 * P, RW, ANON).unwrap();
+    let lower = w.map(0, 2 * P, PROT_READ, ANON).unwrap();
+    assert!(w.readable(lower));
+    let (maps, total) = (w.maps(), w.mm.total_vm);
+    w.pt.fail_moves = true;
+    assert_eq!(
+        w.mremap(lower, 2 * P, 4 * P, MREMAP_MAYMOVE, 0),
+        Err(Errno::ENOMEM)
+    );
+    assert_eq!((w.maps(), w.mm.total_vm), (maps, total));
+    assert!(w.pt.pages.contains_key(&lower));
+    let _ = upper;
+    w.check_invariants();
 }

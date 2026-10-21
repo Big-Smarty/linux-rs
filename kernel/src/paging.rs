@@ -1245,6 +1245,92 @@ impl Tables {
         freed
     }
 
+    /// `move_page_tables`: move the user entries of `pages` pages from `old_start` to
+    /// `new_start` (frames, flags and the resident counters unchanged; the old translations are
+    /// invalidated). The destination must be free. All or nothing: when a table for the
+    /// destination cannot be allocated the entries moved so far are moved back (their tables
+    /// exist) and the error is returned.
+    ///
+    /// # Errors
+    /// Table exhaustion (`Error::Memory`).
+    pub fn mm_move(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        old_start: u64,
+        new_start: u64,
+        pages: u64,
+    ) -> Result<(), Error> {
+        let mut moved = 0u64;
+        let mut failure = None;
+        while moved < pages {
+            let from = old_start + moved * PAGE;
+            let to = new_start + moved * PAGE;
+            match self.mm_move_one(allocator, from, to) {
+                Ok(()) => moved += 1,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let Some(error) = failure else {
+            return Ok(());
+        };
+        // Move back what moved: the source entries' tables still exist and the entries are not
+        // present there any more, so this cannot fail.
+        for done in 0..moved {
+            let from = new_start + done * PAGE;
+            let to = old_start + done * PAGE;
+            let back = self.mm_move_one(allocator, from, to);
+            assert!(back.is_ok(), "mm_move: revert of a moved entry failed");
+        }
+        Err(error)
+    }
+
+    /// One entry of [`Tables::mm_move`]: a mapped user entry at `from` becomes the entry at `to`.
+    fn mm_move_one(
+        &mut self,
+        allocator: &mut Allocator<'_>,
+        from: u64,
+        to: u64,
+    ) -> Result<(), Error> {
+        let Some(slot) = self.user_slot(from)? else {
+            return Ok(());
+        };
+        // SAFETY: `slot` is a PTE of this tree (see `user_slot`); `&mut self` excludes software
+        // writers and `AtomicU64` makes the swap atomic against the hardware's accessed/dirty
+        // updates.
+        let entry = unsafe { AtomicU64::from_ptr(slot) };
+        let seen = entry.load(Ordering::Acquire);
+        // Never move what is not a user page.
+        if seen & MAPPED == 0 || seen & USER == 0 {
+            return Ok(());
+        }
+        // Build the destination first (it may need tables): a failure leaves the source alone.
+        // `map` accounts the new leaf, so the old one is un-accounted here.
+        let old = entry.swap(0, Ordering::AcqRel);
+        self.account(old, 0);
+        if old & PRESENT != 0 {
+            tlb::flush(VirtAddr::new(from));
+        }
+        let flags = old & !ADDRESS;
+        match self.map(
+            allocator,
+            Virtual(to),
+            Physical(frame_bits(old)),
+            flags,
+            false,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // SAFETY: the slot was emptied above and nothing else touched it.
+                entry.store(old, Ordering::Release);
+                self.account(0, old);
+                Err(error)
+            }
+        }
+    }
+
     /// `change_protection`: re-protect the mapped pages of the range. The write
     /// bit is only ever cleared here (a private page becomes writable again
     /// through the write fault), `!exec` sets NX, and `!accessible` turns the
@@ -1358,6 +1444,15 @@ macro_rules! mm_pages {
             }
             fn protect(&mut self, start: u64, pages: u64, prot: kernel::mm::PageProt) {
                 self.parts(|tables, _| tables.mm_protect(start, pages, prot));
+            }
+            fn move_pages(
+                &mut self,
+                old_start: u64,
+                new_start: u64,
+                pages: u64,
+            ) -> Result<(), kernel::mm::OutOfMemory> {
+                self.parts(|tables, frames| tables.mm_move(frames, old_start, new_start, pages))
+                    .map_err(out_of_memory)
             }
         }
     };

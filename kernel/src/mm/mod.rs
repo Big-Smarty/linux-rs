@@ -16,6 +16,7 @@ mod flags;
 mod layout;
 mod ops;
 mod pt;
+mod remap;
 mod space;
 
 #[cfg(test)]
@@ -30,4 +31,5 @@ pub use flags::*;
 pub use layout::{DEFAULT_MAP_WINDOW, mmap_address_hint_valid, pick_mmap_base, round_hint_to_min};
 pub use ops::{FileMapping, Mmap, Unsupported, mmap_off_to_pgoff};
 pub use pt::{OutOfMemory, Pte, UserPages};
+pub use remap::{MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE};
 pub use space::{Mm, TASK_SIZE, Vma};

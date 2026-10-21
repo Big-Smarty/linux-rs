@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Selected semantics from Linux 6.18.57, commit
 // 2ff600d29ee478d0a8d46ef8a58afb5e038fe692: mm/mmap.c (`SYSCALL_DEFINE1(brk)`,
-// `ksys_mmap_pgoff`, `SYSCALL_DEFINE2(munmap)`), arch/x86/kernel/sys_x86_64.c
+// `ksys_mmap_pgoff`, `SYSCALL_DEFINE2(munmap)`), mm/mremap.c (`SYSCALL_DEFINE5(mremap)`), arch/x86/kernel/sys_x86_64.c
 // (`SYSCALL_DEFINE6(mmap)`), mm/mprotect.c (`SYSCALL_DEFINE3(mprotect)`),
 // mm/madvise.c (`do_madvise`, `is_valid_madvise`, `madvise_should_skip`,
 // `madvise_walk_vmas`, `madvise_vma_behavior` for `MADV_NORMAL`),
@@ -11,7 +11,7 @@
 // outcomes to a return value); a request Linux serves with a shared file page,
 // shmem or hugetlb object this kernel does not have yet ends in `Unimplemented`.
 #![forbid(unsafe_code)]
-//! Memory syscalls: `brk`, `mmap`, `munmap`, `mprotect`, `madvise`.
+//! Memory syscalls: `brk`, `mmap`, `munmap`, `mremap`, `mprotect`, `madvise`.
 //!
 //! Context: the one task, address-space lock held by construction (the
 //! binary's `Process` lock). Heap storage for the VMA vector is reserved by
@@ -40,13 +40,21 @@ use syscalls::{Errno, Sysno};
 
 pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, args: [u64; 6]) -> Option<Outcome> {
     Some(match sysno {
-        Sysno::brk | Sysno::mmap | Sysno::munmap => {
+        Sysno::brk | Sysno::mmap | Sysno::munmap | Sysno::mremap => {
             let outcome = match sysno {
                 Sysno::brk => {
                     let AddressSpace { mm, env, pages } = ctx.address_space();
                     Outcome::Return(mm.brk(env, pages, args[0]).cast_signed())
                 }
                 Sysno::mmap => mmap(ctx, args),
+                Sysno::mremap => {
+                    let AddressSpace { mm, env, pages } = ctx.address_space();
+                    let [addr, old_len, new_len, flags, new_addr, _] = args;
+                    Outcome::Return(
+                        mm.mremap(env, pages, addr, old_len, new_len, flags, new_addr)
+                            .map_or_else(error, u64::cast_signed),
+                    )
+                }
                 _ => {
                     let AddressSpace { mm, env, pages } = ctx.address_space();
                     status(mm.munmap(env, pages, args[0], args[1]))

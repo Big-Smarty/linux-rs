@@ -405,8 +405,8 @@ mod tests {
             assert_eq!(outcome, neg(Errno::ENOSYS), "{number:?}");
         }
         // Everything else Linux implements still stops loudly.
-        let outcome = dispatch(&mut task, Sysno::mremap as u64, [0; 6]);
-        assert_eq!(outcome, Outcome::Unimplemented(25));
+        let outcome = dispatch(&mut task, Sysno::timer_create as u64, [0; 6]);
+        assert_eq!(outcome, Outcome::Unimplemented(222));
     }
 
     #[test]
@@ -414,7 +414,7 @@ mod tests {
         let mut task = task();
         let setup = dispatch(&mut task, Sysno::io_uring_setup as u64, [0; 6]);
         assert_eq!(setup, Outcome::Unimplemented(425));
-        let mremap = dispatch(&mut task, Sysno::mremap as u64, [0; 6]);
-        assert_eq!(mremap, Outcome::Unimplemented(25));
+        let timer = dispatch(&mut task, Sysno::timer_create as u64, [0; 6]);
+        assert_eq!(timer, Outcome::Unimplemented(222));
     }
 }

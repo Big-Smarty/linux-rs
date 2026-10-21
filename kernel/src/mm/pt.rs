@@ -62,4 +62,13 @@ pub trait UserPages {
     /// `!prot.accessible`. It must not raise the hardware write bit of a
     /// private page that is not known exclusive; the write fault does that.
     fn protect(&mut self, start: u64, pages: u64, prot: PageProt);
+    /// `move_page_tables` (`mremap`): move every mapping of the `pages` pages at `old_start` to
+    /// `new_start`, keeping the frames and the entry bits; the destination holds no mapping.
+    /// All or nothing: on failure (a table could not be allocated) the tables are exactly as
+    /// before.
+    ///
+    /// # Errors
+    /// [`OutOfMemory`] if an intermediate table cannot be allocated.
+    fn move_pages(&mut self, old_start: u64, new_start: u64, pages: u64)
+    -> Result<(), OutOfMemory>;
 }
