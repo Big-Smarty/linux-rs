@@ -160,9 +160,9 @@ enum Chr {
 /// The character devices of the reference configuration that matter here
 /// (`drivers/char/mem.c` `devlist`, `drivers/tty/tty_io.c`).
 ///
-/// Only `0:*` (no driver can register major 0 through `cdev_add`) and `5:0`
-/// (`/dev/tty` without a controlling terminal, `tty_open_current_tty`) answer
-/// `ENXIO`; every other number may belong to a driver of the reference
+/// Only `0:*` (no driver can register major 0 through `cdev_add`) answers
+/// `ENXIO` here (`/dev/tty` without a controlling terminal is the caller's
+/// state: `syscall::tty::after_open`); every other number may belong to a driver of the reference
 /// configuration (misc 10, input 13, fb 29, ...), so opening it succeeds and
 /// each later operation stops the kernel loudly.
 fn chrdev(rdev: u32) -> Chr {
@@ -171,8 +171,12 @@ fn chrdev(rdev: u32) -> Chr {
         (1, 5) => Chr::Driver(CharDev::Zero),
         (1, 7) => Chr::Driver(CharDev::Full),
         (5, 1) => Chr::Driver(CharDev::Console),
-        (0, _) | (5, 0) => Chr::Absent,
-        // ptmx, the vt and serial ttys and the unix98 pty slaves: tty_open.
+        // `tty_open_current_tty` answers `ENXIO` without a controlling terminal:
+        // the caller's state, checked after the open (`syscall::tty::after_open`).
+        (5, 0) => Chr::Driver(CharDev::TtyAux),
+        (4, 64) => Chr::Driver(CharDev::TtyS0),
+        (0, _) => Chr::Absent,
+        // ptmx, the vt and the other serial ttys and the unix98 pty slaves: tty_open.
         (5, 2) | (4 | 136..=143, _) => Chr::Unported { stream: true },
         _ => Chr::Unported { stream: false },
     }
@@ -184,6 +188,9 @@ impl Vfs {
         let Some(file) = self.files.put(id) else {
             return;
         };
+        if matches!(file.kind, FileKind::Char(dev) if dev.is_tty()) {
+            self.tty_touched = true;
+        }
         match file.kind {
             FileKind::Pipe { pipe, writer } => self.pipe_release(pipe, writer),
             _ => {
@@ -821,7 +828,7 @@ impl Vfs {
         fmode |= FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE;
         match kind {
             // tty_open: nonseekable_open
-            FileKind::Char(CharDev::Console) => {
+            FileKind::Char(dev) if dev.is_tty() => {
                 fmode &= !(FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE);
             }
             FileKind::Unsupported if unported_stream => {
@@ -853,7 +860,12 @@ impl Vfs {
     ) -> KResult<FileId> {
         self.fs.iget(inode);
         match self.files.alloc(File::new(Some(inode), kind, flags, mode)) {
-            Ok(id) => Ok(id),
+            Ok(id) => {
+                if matches!(kind, FileKind::Char(dev) if dev.is_tty()) {
+                    self.tty_touched = true;
+                }
+                Ok(id)
+            }
             Err(error) => {
                 self.fs.iput(inode);
                 Err(error)
@@ -905,6 +917,41 @@ impl Vfs {
         }
         self.fput(file);
         Ok(())
+    }
+
+    // ---- the console tty's files ---------------------------------------------
+
+    /// Whether a file on the console tty was opened or released since the last
+    /// call (the tty's `count` must be recounted).
+    pub fn take_tty_touch(&mut self) -> bool {
+        core::mem::take(&mut self.tty_touched)
+    }
+
+    /// The open files on the console tty and how many of them are
+    /// `/dev/console` ones (`cons_filp`).
+    pub fn tty_files(&mut self) -> (u32, u32) {
+        let (mut total, mut console) = (0, 0);
+        for file in self.files.iter_mut() {
+            if let FileKind::Char(dev) = file.kind
+                && dev.is_tty()
+            {
+                total += 1;
+                if dev == CharDev::Console {
+                    console += 1;
+                }
+            }
+        }
+        (total, console)
+    }
+
+    /// `__tty_hangup`: every `tty_fops` file becomes a `hung_up_tty_fops` one;
+    /// the `/dev/console` files keep working.
+    pub fn tty_hangup_files(&mut self) {
+        for file in self.files.iter_mut() {
+            if matches!(file.kind, FileKind::Char(CharDev::TtyAux | CharDev::TtyS0)) {
+                file.kind = FileKind::Char(CharDev::HungUp);
+            }
+        }
     }
 
     // ---- pipes ---------------------------------------------------------------

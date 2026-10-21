@@ -372,6 +372,9 @@ pub struct Vfs {
     coherence_lost: bool,
     /// A private `/dev/zero` mapping was made (its VMA keeps no `vm_file`).
     zero_mapped: bool,
+    /// A file on the console tty was opened or released since the tty last
+    /// looked ([`Vfs::take_tty_touch`]): `tty->count` changed.
+    tty_touched: bool,
 }
 
 impl Vfs {
@@ -392,6 +395,7 @@ impl Vfs {
             pins: Vec::new(),
             coherence_lost: false,
             zero_mapped: false,
+            tty_touched: false,
         })
     }
 }

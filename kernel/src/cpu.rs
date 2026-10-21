@@ -638,6 +638,8 @@ unsafe fn install_idt() {
             Some(&handler) => handler,
             None => match index {
                 0x30 => irq0_entry as *const (),
+                0x31 => irq1_entry as *const (),
+                0x34 => irq4_entry as *const (),
                 0x37 => pic_spurious7_entry as *const (),
                 0x3f => pic_spurious15_entry as *const (),
                 0xec => lapic_timer_entry as *const (),
@@ -823,6 +825,8 @@ entry!(v29, 29, error);
 entry!(v30, 30, error);
 entry!(v31, 31);
 entry!(irq0_entry, 0x30);
+entry!(irq1_entry, 0x31);
+entry!(irq4_entry, 0x34);
 entry!(pic_spurious7_entry, 0x37);
 entry!(pic_spurious15_entry, 0x3f);
 entry!(lapic_timer_entry, 0xec);
@@ -852,6 +856,12 @@ fn external_interrupt(vector: u64, user: bool) -> bool {
         v if v == u64::from(SPURIOUS_VECTOR) => crate::apic::spurious_interrupt(),
         v if v == u64::from(ERROR_VECTOR) => crate::apic::error_interrupt(),
         v if v == base => crate::timer::isa_irq0_interrupt(user),
+        // The console tty's input: the i8042 keyboard (IRQ1) and, in the QEMU
+        // profile, the 8250 (IRQ4). A vector nothing routed stays unexpected.
+        #[cfg(not(feature = "baremetal-suite"))]
+        v if v == base + 1 && crate::ttyin::keyboard_enabled() => crate::i8042::interrupt(),
+        #[cfg(all(feature = "qemu-self-test", not(feature = "baremetal-suite")))]
+        v if v == base + 4 && crate::ttyin::serial_enabled() => crate::ttyin::serial_interrupt(),
         v if v == u64::from(LOCAL_TIMER_VECTOR) => crate::timer::lapic_timer_interrupt(user),
         // 8259 lines 7 and 15 raise a spurious vector when a request vanishes
         // between INTR and acknowledge (Linux spurious_8259A_irq): ignore only

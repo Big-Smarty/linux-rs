@@ -110,9 +110,14 @@ impl Vfs {
             // `FOP_UNSIGNED_OFFSET` or a regular file: `ULONG_MAX`.
             FileKind::Directory
             | FileKind::Pipe { .. }
-            | FileKind::Char(CharDev::Console | CharDev::Null | CharDev::Full) => {
-                Mappable::File(info(false, u64::MAX))
-            }
+            | FileKind::Char(
+                CharDev::Console
+                | CharDev::TtyAux
+                | CharDev::TtyS0
+                | CharDev::HungUp
+                | CharDev::Null
+                | CharDev::Full,
+            ) => Mappable::File(info(false, u64::MAX)),
             FileKind::Char(CharDev::Zero) => Mappable::Zero(info(true, u64::MAX)),
             FileKind::Path => return None,
             FileKind::Unsupported => Mappable::Unported,

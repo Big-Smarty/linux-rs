@@ -30,6 +30,7 @@ pub mod sync;
 pub mod syscall;
 pub mod task;
 pub mod time;
+pub mod tty;
 pub mod usercopy;
 pub mod vfs;
 pub mod xstate;

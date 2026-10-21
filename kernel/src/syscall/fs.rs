@@ -145,6 +145,14 @@ fn open<C: Context>(ctx: &mut C, dfd: i32, path: u64, flags: u64, mode: u64) -> 
     let nofile = ctx.rlimit_nofile();
     let fd = ctx.files().fdt.alloc_fd(0, nofile, op.cloexec)?;
     let opened = env_for(ctx, dfd, &name).and_then(|env| ctx.files().vfs.open(&env, &name, &op));
+    // `tty_open`: what depends on the caller (`/dev/tty`, the controlling terminal).
+    let opened = opened.and_then(|file| match super::tty::after_open(ctx, file, op.flags) {
+        Ok(()) => Ok(file),
+        Err(errno) => {
+            ctx.files().vfs.fput(file);
+            Err(errno)
+        }
+    });
     let files = ctx.files();
     match opened {
         Ok(file) => {

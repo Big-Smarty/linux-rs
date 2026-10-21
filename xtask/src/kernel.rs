@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod suite;
+pub(crate) mod ttydrive;
 
 pub use suite::create as baremetal_suite;
 
@@ -210,6 +211,11 @@ enum User {
     /// [`User::Oracle`] for a group whose output is the machine's, not `qemu64`'s: run under KVM
     /// with `-cpu host` (SMEP/SMAP on, the XSAVE `AT_MINSIGSTKSZ` of the host).
     OracleHost(&'static str),
+    /// Like [`User::Oracle`], with a person at the serial port: the harness's tty driver types the
+    /// bytes of the group's script at every `init: stage <name>`, and the serial transcript of every
+    /// stage (the echo, the output under test) must equal the pinned Linux's as well
+    /// ([`ttydrive::compare`]).
+    OracleInput(&'static str),
     /// `-- forkleak`: 200 fork/exit/wait rounds; the counts line equals the pinned Linux's and
     /// the free RAM `sysinfo` reports is exactly the same before and after the rounds (every
     /// frame and kernel object came back).
@@ -375,6 +381,25 @@ macro_rules! oracle_case {
             forbid_success: false,
             modules: ARCHIVE_ONLY,
             user: User::Oracle(stringify!($group)),
+            framebuffers: 1,
+            plat: Q35_TCG,
+        }
+    };
+}
+
+/// One oracle test group that needs input (`-- <group>`, [`ttydrive`]): as [`oracle_case!`], run with the
+/// serial port connected to the driver instead of a file.
+macro_rules! oracle_input_case {
+    ($group:ident) => {
+        DebugCase {
+            name: concat!("oracle-", stringify!($group)),
+            cmdline: Some(concat!("-- ", stringify!($group))),
+            cpu: "qemu64",
+            expected_exit: 33,
+            required: SUCCESS_MARKERS,
+            forbid_success: false,
+            modules: ARCHIVE_ONLY,
+            user: User::OracleInput(stringify!($group)),
             framebuffers: 1,
             plat: Q35_TCG,
         }
@@ -879,6 +904,15 @@ const DEBUG_CASES: &[DebugCase] = &[
             ..Q35_TCG
         },
     },
+    // The console tty without input: termios and speeds, window size, flow control, the small
+    // ioctls, controlling terminals, job control, hangup (`user/init` group `tty`).
+    oracle_case!(tty),
+    // The console tty with a driver at the serial port: line editing, VMIN/VTIME, the input and
+    // echo flags, output processing, flow control, poll, ISIG (`user/init` group `ttyin`).
+    oracle_input_case!(ttyin),
+    // The PS/2 keyboard (QMP `send-key` at the i8042): the default US keymap through the tty
+    // (`user/init` group `ttykbd`; the Linux reference runs it with a vt console).
+    oracle_input_case!(ttykbd),
     // 200 fork/exit/wait rounds: nothing is left behind (`user/init` mode `forkleak`).
     // Pool exhaustion and every unwinding path of `copy_process` (this kernel only: Linux's limit
     // is `max_threads`, not a stack pool).
@@ -3765,6 +3799,22 @@ fn require_exit(
     Ok(())
 }
 
+/// The serial log as bytes, bounded like [`read_serial_log`] (a transcript may hold any byte).
+fn read_serial_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(|error| contextual(path, &error))?
+        .take(SERIAL_LOG_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > SERIAL_LOG_LIMIT {
+        return Err(invalid(format!(
+            "{} exceeds {SERIAL_LOG_LIMIT} bytes",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Guest-controlled, so bounded; invalid UTF-8 is an error, not an empty log.
 fn read_serial_log(path: &Path) -> io::Result<String> {
     let mut bytes = Vec::new();
@@ -3807,7 +3857,11 @@ fn debug_qemu_args(
         OsString::from("-monitor"),
         OsString::from("none"),
         OsString::from("-serial"),
-        OsString::from(format!("file:{}", relative(&case_dir.join("serial.log"))?)),
+        OsString::from(match case.user {
+            // The serial port is the driver's socket: QEMU waits for the connection.
+            User::OracleInput(_) => "chardev:ttys0".to_owned(),
+            _ => format!("file:{}", relative(&case_dir.join("serial.log"))?),
+        }),
         OsString::from("-no-reboot"),
         OsString::from("-nic"),
         OsString::from("none"),
@@ -3832,6 +3886,20 @@ fn debug_qemu_args(
         OsString::from("-device"),
         OsString::from("isa-debug-exit,iobase=0xf4,iosize=0x04"),
     ];
+    if matches!(case.user, User::OracleInput(_)) {
+        args.extend([
+            OsString::from("-chardev"),
+            OsString::from(format!(
+                "socket,id=ttys0,path={},server=on,wait=on",
+                relative(&case_dir.join("serial.sock"))?
+            )),
+            OsString::from("-qmp"),
+            OsString::from(format!(
+                "unix:{},server=on,wait=off",
+                relative(&case_dir.join("qmp.sock"))?
+            )),
+        ]);
+    }
     if case.framebuffers == 2 {
         // A second display: OVMF publishes a second GOP handle, so Limine
         // reports two framebuffers and the console must draw on both.
@@ -3903,6 +3971,7 @@ fn run_debug_case(
     Ok(second)
 }
 
+#[allow(clippy::too_many_lines, reason = "one QEMU run, in order")]
 fn run_debug_case_in(
     root: &Path,
     output: &Path,
@@ -3932,10 +4001,45 @@ fn run_debug_case_in(
     let stderr = case_dir.join("qemu.stderr.log");
     let mut command = supervised(&tools.qemu.path);
     command.args(&args).current_dir(root).stdin(Stdio::null());
-    let process = run_with_logs(&mut command, &stdout, &stderr, timeout)?;
-    let (markers_match, mut diagnostic) = match read_serial_log(&case_dir.join("serial.log")) {
-        Ok(serial) => validate_debug_case(case, &process, &serial, &tools.fixtures.expected),
-        Err(error) => (false, format!("unusable serial log: {error}")),
+    let process = if let User::OracleInput(group) = case.user {
+        let script = ttydrive::script_for(group)
+            .ok_or_else(|| invalid(format!("no input script for group {group}")))?;
+        ttydrive::run_driven(
+            &mut command,
+            &stdout,
+            &stderr,
+            &root.join(relative_path(root, &case_dir.join("serial.sock"))?),
+            Some(&root.join(relative_path(root, &case_dir.join("qmp.sock"))?)),
+            &case_dir.join("serial.log"),
+            script,
+            timeout,
+        )?
+    } else {
+        run_with_logs(&mut command, &stdout, &stderr, timeout)?
+    };
+    let (markers_match, mut diagnostic) = if let User::OracleInput(group) = case.user {
+        match read_serial_bytes(&case_dir.join("serial.log")) {
+            // The stage transcripts carry the tty's echo (control characters): the generic
+            // validator sees the log without them, the driver compares them with Linux's.
+            Ok(raw) => {
+                let (ok, why) = validate_debug_case(
+                    case,
+                    &process,
+                    &ttydrive::sanitize(&raw),
+                    &tools.fixtures.expected,
+                );
+                match ttydrive::compare(group, &raw, oracle_items(group)) {
+                    Ok(()) => (ok, why),
+                    Err(difference) => (false, format!("tty transcript: {difference}")),
+                }
+            }
+            Err(error) => (false, format!("unusable serial log: {error}")),
+        }
+    } else {
+        match read_serial_log(&case_dir.join("serial.log")) {
+            Ok(serial) => validate_debug_case(case, &process, &serial, &tools.fixtures.expected),
+            Err(error) => (false, format!("unusable serial log: {error}")),
+        }
     };
     let disk_final = file_hash(root, &tools.sha256sum.path, &boot_image.disk)?;
     let disk_unchanged = disk_final == boot_image.disk_sha256_initial;
@@ -4441,9 +4545,11 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
             protection,
         } => (argc, mode_line, exact_summary, protection),
         User::ForkLeak => (2, Some(FORKLEAK_MODE_LINE), true, (false, false)),
-        User::ForkBomb | User::Segfault | User::Unimplemented | User::Oracle(_) => {
-            (2, None, true, (false, false))
-        }
+        User::ForkBomb
+        | User::Segfault
+        | User::Unimplemented
+        | User::Oracle(_)
+        | User::OracleInput(_) => (2, None, true, (false, false)),
         User::OracleHost(_) => (2, None, false, (true, true)),
     };
     let audit = find.at(
@@ -4499,7 +4605,7 @@ fn validate_userspace(lines: &[&str], user: User, init: &fixture::ElfFacts) -> R
     if user == User::ForkBomb {
         positions.extend(forkbomb_records(&find)?);
     }
-    if let User::Oracle(group) | User::OracleHost(group) = user {
+    if let User::Oracle(group) | User::OracleHost(group) | User::OracleInput(group) = user {
         let (first, last) = validate_oracle(lines, group)?;
         positions.push(first);
         // A one-line group has first == last; strict ordering must not reject it.
@@ -4587,7 +4693,29 @@ fn oracle_rows(group: &str) -> impl Iterator<Item = (&'static str, &'static str)
                 fields.next()?,
                 fields.next()?,
             );
-            (row_group == group).then_some((kind, line))
+            // `stage` and `echo` rows belong to the tty driver's comparison ([`ttydrive::compare`]).
+            (row_group == group && matches!(kind, "check" | "info" | "summary"))
+                .then_some((kind, line))
+        })
+}
+
+/// The `(kind, name, text)` of every row of `group` (all kinds), for [`ttydrive::compare`].
+fn oracle_items(
+    group: &str,
+) -> impl Iterator<Item = (&'static str, &'static str, &'static str)> + '_ {
+    ORACLE_EXPECTED
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .skip(1)
+        .filter_map(move |row| {
+            let mut fields = row.splitn(4, '\t');
+            let (row_group, kind, name, text) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            (row_group == group).then_some((kind, name, text))
         })
 }
 
@@ -4807,6 +4935,7 @@ fn user_tail(
         User::Ok { .. }
         | User::Oracle(_)
         | User::OracleHost(_)
+        | User::OracleInput(_)
         | User::ForkLeak
         | User::ForkBomb => {
             let mut tail = vec![find.exact("init: ok", "init: ok")?];
@@ -8152,6 +8281,7 @@ mod tests {
         assert_eq!(rows.next(), Some("group\tkind\tname\tline"));
         let mut checks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         let mut summaries = BTreeMap::new();
+        let mut stages: Vec<(&str, &str)> = Vec::new();
         for row in rows {
             let [group, kind, name, line]: [&str; 4] =
                 row.split('\t').collect::<Vec<_>>().try_into().unwrap();
@@ -8165,11 +8295,22 @@ mod tests {
                     assert_eq!(name, "-");
                     summaries.insert(group, line);
                 }
+                "stage" => {
+                    assert_eq!(line, format!("init: stage {name}"));
+                    assert!(
+                        !stages.contains(&(group, name)),
+                        "{group}.{name}: stage twice"
+                    );
+                    stages.push((group, name));
+                }
+                // The transcript of the stage just announced (escaped, see `ttydrive::escape`).
+                "echo" => assert_eq!(stages.last(), Some(&(group, name))),
                 other => panic!("unknown kind {other}"),
             }
         }
         let groups = [
-            "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe", "xstate",
+            "mm", "ids", "time", "signal", "fs", "proc", "fork", "jobctl", "pipe", "xstate", "tty",
+            "ttyin", "ttykbd",
         ];
         assert_eq!(
             checks.keys().copied().collect::<Vec<_>>().len(),

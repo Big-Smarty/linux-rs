@@ -9,8 +9,8 @@
 // Transformation: the poll table is the task's one wait key: a task that must
 // sleep sleeps once on `sched::PIPE_KEY` (every pipe change wakes it) with the
 // timeout as its timer, then scans every descriptor again, so it needs no
-// per-file wait entries and no `poll_freewait`. The console has no input
-// source, so it is never readable.
+// per-file wait entries and no `poll_freewait`. A change of the console tty wakes
+// the same key as a pipe change.
 #![forbid(unsafe_code)]
 //! `poll(2)`: readiness of pipes, the console and files that have no `->poll`.
 //!
@@ -292,8 +292,10 @@ fn vfs_poll<C: Context>(ctx: &mut C, view: &super::fd::View) -> Result<u16, Stop
             }
             mask
         }
-        // `n_tty_poll`: no input ever arrives, the write queue is always empty.
-        FileKind::Char(CharDev::Console) => POLLOUT | POLLWRNORM,
+        // `tty_poll` -> `n_tty_poll`, or `hung_up_tty_poll`.
+        FileKind::Char(CharDev::Console | CharDev::TtyAux | CharDev::TtyS0 | CharDev::HungUp) => {
+            super::tty::poll_mask(ctx, view)
+        }
         // No `->poll`: `DEFAULT_POLLMASK`.
         FileKind::Regular | FileKind::Directory | FileKind::Char(_) => DEFAULT_POLLMASK,
         // `fdget` refused `O_PATH` already.

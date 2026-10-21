@@ -935,11 +935,11 @@ ws-drivers-infiniband-ulp	drivers/infiniband/ulp	docs/subsystems/drivers.md	P2	n
 ws-drivers-input	drivers/input	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-input-gameport	drivers/input/gameport	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-input-joystick	drivers/input/joystick	docs/subsystems/drivers.md	P2	not_started
-ws-drivers-input-keyboard	drivers/input/keyboard	docs/subsystems/drivers.md	P2	not_started
+ws-drivers-input-keyboard	drivers/input/keyboard	docs/subsystems/drivers.md	P2	in_progress
 ws-drivers-input-misc	drivers/input/misc	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-input-mouse	drivers/input/mouse	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-input-rmi4	drivers/input/rmi4	docs/subsystems/drivers.md	P2	not_started
-ws-drivers-input-serio	drivers/input/serio	docs/subsystems/drivers.md	P2	not_started
+ws-drivers-input-serio	drivers/input/serio	docs/subsystems/drivers.md	P2	in_progress
 ws-drivers-input-tablet	drivers/input/tablet	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-input-tests	drivers/input/tests	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-input-touchscreen	drivers/input/touchscreen	docs/subsystems/drivers.md	P2	not_started
@@ -1375,8 +1375,8 @@ ws-drivers-tty	drivers/tty	docs/subsystems/drivers.md	P0	in_progress
 ws-drivers-tty-hvc	drivers/tty/hvc	docs/subsystems/drivers.md	P0	not_started
 ws-drivers-tty-ipwireless	drivers/tty/ipwireless	docs/subsystems/drivers.md	P0	not_started
 ws-drivers-tty-serdev	drivers/tty/serdev	docs/subsystems/drivers.md	P0	not_started
-ws-drivers-tty-serial	drivers/tty/serial	docs/subsystems/drivers.md	P0	not_started
-ws-drivers-tty-vt	drivers/tty/vt	docs/subsystems/drivers.md	P0	not_started
+ws-drivers-tty-serial	drivers/tty/serial	docs/subsystems/drivers.md	P0	in_progress
+ws-drivers-tty-vt	drivers/tty/vt	docs/subsystems/drivers.md	P0	in_progress
 ws-drivers-ufs	drivers/ufs	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-ufs-core	drivers/ufs/core	docs/subsystems/drivers.md	P2	not_started
 ws-drivers-ufs-host	drivers/ufs/host	docs/subsystems/drivers.md	P2	not_started

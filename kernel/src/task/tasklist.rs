@@ -132,6 +132,13 @@ pub struct TaskStruct {
     pub cred: CredSnapshot,
     /// `signal->leader`: a session leader.
     pub session_leader: bool,
+    /// `signal->tty != NULL`: the console tty is the controlling terminal
+    /// (there is one tty, so no pointer). Inherited by `fork`, cleared by
+    /// `setsid` and by the tty's hangup/release ([`Tasklist::session_clear_tty`]).
+    pub ctty: bool,
+    /// `signal->tty_old_pgrp`: the foreground group of a terminal that was
+    /// hung up under the session leader (`tty_signal_session_leader`).
+    pub tty_old_pgrp: Option<super::pid::PidRef>,
     /// Own CPU time in nanoseconds, folded in by the owner before it exits
     /// (`task_cputime`).
     pub utime_ns: u64,
@@ -234,6 +241,8 @@ impl Tasklist {
                 flags: 0,
                 cred: CredSnapshot::of(cred),
                 session_leader: false,
+                ctty: false,
+                tty_old_pgrp: None,
                 utime_ns: 0,
                 stime_ns: 0,
                 cutime_ns: 0,
@@ -315,7 +324,8 @@ impl Tasklist {
     pub fn fork(&mut self, parent: TaskId, params: ForkParams) -> Result<TaskId, Errno> {
         self.fork_allowed(parent, params)?;
         let p = self.tasks.get(parent).ok_or(Errno::ESRCH)?;
-        let (pgid, sid, cred, exec_id) = (p.pids[2], p.pids[3], p.cred, p.self_exec_id);
+        let (pgid, sid, cred, exec_id, ctty) =
+            (p.pids[2], p.pids[3], p.cred, p.self_exec_id, p.ctty);
         // copy_sighand / copy_signal / dup_task_struct: the parent's
         // dispositions, blocked mask and altstack; nothing pending.
         let signals = Box::try_new(
@@ -341,6 +351,9 @@ impl Tasklist {
             flags: PF_FORKNOEXEC,
             cred,
             session_leader: false,
+            // copy_signal: `p->signal->tty = tty_kref_get(current->signal->tty)`.
+            ctty,
+            tty_old_pgrp: None,
             utime_ns: 0,
             stime_ns: 0,
             cutime_ns: 0,

@@ -225,6 +225,17 @@ fn validate_command_options(
 }
 
 fn main() -> ExitCode {
+    // The evidence tool for the console tty's input groups has its own arguments.
+    let mut raw = env::args_os();
+    if raw.nth(1).is_some_and(|word| word == "tty-oracle") {
+        return match kernel::ttydrive::cli(raw.collect()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = writeln!(io::stderr().lock(), "xtask: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let options = match arguments() {
         Ok(Some(options)) => options,
         Ok(None) => {

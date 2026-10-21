@@ -1,8 +1,8 @@
-# Expected output lines of the oracle syscall suite (user/init modes mm ids time signal fs proc fork jobctl pipe xstate) on the pinned
+# Expected output lines of the oracle syscall suite (user/init modes mm ids time signal fs proc fork jobctl pipe xstate tty ttyin ttykbd) on the pinned
 # Linux 6.18.57 reference kernel: QEMU q35, -cpu qemu64 (TCG), -smp 1 -m 512M, "console=ttyS0 panic=-1 vdso=0 norandmaps -- <mode>",
-# the harness-built /init and generated initramfs (target/linux-reference/init-reference-006 for mm ids time signal fs proc, -009/-010 for fork, -011 for jobctl and pipe; docs/implementation.md#oracle-syscall-test-suite).
+# the harness-built /init and generated initramfs (target/linux-reference/init-reference-006 for mm ids time signal fs proc, -009/-010 for fork, -011 for jobctl and pipe, -014 for tty, ttyin and ttykbd (ttyin/ttykbd are driven through the serial port / QMP send-key by `xtask tty-oracle`; ttykbd runs with "console=ttyS0 console=tty0" so that /dev/console is the vt; kinds stage and echo are the driver's transcript rows, see docs/kernel-tooling.md); docs/implementation.md#oracle-syscall-test-suite).
 # The `xstate` group is the exception to the machine: it drives AVX-512 and PKRU state, so it was recorded under KVM with -cpu host (AMD Zen 5) and runs only where KVM does (target/linux-reference/init-reference-012; docs/implementation.md#extended-cpu-state-xsave-pkru). Its `info` rows name the machine (XCR0, sizes, offsets) and are not compared by value.
-# Columns: group, kind (check|info|summary), name, line (the exact stdout line without the newline).
+# Columns: group, kind (check|info|summary|stage|echo), name, line (the exact stdout line without the newline).
 # A consumer matches "check" and "summary" rows exactly; "info" rows are recorded observations (tmpfs d_off cookies), not requirements.
 # Kernel printk lines may interleave with console output and must be filtered by the consumer (keep lines that start with
 # "init: test", "init: tests" or "init: info").
@@ -1480,3 +1480,325 @@ xstate	check	wrpkru-with-ecx-not-zero-is-sigsegv	init: test xstate.wrpkru-with-e
 xstate	check	xrstor-misaligned-is-sigsegv	init: test xstate.xrstor-misaligned-is-sigsegv ok
 xstate	check	xrstor-reserved-header-bytes-is-sigsegv	init: test xstate.xrstor-reserved-header-bytes-is-sigsegv ok
 xstate	summary	-	init: tests xstate passed=168 failed=0
+tty	check	mknod-ttyS0	init: test tty.mknod-ttyS0 ok
+tty	check	mknod-tty	init: test tty.mknod-tty ok
+tty	check	tcgets-fd0	init: test tty.tcgets-fd0 ok
+tty	check	tcgets-fd1	init: test tty.tcgets-fd1 ok
+tty	check	tcgets-fd2	init: test tty.tcgets-fd2 ok
+tty	check	tcgets2	init: test tty.tcgets2 ok
+tty	check	tcgeta	init: test tty.tcgeta ok
+tty	check	tiocglcktrmios-nothing-locked	init: test tty.tiocglcktrmios-nothing-locked ok
+tty	check	tcgets-fault	init: test tty.tcgets-fault ok
+tty	check	tcgets2-fault	init: test tty.tcgets2-fault ok
+tty	check	tcgetx	init: test tty.tcgetx ok
+tty	check	winsize-default	init: test tty.winsize-default ok
+tty	check	tiocswinsz	init: test tty.tiocswinsz ok
+tty	check	winsize-set	init: test tty.winsize-set ok
+tty	check	winsize-via-ttyS0	init: test tty.winsize-via-ttyS0 ok
+tty	check	tiocswinsz-fault	init: test tty.tiocswinsz-fault ok
+tty	check	tiocgwinsz-fault	init: test tty.tiocgwinsz-fault ok
+tty	check	winsize-reset	init: test tty.winsize-reset ok
+tty	check	tcsets	init: test tty.tcsets ok
+tty	check	tcsets-readback	init: test tty.tcsets-readback ok
+tty	check	tcsets-restore	init: test tty.tcsets-restore ok
+tty	check	tcsets-restored	init: test tty.tcsets-restored ok
+tty	check	tcsetsw	init: test tty.tcsetsw ok
+tty	check	tcsetsw-readback	init: test tty.tcsetsw-readback ok
+tty	check	tcsetsf	init: test tty.tcsetsf ok
+tty	check	tcsetsf-readback	init: test tty.tcsetsf-readback ok
+tty	check	tcsets2	init: test tty.tcsets2 ok
+tty	check	tcsets2-readback	init: test tty.tcsets2-readback ok
+tty	check	tcsetsw2	init: test tty.tcsetsw2 ok
+tty	check	tcsetsw2-readback	init: test tty.tcsetsw2-readback ok
+tty	check	tcsetsf2	init: test tty.tcsetsf2 ok
+tty	check	tcsetsf2-readback	init: test tty.tcsetsf2-readback ok
+tty	check	tcseta	init: test tty.tcseta ok
+tty	check	tcseta-readback	init: test tty.tcseta-readback ok
+tty	check	tcsetaw	init: test tty.tcsetaw ok
+tty	check	tcsetaw-readback	init: test tty.tcsetaw-readback ok
+tty	check	tcsetaf	init: test tty.tcsetaf ok
+tty	check	tcsetaf-readback	init: test tty.tcsetaf-readback ok
+tty	check	tcsets-fault	init: test tty.tcsets-fault ok
+tty	check	tcsets2-fault	init: test tty.tcsets2-fault ok
+tty	check	tcseta-fault	init: test tty.tcseta-fault ok
+tty	check	tiocslcktrmios	init: test tty.tiocslcktrmios ok
+tty	check	locked-echo-set	init: test tty.locked-echo-set ok
+tty	check	locked-echo-unchanged	init: test tty.locked-echo-unchanged ok
+tty	check	termios-restored	init: test tty.termios-restored ok
+tty	check	baud-9600-default	init: test tty.baud-9600-default ok
+tty	check	baud-19200	init: test tty.baud-19200 ok
+tty	check	baud-38400	init: test tty.baud-38400 ok
+tty	check	baud-57600	init: test tty.baud-57600 ok
+tty	check	baud-115200	init: test tty.baud-115200 ok
+tty	check	baud-230400-refused	init: test tty.baud-230400-refused ok
+tty	check	baud-bother-12345	init: test tty.baud-bother-12345 ok
+tty	check	baud-bother-57600-becomes-code	init: test tty.baud-bother-57600-becomes-code ok
+tty	check	baud-bother-too-fast	init: test tty.baud-bother-too-fast ok
+tty	check	baud-0	init: test tty.baud-0 ok
+tty	check	baud-0-speeds	init: test tty.baud-0-speeds ok
+tty	check	baud-back	init: test tty.baud-back ok
+tty	check	tcsets-baud	init: test tty.tcsets-baud ok
+tty	check	baud-restored	init: test tty.baud-restored ok
+tty	check	tiocgetd	init: test tty.tiocgetd ok
+tty	check	tiocsetd-ntty	init: test tty.tiocsetd-ntty ok
+tty	check	tiocsetd-invalid	init: test tty.tiocsetd-invalid ok
+tty	check	tiocsetd-negative	init: test tty.tiocsetd-negative ok
+tty	check	tiocgexcl-off	init: test tty.tiocgexcl-off ok
+tty	check	tiocexcl	init: test tty.tiocexcl ok
+tty	check	tiocgexcl-on	init: test tty.tiocgexcl-on ok
+tty	check	tiocnxcl	init: test tty.tiocnxcl ok
+tty	check	tiocgexcl-off-again	init: test tty.tiocgexcl-off-again ok
+tty	check	tiocgdev	init: test tty.tiocgdev ok
+tty	check	tiocgsoftcar	init: test tty.tiocgsoftcar ok
+tty	check	tiocssoftcar-off	init: test tty.tiocssoftcar-off ok
+tty	check	softcar-clears-clocal	init: test tty.softcar-clears-clocal ok
+tty	check	tiocssoftcar-on	init: test tty.tiocssoftcar-on ok
+tty	check	softcar-sets-clocal	init: test tty.softcar-sets-clocal ok
+tty	check	fionread	init: test tty.fionread ok
+tty	check	tiocoutq	init: test tty.tiocoutq ok
+tty	check	fionread-fault	init: test tty.fionread-fault ok
+tty	check	tcflsh-0	init: test tty.tcflsh-0 ok
+tty	check	tcflsh-1	init: test tty.tcflsh-1 ok
+tty	check	tcflsh-2	init: test tty.tcflsh-2 ok
+tty	check	tcflsh-invalid	init: test tty.tcflsh-invalid ok
+tty	check	tcxonc-invalid	init: test tty.tcxonc-invalid ok
+tty	check	tcsbrk-drain	init: test tty.tcsbrk-drain ok
+tty	check	tioccons-console	init: test tty.tioccons-console ok
+tty	check	pipe-tcgets	init: test tty.pipe-tcgets ok
+tty	check	pipe-tiocgwinsz	init: test tty.pipe-tiocgwinsz ok
+tty	check	null-tcgets	init: test tty.null-tcgets ok
+tty	check	unknown-ioctl	init: test tty.unknown-ioctl ok
+tty	check	tiocsti	init: test tty.tiocsti ok
+tty	check	tiocsti-queued	init: test tty.tiocsti-queued ok
+tty	check	tiocsti-read	init: test tty.tiocsti-read ok
+tty	check	tiocsti-fault	init: test tty.tiocsti-fault ok
+tty	check	tcxonc-tcooff	init: test tty.tcxonc-tcooff ok
+tty	check	write-while-stopped	init: test tty.write-while-stopped ok
+tty	check	outq-while-stopped	init: test tty.outq-while-stopped ok
+tty	check	tcxonc-tcoon	init: test tty.tcxonc-tcoon ok
+tty	check	outq-after-tcoon	init: test tty.outq-after-tcoon ok
+tty	check	fill-queue-1	init: test tty.fill-queue-1 ok
+tty	check	fill-queue-2	init: test tty.fill-queue-2 ok
+tty	check	fill-queue-full	init: test tty.fill-queue-full ok
+tty	check	outq-full	init: test tty.outq-full ok
+tty	check	poll-full-queue-not-writable	init: test tty.poll-full-queue-not-writable ok
+tty	check	tcflsh-output-empties-queue	init: test tty.tcflsh-output-empties-queue ok
+tty	check	tiocgpgrp-no-ctty	init: test tty.tiocgpgrp-no-ctty ok
+tty	check	tiocgsid-no-ctty	init: test tty.tiocgsid-no-ctty ok
+tty	check	tiocspgrp-no-ctty	init: test tty.tiocspgrp-no-ctty ok
+tty	check	tiocnotty-no-ctty	init: test tty.tiocnotty-no-ctty ok
+tty	check	tiocsctty-not-leader	init: test tty.tiocsctty-not-leader ok
+tty	check	open-dev-tty-no-ctty	init: test tty.open-dev-tty-no-ctty ok
+tty	check	open-ttyS0-no-leader-no-ctty	init: test tty.open-ttyS0-no-leader-no-ctty ok
+tty	check	open-ttyS0-session-leader-acquires	init: test tty.open-ttyS0-session-leader-acquires ok
+tty	check	console-still-works-after-hangup	init: test tty.console-still-works-after-hangup ok
+tty	check	reacquire-after-hangup	init: test tty.reacquire-after-hangup ok
+tty	check	tiocsctty-owner	init: test tty.tiocsctty-owner ok
+tty	check	tiocsctty-steal	init: test tty.tiocsctty-steal ok
+tty	check	tiocsctty-stolen-session-loses-terminal	init: test tty.tiocsctty-stolen-session-loses-terminal ok
+tty	check	tiocspgrp-rules	init: test tty.tiocspgrp-rules ok
+tty	check	sigwinch-on-resize	init: test tty.sigwinch-on-resize ok
+tty	check	background-reads	init: test tty.background-reads ok
+tty	check	background-writes	init: test tty.background-writes ok
+tty	check	tiocnotty	init: test tty.tiocnotty ok
+tty	check	setsid-clears-terminal	init: test tty.setsid-clears-terminal ok
+tty	check	tiocvhangup	init: test tty.tiocvhangup ok
+tty	check	leader-exit-sighup-to-group	init: test tty.leader-exit-sighup-to-group ok
+tty	summary	-	init: tests tty passed=124 failed=0
+ttyin	stage	canon-echo	init: stage canon-echo
+ttyin	echo	canon-echo	hello\x0d\x0aab\x08 \x08c\x0d\x0afoo bar\x08 \x08\x08 \x08\x08 \x08baz\x0d\x0axyz\x08 \x08\x08 \x08\x08 \x08ok\x0d\x0aabc^\x08^Cq\x0d\x0aabc^R\x0d\x0aabcdef\x0d\x0aa\x09\x08\x08\x08\x08\x08\x08\x08b\x0d\x0a\x0d\x0a
+ttyin	check	canon-line	init: test ttyin.canon-line ok
+ttyin	check	canon-erase	init: test ttyin.canon-erase ok
+ttyin	check	canon-word-erase	init: test ttyin.canon-word-erase ok
+ttyin	check	canon-kill	init: test ttyin.canon-kill ok
+ttyin	check	canon-eof-after-data	init: test ttyin.canon-eof-after-data ok
+ttyin	check	canon-eof-alone-reads-zero	init: test ttyin.canon-eof-alone-reads-zero ok
+ttyin	check	canon-lnext	init: test ttyin.canon-lnext ok
+ttyin	check	canon-reprint-keeps-the-line	init: test ttyin.canon-reprint-keeps-the-line ok
+ttyin	check	canon-erase-tab	init: test ttyin.canon-erase-tab ok
+ttyin	stage	canon-long	init: stage canon-long
+ttyin	echo	canon-long	\x0d\x0a
+ttyin	check	canon-long-line-one-read	init: test ttyin.canon-long-line-one-read ok
+ttyin	check	canon-long-line-last-byte	init: test ttyin.canon-long-line-last-byte ok
+ttyin	check	canon-line-in-pieces	init: test ttyin.canon-line-in-pieces ok
+ttyin	stage	nonblock	init: stage nonblock
+ttyin	echo	nonblock	\x0d\x0a
+ttyin	check	nonblock-empty-eagain	init: test ttyin.nonblock-empty-eagain ok
+ttyin	check	nonblock-then-data	init: test ttyin.nonblock-then-data ok
+ttyin	stage	raw-vmin3	init: stage raw-vmin3
+ttyin	echo	raw-vmin3	\x0d\x0a
+ttyin	check	raw-vmin3-bytes	init: test ttyin.raw-vmin3-bytes ok
+ttyin	check	raw-vmin3-waited-for-the-third	init: test ttyin.raw-vmin3-waited-for-the-third ok
+ttyin	stage	raw-vmin1	init: stage raw-vmin1
+ttyin	echo	raw-vmin1	\x0d\x0a
+ttyin	check	raw-vmin1	init: test ttyin.raw-vmin1 ok
+ttyin	stage	raw-vmin100	init: stage raw-vmin100
+ttyin	echo	raw-vmin100	\x0d\x0a
+ttyin	check	raw-vmin100	init: test ttyin.raw-vmin100 ok
+ttyin	stage	raw-vtime-timeout	init: stage raw-vtime-timeout
+ttyin	echo	raw-vtime-timeout	\x0d\x0a
+ttyin	check	raw-vtime-timeout-returns-zero	init: test ttyin.raw-vtime-timeout-returns-zero ok
+ttyin	check	raw-vtime-timeout-waited	init: test ttyin.raw-vtime-timeout-waited ok
+ttyin	stage	raw-vtime-early	init: stage raw-vtime-early
+ttyin	echo	raw-vtime-early	\x0d\x0a
+ttyin	check	raw-vtime-early-byte	init: test ttyin.raw-vtime-early-byte ok
+ttyin	check	raw-vtime-early-before-the-timeout	init: test ttyin.raw-vtime-early-before-the-timeout ok
+ttyin	stage	raw-vtime-interbyte	init: stage raw-vtime-interbyte
+ttyin	echo	raw-vtime-interbyte	\x0d\x0a
+ttyin	check	raw-vtime-interbyte-one-byte	init: test ttyin.raw-vtime-interbyte-one-byte ok
+ttyin	check	raw-vtime-interbyte-waited	init: test ttyin.raw-vtime-interbyte-waited ok
+ttyin	stage	raw-vtime-two	init: stage raw-vtime-two
+ttyin	echo	raw-vtime-two	\x0d\x0a
+ttyin	check	raw-vtime-two-bytes	init: test ttyin.raw-vtime-two-bytes ok
+ttyin	check	raw-vmin0-vtime0-returns-at-once	init: test ttyin.raw-vmin0-vtime0-returns-at-once ok
+ttyin	stage	input-icrnl	init: stage input-icrnl
+ttyin	echo	input-icrnl	\x0d\x0a
+ttyin	check	input-icrnl	init: test ttyin.input-icrnl ok
+ttyin	stage	input-no-icrnl	init: stage input-no-icrnl
+ttyin	echo	input-no-icrnl	\x0d\x0a
+ttyin	check	input-no-icrnl	init: test ttyin.input-no-icrnl ok
+ttyin	stage	input-inlcr	init: stage input-inlcr
+ttyin	echo	input-inlcr	\x0d\x0a
+ttyin	check	input-inlcr	init: test ttyin.input-inlcr ok
+ttyin	stage	input-igncr	init: stage input-igncr
+ttyin	echo	input-igncr	\x0d\x0a
+ttyin	check	input-igncr	init: test ttyin.input-igncr ok
+ttyin	stage	input-istrip	init: stage input-istrip
+ttyin	echo	input-istrip	\x0d\x0a
+ttyin	check	input-istrip	init: test ttyin.input-istrip ok
+ttyin	stage	input-iuclc	init: stage input-iuclc
+ttyin	echo	input-iuclc	\x0d\x0a
+ttyin	check	input-iuclc	init: test ttyin.input-iuclc ok
+ttyin	stage	echo-off	init: stage echo-off
+ttyin	echo	echo-off	\x0d\x0a
+ttyin	check	echo-off-line	init: test ttyin.echo-off-line ok
+ttyin	stage	echo-nl-only	init: stage echo-nl-only
+ttyin	echo	echo-nl-only	\x0d\x0a\x0d\x0a
+ttyin	check	echo-nl-only-line	init: test ttyin.echo-nl-only-line ok
+ttyin	stage	no-echoe	init: stage no-echoe
+ttyin	echo	no-echoe	abc^?d^U\x0d\x0axy^Az\x0d\x0a\x0d\x0a
+ttyin	check	no-echoe-line	init: test ttyin.no-echoe-line ok
+ttyin	stage	no-echok	init: stage no-echok
+ttyin	echo	no-echok	abc\x08 \x08d^Uxy^Az\x0d\x0a\x0d\x0a
+ttyin	check	no-echok-line	init: test ttyin.no-echok-line ok
+ttyin	stage	no-echoctl	init: stage no-echoctl
+ttyin	echo	no-echoctl	abc\x08 \x08d\x08 \x08\x08 \x08\x08 \x08xy\x01z\x0d\x0a\x0d\x0a
+ttyin	check	no-echoctl-line	init: test ttyin.no-echoctl-line ok
+ttyin	stage	echoprt	init: stage echoprt
+ttyin	echo	echoprt	abc\\c/d^U\x0d\x0axy^Az\x0d\x0a\x0d\x0a
+ttyin	check	echoprt-line	init: test ttyin.echoprt-line ok
+ttyin	stage	no-echoke	init: stage no-echoke
+ttyin	echo	no-echoke	abc\x08 \x08d^U\x0d\x0axy^Az\x0d\x0a\x0d\x0a
+ttyin	check	no-echoke-line	init: test ttyin.no-echoke-line ok
+ttyin	stage	no-iexten	init: stage no-iexten
+ttyin	echo	no-iexten	abc\x08 \x08d\x08 \x08\x08 \x08\x08 \x08xy^Az\x0d\x0a\x0d\x0a
+ttyin	check	no-iexten-line	init: test ttyin.no-iexten-line ok
+ttyin	stage	out-opost-onlcr	init: stage out-opost-onlcr
+ttyin	echo	out-opost-onlcr	a\x0d\x0ab\x0dc\x09d\x08e\x09f\x0d\x0axy\xc3\xa9\x09z\x0d\x0a0123456789\x09q\x0d\x09w\x0d\x0a\x0d\x0a
+ttyin	check	out-opost-onlcr	init: test ttyin.out-opost-onlcr ok
+ttyin	stage	out-opost-only	init: stage out-opost-only
+ttyin	echo	out-opost-only	a\x0ab\x0dc\x09d\x08e\x09f\x0axy\xc3\xa9\x09z\x0a0123456789\x09q\x0d\x09w\x0a\x0d\x0a
+ttyin	check	out-opost-only	init: test ttyin.out-opost-only ok
+ttyin	stage	out-no-opost	init: stage out-no-opost
+ttyin	echo	out-no-opost	a\x0ab\x0dc\x09d\x08e\x09f\x0axy\xc3\xa9\x09z\x0a0123456789\x09q\x0d\x09w\x0a\x0d\x0a
+ttyin	check	out-no-opost	init: test ttyin.out-no-opost ok
+ttyin	stage	out-ocrnl	init: stage out-ocrnl
+ttyin	echo	out-ocrnl	a\x0ab\x0ac\x09d\x08e\x09f\x0axy\xc3\xa9\x09z\x0a0123456789\x09q\x0a\x09w\x0a\x0d\x0a
+ttyin	check	out-ocrnl	init: test ttyin.out-ocrnl ok
+ttyin	stage	out-onocr	init: stage out-onocr
+ttyin	echo	out-onocr	a\x0ab\x0dc\x09d\x08e\x09f\x0axy\xc3\xa9\x09z\x0a0123456789\x09q\x0d\x09w\x0a\x0d\x0a
+ttyin	check	out-onocr	init: test ttyin.out-onocr ok
+ttyin	stage	out-onlret	init: stage out-onlret
+ttyin	echo	out-onlret	a\x0ab\x0dc\x09d\x08e\x09f\x0axy\xc3\xa9\x09z\x0a0123456789\x09q\x0d\x09w\x0a\x0d\x0a
+ttyin	check	out-onlret	init: test ttyin.out-onlret ok
+ttyin	stage	out-olcuc	init: stage out-olcuc
+ttyin	echo	out-olcuc	A\x0d\x0aB\x0dC\x09D\x08E\x09F\x0d\x0aXY\xc3\xa9\x09Z\x0d\x0a0123456789\x09Q\x0d\x09W\x0d\x0a\x0d\x0a
+ttyin	check	out-olcuc	init: test ttyin.out-olcuc ok
+ttyin	stage	out-xtabs	init: stage out-xtabs
+ttyin	echo	out-xtabs	a\x0d\x0ab\x0dc       d\x08e       f\x0d\x0axy\xc3\xa9    z\x0d\x0a0123456789      q\x0d        w\x0d\x0a\x0d\x0a
+ttyin	check	out-xtabs	init: test ttyin.out-xtabs ok
+ttyin	stage	out-onlcr-ocrnl-xtabs	init: stage out-onlcr-ocrnl-xtabs
+ttyin	echo	out-onlcr-ocrnl-xtabs	a\x0d\x0ab\x0ac      d\x08e       f\x0d\x0axy\xc3\xa9    z\x0d\x0a0123456789      q\x0a       w\x0d\x0a\x0d\x0a
+ttyin	check	out-onlcr-ocrnl-xtabs	init: test ttyin.out-onlcr-ocrnl-xtabs ok
+ttyin	stage	flow-xoff	init: stage flow-xoff
+ttyin	echo	flow-xoff	held\x0d\x0a\x0d\x0a
+ttyin	check	flow-xoff-queue-empty-before	init: test ttyin.flow-xoff-queue-empty-before ok
+ttyin	check	flow-xoff-write	init: test ttyin.flow-xoff-write ok
+ttyin	check	flow-xoff-queued	init: test ttyin.flow-xoff-queued ok
+ttyin	check	flow-xon-drains	init: test ttyin.flow-xon-drains ok
+ttyin	stage	flow-ixany	init: stage flow-ixany
+ttyin	echo	flow-ixany	any\x0d\x0a\x0d\x0a
+ttyin	check	flow-ixany	init: test ttyin.flow-ixany ok
+ttyin	stage	flow-tcooff	init: stage flow-tcooff
+ttyin	echo	flow-tcooff	tco\x0d\x0a\x0d\x0a
+ttyin	check	flow-tcooff-stays-stopped-on-xon	init: test ttyin.flow-tcooff-stays-stopped-on-xon ok
+ttyin	stage	poll-canon	init: stage poll-canon
+ttyin	echo	poll-canon	\x0d\x0a
+ttyin	check	poll-canon-nothing	init: test ttyin.poll-canon-nothing ok
+ttyin	check	poll-canon-partial-line-not-readable	init: test ttyin.poll-canon-partial-line-not-readable ok
+ttyin	check	poll-canon-line-readable	init: test ttyin.poll-canon-line-readable ok
+ttyin	check	poll-console-writable	init: test ttyin.poll-console-writable ok
+ttyin	check	poll-canon-read	init: test ttyin.poll-canon-read ok
+ttyin	stage	poll-vmin	init: stage poll-vmin
+ttyin	echo	poll-vmin	\x0d\x0a
+ttyin	check	poll-vmin-two-bytes-not-readable	init: test ttyin.poll-vmin-two-bytes-not-readable ok
+ttyin	check	poll-vmin-three-bytes-readable	init: test ttyin.poll-vmin-three-bytes-readable ok
+ttyin	check	poll-vmin-read	init: test ttyin.poll-vmin-read ok
+ttyin	stage	fionread	init: stage fionread
+ttyin	echo	fionread	\x0d\x0a
+ttyin	check	fionread-partial-line-is-zero	init: test ttyin.fionread-partial-line-is-zero ok
+ttyin	check	fionread-read	init: test ttyin.fionread-read ok
+ttyin	stage	fionread-canon	init: stage fionread-canon
+ttyin	echo	fionread-canon	\x0d\x0a
+ttyin	check	fionread-counts-lines-without-eof-chars	init: test ttyin.fionread-counts-lines-without-eof-chars ok
+ttyin	check	fionread-lines	init: test ttyin.fionread-lines ok
+ttyin	stage	fionread-raw	init: stage fionread-raw
+ttyin	echo	fionread-raw	\x0d\x0a
+ttyin	check	fionread-raw	init: test ttyin.fionread-raw ok
+ttyin	stage	tcflsh	init: stage tcflsh
+ttyin	echo	tcflsh	\x0d\x0a
+ttyin	check	tcflsh-input	init: test ttyin.tcflsh-input ok
+ttyin	stage	tcsetsf	init: stage tcsetsf
+ttyin	echo	tcsetsf	\x0d\x0a
+ttyin	check	tcsetsf-flushes-input	init: test ttyin.tcsetsf-flushes-input ok
+ttyin	stage	isig	init: stage isig
+ttyin	echo	isig	ab^C^\\^Z\x0d\x0a
+ttyin	check	isig-signals-flush-and-interrupt	init: test ttyin.isig-signals-flush-and-interrupt ok
+ttyin	stage	isig-off	init: stage isig-off
+ttyin	echo	isig-off	^C^\\^Z\x0d\x0a\x0d\x0a
+ttyin	check	isig-off-characters-are-data	init: test ttyin.isig-off-characters-are-data ok
+ttyin	stage	isig-noflsh	init: stage isig-noflsh
+ttyin	echo	isig-noflsh	ab^C\x0d\x0a\x0d\x0a
+ttyin	check	isig-noflsh-input-survives	init: test ttyin.isig-noflsh-input-survives ok
+ttyin	summary	-	init: tests ttyin passed=73 failed=0
+ttykbd	stage	kbd-ascii	init: stage kbd-ascii
+ttykbd	echo	kbd-ascii	\x0d\x0a
+ttykbd	check	kbd-ascii	init: test ttykbd.kbd-ascii ok
+ttykbd	stage	kbd-shift	init: stage kbd-shift
+ttykbd	echo	kbd-shift	\x0d\x0a
+ttykbd	check	kbd-shift	init: test ttykbd.kbd-shift ok
+ttykbd	stage	kbd-ctrl	init: stage kbd-ctrl
+ttykbd	echo	kbd-ctrl	\x0d\x0a
+ttykbd	check	kbd-ctrl	init: test ttykbd.kbd-ctrl ok
+ttykbd	stage	kbd-special	init: stage kbd-special
+ttykbd	echo	kbd-special	\x0d\x0a
+ttykbd	check	kbd-special	init: test ttykbd.kbd-special ok
+ttykbd	stage	kbd-cursor	init: stage kbd-cursor
+ttykbd	echo	kbd-cursor	\x0d\x0a
+ttykbd	check	kbd-cursor	init: test ttykbd.kbd-cursor ok
+ttykbd	stage	kbd-function	init: stage kbd-function
+ttykbd	echo	kbd-function	\x0d\x0a
+ttykbd	check	kbd-function	init: test ttykbd.kbd-function ok
+ttykbd	stage	kbd-alt	init: stage kbd-alt
+ttykbd	echo	kbd-alt	\x0d\x0a
+ttykbd	check	kbd-alt	init: test ttykbd.kbd-alt ok
+ttykbd	stage	kbd-caps	init: stage kbd-caps
+ttykbd	echo	kbd-caps	\x0d\x0a
+ttykbd	check	kbd-caps	init: test ttykbd.kbd-caps ok
+ttykbd	stage	kbd-numpad-off	init: stage kbd-numpad-off
+ttykbd	echo	kbd-numpad-off	\x0d\x0a
+ttykbd	check	kbd-numpad-off	init: test ttykbd.kbd-numpad-off ok
+ttykbd	stage	kbd-numpad-on	init: stage kbd-numpad-on
+ttykbd	echo	kbd-numpad-on	\x0d\x0a
+ttykbd	check	kbd-numpad-on	init: test ttykbd.kbd-numpad-on ok
+ttykbd	summary	-	init: tests ttykbd passed=10 failed=0

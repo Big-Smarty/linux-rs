@@ -41,6 +41,19 @@ pub const PID_MAX_DEFAULT: u32 = 0x8000;
 /// A handle to a [`Pid`].
 pub type PidId = Id<Pid>;
 
+/// A counted `struct pid *` that outlives the tasks attached to it: what a
+/// terminal keeps of its session and foreground group, and a session leader of
+/// the group of a hung-up terminal. The task model frees a [`Pid`] with its last
+/// task, so the reference is the (generation-checked) handle plus the number
+/// the pid had: `pid_vnr` of a dead pid still answers its number (the
+/// `struct pid` stays allocated in Linux), `pid_task` finds no task, and a
+/// number that was reused names a different pid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PidRef {
+    pub id: PidId,
+    pub nr: i32,
+}
+
 /// `struct pid`: the number and the tasks attached to it per [`PidType`].
 #[derive(Debug)]
 pub struct Pid {

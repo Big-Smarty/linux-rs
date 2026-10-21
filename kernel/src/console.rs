@@ -364,10 +364,26 @@ pub fn write(arguments: fmt::Arguments<'_>) {
 
 fn pixel_byte(byte: u8) {
     let count = COUNT.load(Ordering::Acquire);
-    if count == 0 || byte == b'\r' {
+    if count == 0 {
         return;
     }
     let (cols, rows) = (COLS.load(Ordering::Relaxed), ROWS.load(Ordering::Relaxed));
+    // Carriage return and backspace only move the cursor (the vt's `cr()` and `bs()`); the
+    // cell keeps what it shows, as on a vt.
+    if byte == b'\r' || byte == 0x08 {
+        let mut old = CURSOR.load(Ordering::Relaxed);
+        loop {
+            let next = if byte == b'\r' {
+                fbtext::carriage_return(old, cols, rows)
+            } else {
+                fbtext::backspace(old, cols, rows)
+            };
+            match CURSOR.compare_exchange_weak(old, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(observed) => old = observed,
+            }
+        }
+    }
     if byte == b'\t' {
         // fbcon/vt: advance to the next multiple of 8 columns (spaces, no glyph).
         let column = (CURSOR.load(Ordering::Relaxed) >> 1) % cols;

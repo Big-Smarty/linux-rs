@@ -244,6 +244,35 @@ pub fn step(state: usize, cols: usize, rows: usize, newline: bool) -> Step {
     }
 }
 
+/// The cursor state after a carriage return (`cr()` of `drivers/tty/vt/vt.c`: column 0
+/// of the cursor's row, the deferred wrap cancelled).
+#[must_use]
+pub fn carriage_return(state: usize, cols: usize, rows: usize) -> usize {
+    let total = cols * rows;
+    let wrap = state & 1 == 1;
+    let pos = (state >> 1).min(total);
+    // With a deferred wrap the cursor still is in the last column of the row before `pos`.
+    let row_start = if wrap { pos - cols } else { pos - pos % cols };
+    cursor(row_start, false)
+}
+
+/// The cursor state after a backspace (`bs()` of `drivers/tty/vt/vt.c`: one column left
+/// unless in column 0; the deferred wrap is cancelled by the move).
+#[must_use]
+pub fn backspace(state: usize, cols: usize, rows: usize) -> usize {
+    let total = cols * rows;
+    let wrap = state & 1 == 1;
+    let pos = (state >> 1).min(total);
+    if wrap {
+        // The cursor is in the last column; moving left lands two cells before `pos`.
+        return cursor(pos - 2.min(pos), false);
+    }
+    if pos.is_multiple_of(cols) {
+        return cursor(pos, false);
+    }
+    cursor(pos - 1, false)
+}
+
 /// The glyph index for a byte: printable ASCII is exact, anything else '?'.
 #[must_use]
 pub const fn glyph_index(byte: u8) -> u8 {
@@ -263,6 +292,24 @@ pub const fn glyph_pixel(row_bits: u8, x: usize, scale_x: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn carriage_return_and_backspace_follow_the_vt_cursor() {
+        use super::{backspace, carriage_return, cursor};
+        // 4x2 grid. Mid-row.
+        assert_eq!(carriage_return(cursor(2, false), 4, 2), cursor(0, false));
+        assert_eq!(carriage_return(cursor(6, false), 4, 2), cursor(4, false));
+        assert_eq!(backspace(cursor(2, false), 4, 2), cursor(1, false));
+        // Column 0 stays.
+        assert_eq!(backspace(cursor(4, false), 4, 2), cursor(4, false));
+        // After a character in the last column the cursor stays there with a pending wrap:
+        // return goes to the row start, backspace to the column before.
+        assert_eq!(carriage_return(cursor(4, true), 4, 2), cursor(0, false));
+        assert_eq!(backspace(cursor(4, true), 4, 2), cursor(2, false));
+        // Pending scroll after the last cell of the last row.
+        assert_eq!(carriage_return(cursor(8, true), 4, 2), cursor(4, false));
+        assert_eq!(backspace(cursor(8, false), 4, 2), cursor(8, false));
+    }
+
     use super::*;
 
     fn fb(bpp: u16, sizes: [u8; 3], shifts: [u8; 3]) -> Framebuffer {
