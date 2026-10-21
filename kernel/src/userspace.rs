@@ -74,7 +74,7 @@ use kernel::{
         script,
         stack::{self, ARG_PAGES, Aux, ENVP, STACK_START, STACK_TOP, StackError},
     },
-    image::elf::Elf,
+    image::elf::ET_DYN,
     loadavg::LoadAvg,
     mm::{self, Env, FaultOutcome, Mm, PF_WRITE},
     procfs::{
@@ -438,6 +438,29 @@ fn interpreter_failure(vfs: &mut Vfs, interpreter: &[u8], unsupported: Unsupport
     }
 }
 
+/// Where the lowest string of `/init`'s argument block starts (`bprm->p` after `copy_strings`):
+/// the block laid out once into the heap, because `setup_arg_pages` sizes the stack VMA by the
+/// pages the strings use and the VMA must exist before anything is mapped.
+fn probe_arg_start(argv: &InitArgv<'_>, aux: &Aux) -> Result<u64, Error> {
+    let mut scratch = alloc::vec::Vec::new();
+    scratch
+        .try_reserve_exact(stack::WINDOW_BYTES)
+        .map_err(|_| Error::Vfs(Errno::ENOMEM))?;
+    while scratch.len() < stack::WINDOW_BYTES {
+        scratch
+            .push_within_capacity(0u8)
+            .map_err(|_| Error::Vfs(Errno::ENOMEM))?;
+    }
+    let built = stack::build(
+        &mut scratch,
+        FILENAME,
+        iter::once(Word::plain(FILENAME)).chain(argv.clone()),
+        ENVP.iter().copied(),
+        aux,
+    )?;
+    Ok(built.arg_start)
+}
+
 fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<Loaded, Error> {
     // kernel_init_freeable: `init_eaccess(ramdisk_execute_command)` failing sends
     // Linux to `prepare_namespace`; any lookup failure counts.
@@ -452,22 +475,25 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
         Ok(Some(interpreter)) => return Err(script_failure(&mut vfs, interpreter)),
         Ok(None) => {}
     }
-    let plan = match LoadPlan::new(file) {
-        Err(LoadError::Unsupported(Unsupported::Interpreter)) => {
-            // The plan checked the header and the `PT_INTERP` bytes (Linux
-            // order); the interpreter is now looked up in the archives.
-            let path = Elf::linux_x86_64(file)
-                .ok()
-                .and_then(|elf| elf.interpreter().ok().flatten())
-                .unwrap_or_default();
-            return Err(interpreter_failure(
-                &mut vfs,
-                path,
-                Unsupported::Interpreter,
-            ));
-        }
-        other => other?,
-    };
+    let plan = LoadPlan::new(file)?;
+    if plan.has_interpreter {
+        // The plan checked the header and the `PT_INTERP` bytes (Linux
+        // order); the interpreter is now looked up in the archives.
+        let path = LoadPlan::interpreter(file).unwrap_or_default();
+        return Err(interpreter_failure(
+            &mut vfs,
+            path,
+            Unsupported::Interpreter,
+        ));
+    }
+    // shortcut: the boot loader places `ET_EXEC` images only; `execve` (`syscall::exec`)
+    // places `ET_DYN` ones and interpreters through the same `exec::load`. Upgrade by
+    // building `/init` through that path too.
+    if plan.file_type == ET_DYN {
+        return Err(Error::Load(LoadError::Unsupported(
+            Unsupported::SharedObject,
+        )));
+    }
 
     // The address space is built by the one mapping-rule mechanism (`mm`):
     // the shared zero page, the stack VMA, then every `PT_LOAD` (the loader
@@ -482,7 +508,27 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
     let mut env = Env::init(total_pages, 0);
     env.ospke = fpu::config().ospke;
     let mut mm = Mm::new(&env);
-    insert_stack(&mut mm, &env, plan.exec_stack)?;
+    // `setup_arg_pages` sizes the stack VMA by the argument pages, so the block is laid out
+    // once (into the heap) to learn where its strings start, before anything is mapped.
+    let argv = InitArgv::parse(command_line)?;
+    let aux = Aux {
+        hwcap: __cpuid(1).edx,
+        phdr: plan.phdr,
+        phnum: plan.phnum,
+        entry: plan.entry,
+        base: 0,
+        random: random_bytes(),
+    };
+    let arg_start = probe_arg_start(&argv, &aux)?;
+    let rlim_stack = kernel::task::Rlimits::init(0)
+        .get(kernel::task::RLIMIT_STACK)
+        .cur;
+    insert_stack(
+        &mut mm,
+        &env,
+        plan.exec_stack,
+        stack::stack_vma_start(arg_start, rlim_stack),
+    )?;
     map_segments(
         &plan,
         file,
@@ -499,14 +545,6 @@ fn load_init(command_line: &[u8], mut vfs: Vfs, tables: &mut Tables) -> Result<L
     // The argument block lives in the top ARG_PAGES pages: one contiguous
     // frame so `stack::build` can write it as a single window.
     let mut top = allocator.allocate_order(2)?;
-    let argv = InitArgv::parse(command_line)?;
-    let aux = Aux {
-        hwcap: __cpuid(1).edx,
-        phdr: plan.phdr,
-        phnum: plan.phnum,
-        entry: plan.entry,
-        random: random_bytes(),
-    };
     let built = stack::build(
         top.bytes(),
         FILENAME,
@@ -1593,7 +1631,7 @@ impl Syscall<'_> {
         attrs.clear_child_tid = request.clear_child_tid;
         attrs.robust_list = 0;
         let tid = pid.cast_unsigned();
-        let (mut tables, space) = match memory {
+        let (mut tables, mut space) = match memory {
             ChildMemory::Copy { space, tables } => (tables, space),
             ChildMemory::Lend { placeholder } => {
                 // The parent's view is brought up to date with the address space it lends
@@ -1613,6 +1651,22 @@ impl Syscall<'_> {
                 (tables, space)
             }
         };
+        // schedule_tail: `CLONE_CHILD_SETTID` stores the child's id in the child's memory before
+        // it first runs in user mode (a failing store is ignored, as `put_user`'s is). The
+        // child's memory is its own copy (or the one it takes from the lender), nobody else
+        // can see the page before the child runs, so the parent stores it now.
+        if request.set_child_tid != 0 {
+            let mut faults = 0;
+            let mut pages = FaultPages {
+                mm: &mut space,
+                env: &self.own.env,
+                vfs: &mut process.vfs,
+                owner: child_owner,
+                space: &mut tables.user_space(),
+                faults: &mut faults,
+            };
+            let _ = usercopy::copy_to_user(&mut pages, request.set_child_tid, &tid.to_le_bytes());
+        }
         let own = Owned {
             me: child,
             sched,

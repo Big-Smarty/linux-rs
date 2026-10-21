@@ -23,9 +23,14 @@
 //! arithmetic wraps exactly where the C does, so hostile sizes take the same
 //! branch Linux takes.
 //!
+//! `ET_DYN` images and `PT_INTERP` are planned here and placed by [`super::load`]: the plan keeps
+//! the unbiased numbers (`total_mapping_size`, `maximum_alignment`), the bias is chosen when the
+//! first segment is mapped. The interpreter is an [`InterpPlan`] built from the file the caller
+//! opened (`open_exec`), with the `-ELIBBAD`/`-EIO` order of `load_elf_binary`.
+//!
 //! # Differences from Linux (all explicit, none silent)
-//! * shortcut: `ET_DYN` (static PIE) and `PT_INTERP` (dynamic) fail with
-//!   [`Unsupported`]; upgrade with the mmap-base/ASLR and interpreter work.
+//! * `PT_GNU_PROPERTY` is not read: `CONFIG_ARCH_USE_GNU_PROPERTY` is not selected on x86
+//!   (`arch/x86/Kconfig`), so `parse_elf_properties` returns 0 before looking at the note.
 //! * shortcut: a later `MAP_FIXED` segment that replaces the argument stack
 //!   fails with [`Unsupported::Overlap`] (Linux runs on with the clobbered
 //!   stack); replacing other segments' pages is exact (the model unmaps them).
@@ -39,18 +44,22 @@
 //! * No randomisation: this is Linux with `norandmaps` (`randomize_va_space=0`).
 
 use crate::{
-    image::elf::{self, ET_DYN, Elf, PF_R, PF_W, PF_X, PT_LOAD},
+    image::elf::{self, Elf, PF_R, PF_W, PF_X, PT_LOAD},
     memory::PAGE,
 };
 use syscalls::Errno;
 
 pub const MAX_LOADS: usize = 16;
+/// `ELF_ET_DYN_BASE` for a 64-bit task: `DEFAULT_MAP_WINDOW / 3 * 2`.
+pub const ELF_ET_DYN_BASE: u64 = crate::mm::DEFAULT_MAP_WINDOW / 3 * 2;
 /// `sizeof(struct elf_phdr)` for `AT_PHENT`.
 pub const PHENT: u64 = 56;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unsupported {
+    /// An `ET_DYN` image where the caller (the boot loader) cannot place one.
     SharedObject,
+    /// A `PT_INTERP` image where the caller (the boot loader) cannot load an interpreter.
     Interpreter,
     Overlap,
     BeyondEof,
@@ -190,14 +199,44 @@ impl Segment {
     }
 }
 
+/// `total_mapping_size`: the span from the lowest page start to the highest end of the `PT_LOAD`s
+/// (zero without any), wrapping where the C does.
+fn total_mapping_size(segments: &[Segment]) -> u64 {
+    if segments.is_empty() {
+        return 0;
+    }
+    let min = segments.iter().map(|s| s.start).min().unwrap_or(u64::MAX);
+    let max = segments
+        .iter()
+        .map(|s| s.vaddr.wrapping_add(s.memsz))
+        .max()
+        .unwrap_or(0);
+    max.wrapping_sub(min)
+}
+
+/// `maximum_alignment`: the largest power-of-two `p_align` of a `PT_LOAD`, page aligned (a page
+/// when none is valid).
+fn maximum_alignment(aligns: impl Iterator<Item = u64>) -> u64 {
+    let widest = aligns.filter(|a| a.is_power_of_two()).max().unwrap_or(0);
+    page_align(widest)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LoadPlan {
+    /// `e_type`: `ET_EXEC` or `ET_DYN`.
+    pub file_type: u16,
+    /// `e_entry`, not biased.
     pub entry: u64,
-    /// `AT_PHDR`: zero when no segment maps the program-header table.
+    /// `AT_PHDR` before the bias: zero when no segment maps the program-header table.
     pub phdr: u64,
     pub phnum: u16,
     /// `PT_GNU_STACK` with `PF_X` (the 64-bit default is non-executable).
     pub exec_stack: bool,
+    /// The image names an interpreter (`PT_INTERP`): [`LoadPlan::interpreter`].
+    pub has_interpreter: bool,
+    /// `total_mapping_size` and `maximum_alignment` of the `PT_LOAD`s (used for `ET_DYN`).
+    pub total_size: u64,
+    pub alignment: u64,
     segments: [Segment; MAX_LOADS],
     loads: usize,
 }
@@ -206,31 +245,32 @@ impl LoadPlan {
     /// # Errors
     /// The `execve` errno Linux 6.18.57 returns for the same header bytes, or
     /// an explicit [`Unsupported`] for valid input this slice does not load.
-    /// Mapping errors come later, from [`super::load::map_segments`].
+    /// Mapping errors come later, from [`super::load::map_image`].
     pub fn new(file: &[u8]) -> Result<Self, LoadError> {
         let enoexec = |_: elf::Error| failed(Errno::ENOEXEC);
         // Magic, e_type, elf_check_arch, e_phentsize, e_phnum, table bytes.
         let image = Elf::linux_x86_64(file).map_err(enoexec)?;
-        match image.interpreter() {
-            Ok(None) => {}
-            Ok(Some(_)) => return Err(LoadError::Unsupported(Unsupported::Interpreter)),
+        let has_interpreter = match image.interpreter() {
+            Ok(path) => path.is_some(),
             Err(elf::Error::Bounds(_)) => return Err(failed(Errno::EIO)),
             Err(_) => return Err(failed(Errno::ENOEXEC)),
-        }
+        };
         let exec_stack = image.executable_stack().map_err(enoexec)? == Some(true);
-        if image.header().file_type == ET_DYN {
-            return Err(LoadError::Unsupported(Unsupported::SharedObject));
-        }
 
         let phoff = image.header().program_offset;
         let mut plan = Self {
+            file_type: image.header().file_type,
             entry: image.header().entry,
             phdr: 0,
             phnum: image.header().program_count,
             exec_stack,
+            has_interpreter,
+            total_size: 0,
+            alignment: 0,
             segments: [Segment::default(); MAX_LOADS],
             loads: 0,
         };
+        let mut aligns = [0u64; MAX_LOADS];
         for index in 0..plan.phnum {
             let header = image.program(index).map_err(enoexec)?;
             if header.kind != PT_LOAD {
@@ -244,9 +284,89 @@ impl LoadPlan {
             if header.offset <= phoff && phoff < header.offset.wrapping_add(header.file_size) {
                 plan.phdr = (phoff - header.offset).wrapping_add(header.virtual_address);
             }
+            aligns[plan.loads] = header.alignment;
             plan.segments[plan.loads] = Segment::new(&header);
             plan.loads += 1;
         }
+        plan.total_size = total_mapping_size(plan.segments());
+        plan.alignment = maximum_alignment(aligns[..plan.loads].iter().copied());
+        Ok(plan)
+    }
+
+    #[must_use]
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments[..self.loads]
+    }
+
+    /// The first `PT_INTERP` string of `file` (the one [`LoadPlan::new`] validated), up to its
+    /// first NUL: `elf_interpreter` is used as a C string by `open_exec`. `None` for an image
+    /// without one.
+    #[must_use]
+    pub fn interpreter(file: &[u8]) -> Option<&[u8]> {
+        Elf::linux_x86_64(file).ok()?.interpreter().ok().flatten()
+    }
+}
+
+/// The interpreter image, validated the way `load_elf_binary` does before `begin_new_exec`, with
+/// the numbers `load_elf_interp` needs afterwards.
+#[derive(Clone, Copy, Debug)]
+pub struct InterpPlan {
+    /// `e_type` (checked by [`super::load`] after the point of no return, as Linux does).
+    pub file_type: u16,
+    /// `e_entry`, not biased.
+    pub entry: u64,
+    pub total_size: u64,
+    segments: [Segment; MAX_LOADS],
+    loads: usize,
+}
+
+impl InterpPlan {
+    /// `elf_read` of the header, the `ELFMAG`/`elf_check_arch` checks and `load_elf_phdrs` of
+    /// the interpreter. Every failure after the header read is `-ELIBBAD` (`load_elf_binary`
+    /// keeps that value when `load_elf_phdrs` returns `NULL`).
+    ///
+    /// # Errors
+    /// `EIO` (a file shorter than the header), `ELIBBAD`, or an [`Unsupported`] case.
+    pub fn new(file: &[u8]) -> Result<Self, LoadError> {
+        let libbad = |_: elf::Error| failed(Errno::ELIBBAD);
+        if file.len() < 64 {
+            return Err(failed(Errno::EIO));
+        }
+        // Magic and machine; the class and byte order are not looked at (`elf_check_arch` is
+        // `e_machine == EM_X86_64`).
+        let image = Elf::parse_as(file, elf::Class::Elf64, crate::image::bytes::Endian::Little)
+            .map_err(libbad)?;
+        let header = image.header();
+        if header.ident[..4] != *b"\x7fELF" || header.machine != elf::EM_X86_64 {
+            return Err(failed(Errno::ELIBBAD));
+        }
+        // load_elf_phdrs
+        let table = u64::from(header.program_entry_size) * u64::from(header.program_count);
+        if header.program_entry_size != elf::Class::Elf64.program_bytes()
+            || table == 0
+            || table > 65536
+        {
+            return Err(failed(Errno::ELIBBAD));
+        }
+        let mut plan = Self {
+            file_type: header.file_type,
+            entry: header.entry,
+            total_size: 0,
+            segments: [Segment::default(); MAX_LOADS],
+            loads: 0,
+        };
+        for index in 0..header.program_count {
+            let program = image.program(index).map_err(libbad)?;
+            if program.kind != PT_LOAD {
+                continue;
+            }
+            if plan.loads == MAX_LOADS {
+                return Err(LoadError::Unsupported(Unsupported::TooManyLoads));
+            }
+            plan.segments[plan.loads] = Segment::new(&program);
+            plan.loads += 1;
+        }
+        plan.total_size = total_mapping_size(plan.segments());
         Ok(plan)
     }
 

@@ -1,4 +1,5 @@
 #![allow(
+    clippy::doc_markdown,
     clippy::unreadable_literal,
     clippy::cast_possible_truncation,
     clippy::similar_names,
@@ -11,7 +12,7 @@ use super::{
     ARG_PAGES, AT_BASE, AT_CLKTCK, AT_EGID, AT_ENTRY, AT_EUID, AT_EXECFN, AT_FLAGS, AT_GID,
     AT_HWCAP, AT_HWCAP2, AT_MINSIGSTKSZ, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM,
     AT_PLATFORM, AT_RANDOM, AT_SECURE, AT_UID, Aux, ENVP, STACK_PAGES, STACK_START, STACK_TOP,
-    StackError, WINDOW_BYTES, Word, build, weak_random,
+    StackError, WINDOW_BYTES, Word, build, set_aux, stack_vma_start, weak_random,
 };
 use std::{string::String, vec::Vec};
 
@@ -20,6 +21,7 @@ const AUX: Aux = Aux {
     phdr: 0x20_0040,
     phnum: 7,
     entry: 0x20_47d0,
+    base: 0,
     random: *b"0123456789abcdef",
 };
 
@@ -251,4 +253,76 @@ fn weak_random_is_splitmix64() {
         &0xe220_a839_7b1d_cdafu64.to_le_bytes()
     );
     assert_ne!(weak_random(1), weak_random(2));
+}
+
+/// src: fs/exec.c `setup_arg_pages`: `stack_expand = min(rlim_stack, stack_size + 128 KiB)`,
+/// the VMA never shrinks below its argument pages.
+#[test]
+fn the_stack_vma_is_the_argument_pages_plus_128_kib() {
+    const P: u64 = 4096;
+    // One page of strings: 1 + 32 pages.
+    assert_eq!(
+        stack_vma_start(STACK_TOP - 100, 8 << 20),
+        STACK_TOP - 33 * P
+    );
+    // Strings across a page boundary: 2 + 32.
+    assert_eq!(
+        stack_vma_start(STACK_TOP - P - 1, 8 << 20),
+        STACK_TOP - 34 * P
+    );
+    // A small RLIMIT_STACK bounds the expansion (rounded down to a page) but not the arguments.
+    assert_eq!(
+        stack_vma_start(STACK_TOP - 100, 16 * P + 7),
+        STACK_TOP - 16 * P
+    );
+    assert_eq!(stack_vma_start(STACK_TOP - 100, 0), STACK_TOP - P);
+    // The full window (four pages of strings) is the lowest start there is.
+    assert_eq!(stack_vma_start(STACK_TOP - 4 * P, 8 << 20), STACK_START);
+}
+
+/// `create_elf_tables` stores `AT_PHDR`, `AT_BASE` and `AT_ENTRY` after the mappings exist: the
+/// block built before has room for them in the same places.
+#[test]
+fn set_aux_stores_into_the_built_vector() {
+    let mut window = std::vec![0u8; WINDOW_BYTES];
+    let built = build(
+        &mut window,
+        b"/prog",
+        [Word::plain(b"prog")].into_iter(),
+        ENVP.iter().copied(),
+        &AUX,
+    )
+    .unwrap();
+    let find = |window: &[u8], id: u64| {
+        let base = STACK_TOP - window.len() as u64;
+        let mut at = (built.auxv - base) as usize;
+        loop {
+            let key = u64::from_le_bytes(window[at..at + 8].try_into().unwrap());
+            if key == AT_NULL {
+                return None;
+            }
+            if key == id {
+                return Some(u64::from_le_bytes(
+                    window[at + 8..at + 16].try_into().unwrap(),
+                ));
+            }
+            at += 16;
+        }
+    };
+    assert_eq!(find(&window, AT_BASE), Some(0));
+    for (id, value) in [
+        (AT_BASE, 0x7fff_f7ff_0000),
+        (AT_PHDR, 0x5555_5555_4040),
+        (AT_ENTRY, 0x5555_5555_5200),
+    ] {
+        assert!(set_aux(&mut window, &built, id, value));
+        assert_eq!(find(&window, id), Some(value));
+    }
+    // AT_RANDOM was not touched; an entry that is not there is refused.
+    assert_eq!(find(&window, AT_RANDOM), Some(built.random));
+    assert!(!set_aux(&mut window, &built, 0x1234, 1));
+    assert!(
+        !set_aux(&mut window[..16], &built, AT_BASE, 1),
+        "a window that misses the vector"
+    );
 }

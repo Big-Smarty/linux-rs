@@ -19,6 +19,9 @@
 //! failure there kills the task with `SIGSEGV` and never returns to the old
 //! image.
 //!
+//! * `PT_INTERP`: the interpreter is opened after the image's own header checks and validated
+//!   before the point of no return (`ENOENT`, `EACCES`, `EIO`, `ELIBBAD`); both files are
+//!   mapped by [`commit`] and pinned by the VMAs that name them.
 //! * `execveat` with `AT_EMPTY_PATH` and an empty path (execution of an open
 //!   descriptor) is `Unimplemented`: the name `comm` and `/dev/fd/N` take from
 //!   the dentry is not resolved yet.
@@ -34,12 +37,12 @@ use super::{
 use crate::{
     exec::{
         bprm::{
-            CountError, Prepared, Strings, build_window, comm_of, count, open_exec_file,
-            plan_image, string_budget,
+            CountError, Prepared, PreparedInterp, Strings, build_window, comm_of, count,
+            open_exec_file, open_interpreter, string_budget,
         },
-        load::{exec_file, insert_stack, map_segments},
-        plan::LoadError,
-        stack::{ARG_PAGES, Aux, STACK_TOP},
+        load::{Interp, exec_file, insert_stack, map_image},
+        plan::{LoadError, LoadPlan},
+        stack::{ARG_PAGES, AT_BASE, AT_ENTRY, AT_PHDR, Aux, STACK_TOP, set_aux, stack_vma_start},
     },
     memory::{PAGE, PAGE_BYTES},
     mm::{Mm, PageProt, TASK_SIZE},
@@ -98,25 +101,35 @@ fn execveat<C: Context>(
         Err(errno) => return fail(errno),
     };
     // `file` is the description to release on every failure: a script replaces it
-    // with its interpreter's.
-    match prepare(ctx, dfd, &path, argv, envp, flags, &mut file, &mut bytes) {
+    // with its interpreter's; `interp` is the `PT_INTERP` file of the image, once opened.
+    let mut interp = None;
+    match prepare(
+        ctx,
+        dfd,
+        &path,
+        argv,
+        envp,
+        flags,
+        &mut file,
+        &mut bytes,
+        &mut interp,
+    ) {
         Ok(None) => {
             // AT_EXECVE_CHECK: the checks passed, nothing is executed.
             ctx.files().vfs.fput(file);
             Outcome::Return(0)
         }
-        Ok(Some(prepared)) => commit(ctx, sysno, &prepared),
-        Err(Prep::Errno(errno)) => {
+        Ok(Some(mut prepared)) => commit(ctx, sysno, &mut prepared),
+        Err(failure) => {
             ctx.files().vfs.fput(file);
-            fail(errno)
-        }
-        Err(Prep::Restart) => {
-            ctx.files().vfs.fput(file);
-            Outcome::Return(-ERESTARTNOHAND)
-        }
-        Err(Prep::Unsupported) => {
-            ctx.files().vfs.fput(file);
-            Outcome::Unimplemented(sysno as u32)
+            if let Some(interp) = interp {
+                ctx.files().vfs.fput(interp.file);
+            }
+            match failure {
+                Prep::Errno(errno) => fail(errno),
+                Prep::Restart => Outcome::Return(-ERESTARTNOHAND),
+                Prep::Unsupported => Outcome::Unimplemented(sysno as u32),
+            }
         }
     }
 }
@@ -163,6 +176,7 @@ fn prepare<C: Context>(
     flags: u32,
     file: &mut crate::vfs::FileId,
     bytes: &mut Vec<u8>,
+    interp_file: &mut Option<PreparedInterp>,
 ) -> Result<Option<Prepared>, Prep> {
     // bprm->filename: the path as given, or the /dev/fd name of a path
     // relative to a descriptor.
@@ -199,6 +213,7 @@ fn prepare<C: Context>(
         phdr: 0,
         phnum: 0,
         entry: 0,
+        base: 0,
         random: [0; 16],
     };
     // The block must fit before the format is looked at (copy_strings fails
@@ -218,7 +233,7 @@ fn prepare<C: Context>(
         }
         depth += 1;
         let Some(line) = crate::exec::script::parse(bytes)? else {
-            break plan_image(ctx.files().vfs, bytes)?;
+            break LoadPlan::new(bytes)?;
         };
         if inaccessible {
             return Err(Errno::ENOENT.into());
@@ -240,24 +255,45 @@ fn prepare<C: Context>(
         *file = next_file;
         *bytes = next_bytes;
     };
+    // `PT_INTERP`: open_exec(interpreter) relative to the caller's root and working directory,
+    // then the interpreter's header and program table.
+    if plan.has_interpreter {
+        let path = LoadPlan::interpreter(bytes).unwrap_or_default();
+        let opened = env_for(ctx, AT_FDCWD, path)
+            .map_err(LoadError::Errno)
+            .and_then(|env| open_interpreter(ctx.files().vfs, &env, path))?;
+        let (interp_bytes, interp, interp_plan) = opened;
+        *interp_file = Some(PreparedInterp {
+            file: interp,
+            bytes: interp_bytes,
+            plan: interp_plan,
+        });
+    }
     let machine = ctx.exec_aux();
+    // AT_PHDR, AT_BASE and AT_ENTRY are stored by `commit` once the images are mapped.
     let aux = Aux {
         hwcap: machine.hwcap,
         phdr: plan.phdr,
         phnum: plan.phnum,
         entry: plan.entry,
+        base: 0,
         random: machine.random,
     };
     let (window, built) = build_window(&filename, &arg_strings, &env, &aux)?;
-    // Everything the commit cannot afford to fail on is reserved now.
-    ctx.files().vfs.reserve_pin()?;
+    // Everything the commit cannot afford to fail on is reserved now: one pin for the image's
+    // file, one for the interpreter's.
+    ctx.files()
+        .vfs
+        .reserve_pins(1 + usize::from(interp_file.is_some()))?;
     ctx.exec_prepare_mm()?;
     Ok(Some(Prepared {
         file: *file,
         bytes: core::mem::take(bytes),
         plan,
+        interp: interp_file.take(),
         window,
         built,
+        rlim_stack,
         comm: comm_of(&filename),
     }))
 }
@@ -291,7 +327,7 @@ fn dev_fd_name(fd: i32, path: &[u8]) -> Result<Vec<u8>, Errno> {
 /// `begin_new_exec` and the tail of `load_elf_binary`: the point of no return.
 /// The old image is gone when the first step runs; every failure from here on
 /// is fatal to the task.
-fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &Prepared) -> Outcome {
+fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
     // Close-on-exec descriptors (`do_close_on_exec`).
     {
         let Files { vfs, fdt, .. } = ctx.files();
@@ -322,8 +358,22 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &Prepared) -> Outcome {
             *mm = Mm::new(env);
         }
         unmapped.map_err(LoadError::Errno).and_then(|()| {
-            insert_stack(mm, env, p.plan.exec_stack)?;
-            map_segments(&p.plan, &p.bytes, &exec_file(id), mm, env, &mut *pages)?;
+            let start = stack_vma_start(p.built.arg_start, p.rlim_stack);
+            insert_stack(mm, env, p.plan.exec_stack, start)?;
+            let interp = p.interp.as_ref().map(|interp| Interp {
+                plan: &interp.plan,
+                bytes: &interp.bytes,
+                info: exec_file(u64::from(interp.file.index())),
+            });
+            let layout = map_image(
+                &p.plan,
+                &p.bytes,
+                &exec_file(id),
+                interp.as_ref(),
+                mm,
+                env,
+                &mut *pages,
+            )?;
             mm.record_stack(
                 p.built.sp,
                 p.built.arg_start,
@@ -331,20 +381,43 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &Prepared) -> Outcome {
                 p.built.env_start,
                 p.built.env_end,
             );
-            install_arguments(p, pages)
+            // create_elf_tables: the values that depend on where the images were mapped.
+            for (id, value) in [
+                (AT_PHDR, layout.phdr),
+                (AT_BASE, layout.interp_base),
+                (AT_ENTRY, layout.e_entry),
+            ] {
+                if !set_aux(&mut p.window, &p.built, id, value) {
+                    return Err(LoadError::Errno(Errno::EFAULT));
+                }
+            }
+            install_arguments(p, pages)?;
+            Ok(layout)
         })
     };
     super::memory::unpin_unmapped(ctx);
-    if let Err(error) = mapped {
-        // bprm_execve: "ensure the code never returns to the userspace process".
-        ctx.state().force_fatal_sig(SIGSEGV);
-        return match error {
-            LoadError::Errno(errno) => fail(errno),
-            LoadError::Unsupported(_) => Outcome::Unimplemented(sysno as u32),
-        };
-    }
+    let interp_id = p.interp.as_ref().map(|interp| interp.file);
+    let layout = match mapped {
+        Ok(layout) => layout,
+        Err(error) => {
+            if let Some(file) = interp_id {
+                ctx.files().vfs.fput(file);
+            }
+            // bprm_execve: "ensure the code never returns to the userspace process".
+            ctx.state().force_fatal_sig(SIGSEGV);
+            return match error {
+                LoadError::Errno(errno) => fail(errno),
+                LoadError::Unsupported(_) => Outcome::Unimplemented(sysno as u32),
+            };
+        }
+    };
+    // The VMAs hold the files (`vm_file`); `bprm->interpreter` is released (`fput`).
     let Files { vfs, owner, .. } = ctx.files();
     vfs.pin(owner, id);
+    if let Some(file) = interp_id {
+        vfs.pin(owner, u64::from(file.index()));
+        vfs.fput(file);
+    }
     // flush_signal_handlers(me, 0) and the new name.
     ctx.state().flush_on_exec();
     ctx.attrs().comm = p.comm;
@@ -352,7 +425,7 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &Prepared) -> Outcome {
     let tasks = ctx.tasks();
     tasks.list.exec_committed(tasks.current, &cred);
     // flush_thread + start_thread.
-    ctx.start_thread(p.plan.entry, p.built.sp);
+    ctx.start_thread(layout.entry, p.built.sp);
     Outcome::Return(0)
 }
 
@@ -758,7 +831,8 @@ mod tests {
         let path = getname(t, name, false)?;
         let env = env_for(t, dfd, &path)?;
         let (mut bytes, mut file) = open_exec_file(t.files().vfs, &env, &path, true)?;
-        let prepared = match prepare(t, dfd, &path, a, e, 0, &mut file, &mut bytes) {
+        let mut interp = None;
+        let prepared = match prepare(t, dfd, &path, a, e, 0, &mut file, &mut bytes, &mut interp) {
             Ok(Some(prepared)) => prepared,
             Ok(None) => unreachable!("no AT_EXECVE_CHECK"),
             Err(Prep::Errno(errno)) => {
@@ -896,7 +970,7 @@ mod tests {
                 kind: 1,
                 flags: 5,
                 offset: 0,
-                vaddr: 0x7fff_ffff_f000 - 0x24000,
+                vaddr: 0x7fff_ffff_f000 - 0x20000,
                 filesz: 0x100,
                 memsz: 0x30000,
             }],

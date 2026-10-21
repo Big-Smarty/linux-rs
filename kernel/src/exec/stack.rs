@@ -16,7 +16,9 @@
 //! Configuration reproduced: `x86_64`, `norandmaps` (no stack, brk or
 //! `arch_align_stack` randomisation), `vdso=0` (no `AT_SYSINFO_EHDR`),
 //! `CONFIG_RSEQ=n` (no `AT_RSEQ_*`; rseq(2) is not implemented), root
-//! credentials, not secure-exec, no interpreter.
+//! credentials, not secure-exec. `AT_PHDR`, `AT_BASE` and `AT_ENTRY` depend on where the image
+//! and its interpreter end up: [`build`] takes provisional values and [`set_aux`] stores the
+//! final ones once the mappings exist (the block is built before the point of no return).
 //!
 //! Layout from the top: one empty pointer slot, the exec filename, `envp`
 //! strings, `argv` strings, 16-byte alignment, the platform string, 16 random
@@ -32,11 +34,22 @@ pub const STACK_TOP: u64 = TASK_SIZE_MAX;
 pub const ARG_PAGES: usize = 4;
 /// `setup_arg_pages` expands the stack VMA by `stack_expand = 128 KiB`.
 pub const EXPAND_PAGES: usize = 32;
-/// shortcut: the stack never grows past this fixed extent (Linux grows it on
-/// demand up to `RLIMIT_STACK`, 8 MiB). Upgrade with a user page-fault handler
-/// that can allocate frames.
+/// The most pages the initial stack VMA can span (a full argument window plus the expansion).
 pub const STACK_PAGES: usize = ARG_PAGES + EXPAND_PAGES;
+/// The lowest start the initial stack VMA can have ([`stack_vma_start`] with a full window).
 pub const STACK_START: u64 = STACK_TOP - (STACK_PAGES as u64) * PAGE;
+
+/// Where the stack VMA starts once `setup_arg_pages` is done: the pages that hold the strings
+/// (`bprm->vma`, from the page of the lowest string up to `STACK_TOP`) plus the 128 KiB
+/// `stack_expand`, but not more than `RLIMIT_STACK` (`min(rlim_stack, stack_size +
+/// stack_expand)`; the VMA is never shrunk below its argument pages).
+#[must_use]
+pub fn stack_vma_start(arg_start: u64, rlim_stack_cur: u64) -> u64 {
+    let size = STACK_TOP - (arg_start & !(PAGE - 1));
+    let expand = (rlim_stack_cur & !(PAGE - 1)).min(size + (EXPAND_PAGES as u64) * PAGE);
+    // The argument window bounds the strings: never below STACK_START.
+    (STACK_TOP - size.max(expand)).max(STACK_START)
+}
 /// The window [`build`] fills: the top `ARG_PAGES` pages.
 pub const WINDOW_BYTES: usize = ARG_PAGES * crate::memory::PAGE_BYTES;
 
@@ -75,7 +88,10 @@ pub struct Aux {
     pub hwcap: u32,
     pub phdr: u64,
     pub phnum: u16,
+    /// `AT_ENTRY`: the image's own entry point (not the interpreter's).
     pub entry: u64,
+    /// `AT_BASE`: where the interpreter is loaded, 0 without one.
+    pub base: u64,
     pub random: [u8; 16],
 }
 
@@ -92,6 +108,8 @@ pub struct Built {
     pub argc: u64,
     /// `AT_EXECFN` string address.
     pub execfn: u64,
+    /// Address of the first auxiliary vector entry ([`set_aux`]).
+    pub auxv: u64,
     pub random: u64,
     /// `mm->arg_start`, `arg_end`, `env_start`, `env_end`.
     pub arg_start: u64,
@@ -204,7 +222,7 @@ pub fn build<'w>(
         (AT_PHDR, aux.phdr),
         (AT_PHENT, super::plan::PHENT),
         (AT_PHNUM, u64::from(aux.phnum)),
-        (AT_BASE, 0),
+        (AT_BASE, aux.base),
         (AT_FLAGS, 0),
         (AT_ENTRY, aux.entry),
         (AT_UID, 0),
@@ -248,6 +266,7 @@ pub fn build<'w>(
     }
     stack.word(at, 0)?;
     at += 8;
+    let auxv_at = at;
     for (id, value) in auxv {
         stack.word(at, id)?;
         stack.word(at + 8, value)?;
@@ -258,6 +277,7 @@ pub fn build<'w>(
     Ok(Built {
         sp,
         argc: arg_count,
+        auxv: auxv_at,
         execfn,
         random,
         arg_start,
@@ -265,6 +285,33 @@ pub fn build<'w>(
         env_start,
         env_end: execfn,
     })
+}
+
+/// Store `value` in the auxiliary vector entry `id` of a block [`build`] made (`window` covers
+/// `[STACK_TOP - window.len(), STACK_TOP)`). False when there is no such entry.
+#[must_use]
+pub fn set_aux(window: &mut [u8], built: &Built, id: u64, value: u64) -> bool {
+    let base = STACK_TOP - window.len() as u64;
+    let Some(mut at) = built.auxv.checked_sub(base) else {
+        return false;
+    };
+    loop {
+        let Some(entry) = usize::try_from(at)
+            .ok()
+            .and_then(|at| window.get_mut(at..at + 16))
+        else {
+            return false;
+        };
+        let key = u64::from_le_bytes(entry[..8].try_into().unwrap_or([0; 8]));
+        if key == AT_NULL {
+            return false;
+        }
+        if key == id {
+            entry[8..].copy_from_slice(&value.to_le_bytes());
+            return true;
+        }
+        at += 16;
+    }
 }
 
 /// `SplitMix64` (Vigna): expands a 64-bit seed into the 16 `AT_RANDOM` bytes.

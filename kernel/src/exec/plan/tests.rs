@@ -1,4 +1,5 @@
 #![allow(
+    clippy::doc_markdown,
     clippy::unreadable_literal,
     clippy::cast_possible_truncation,
     clippy::similar_names,
@@ -7,7 +8,7 @@
     clippy::cast_possible_wrap
 )]
 extern crate std;
-use super::{LoadError, LoadPlan, MAX_LOADS, Unsupported};
+use super::{ELF_ET_DYN_BASE, InterpPlan, LoadError, LoadPlan, MAX_LOADS, Unsupported};
 use std::vec::Vec;
 use syscalls::Errno;
 
@@ -262,7 +263,7 @@ fn header_rejections_are_enoexec_in_linux_order() {
 }
 
 #[test]
-fn dynamic_and_pie_are_explicitly_unsupported_not_errors() {
+fn interpreter_strings_follow_load_elf_binary_order() {
     let interp = Ph {
         kind: INTERP,
         flags: R,
@@ -278,7 +279,10 @@ fn dynamic_and_pie_are_explicitly_unsupported_not_errors() {
         0x2000,
     );
     file[0x1000..0x1005].copy_from_slice(b"/ld\0\0");
-    assert_eq!(unsupported(LoadPlan::new(&file)), Unsupported::Interpreter);
+    // The plan accepts it and names the interpreter, up to its first NUL.
+    let plan = LoadPlan::new(&file).unwrap();
+    assert!(plan.has_interpreter);
+    assert_eq!(LoadPlan::interpreter(&file), Some(&b"/ld"[..]));
     file[0x1004] = b'x'; // unterminated
     file[0x1003] = b'x';
     assert_eq!(errno(LoadPlan::new(&file)), Errno::ENOEXEC);
@@ -306,8 +310,125 @@ fn dynamic_and_pie_are_explicitly_unsupported_not_errors() {
         errno(LoadPlan::new(&elf(EXEC, 0x1000, &[beyond], 0x2000))),
         Errno::EIO
     );
-    let pie = elf(DYN, 0x1000, &[load(R, 0, 0, 0x100, 0x100)], 0x1000);
-    assert_eq!(unsupported(LoadPlan::new(&pie)), Unsupported::SharedObject);
+    // No PT_INTERP: no interpreter.
+    let plain = LoadPlan::new(&elf(
+        EXEC,
+        0x1000,
+        &[load(R, 0, 0x400000, 0x10, 0x10)],
+        0x1000,
+    ));
+    assert!(!plain.unwrap().has_interpreter);
+}
+
+#[test]
+fn et_dyn_plans_keep_the_unbiased_size_and_alignment() {
+    // Two loads with a hole: total_mapping_size runs from the first page to the last end.
+    let phs = [
+        load(R | X, 0, 0, 0x400, 0x400),
+        load(R | W, 0x1010, 0x20010, 0x20, 0x3000),
+    ];
+    let plan = LoadPlan::new(&elf(DYN, 0x200, &phs, 0x2000)).unwrap();
+    assert_eq!(plan.file_type, DYN);
+    assert_eq!((plan.total_size, plan.alignment), (0x23010, 0x1000));
+    assert_eq!(plan.phdr, 0x40, "the table is inside the first load");
+    // ELF_ET_DYN_BASE = DEFAULT_MAP_WINDOW / 3 * 2.
+    assert_eq!(ELF_ET_DYN_BASE, 0x5555_5555_4aaa);
+    // `maximum_alignment` skips p_align that is not a power of two and rounds up to a page.
+    let odd = |a: u64| {
+        let mut file = elf(DYN, 0x200, &[load(R, 0, 0, 0x10, 0x10)], 0x1000);
+        file[64 + 48..64 + 56].copy_from_slice(&a.to_le_bytes());
+        LoadPlan::new(&file).unwrap().alignment
+    };
+    assert_eq!(
+        (odd(0), odd(1), odd(3), odd(0x1000), odd(0x20_0000)),
+        (0, 0x1000, 0, 0x1000, 0x20_0000)
+    );
+    // A starting page offset: the span is measured from the first page start.
+    let off = LoadPlan::new(&elf(DYN, 0, &[load(R, 0x200, 0x200, 0x200, 0x300)], 0x1000)).unwrap();
+    assert_eq!(off.total_size, 0x500);
+    assert_eq!(off.phdr, 0, "no load maps the program header table");
+    // No PT_LOAD: no size (no program header at all is ENOEXEC).
+    let note = Ph {
+        kind: GNU_STACK,
+        flags: R | W,
+        offset: 0,
+        vaddr: 0,
+        filesz: 0,
+        memsz: 0,
+    };
+    assert_eq!(
+        LoadPlan::new(&elf(DYN, 0, &[note], 0x1000))
+            .unwrap()
+            .total_size,
+        0
+    );
+}
+
+#[test]
+fn interpreter_images_fail_with_libbad_before_the_point_of_no_return() {
+    let libbad = |r: Result<InterpPlan, LoadError>| match r {
+        Err(LoadError::Errno(e)) => e,
+        other => panic!("{other:?}"),
+    };
+    let good = elf(DYN, 0x1200, &[load(R | X, 0, 0, 0x300, 0x300)], 0x1000);
+    let plan = InterpPlan::new(&good).unwrap();
+    assert_eq!(
+        (plan.file_type, plan.entry, plan.total_size),
+        (DYN, 0x1200, 0x300)
+    );
+    assert_eq!(plan.segments().len(), 1);
+    // The header read: a short file is EIO.
+    assert_eq!(libbad(InterpPlan::new(&good[..63])), Errno::EIO);
+    assert_eq!(libbad(InterpPlan::new(&[])), Errno::EIO);
+    // Magic, machine, program header size and table.
+    let mut bad = good.clone();
+    bad[0] = 0;
+    assert_eq!(libbad(InterpPlan::new(&bad)), Errno::ELIBBAD);
+    let mut bad = good.clone();
+    bad[18] = 3;
+    assert_eq!(libbad(InterpPlan::new(&bad)), Errno::ELIBBAD);
+    let mut bad = good.clone();
+    bad[54] = 32;
+    assert_eq!(libbad(InterpPlan::new(&bad)), Errno::ELIBBAD);
+    let mut bad = good.clone();
+    bad[56] = 0;
+    assert_eq!(
+        libbad(InterpPlan::new(&bad)),
+        Errno::ELIBBAD,
+        "no program headers"
+    );
+    let mut bad = good.clone();
+    bad[56..58].copy_from_slice(&1200u16.to_le_bytes()); // 1200 * 56 > 65536
+    assert_eq!(libbad(InterpPlan::new(&bad)), Errno::ELIBBAD);
+    let mut bad = good.clone();
+    bad[32..40].copy_from_slice(&0x10_0000u64.to_le_bytes()); // the table lies outside the file
+    assert_eq!(libbad(InterpPlan::new(&bad)), Errno::ELIBBAD);
+    // e_type and the loads are checked later, by the loader: the plan still builds.
+    let mut rel = good.clone();
+    rel[16] = 1;
+    assert_eq!(InterpPlan::new(&rel).unwrap().file_type, 1);
+    let note = Ph {
+        kind: GNU_STACK,
+        flags: R | W,
+        offset: 0,
+        vaddr: 0,
+        filesz: 0,
+        memsz: 0,
+    };
+    assert_eq!(
+        InterpPlan::new(&elf(DYN, 0, &[note], 0x1000))
+            .unwrap()
+            .total_size,
+        0
+    );
+    // 17 loads do not fit the table of this kernel: a loud stop, not an errno.
+    let loads: std::vec::Vec<Ph> = (0..=MAX_LOADS as u64)
+        .map(|i| load(R, 0, i * 0x1000, 0x10, 0x10))
+        .collect();
+    match InterpPlan::new(&elf(DYN, 0, &loads, 0x1000)) {
+        Err(LoadError::Unsupported(Unsupported::TooManyLoads)) => {}
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

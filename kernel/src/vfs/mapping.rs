@@ -150,7 +150,15 @@ impl Vfs {
     /// # Errors
     /// `ENOMEM`.
     pub fn reserve_pin(&mut self) -> KResult<()> {
-        self.pins.try_reserve(1).map_err(|_| Errno::ENOMEM)
+        self.reserve_pins(1)
+    }
+
+    /// Make room for `count` more [`Vfs::pin`]s.
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn reserve_pins(&mut self, count: usize) -> KResult<()> {
+        self.pins.try_reserve(count).map_err(|_| Errno::ENOMEM)
     }
 
     /// A mapping of address space `owner` now holds the open file description
