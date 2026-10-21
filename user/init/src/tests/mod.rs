@@ -38,6 +38,7 @@ use crate::exit;
 
 pub mod busybox;
 pub mod dynelf;
+mod dynsys;
 pub mod fork;
 pub mod fs;
 pub mod ids;

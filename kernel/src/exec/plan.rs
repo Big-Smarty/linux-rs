@@ -184,12 +184,14 @@ impl Segment {
     pub fn fill_page(&self, file: &[u8], index: u64, out: &mut [u8]) {
         out.fill(0);
         if index < self.file_pages {
-            let from = self.file_offset + index * PAGE;
+            // `start` is the unbiased page start and an `ET_DYN` interpreter's `vaddr` may lie
+            // anywhere (only the biased address is range checked), so these wrap like the C.
+            let from = self.file_offset.wrapping_add(index * PAGE);
             if let Some(tail) = usize::try_from(from).ok().and_then(|from| file.get(from..)) {
                 let count = tail.len().min(out.len());
                 out[..count].copy_from_slice(&tail[..count]);
             }
-            let last = self.start + index * PAGE;
+            let last = self.start.wrapping_add(index * PAGE);
             if self.zero_from != 0 && page_start(self.zero_from) == last {
                 // Below one page by construction.
                 #[allow(clippy::cast_possible_truncation)]

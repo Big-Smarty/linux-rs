@@ -393,6 +393,24 @@ fn image(kind: u16, entry: u64, phs: &[Ph]) -> Vec<u8> {
     elf(kind, entry, phs, 0x1040)
 }
 
+/// src: fs/binfmt_elf.c `load_elf_interp` only range checks the biased `load_addr + vaddr`, so an
+/// `ET_DYN` interpreter whose `PT_LOAD` lies near 2^64 reaches the file-page installation with an
+/// unbiased start that must wrap (a hostile interpreter must not panic the kernel).
+#[test]
+fn an_interpreter_segment_near_the_top_of_the_address_space_does_not_overflow() {
+    let main = image(DYN, 0x200, &pie_phs());
+    let high = 0u64.wrapping_sub(0x1_0000);
+    let interp = elf(
+        DYN,
+        0x300,
+        &[load(R | X, 0, high, 0x11000, 0x11000)],
+        0x12000,
+    );
+    let (_, _, layout) = dyn_build(&main, Some(&interp)).unwrap();
+    // Mapped top-down (0x11000 bytes), then `load_addr = map_addr - vaddr` with vaddr = -0x10000.
+    assert_eq!(layout.interp_base, MMAP_TOP - 0x11000 + 0x1_0000);
+}
+
 /// src: fs/binfmt_elf.c `load_elf_binary` (ET_DYN with PT_INTERP: `load_bias = ELF_ET_DYN_BASE`,
 /// `MAP_FIXED_NOREPLACE`, `total_size` mapping trimmed to the first segment) and
 /// `load_elf_interp` (the interpreter lands top-down, below the stack gap).

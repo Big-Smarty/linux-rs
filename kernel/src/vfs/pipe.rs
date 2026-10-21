@@ -175,10 +175,19 @@ impl Pipe {
         Ok(copy)
     }
 
+    /// Make room for one more buffer, so that a following [`Pipe::push_buf`] cannot fail with
+    /// `ENOMEM` (`splice_pipe_to_pipe` has to queue a buffer it already detached).
+    ///
+    /// # Errors
+    /// `ENOMEM`.
+    pub fn reserve_buf(&mut self) -> KResult<()> {
+        self.bufs.try_reserve(1).map_err(|_| Errno::ENOMEM)
+    }
+
     /// Append a buffer taken from another pipe.
     ///
     /// # Errors
-    /// `ENOMEM`; `EINVAL` when the pipe is full.
+    /// `ENOMEM` (never after [`Pipe::reserve_buf`]); `EINVAL` when the pipe is full.
     pub fn push_buf(&mut self, buf: PipeBuf) -> KResult<()> {
         if self.is_full() {
             return Err(Errno::EINVAL);

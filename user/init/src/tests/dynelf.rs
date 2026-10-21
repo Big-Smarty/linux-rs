@@ -17,7 +17,9 @@
 //! 3. The errno order of `execve` for a bad interpreter (`ENOENT`, `EACCES`, `ELIBBAD`, `EIO`,
 //!    `ENOEXEC`) and the death by `SIGSEGV` of an exec that fails after the point of no return.
 //!
-//! The auxiliary vector is compared without `AT_RSEQ_FEATURE_SIZE`/`AT_RSEQ_ALIGN`: the reference
+//! The auxiliary vector is compared without the values of `AT_HWCAP` and `AT_MINSIGSTKSZ` (CPUID
+//! of the machine the group runs on; the `xstate` group checks the latter against the XSAVE area)
+//! and without `AT_RSEQ_FEATURE_SIZE`/`AT_RSEQ_ALIGN`: the reference
 //! kernel has `CONFIG_RSEQ=y`, the declared configuration of this kernel `n`
 //! (`kernel/src/config.rs`); the runner removes those two entries from `LD_SHOW_AUXV` output and
 //! from its own dump. Inode numbers in `maps` lines are masked: they are not part of the contract.
@@ -756,22 +758,38 @@ fn cstr(path: &str, buf: &mut [u8; 128]) -> usize {
     addr(buf)
 }
 
-/// `AT_RSEQ_FEATURE_SIZE`/`AT_RSEQ_ALIGN` lines of `LD_SHOW_AUXV` output are removed: see the
-/// module note. `lines` is the raw output; the result is compacted in place.
+/// `LD_SHOW_AUXV` output, normalised: the `AT_RSEQ_FEATURE_SIZE`/`AT_RSEQ_ALIGN` lines are removed
+/// (see the module note) and the values of the CPU dependent entries `AT_HWCAP` and
+/// `AT_MINSIGSTKSZ` become `*` (they come from the CPUID of the machine the group runs on, which
+/// is not the machine the rows were recorded on). `lines` is the raw output; the result is
+/// compacted in place.
 fn drop_rseq_lines(out: &mut Outcome) {
-    let (mut from, mut to) = (0, 0);
-    while from < out.len {
-        let end = out.kept[from..out.len]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(out.len, |n| from + n + 1);
-        if !out.kept[from..end].starts_with(b"AT_RSEQ_") {
-            out.kept.copy_within(from..end, to);
-            to += end - from;
+    let mut masked = [0u8; KEEP_MAX];
+    let mut len = 0;
+    for line in out.kept[..out.len].split_inclusive(|&b| b == b'\n') {
+        if line.starts_with(b"AT_RSEQ_") {
+            continue;
         }
-        from = end;
+        let cpu = line.starts_with(b"AT_HWCAP:") || line.starts_with(b"AT_MINSIGSTKSZ:");
+        let line = match line.iter().position(|&b| b == b':') {
+            // Keep the name and the padding up to the value column.
+            Some(colon) if cpu => {
+                let pad = line[colon + 1..].iter().take_while(|&&b| b == b' ').count();
+                let head = &line[..colon + 1 + pad];
+                masked[len..len + head.len()].copy_from_slice(head);
+                len += head.len();
+                masked[len] = b'*';
+                masked[len + 1] = b'\n';
+                len += 2;
+                continue;
+            }
+            _ => line,
+        };
+        masked[len..len + line.len()].copy_from_slice(line);
+        len += line.len();
     }
-    out.len = to;
+    out.kept[..len].copy_from_slice(&masked[..len]);
+    out.len = len;
 }
 
 /// Masks the inode column (the fifth) of `maps` lines when it is not zero.
@@ -1137,8 +1155,11 @@ fn probe(path: &str, argv0: &str, extra_env: &[&str]) -> Probed {
         for pair in raw[..need - 8].chunks_exact(16) {
             let key = u64::from_le_bytes(pair[..8].try_into().unwrap_or([0; 8]));
             let value = u64::from_le_bytes(pair[8..].try_into().unwrap_or([0; 8]));
-            // AT_RSEQ_FEATURE_SIZE, AT_RSEQ_ALIGN (see the module note).
-            if key != 27 && key != 28 && key != 0 {
+            // AT_RSEQ_FEATURE_SIZE, AT_RSEQ_ALIGN (see the module note); AT_HWCAP and
+            // AT_MINSIGSTKSZ depend on the CPU (`drop_rseq_lines`).
+            if key == 16 || key == 51 {
+                let _ = write!(text, " {key}=*");
+            } else if key != 27 && key != 28 && key != 0 {
                 let _ = write!(text, " {key}={value:#x}");
             }
         }
@@ -1994,6 +2015,7 @@ pub fn run() -> bool {
     errors(&mut t);
     mremap_checks(&mut t);
     clone_checks(&mut t);
+    super::dynsys::checks(&mut t);
     let (p, f) = t.counts();
     passed += p;
     failed += f;

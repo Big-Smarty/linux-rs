@@ -138,8 +138,12 @@ impl Mm {
         if vrm.flags & MREMAP_DONTUNMAP != 0 && vrm.old_len != vrm.new_len {
             return Err(Errno::EINVAL);
         }
-        // vrm_overlaps: the target must not overlap the source.
-        let (end_old, end_new) = (vrm.addr + vrm.old_len, vrm.new_addr + vrm.new_len);
+        // vrm_overlaps: the target must not overlap the source. `addr` and `old_len` are the
+        // caller's, so the sum wraps like Linux's unsigned long (a wrapped end then finds no VMA).
+        let (end_old, end_new) = (
+            vrm.addr.wrapping_add(vrm.old_len),
+            vrm.new_addr + vrm.new_len,
+        );
         if end_old > vrm.new_addr && end_new > vrm.addr {
             return Err(Errno::EINVAL);
         }
@@ -472,7 +476,9 @@ impl Mm {
         pt: &mut (impl UserPages + ?Sized),
         vrm: &mut Vrm,
     ) -> Result<u64, Errno> {
-        let (start, end) = (vrm.addr, vrm.addr + vrm.old_len);
+        // The caller's `addr + old_len` wraps like Linux's unsigned long: no VMA lies at a wrapped
+        // start, so the walk ends with -EFAULT.
+        let (start, end) = (vrm.addr, vrm.addr.wrapping_add(vrm.old_len));
         let new_addr = vrm.new_addr;
         let mut target_addr = new_addr;
         let mut res: Result<u64, Errno> = Err(Errno::EFAULT);

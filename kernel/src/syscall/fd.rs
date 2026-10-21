@@ -1460,15 +1460,28 @@ fn splice_pipe_to_pipe<C: Context>(
                 // Raced with another reader or writer: a zero would mean EOF, so retry.
                 continue 'retry;
             }
+            // Linux moves ring slots and never allocates: make the room in `to` first so that a
+            // buffer detached from `from` can always be queued (no byte is ever dropped).
             let front = ctx.files().vfs.pipe_ref(from).front_len() as u64;
-            let (buf, moved) = if len >= front {
-                let buf = ctx.files().vfs.pipe_mut(from).take_front();
-                (buf.ok_or(Errno::EINVAL)?, front)
-            } else {
-                let buf = ctx.files().vfs.pipe_mut(from).split_front(len as usize)?;
-                (buf, len)
+            let moved_buf = ctx.files().vfs.pipe_mut(to).reserve_buf().and_then(|()| {
+                if len >= front {
+                    let buf = ctx.files().vfs.pipe_mut(from).take_front();
+                    buf.map(|buf| (buf, front)).ok_or(Errno::EINVAL)
+                } else {
+                    let buf = ctx.files().vfs.pipe_mut(from).split_front(len as usize);
+                    buf.map(|buf| (buf, len))
+                }
+            });
+            let (buf, moved) = match moved_buf {
+                Ok(pair) => pair,
+                Err(error) if ret == 0 => return Err(error.into()),
+                Err(_) => break,
             };
-            ctx.files().vfs.pipe_mut(to).push_buf(buf)?;
+            let queued = ctx.files().vfs.pipe_mut(to).push_buf(buf);
+            assert!(
+                queued.is_ok(),
+                "splice: the room was reserved in the output pipe"
+            );
             ret += moved as i64;
             len -= moved;
             if len == 0 {
@@ -1482,7 +1495,7 @@ fn splice_pipe_to_pipe<C: Context>(
 /// `iter_file_splice_write` (and the `splice_write_null`/`zero` of the memory devices): gather
 /// the buffered bytes, write them to `output`, consume what was written, until `len` bytes are
 /// done, the pipe is drained after at least one write, or it is empty with no writer left.
-/// Outputs without a `->splice_write` are `EINVAL` once there are data.
+/// Outputs without a `->splice_write` (`/dev/full`) are `EINVAL` at once (`do_splice_from`).
 fn splice_from_pipe<C: Context>(
     ctx: &mut C,
     pipe: crate::vfs::PipeId,
@@ -1504,6 +1517,10 @@ fn splice_from_pipe<C: Context>(
         FileKind::Char(CharDev::Full) | FileKind::Directory => false,
         _ => return Err(Stop::Unimplemented),
     };
+    // do_splice_from: an output without ->splice_write is EINVAL before the pipe is touched.
+    if !splice_write {
+        return Err(Errno::EINVAL.into()); // warn_unsupported(out, "write")
+    }
     let mut total = len;
     let mut spliced: i64 = 0;
     let mut result: Sys = Ok(0);
@@ -1546,23 +1563,23 @@ fn splice_from_pipe<C: Context>(
         // Build the vector: at most `total` bytes of the buffers.
         let mut data = Vec::new();
         let take = usize::try_from(total).unwrap_or(usize::MAX);
-        ctx.files().vfs.pipe_ref(pipe).peek(take, &mut data)?;
+        if let Err(error) = ctx.files().vfs.pipe_ref(pipe).peek(take, &mut data) {
+            // Out of memory after some bytes were written is a short count.
+            result = Err(error.into());
+            break;
+        }
         let gathered = data.len() as i64;
         if gathered == 0 {
             break;
         }
-        let written = if splice_write {
-            let mut src = Src::kernel(data);
-            match output.kind {
-                FileKind::Regular => match output.inode {
-                    Some(inode) => write_regular(ctx, output, inode, &mut src, pos),
-                    None => Err(Errno::EINVAL.into()),
-                },
-                FileKind::Char(CharDev::Null | CharDev::Zero) => Ok(gathered),
-                _ => tty::write(ctx, output, &mut src),
-            }
-        } else {
-            Err(Errno::EINVAL.into()) // warn_unsupported(out, "write")
+        let mut src = Src::kernel(data);
+        let written = match output.kind {
+            FileKind::Regular => match output.inode {
+                Some(inode) => write_regular(ctx, output, inode, &mut src, pos),
+                None => Err(Errno::EINVAL.into()),
+            },
+            FileKind::Char(CharDev::Null | CharDev::Zero) => Ok(gathered),
+            _ => tty::write(ctx, output, &mut src),
         };
         match written {
             Ok(n) if n > 0 => {
@@ -1598,13 +1615,15 @@ fn vmsplice<C: Context>(ctx: &mut C, fd: u64, uiov: u64, nr_segs: u64, flags: u6
     } else {
         return Err(Errno::EBADF.into());
     };
-    let FileKind::Pipe { pipe, .. } = view.kind else {
-        return Err(Errno::EBADF.into());
-    };
+    // import_iovec first and the empty iterator's zero before `get_pipe_info` (EBADF), as in
+    // fs/splice.c:1600-1608.
     let (segs, total) = import_segs(ctx, uiov, nr_segs)?;
     if total == 0 {
         return Ok(0);
     }
+    let FileKind::Pipe { pipe, .. } = view.kind else {
+        return Err(Errno::EBADF.into());
+    };
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
     if source {
         vmsplice_to_pipe(ctx, pipe, &segs, nonblock)
@@ -1658,7 +1677,11 @@ fn vmsplice_to_pipe<C: Context>(
                 failure = Some(Errno::EAGAIN);
                 break 'segments;
             }
-            vfs.pipe_mut(pipe).push_spliced(&page[..chunk])?;
+            // Out of memory after some bytes were queued is a short count, as for a fault.
+            if let Err(error) = vfs.pipe_mut(pipe).push_spliced(&page[..chunk]) {
+                failure = Some(error);
+                break 'segments;
+            }
             total += chunk as i64;
             done += chunk as u64;
         }
@@ -1719,7 +1742,10 @@ fn vmsplice_to_user<C: Context>(
             let mut piece = Vec::new();
             let want = usize::try_from(total).unwrap_or(usize::MAX);
             let front = ctx.files().vfs.pipe_ref(pipe).front_len().min(want);
-            ctx.files().vfs.pipe_ref(pipe).peek(front, &mut piece)?;
+            if let Err(error) = ctx.files().vfs.pipe_ref(pipe).peek(front, &mut piece) {
+                result = Err(error.into());
+                break 'outer;
+            }
             if piece.is_empty() {
                 // eat_empty_buffer
                 ctx.files().vfs.pipe_mut(pipe).consume(0);
@@ -2304,12 +2330,16 @@ fn copy_file_range<C: Context>(ctx: &mut C, a: [u64; 6]) -> Sys {
         return Err(Stop::Unimplemented);
     };
     let size_in = i64::try_from(ctx.files().vfs.fs.inode(in_inode).size).unwrap_or(i64::MAX);
+    // The offsets are the caller's and may be negative: the C subtracts in uint64_t / loff_t
+    // (-fwrapv), so every step wraps and a bad offset fails later in `rw_verify_area`.
     count = if pos_in >= size_in {
         0
     } else {
-        count.min((size_in - pos_in) as u64)
+        count.min((size_in as u64).wrapping_sub(pos_in as u64))
     };
-    // generic_write_check_limits
+    // generic_write_check_limits: `count` is a loff_t there.
+    #[allow(clippy::cast_possible_wrap)]
+    let mut limited = count as i64;
     let limit = ctx.rlimit_fsize();
     if limit != RLIM_INFINITY {
         let limit = limit as i64;
@@ -2317,7 +2347,7 @@ fn copy_file_range<C: Context>(ctx: &mut C, a: [u64; 6]) -> Sys {
             ctx.state().send_sig(SIGXFSZ);
             return Err(Errno::EFBIG.into());
         }
-        count = count.min((limit - pos_out) as u64);
+        limited = limited.min(limit.wrapping_sub(pos_out));
     }
     let max_size = if output.flags & O_LARGEFILE == 0 {
         MAX_NON_LFS
@@ -2327,7 +2357,8 @@ fn copy_file_range<C: Context>(ctx: &mut C, a: [u64; 6]) -> Sys {
     if pos_out >= max_size {
         return Err(Errno::EFBIG.into());
     }
-    count = count.min((max_size - pos_out) as u64);
+    limited = limited.min(max_size.wrapping_sub(pos_out));
+    count = limited as u64;
     // Don't allow overlapped copying within the same file.
     if in_inode == out_inode
         && (pos_out as u64).wrapping_add(count) > pos_in as u64
@@ -2351,19 +2382,20 @@ fn copy_file_range<C: Context>(ctx: &mut C, a: [u64; 6]) -> Sys {
     if moved > 0 {
         pos_in += moved;
         pos_out += moved;
+        // A failing store of one offset is -EFAULT but the other offset is still updated.
+        let mut fault = false;
         if off_in != 0 {
-            if copy_to_user(ctx, off_in, &pos_in.to_le_bytes()) != 0 {
-                return Err(Errno::EFAULT.into());
-            }
+            fault |= copy_to_user(ctx, off_in, &pos_in.to_le_bytes()) != 0;
         } else {
             set_pos(ctx, &input, pos_in);
         }
         if off_out != 0 {
-            if copy_to_user(ctx, off_out, &pos_out.to_le_bytes()) != 0 {
-                return Err(Errno::EFAULT.into());
-            }
+            fault |= copy_to_user(ctx, off_out, &pos_out.to_le_bytes()) != 0;
         } else {
             set_pos(ctx, &output, pos_out);
+        }
+        if fault {
+            return Err(Errno::EFAULT.into());
         }
     }
     Ok(moved)

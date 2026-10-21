@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Host tests of the syscalls the `dynelf` lane added (`creat`, `fadvise64`, `splice`, `vmsplice`,
-//! `copy_file_range`, the `FICLONE` ioctls, the extended attribute family, `getsockname` and
-//! `getpeername`, `mremap` through the dispatcher), through [`super::dispatch`] on the real tmpfs
+//! `copy_file_range`, the `FICLONE` ioctls, the extended attribute family, the `CONFIG_NET`-off
+//! socket calls, `mremap` through the dispatcher), through [`super::dispatch`] on the real tmpfs
 //! rootfs of `testing::Task`. The differential evidence is the `dynelf` oracle group (programs of
 //! the host that call all of them) and its `sys-*` checks.
 
@@ -626,22 +626,140 @@ fn extended_attributes_of_tmpfs_are_empty_and_named_like_linux() {
     );
 }
 
+/// The reference build has `CONFIG_NET` unset: every socket call is `sys_ni_syscall` (-ENOSYS)
+/// whatever the descriptor is (`kernel/sys_ni.c`; the reference System.map holds only the weak
+/// stubs).
 #[test]
-fn socket_name_calls_say_not_a_socket() {
+fn socket_calls_are_enosys_as_config_net_is_off() {
     let mut t = t();
     let f = filled(&mut t, "/n", b"n");
     let (r, _) = pipe(&mut t, 0);
-    for sysno in [Sysno::getsockname, Sysno::getpeername] {
-        assert_eq!(
-            call(&mut t, sysno, &[f, OUT, OUT + 64]),
-            err(Errno::ENOTSOCK)
-        );
-        assert_eq!(call(&mut t, sysno, &[r, 0, 0]), err(Errno::ENOTSOCK));
-        assert_eq!(call(&mut t, sysno, &[99, OUT, OUT + 64]), err(Errno::EBADF));
-        // `int fd`: the upper half of the register is ignored.
-        assert_eq!(
-            call(&mut t, sysno, &[(1 << 32) | f, 0, 0]),
-            err(Errno::ENOTSOCK)
-        );
+    for sysno in [
+        Sysno::getsockname,
+        Sysno::getpeername,
+        Sysno::socket,
+        Sysno::connect,
+        Sysno::accept,
+        Sysno::accept4,
+        Sysno::setsockopt,
+        Sysno::sendmmsg,
+    ] {
+        for fd in [f, r, 99, (1 << 32) | f] {
+            assert_eq!(
+                call(&mut t, sysno, &[fd, OUT, OUT + 64]),
+                err(Errno::ENOSYS)
+            );
+        }
     }
+}
+
+/// fs/splice.c `do_splice_from`: an output without `->splice_write` (`/dev/full`) is `EINVAL`
+/// before the pipe is looked at, whether the pipe is empty with a live writer (it would block),
+/// empty without a writer (it would be 0) or holds data.
+#[test]
+fn splice_into_an_output_without_splice_write_is_einval_at_once() {
+    let mut t = t();
+    let node = cstr(&mut t, PATH, "/full");
+    assert_eq!(
+        call(&mut t, Sysno::mknod, &[node, 0o20_666, (1 << 8) | 7]),
+        ok(0)
+    );
+    let full = fd(open(&mut t, "/full", O_RDWR, 0));
+    let (r, w) = pipe(&mut t, 0);
+    assert_eq!(
+        call(&mut t, Sysno::splice, &[r, 0, full, 0, 10, 0]),
+        err(Errno::EINVAL),
+        "empty pipe, writer alive"
+    );
+    assert_eq!(call(&mut t, Sysno::write, &[w, BUF, 3]), ok(3));
+    assert_eq!(
+        call(&mut t, Sysno::splice, &[r, 0, full, 0, 10, 0]),
+        err(Errno::EINVAL),
+        "data"
+    );
+    assert_eq!(queued(&mut t, r), 3, "nothing was consumed");
+    assert_eq!(call(&mut t, Sysno::close, &[w]), ok(0));
+    assert_eq!(call(&mut t, Sysno::read, &[r, OUT, 8]), ok(3));
+    assert_eq!(
+        call(&mut t, Sysno::splice, &[r, 0, full, 0, 10, 0]),
+        err(Errno::EINVAL),
+        "empty pipe, no writer"
+    );
+}
+
+/// fs/splice.c `SYSCALL_DEFINE4(vmsplice)`: `import_iovec` (EINVAL/EFAULT), the empty iterator's
+/// 0, and only then `get_pipe_info` (EBADF) for a descriptor that is not a pipe.
+#[test]
+fn vmsplice_of_a_non_pipe_imports_the_vector_before_it_says_ebadf() {
+    let mut t = t();
+    let f = fd(open(&mut t, "/v", O_CREAT | O_RDWR, 0o644));
+    let iov = 0x4000;
+    put(&mut t, iov, &BUF.to_le_bytes());
+    put(&mut t, iov + 8, &0u64.to_le_bytes());
+    assert_eq!(
+        call(&mut t, Sysno::vmsplice, &[f, iov, 1, 0]),
+        ok(0),
+        "empty vector"
+    );
+    assert_eq!(
+        call(&mut t, Sysno::vmsplice, &[f, iov, 0, 0]),
+        ok(0),
+        "no segments"
+    );
+    assert_eq!(
+        call(&mut t, Sysno::vmsplice, &[f, iov, 1025, 0]),
+        err(Errno::EINVAL)
+    );
+    assert_eq!(
+        call(&mut t, Sysno::vmsplice, &[f, BAD, 1, 0]),
+        err(Errno::EFAULT)
+    );
+    put(&mut t, iov + 8, &4u64.to_le_bytes());
+    assert_eq!(
+        call(&mut t, Sysno::vmsplice, &[f, iov, 1, 0]),
+        err(Errno::EBADF)
+    );
+}
+
+/// fs/read_write.c `generic_copy_file_checks` runs before `rw_verify_area`, in unsigned /
+/// wrapping `loff_t` arithmetic: the offsets of the caller never panic, they fail with the
+/// errno `rw_verify_area` gives. A fault storing one offset still updates the other.
+#[test]
+fn copy_file_range_with_extreme_offsets_fails_like_rw_verify_area() {
+    let mut t = t();
+    let src = filled(&mut t, "/a", b"0123456789");
+    let dst = fd(open(&mut t, "/b", O_CREAT | O_RDWR, 0o644));
+    for pos_in in [i64::MIN, -1, i64::MAX] {
+        for pos_out in [i64::MIN, -1, i64::MAX, 0] {
+            for len in [0u64, 1, 10, 1 << 62, u64::MAX] {
+                put(&mut t, OUT + 8, &pos_in.to_le_bytes());
+                put(&mut t, OUT + 16, &pos_out.to_le_bytes());
+                let _ = call(
+                    &mut t,
+                    Sysno::copy_file_range,
+                    &[src, OUT + 8, dst, OUT + 16, len, 0],
+                );
+            }
+        }
+    }
+    put(&mut t, OUT + 8, &i64::MIN.to_le_bytes());
+    put(&mut t, OUT + 16, &0i64.to_le_bytes());
+    assert_eq!(
+        call(
+            &mut t,
+            Sysno::copy_file_range,
+            &[src, OUT + 8, dst, OUT + 16, 0, 0]
+        ),
+        err(Errno::EINVAL)
+    );
+    put(&mut t, OUT + 8, &0i64.to_le_bytes());
+    put(&mut t, OUT + 16, &(-1i64).to_le_bytes());
+    assert_eq!(
+        call(
+            &mut t,
+            Sysno::copy_file_range,
+            &[src, OUT + 8, dst, OUT + 16, 0, 0]
+        ),
+        err(Errno::EINVAL)
+    );
 }

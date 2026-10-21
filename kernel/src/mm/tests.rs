@@ -1804,6 +1804,41 @@ fn mremap_argument_errors_follow_check_order() {
     w.check_invariants();
 }
 
+/// src: mm/mremap.c `vrm_overlaps` and `remap_move` add the caller's `addr` and `old_len` in
+/// unsigned long, which wraps; a wrapped range holds no VMA, so Linux answers EFAULT (or the
+/// earlier EINVAL). It must never be an arithmetic panic (an unprivileged `mremap` argument).
+#[test]
+fn mremap_wrapping_ranges_never_panic() {
+    let mut w = W::new();
+    let _ = w.map(0, 4 * P, RW, ANON).unwrap();
+    let top = 0u64.wrapping_sub(P);
+    for flags in 0..8u64 {
+        for old in [P, 2 * P, 0u64.wrapping_sub(3 * P), 0u64.wrapping_sub(P)] {
+            for new in [P, 2 * P, old] {
+                for addr in [top, top - P, 0x7fff_ffff_f000, 0x10000] {
+                    for to in [0x10000, 0x40000, TASK_SIZE - P] {
+                        let _ = w.mremap(addr, old, new, flags, to);
+                    }
+                }
+            }
+        }
+    }
+    let fixed = MREMAP_MAYMOVE | MREMAP_FIXED;
+    let huge = 0u64.wrapping_sub(P);
+    for (old, new, what) in [
+        (2 * P, P, "wrapped end, no VMA at the start"),
+        (huge, P, "huge old length"),
+        (P, P, "equal-length batched move of an unmapped top page"),
+    ] {
+        assert_eq!(
+            w.mremap(top, old, new, fixed, 0x10000),
+            Err(Errno::EFAULT),
+            "{what}"
+        );
+    }
+    w.check_invariants();
+}
+
 /// src: mm/mremap.c `shrink_vma`, `expand_vma`, `expand_vma_in_place`, `vma_expandable`.
 #[test]
 fn mremap_shrinks_and_expands_in_place() {
