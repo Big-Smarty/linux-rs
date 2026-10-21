@@ -909,7 +909,7 @@ struct Owned {
     fs: FsId,
     /// `current->vfork_done` (`CLONE_VFORK`): the parent sleeping until this task's `execve`
     /// or exit.
-    vfork_parent: Option<Lender>,
+    vfork_parent: Option<VforkParent>,
     /// `bprm->mm`: the fresh address space the `execve` of a task that shares its own moves to,
     /// made before the point of no return ([`Context::exec_prepare`]), with the executable
     /// that becomes its `exe_file`.
@@ -933,7 +933,7 @@ struct PendingMm {
 
 /// The parent of a `vfork` child.
 #[derive(Clone, Copy)]
-struct Lender {
+struct VforkParent {
     sched: SchedId,
 }
 
@@ -981,11 +981,11 @@ fn vfork_done_key(parent: SchedId) -> WaitKey {
 /// `complete_vfork_done`, called by the child when it execs or exits: the parent wakes. A
 /// parent that no longer exists (it was killed while it waited) has nothing to wake; the flag
 /// of its slot is cleared by the next task that waits there before its child can run.
-fn complete_vfork(lender: Lender) {
-    let alive = matches!(ktask::state(lender.sched), Some(state) if state != TaskState::Dead);
+fn complete_vfork(parent: VforkParent) {
+    let alive = matches!(ktask::state(parent.sched), Some(state) if state != TaskState::Dead);
     if alive {
-        VFORK_DONE.lock()[lender.sched.index()] = true;
-        ktask::wake_up_key(vfork_done_key(lender.sched), WakeMode::Normal, 0);
+        VFORK_DONE.lock()[parent.sched.index()] = true;
+        ktask::wake_up_key(vfork_done_key(parent.sched), WakeMode::Normal, 0);
     }
 }
 
@@ -1889,7 +1889,7 @@ impl Syscall<'_> {
             mm: child_mm,
             files: child_files,
             fs: child_fs,
-            vfork_parent: request.vfork.then_some(Lender {
+            vfork_parent: request.vfork.then_some(VforkParent {
                 sched: self.own.sched,
             }),
             pending_mm: None,
@@ -2174,6 +2174,11 @@ impl Context for Syscall<'_> {
         let Process {
             tasks, vfs, mms, ..
         } = self.shared.get();
+        // `de_thread` slept, so the slot `exec_prepare` reserved may have been taken by another
+        // task: reserve again before anything is moved; the pending space stays for the exit.
+        if self.own.pending_mm.is_some() && must(mms, id).users > 1 {
+            mms.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        }
         let old = must(mms, id);
         match self.own.pending_mm.take() {
             // exec_mmap: the address space has other users (a `vfork` parent, a `CLONE_VM`
@@ -2239,8 +2244,8 @@ impl Context for Syscall<'_> {
             None => {}
         }
         // exec_mm_release -> mm_release: `complete_vfork_done`.
-        if let Some(lender) = self.own.vfork_parent.take() {
-            complete_vfork(lender);
+        if let Some(parent) = self.own.vfork_parent.take() {
+            complete_vfork(parent);
         }
         // unshare_sighand: the dispositions are this process's alone from now on.
         tasks.unshare_sighand(me)
@@ -2579,8 +2584,8 @@ fn mmput(process: &mut Process, id: MmId, group_gone: Option<i32>) {
 /// context: a `vfork` parent wakes, an address space made for an `execve` that did not happen
 /// goes, and the task's use of its own ends.
 fn exit_mm(process: &mut Process, own: &mut Owned, group_gone: Option<i32>) {
-    if let Some(lender) = own.vfork_parent.take() {
-        complete_vfork(lender);
+    if let Some(parent) = own.vfork_parent.take() {
+        complete_vfork(parent);
     }
     if let Some(pending) = own.pending_mm.take() {
         destroy_tables(pending.tables);

@@ -327,8 +327,16 @@ fn dev_fd_name(fd: i32, path: &[u8]) -> Result<Vec<u8>, Errno> {
 /// is fatal to the task.
 fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
     // bprm->point_of_no_return: from here an error ends the task with SIGSEGV (unless it is
-    // being killed already) after the errno is stored (`bprm_execve`).
-    let die = |ctx: &mut C, errno: Errno| {
+    // being killed already) after the errno is stored (`bprm_execve`). `free_bprm` releases
+    // `bprm->interpreter` on every failure and `bprm->file` unless it already became
+    // `mm->exe_file` (`own_file`).
+    let die = |ctx: &mut C, p: &mut Prepared, own_file: bool, errno: Errno| {
+        if own_file {
+            ctx.files().vfs.fput(p.file);
+        }
+        if let Some(interp) = p.interp.take() {
+            ctx.files().vfs.fput(interp.file);
+        }
         if !ctx.state().fatal_signal_pending() {
             ctx.state().force_fatal_sig(SIGSEGV);
         }
@@ -337,11 +345,11 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
     // de_thread: every other thread of the group is killed and gone, and a thread that is not
     // the leader takes the leader's pid.
     if let Err(errno) = de_thread(ctx) {
-        return die(ctx, errno);
+        return die(ctx, p, true, errno);
     }
     // unshare_files: the descriptor table is not shared with another process any more.
     if let Err(errno) = ctx.exec_unshare_files() {
-        return die(ctx, errno);
+        return die(ctx, p, true, errno);
     }
     // Close-on-exec descriptors (`do_close_on_exec`).
     {
@@ -360,7 +368,16 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
     // `vfork` parent wakes: `complete_vfork_done`), and the dispositions made private
     // (`unshare_sighand`); any other task's old image is unmapped below.
     if let Err(errno) = ctx.exec_switch_mm() {
-        return die(ctx, errno);
+        return die(ctx, p, false, errno);
+    }
+    // `de_thread` slept, so the pins reserved by `prepare` may be spent by now: reserve them
+    // again here; nothing between this and `Vfs::pin` gives up the CPU.
+    if let Err(errno) = ctx
+        .files()
+        .vfs
+        .reserve_pins(1 + usize::from(p.interp.is_some()))
+    {
+        return die(ctx, p, false, errno);
     }
     // The old image's mappings go, a fresh address space replaces
     // the VMA set; then `setup_arg_pages` and `elf_load`.
@@ -411,27 +428,24 @@ fn commit<C: Context>(ctx: &mut C, sysno: Sysno, p: &mut Prepared) -> Outcome {
         })
     };
     super::memory::unpin_unmapped(ctx);
-    let interp_id = p.interp.as_ref().map(|interp| interp.file);
     let layout = match mapped {
         Ok(layout) => layout,
         Err(error) => {
-            if let Some(file) = interp_id {
-                ctx.files().vfs.fput(file);
-            }
-            // bprm_execve: "ensure the code never returns to the userspace process".
-            ctx.state().force_fatal_sig(SIGSEGV);
             return match error {
-                LoadError::Errno(errno) => fail(errno),
-                LoadError::Unsupported(_) => Outcome::Unimplemented(sysno as u32),
+                LoadError::Errno(errno) => die(ctx, p, false, errno),
+                LoadError::Unsupported(_) => {
+                    let _ = die(ctx, p, false, Errno::EINVAL);
+                    Outcome::Unimplemented(sysno as u32)
+                }
             };
         }
     };
     // The VMAs hold the files (`vm_file`); `bprm->interpreter` is released (`fput`).
     let Files { vfs, owner, .. } = ctx.files();
     vfs.pin(owner, id);
-    if let Some(file) = interp_id {
-        vfs.pin(owner, u64::from(file.index()));
-        vfs.fput(file);
+    if let Some(interp) = p.interp.take() {
+        vfs.pin(owner, u64::from(interp.file.index()));
+        vfs.fput(interp.file);
     }
     // flush_signal_handlers(me, 0) and the new name.
     ctx.state().flush_on_exec();
@@ -882,6 +896,39 @@ mod tests {
         let first = t.exe;
         assert_eq!(execve(&mut t, "/bin-init", &["x"], &[]), Outcome::Return(0));
         assert_ne!(t.exe, first);
+    }
+
+    #[test]
+    fn a_failing_de_thread_releases_the_executable_and_its_script_interpreter() {
+        use crate::task::tasklist::{CloneParams, ForkParams};
+        let mut t = t();
+        install(&mut t, "/interp", 0o755, &oracle());
+        install(&mut t, "/s", 0o755, b"#!/interp\nbody");
+        let fork = ForkParams {
+            exit_signal: 17,
+            clear_sighand: false,
+        };
+        let sibling = t
+            .tasks
+            .clone_task(
+                t.current,
+                CloneParams {
+                    fork,
+                    thread: true,
+                    share_sighand: true,
+                    reset_altstack: true,
+                },
+            )
+            .unwrap();
+        // The sibling's own `execve` is under way: this one finds the group busy (`EAGAIN`).
+        t.tasks.de_thread_start(sibling, &mut t.wake).unwrap();
+        let (open, refs) = (t.vfs.files.open_count(), t.vfs.files.total_refs());
+        assert_eq!(execve(&mut t, "/s", &["/s"], &[]), neg(Errno::EAGAIN));
+        // free_bprm: neither the script's, nor the interpreter's description stays open.
+        assert_eq!(
+            (t.vfs.files.open_count(), t.vfs.files.total_refs()),
+            (open, refs)
+        );
     }
 
     /// `execveat` up to the point of no return: the `argv` strings the new image would start

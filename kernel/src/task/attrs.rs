@@ -213,9 +213,8 @@ pub struct Attributes {
     /// `task_struct::personality` (`PER_LINUX = 0`).
     pub personality: u32,
     /// `task_struct::clear_child_tid` (`set_tid_address`, `CLONE_CHILD_CLEARTID`).
-    /// Exit does not process it (`mm_release` writes 0 and wakes the futex
-    /// only when `mm_users > 1`; every mm here is private, so it is
-    /// unobservable until `CLONE_VM` exists).
+    /// `mm_release` (at `execve` and at exit, `syscall::futex::mm_release`) writes 0 there and
+    /// wakes one futex waiter only when `mm_users > 1`.
     pub clear_child_tid: u64,
     /// `PFA_NO_NEW_PRIVS` (`PR_SET_NO_NEW_PRIVS`): set once, inherited by `fork`, kept by
     /// `execve`, never cleared.
