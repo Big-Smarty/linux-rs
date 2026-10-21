@@ -1711,6 +1711,8 @@ ttyin	check	out-onocr	init: test ttyin.out-onocr ok
 ttyin	stage	out-onlret	init: stage out-onlret
 ttyin	echo	out-onlret	a\x0ab\x0dc\x09d\x08e\x09f\x0axy\xc3\xa9\x09z\x0a0123456789\x09q\x0d\x09w\x0a\x0d\x0a
 ttyin	check	out-onlret	init: test ttyin.out-onlret ok
+ttyin	stage	out-olcuc	init: stage out-olcuc
+ttyin	echo	out-olcuc	A\x0d\x0aB\x0dC\x09D\x08E\x09F\x0d\x0aXY\xc3\xa9\x09Z\x0d\x0a0123456789\x09Q\x0d\x09W\x0d\x0a\x0d\x0a
 ttyin	check	out-olcuc	init: test ttyin.out-olcuc ok
 ttyin	stage	out-xtabs	init: stage out-xtabs
 ttyin	echo	out-xtabs	a\x0d\x0ab\x0dc       d\x08e       f\x0d\x0axy\xc3\xa9    z\x0d\x0a0123456789      q\x0d        w\x0d\x0a\x0d\x0a

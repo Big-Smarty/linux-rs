@@ -248,6 +248,9 @@ fn raw_vmin(t: &mut T) {
     });
     marker("raw-vmin1");
     let a = bytes(rd(10));
+    // Both of the next bytes have arrived (they are one burst, but a driver may take them one
+    // by one: a read that wakes on the first would see only it).
+    nap(300);
     let b = bytes(rd(2));
     end(&orig);
     t.eq("raw-vmin1", (a, b), ((1, pad(b"x")), (2, pad(b"yz"))));
@@ -412,8 +415,9 @@ fn output_processing(t: &mut T) {
         ("onlcr-ocrnl-xtabs", OPOST | ONLCR | OCRNL | XTABS, !0),
     ];
     for (name, set, _) in cases {
-        let orig = begin(|t| set_word(t, 1, set));
+        // The marker goes out under the default flags: `OLCUC` would shout it.
         marker(format_args!("out-{name}"));
+        let orig = begin(|t| set_word(t, 1, set));
         let r = write(1, text);
         // Utf-8 (IUTF8 not set): bytes above 0x7f count as columns.
         let _ = write(1, b"xy\xc3\xa9\tz\n");
