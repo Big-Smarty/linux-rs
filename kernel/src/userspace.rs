@@ -808,6 +808,15 @@ struct Lent {
 static VFORK_DONE: services::IrqMutex<[Option<Done>; ktask::SLOTS]> =
     services::IrqMutex::new([const { None }; ktask::SLOTS]);
 
+/// A `vfork` child that died while its own `vfork` child still worked in the address space it
+/// had borrowed: the lender it owes that address space to, by the dead task's slot. The grandchild's
+/// [`complete_vfork`] hands the address space on to it. A leaf lock like [`VFORK_DONE`].
+/// shortcut: one entry per slot, so a slot reused by another such task before the grandchild
+/// finishes would overwrite it; slots are only reused after the reaper ran, which needs the
+/// dead task's parent to get the CPU (a `vfork` lender sleeps until this entry is consumed).
+static VFORK_FORWARD: services::IrqMutex<[Option<Lender>; ktask::SLOTS]> =
+    services::IrqMutex::new([const { None }; ktask::SLOTS]);
+
 #[allow(
     clippy::cast_possible_truncation,
     reason = "a slot index is below the pool size"
@@ -824,6 +833,9 @@ fn complete_vfork(lender: Lender, key: u32, lent: Option<Lent>, vfs: &mut Vfs) {
     if alive {
         VFORK_DONE.lock()[lender.sched.index()] = Some(Done { lent });
         ktask::wake_up_key(vfork_done_key(lender.sched), WakeMode::Normal, 0);
+    } else if let Some(next) = VFORK_FORWARD.lock()[lender.sched.index()].take() {
+        // The lender died borrowing: the address space goes to whom it borrowed it from.
+        complete_vfork(next, key, lent, vfs);
     } else if let Some(lent) = lent {
         vfs.unpin_all(key);
         destroy_tables(lent.tables);
@@ -1372,6 +1384,9 @@ impl Syscall<'_> {
                 }
                 return;
             }
+            // An `ITIMER_REAL` that expired is `SIGALRM` sent (possibly fatal) before the next
+            // sleep; left stale, `wait` returns at once and the child never runs.
+            let _ = signal::wait::signal_pending_synced(self);
             if signal::Task::state(self).fatal_signal_pending() {
                 return;
             }
@@ -1703,6 +1718,58 @@ fn into_parts(boxed: Box<TaskLocal>) -> (Tables, Owned) {
     (tables, own)
 }
 
+/// `exit_mm`, the address-space half of [`do_exit`]: `tables` is the task's tree as it leaves
+/// its slot (a placeholder while `own.lent_out`).
+fn exit_mm(mut tables: Tables, own: &mut Owned, vfs: &mut Vfs) {
+    let owner = own.owner();
+    // exit_mm: a `vfork` child that never execed gives the address space it borrowed back
+    // (`mm_release`); everything else frees its own, and a vfork child's wake-up of its parent
+    // follows. A fresh address space made for an `execve` that did not happen goes too.
+    let borrowed = own.vfork_parent.take();
+    if let Some((fresh, _)) = own.pending_mm.take() {
+        destroy_tables(fresh);
+    }
+    // This task's own `vfork` child may have finished while the task was on its way out (a fatal
+    // signal ends the wait early): the address space it lent is back, take it.
+    if own.lent_out {
+        let back = VFORK_DONE.lock()[own.sched.index()].take();
+        if let Some(Done {
+            lent: Some(Lent {
+                tables: real,
+                space,
+            }),
+        }) = back
+        {
+            destroy_tables(core::mem::replace(&mut tables, real));
+            drop(core::mem::replace(&mut own.space, space));
+            own.lent_out = false;
+        }
+    }
+    match borrowed {
+        // Its own `vfork` child still works in the address space this task borrowed: what is
+        // left here are placeholders. The borrowed space cannot go back yet; the child's
+        // completion forwards it to the lender, who keeps sleeping until then.
+        Some(lender) if lender.lent && own.lent_out => {
+            destroy_tables(tables);
+            VFORK_FORWARD.lock()[own.sched.index()] = Some(lender);
+        }
+        Some(lender) if lender.lent => {
+            let space = core::mem::replace(&mut own.space, Mm::new(&own.env));
+            complete_vfork(lender, owner, Some(Lent { tables, space }), vfs);
+        }
+        other => {
+            destroy_tables(tables);
+            // The mappings' pins go with the address space, unless a vfork child still has it.
+            if !own.lent_out {
+                vfs.unpin_all(owner);
+            }
+            if let Some(lender) = other {
+                complete_vfork(lender, owner, None, vfs);
+            }
+        }
+    }
+}
+
 /// `do_exit` of the calling task: `exit` (`group` false) or `do_group_exit`
 /// (`exit_group`, a fatal signal). The last thread of global init panics
 /// (`init_died`); any other task releases its address space, descriptors and
@@ -1745,29 +1812,7 @@ fn do_exit(code: u32, group: bool, signaled: bool) -> ! {
     ktask::set_current_cr3(kernel);
     let mut shared = PROCESS.lock();
     let owner = own.owner();
-    // exit_mm: a `vfork` child that never execed gives the address space it borrowed back
-    // (`mm_release`); everything else frees its own, and a vfork child's wake-up of its parent
-    // follows. A fresh address space made for an `execve` that did not happen goes too.
-    let borrowed = own.vfork_parent.take();
-    if let Some((fresh, _)) = own.pending_mm.take() {
-        destroy_tables(fresh);
-    }
-    match borrowed {
-        Some(lender) if lender.lent => {
-            let space = core::mem::replace(&mut own.space, Mm::new(&own.env));
-            complete_vfork(lender, owner, Some(Lent { tables, space }), &mut shared.vfs);
-        }
-        other => {
-            destroy_tables(tables);
-            // The mappings' pins go with the address space, unless a vfork child still has it.
-            if !own.lent_out {
-                shared.vfs.unpin_all(owner);
-            }
-            if let Some(lender) = other {
-                complete_vfork(lender, owner, None, &mut shared.vfs);
-            }
-        }
-    }
+    exit_mm(tables, &mut own, &mut shared.vfs);
     // exit_files / exit_fs: the executable's reference, every descriptor, the root and working
     // directory.
     shared.vfs.fput(own.exe_file);

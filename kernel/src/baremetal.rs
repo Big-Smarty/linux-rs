@@ -290,7 +290,8 @@ enum Cause {
     TimedOut,
     /// Not run: it needs the monotonic clock and `timer::init` failed.
     NoClock,
-    /// Not run: the group needs a CPU feature this CPU lacks (neither a pass nor a failure).
+    /// Not run: the CPU lacks a feature the group needs, or has AMX state it does not cover
+    /// (neither a pass nor a failure); the text completes "the CPU has ...".
     Unavailable(&'static str),
 }
 
@@ -305,8 +306,8 @@ impl Cause {
             Self::Stopped => Text::from_args(format_args!("kernel stop")),
             Self::TimedOut => Text::from_args(format_args!("timeout")),
             Self::NoClock => Text::from_args(format_args!("skipped, no clock")),
-            Self::Unavailable(flag) => {
-                Text::from_args(format_args!("unavailable on this CPU: no {flag}"))
+            Self::Unavailable(reason) => {
+                Text::from_args(format_args!("unavailable on this CPU: {reason}"))
             }
         }
     }
@@ -841,9 +842,10 @@ fn finish_group() {
     ktask::reset_group();
 }
 
-/// The first CPU feature `group` needs that this CPU lacks, or `None`. Only `xstate` has needs: it
-/// reads and writes the AVX-512 registers and the protection-key register, and checks the
-/// `XSAVE` frame that holds them. (`/init` of every other group runs on any x86-64 CPU.)
+/// Why this CPU cannot run `group`, or `None`: the first CPU feature it lacks (`no <flag>`), or AMX
+/// where the recorded rows assume none. Only `xstate` has needs: it reads and writes the AVX-512
+/// registers and the protection-key register, and checks the `XSAVE` frame that holds them.
+/// (`/init` of every other group runs on any x86-64 CPU.)
 fn unavailable_reason(group: &str) -> Option<&'static str> {
     if group != "xstate" {
         return None;
@@ -852,38 +854,50 @@ fn unavailable_reason(group: &str) -> Option<&'static str> {
     let basic = cpuid.get_feature_info();
     let extended = cpuid.get_extended_feature_info();
     let missing = [
-        ("xsave", basic.as_ref().is_some_and(FeatureInfo::has_xsave)),
         (
-            "avx512f",
+            "no xsave",
+            basic.as_ref().is_some_and(FeatureInfo::has_xsave),
+        ),
+        (
+            "no avx512f",
             extended.as_ref().is_some_and(ExtendedFeatures::has_avx512f),
         ),
         (
-            "avx512bw",
+            "no avx512bw",
             extended
                 .as_ref()
                 .is_some_and(ExtendedFeatures::has_avx512bw),
         ),
         (
-            "avx512dq",
+            "no avx512dq",
             extended
                 .as_ref()
                 .is_some_and(ExtendedFeatures::has_avx512dq),
         ),
         (
-            "avx512vl",
+            "no avx512vl",
             extended
                 .as_ref()
                 .is_some_and(ExtendedFeatures::has_avx512vl),
         ),
         (
-            "pku",
+            "no pku",
             extended.as_ref().is_some_and(ExtendedFeatures::has_pku),
         ),
     ];
     missing
         .into_iter()
         .find(|(_, present)| !present)
-        .map(|(flag, _)| flag)
+        .map(|(reason, _)| reason)
+        // The recorded rows (`req-perm-17`, `req-perm-18`: `EOPNOTSUPP`) are Linux's answers on a
+        // CPU without AMX; with AMX Linux grants the tile-data permission and this kernel stops
+        // loudly (`xstate::Config::amx`). Neither is a result this group can compare.
+        .or_else(|| {
+            extended
+                .as_ref()
+                .is_some_and(ExtendedFeatures::has_amx_tile)
+                .then_some("AMX tile state (not covered)")
+        })
 }
 
 fn start_next() -> ! {
@@ -893,10 +907,10 @@ fn start_next() -> ! {
             late_proofs();
             summary(None)
         };
-        if let Some(flag) = unavailable_reason(group) {
-            log!("SUITE group {} not run: the CPU has no {}\n", group, flag);
+        if let Some(reason) = unavailable_reason(group) {
+            log!("SUITE group {} not run: the CPU has {}\n", group, reason);
             let run = GroupRun {
-                cause: Cause::Unavailable(flag),
+                cause: Cause::Unavailable(reason),
                 report: None,
                 stop: None,
                 millis: 0,

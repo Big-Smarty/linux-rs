@@ -24,7 +24,7 @@
 use alloc::vec::Vec;
 use syscalls::{Errno, Sysno};
 
-use super::{Context, Outcome, Sys, outcome};
+use super::{Context, Outcome, Stop, Sys, outcome};
 use crate::{
     usercopy::{copy_from_user, copy_to_user, strncpy_from_user},
     vfs::{
@@ -128,7 +128,7 @@ pub(super) fn env_for<C: Context>(ctx: &mut C, dfd: i32, path: &[u8]) -> Result<
                 return Err(Errno::ENOTDIR);
             }
             Some(inode) => inode,
-            None if path.is_empty() => fs.pwd,
+            // A pipe has no inode in the file system model: `env_for_at` stops before this.
             None => return Err(Errno::ENOTDIR),
         }
     };
@@ -138,6 +138,21 @@ pub(super) fn env_for<C: Context>(ctx: &mut C, dfd: i32, path: &[u8]) -> Result<
         cred,
         umask: fs.umask,
     })
+}
+
+/// `env_for` for the callers that accept `AT_EMPTY_PATH`: an empty `path` walks from the
+/// descriptor's own inode (`path_init`, `fd_raw` branch). A pipe's inode (pipefs) is not part of
+/// the model, so that case stops loudly instead of acting on the working directory.
+pub(super) fn env_for_at<C: Context>(ctx: &mut C, dfd: i32, path: &[u8]) -> Result<Env, Stop> {
+    if path.is_empty() && dfd != AT_FDCWD {
+        let files = ctx.files();
+        #[allow(clippy::cast_sign_loss)]
+        let id = files.fdt.get(dfd as u32).ok_or(Errno::EBADF)?;
+        if files.vfs.files.get(id).inode.is_none() {
+            return Err(Stop::Unimplemented);
+        }
+    }
+    Ok(env_for(ctx, dfd, path)?)
 }
 
 // ---- open ------------------------------------------------------------------------

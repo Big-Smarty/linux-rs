@@ -66,11 +66,11 @@ fn getrandom<C: Context>(ctx: &mut C, ubuf: u64, len: u64, flags: u32) -> Sys {
     if flags & (GRND_INSECURE | GRND_RANDOM) == (GRND_INSECURE | GRND_RANDOM) {
         return Err(Errno::EINVAL.into());
     }
-    // import_ubuf(ITER_DEST): access_ok on the full length, then the clamp.
+    // import_ubuf(ITER_DEST) (lib/iov_iter.c:1433-1437): the clamp to MAX_RW_COUNT, then access_ok.
+    let len = len.min(u64::from(MAX_RW_COUNT));
     if !access_ok(ubuf, len) {
         return Err(Errno::EFAULT.into());
     }
-    let len = len.min(u64::from(MAX_RW_COUNT));
     if len == 0 {
         return Ok(0);
     }

@@ -1012,3 +1012,52 @@ fn getrandom_flags_lengths_and_faults() {
         super::Outcome::Unimplemented(318)
     );
 }
+
+#[test]
+fn getrandom_clamps_before_access_ok() {
+    let mut t = t();
+    // import_ubuf: len is clamped to MAX_RW_COUNT first, so a huge length at a low buffer
+    // passes access_ok and returns the bytes before the first fault (not EFAULT).
+    let n = match call(&mut t, Sysno::getrandom, &[0x1000, 1 << 62, 0]) {
+        super::Outcome::Return(n) => n,
+        other => panic!("{other:?}"),
+    };
+    assert!(n > 0 && n < 0x7fff_f000, "{n}");
+    assert_eq!(
+        call(&mut t, Sysno::getrandom, &[0x1000, 0x7fff_f001, 0]),
+        ok(n)
+    );
+    // Clamped, the range still leaves the address space: EFAULT from access_ok.
+    assert_eq!(
+        call(
+            &mut t,
+            Sysno::getrandom,
+            &[0x7fff_ffff_f000 - 0x1000, 1 << 62, 0]
+        ),
+        err(Errno::EFAULT)
+    );
+}
+
+#[test]
+fn at_empty_path_on_a_pipe_stops_instead_of_using_the_working_directory() {
+    let mut t = t();
+    assert_eq!(call(&mut t, Sysno::pipe2, &[OUT, 0]), ok(0));
+    let r = u64::from(u32_at(&mut t, OUT));
+    let empty = cstr(&mut t, PATH, "");
+    let new = cstr(&mut t, PATH2, "/linked");
+    let stop = |sysno: Sysno| super::Outcome::Unimplemented(sysno as u32);
+    // path_init starts from the pipe's own inode; this model has none, so it stops loudly.
+    for (sysno, args) in [
+        (Sysno::fchmodat2, vec![r, empty, 0o777, 0x1000]),
+        (Sysno::fchownat, vec![r, empty, 0, 0, 0x1000]),
+        (Sysno::utimensat, vec![r, empty, 0, 0x1000]),
+        (Sysno::linkat, vec![r, empty, AT_FDCWD as u64, new, 0x1000]),
+    ] {
+        assert_eq!(call(&mut t, sysno, &args), stop(sysno), "{sysno:?}");
+    }
+    // A bad descriptor is still EBADF.
+    assert_eq!(
+        call(&mut t, Sysno::fchmodat2, &[99, empty, 0o777, 0x1000]),
+        err(Errno::EBADF)
+    );
+}

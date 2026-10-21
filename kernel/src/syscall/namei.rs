@@ -31,7 +31,7 @@ use syscalls::{Errno, Sysno};
 
 use super::{
     Context, Outcome, Stop, Sys,
-    fs::{env_for, getname},
+    fs::{env_for, env_for_at, getname},
     outcome,
 };
 use crate::vfs::{
@@ -119,19 +119,20 @@ fn linkat<C: Context>(
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL.into());
     }
-    // `LOOKUP_LINKAT_EMPTY`: a descriptor opened with other credentials needs
-    // CAP_DAC_READ_SEARCH. The open-time credentials are not recorded, so the
-    // one case that depends on them (an unprivileged caller) stops loudly.
-    if empty_ok && !ctx.cred().dac_read_search {
+    let old = old?;
+    // `LOOKUP_LINKAT_EMPTY` (fs/namei.c:2641-2646, `path_init`): only a walk relative to a
+    // descriptor checks that a descriptor opened with other credentials needs
+    // CAP_DAC_READ_SEARCH. The open-time credentials are not recorded, so the one case that
+    // depends on them (an unprivileged caller) stops loudly.
+    if empty_ok && olddfd != AT_FDCWD && old.first() != Some(&b'/') && !ctx.cred().dac_read_search {
         return Err(Stop::Unimplemented);
     }
-    let old = old?;
     let lookup = if flags & AT_SYMLINK_FOLLOW != 0 {
         LOOKUP_FOLLOW
     } else {
         0
     };
-    let old_env = env_for(ctx, olddfd, &old)?;
+    let old_env = env_for_at(ctx, olddfd, &old)?;
     // filename_lookup(old) precedes filename_create(new): the new name's own
     // errors (and the walk of its parent) are only seen once the old one exists.
     let vfs = &mut *ctx.files().vfs;

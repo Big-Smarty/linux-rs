@@ -1056,3 +1056,35 @@ fn a_symlinked_init_resolves_and_a_name_with_a_missing_parent_is_dropped() {
     );
     assert!(vfs.lookup(&env, b"/after", 0).is_ok());
 }
+
+#[test]
+fn chown_that_drops_a_set_id_bit_also_needs_the_mode_change_permission() {
+    let (mut vfs, env) = rootfs(1 << 10);
+    vfs.mknod(&env, b"/su", S_IFREG | 0o4755, 0).unwrap();
+    vfs.mknod(&env, b"/plain", S_IFREG | 0o644, 0).unwrap();
+    let su = vfs.lookup(&env, b"/su", 0).unwrap();
+    let plain = vfs.lookup(&env, b"/plain", 0).unwrap();
+    // CAP_CHOWN without CAP_FOWNER, not the owner: `setattr_prepare` refuses ATTR_MODE.
+    let chowner = Env {
+        cred: Cred {
+            chown: true,
+            ..user(1000)
+        },
+        ..env
+    };
+    assert_eq!(
+        vfs.chown(&chowner, su, u32::MAX, u32::MAX),
+        Err(Errno::EPERM)
+    );
+    assert_eq!(vfs.fs.getattr(su).mode, S_IFREG | 0o4755, "nothing changed");
+    assert_eq!(vfs.chown(&chowner, plain, 7, 8), Ok(()));
+    let both = Env {
+        cred: Cred {
+            fowner: true,
+            ..chowner.cred
+        },
+        ..chowner
+    };
+    assert_eq!(vfs.chown(&both, su, 7, u32::MAX), Ok(()));
+    assert_eq!(vfs.fs.getattr(su).mode, S_IFREG | 0o755);
+}

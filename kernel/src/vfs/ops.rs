@@ -722,7 +722,9 @@ impl Vfs {
     ///
     /// # Errors
     /// `EPERM` (`chown_ok`, `chgrp_ok`): the owner may only "change" the owner to
-    /// itself and the group to one it belongs to; anything else needs `CAP_CHOWN`.
+    /// itself and the group to one it belongs to; anything else needs `CAP_CHOWN`. Also
+    /// `EPERM` when a set-id bit would be dropped and the caller neither owns the file nor
+    /// has `CAP_FOWNER` (the `ATTR_MODE` branch of `setattr_prepare`).
     pub fn chown(&mut self, env: &Env, inode: InodeId, uid: u32, gid: u32) -> KResult<()> {
         let cur = self.fs.inode(inode);
         let owner = cur.uid == env.cred.fsuid;
@@ -733,6 +735,17 @@ impl Vfs {
         if gid != u32::MAX
             && !(owner && (gid == cur.gid || gid == env.cred.fsgid) || env.cred.chown)
         {
+            return Err(Errno::EPERM);
+        }
+        // `notify_change` turns ATTR_KILL_SUID/SGID into ATTR_MODE when a set-id bit would go
+        // (fs/attr.c:495-513, judged as `set_owner` does), and `setattr_prepare` then wants
+        // `inode_owner_or_capable` for the mode change, whatever the ids.
+        let mode = cur.mode;
+        let drops_set_id = mode & S_IFMT != S_IFDIR
+            && (mode & S_ISUID != 0
+                || mode & S_ISGID != 0
+                    && (mode & S_IXGRP != 0 || !(env.cred.fsgid == cur.gid || env.cred.fsetid)));
+        if drops_set_id && !(owner || env.cred.fowner) {
             return Err(Errno::EPERM);
         }
         self.fs.set_owner(inode, uid, gid, &env.cred);

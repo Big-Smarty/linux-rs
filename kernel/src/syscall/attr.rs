@@ -33,7 +33,7 @@ use syscalls::{Errno, Sysno};
 use super::{
     Context, Outcome, Stop, Sys,
     fd::fdget,
-    fs::{env_for, getname},
+    fs::{env_for_at, getname},
     outcome,
 };
 use crate::{
@@ -89,9 +89,9 @@ fn user_path_at<C: Context>(
     path: u64,
     nofollow: bool,
     empty_ok: bool,
-) -> Result<(crate::vfs::ops::Env, InodeId), Errno> {
+) -> Result<(crate::vfs::ops::Env, InodeId), Stop> {
     let name = getname(ctx, path, empty_ok)?;
-    let env = env_for(ctx, dfd, &name)?;
+    let env = env_for_at(ctx, dfd, &name)?;
     let flags = if nofollow { 0 } else { LOOKUP_FOLLOW };
     let inode = ctx.files().vfs.lookup(&env, &name, flags)?;
     Ok((env, inode))

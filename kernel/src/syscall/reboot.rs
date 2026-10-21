@@ -12,11 +12,14 @@
 //! decoding are Linux's, in its order. `LINUX_REBOOT_CMD_CAD_ON/OFF` are accepted and
 //! remembered nowhere: Ctrl-Alt-Del is not a key this kernel's keyboard driver acts on, so the
 //! `C_A_D` flag has no reader. The commands that end or restart the machine (`RESTART`,
-//! `RESTART2`, `HALT`, `POWER_OFF`, `KEXEC`, `SW_SUSPEND`) stop loudly
+//! `RESTART2`, `HALT`, `POWER_OFF`) stop loudly
 //! ([`Outcome::Unimplemented`]): there is no shutdown path (`kernel_restart`, ACPI power-off, the
 //! `reboot=` methods) to run, and a call that returns success without stopping the machine is
 //! what `init` would believe. `RESTART2` still copies its command string first, so a bad pointer
-//! is `EFAULT` as in Linux.
+//! is `EFAULT` as in Linux. `SW_SUSPEND` is `EINVAL` (its `case` is under `CONFIG_HIBERNATION`,
+//! `# CONFIG_HIBERNATION is not set` in the reference configuration, so it falls to `default`)
+//! and `KEXEC` is `EINVAL` (`kernel_kexec`: `!kexec_image`; no `kexec_load`/`kexec_file_load`
+//! exists here, so no image can be loaded).
 
 use syscalls::{Errno, Sysno};
 
@@ -32,8 +35,6 @@ const CMD_CAD_ON: u32 = 0x89ab_cdef;
 const CMD_CAD_OFF: u32 = 0x0000_0000;
 const CMD_POWER_OFF: u32 = 0x4321_fedc;
 const CMD_RESTART2: u32 = 0xa1b2_c3d4;
-const CMD_SW_SUSPEND: u32 = 0xd000_fce2;
-const CMD_KEXEC: u32 = 0x4558_4543;
 
 pub(super) fn dispatch<C: Context>(ctx: &mut C, sysno: Sysno, a: [u64; 6]) -> Option<Outcome> {
     let result = match sysno {
@@ -62,9 +63,9 @@ fn reboot<C: Context>(ctx: &mut C, magic1: i32, magic2: i32, cmd: u32, arg: u64)
             }
             Err(Stop::Unimplemented)
         }
-        CMD_RESTART | CMD_HALT | CMD_POWER_OFF | CMD_KEXEC | CMD_SW_SUSPEND => {
-            Err(Stop::Unimplemented)
-        }
+        CMD_RESTART | CMD_HALT | CMD_POWER_OFF => Err(Stop::Unimplemented),
+        // CMD_KEXEC (kernel_kexec() without an image), CMD_SW_SUSPEND (no CONFIG_HIBERNATION
+        // case) and every unknown command: `default: ret = -EINVAL`.
         _ => Err(Errno::EINVAL.into()),
     }
 }
@@ -76,6 +77,9 @@ mod tests {
         dispatch, error,
         testing::{Task, task},
     };
+
+    const CMD_SW_SUSPEND: u32 = 0xd000_fce2;
+    const CMD_KEXEC: u32 = 0x4558_4543;
 
     fn call(t: &mut Task, args: [u64; 4]) -> Outcome {
         dispatch(
@@ -110,15 +114,15 @@ mod tests {
             ),
             Outcome::Return(0)
         );
-        // An unknown command is EINVAL, the machine commands stop loudly.
+        // An unknown command, KEXEC and SW_SUSPEND are EINVAL; the machine commands stop loudly.
         assert_eq!(call(&mut t, [M1, M2, 5, 0]), neg(Errno::EINVAL));
-        for cmd in [
-            CMD_RESTART,
-            CMD_HALT,
-            CMD_POWER_OFF,
-            CMD_KEXEC,
-            CMD_SW_SUSPEND,
-        ] {
+        for cmd in [CMD_KEXEC, CMD_SW_SUSPEND] {
+            assert_eq!(
+                call(&mut t, [M1, M2, u64::from(cmd), 0]),
+                neg(Errno::EINVAL)
+            );
+        }
+        for cmd in [CMD_RESTART, CMD_HALT, CMD_POWER_OFF] {
             assert_eq!(
                 call(&mut t, [M1, M2, u64::from(cmd), 0]),
                 Outcome::Unimplemented(169)
